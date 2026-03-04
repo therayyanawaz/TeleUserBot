@@ -10,6 +10,7 @@ __pycache__/
 
 userbot.session
 userbot.session-journal
+nezami_emoji_map.json
 
 # Runtime state (stored outside repo by default at ~/.tg_userbot/)
 .tg_userbot/

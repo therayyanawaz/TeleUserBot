@@ -269,10 +269,32 @@ def load_custom_emoji_map(
         candidate = payload.get("emoji_map")
         if isinstance(candidate, dict):
             for k, v in candidate.items():
-                raw_map[str(k)] = str(v)
+                key = str(k)
+                if isinstance(v, list):
+                    picked = ""
+                    for item in v:
+                        value = str(item or "").strip()
+                        if value.isdigit():
+                            picked = value
+                            break
+                    if picked:
+                        raw_map[key] = picked
+                else:
+                    raw_map[key] = str(v)
         else:
             for k, v in payload.items():
-                raw_map[str(k)] = str(v)
+                key = str(k)
+                if isinstance(v, list):
+                    picked = ""
+                    for item in v:
+                        value = str(item or "").strip()
+                        if value.isdigit():
+                            picked = value
+                            break
+                    if picked:
+                        raw_map[key] = picked
+                else:
+                    raw_map[key] = str(v)
     elif isinstance(payload, list):
         for item in payload:
             if not isinstance(item, dict):
