@@ -6,13 +6,16 @@ import asyncio
 from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import logging
 import math
 import re
 import threading
 import time
-from typing import Any, Iterable, List, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Iterable, List, Sequence, Tuple
+
+from db import load_recent_breaking, purge_recent_breaking, save_recent_breaking
 
 
 def estimate_tokens_rough(text: str) -> int:
@@ -716,3 +719,672 @@ class LiveTelegramStreamer:
             edit_count=self._edit_count,
             message_count=len(self._all_refs),
         )
+
+
+# -----------------------------------------------------------------------------
+# Aggressive Global Duplicate Suppression
+# -----------------------------------------------------------------------------
+
+_DUPE_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "was",
+    "were",
+    "with",
+    "will",
+    "this",
+    "these",
+    "those",
+    "after",
+    "before",
+    "into",
+    "over",
+    "under",
+    "via",
+    "about",
+    "says",
+    "said",
+    "reported",
+    "report",
+    "breaking",
+    "urgent",
+    "update",
+    "flash",
+    "just",
+    "now",
+    "today",
+    "live",
+    "news",
+}
+
+_BREAKING_HINTS = {
+    "explosion",
+    "strike",
+    "airstrike",
+    "drone",
+    "missile",
+    "killed",
+    "dead",
+    "casualties",
+    "attack",
+    "war",
+    "mobilization",
+    "evacuate",
+    "evacuation",
+    "state",
+    "emergency",
+    "earthquake",
+    "flood",
+    "wildfire",
+    "blast",
+    "hostage",
+    "navy",
+    "rescued",
+}
+
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F1E0-\U0001F1FF"
+    "\U0001F300-\U0001FAFF"
+    "\u2600-\u27BF"
+    "]+",
+    flags=re.UNICODE,
+)
+_URL_RE = re.compile(r"https?://\S+|t\.me/\S+", re.IGNORECASE)
+_TS_RE = re.compile(
+    r"\b(?:\d{1,2}[:.]\d{2}(?::\d{2})?\s?(?:utc|gmt|am|pm)?)\b",
+    re.IGNORECASE,
+)
+_DATE_RE = re.compile(
+    r"\b(?:\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|\d{4}[/-]\d{1,2}[/-]\d{1,2})\b"
+)
+_NOISE_WORD_RE = re.compile(
+    r"\b(?:breaking|urgent|flash|developing|update|news|alert)\b",
+    re.IGNORECASE,
+)
+_NON_WORD_RE = re.compile(r"[^a-z0-9\s]")
+
+
+def normalize_for_global_dupe(text: str) -> str:
+    """
+    Strong normalization tuned for cross-channel reposts/paraphrases.
+    """
+    value = normalize_space(text or "")
+    if not value:
+        return ""
+
+    value = _URL_RE.sub(" ", value)
+    value = _EMOJI_RE.sub(" ", value)
+    value = _TS_RE.sub(" ", value)
+    value = _DATE_RE.sub(" ", value)
+    value = _NOISE_WORD_RE.sub(" ", value)
+    value = value.lower()
+    value = _NON_WORD_RE.sub(" ", value)
+    value = normalize_space(value)
+    return value
+
+
+def build_dupe_fingerprint(text: str) -> tuple[str, str]:
+    normalized = normalize_for_global_dupe(text)
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest() if normalized else ""
+    return normalized, digest
+
+
+def _tokenize_for_dupe(normalized_text: str) -> list[str]:
+    tokens = re.findall(r"[a-z0-9]{2,}", normalized_text)
+    return [token for token in tokens if token not in _DUPE_STOP_WORDS]
+
+
+def _tfidf_cosine(tokens_a: Sequence[str], tokens_b: Sequence[str]) -> float:
+    if not tokens_a or not tokens_b:
+        return 0.0
+    tf_a = Counter(tokens_a)
+    tf_b = Counter(tokens_b)
+    vocab = set(tf_a.keys()) | set(tf_b.keys())
+    if not vocab:
+        return 0.0
+
+    weights_a: dict[str, float] = {}
+    weights_b: dict[str, float] = {}
+    for term in vocab:
+        df = int(term in tf_a) + int(term in tf_b)
+        idf = math.log((2 + 1) / (df + 1)) + 1.0
+        weights_a[term] = float(tf_a.get(term, 0)) * idf
+        weights_b[term] = float(tf_b.get(term, 0)) * idf
+
+    dot = sum(weights_a[t] * weights_b[t] for t in vocab)
+    norm_a = math.sqrt(sum(v * v for v in weights_a.values()))
+    norm_b = math.sqrt(sum(v * v for v in weights_b.values()))
+    if norm_a <= 0 or norm_b <= 0:
+        return 0.0
+    return max(0.0, min(1.0, dot / (norm_a * norm_b)))
+
+
+def _cosine_dense(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    dot = 0.0
+    norm_a = 0.0
+    norm_b = 0.0
+    for a, b in zip(vec_a, vec_b):
+        dot += float(a) * float(b)
+        norm_a += float(a) * float(a)
+        norm_b += float(b) * float(b)
+    if norm_a <= 0.0 or norm_b <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, dot / (math.sqrt(norm_a) * math.sqrt(norm_b))))
+
+
+def _is_breaking_like(normalized_text: str) -> bool:
+    if not normalized_text:
+        return False
+    tokens = set(_tokenize_for_dupe(normalized_text))
+    if not tokens:
+        return False
+    if "state" in tokens and "emergency" in tokens:
+        return True
+    return bool(tokens & _BREAKING_HINTS)
+
+
+@dataclass
+class GlobalDuplicateResult:
+    duplicate: bool
+    final_score: float
+    semantic_score: float
+    tfidf_score: float
+    fuzzy_score: float
+    normalized_text: str
+    text_hash: str
+    matched_channel_id: str | None = None
+    matched_message_id: int | None = None
+    matched_hash: str = ""
+    matched_timestamp: int = 0
+    breaking_duplicate_recent: bool = False
+    merged: bool = False
+    source_name: str = ""
+    matched_source_name: str = ""
+
+
+@dataclass
+class _HybridRecord:
+    channel_id: str
+    message_id: int
+    normalized_text: str
+    token_key: str
+    tokens: tuple[str, ...]
+    embedding: tuple[float, ...] | None
+    timestamp: int
+    text_hash: str
+
+
+class HybridDuplicateEngine:
+    """
+    Aggressive hybrid duplicate detector:
+    final_score = 0.5 * semantic + 0.3 * tfidf + 0.2 * fuzzy
+    """
+
+    def __init__(
+        self,
+        *,
+        threshold: float = 0.87,
+        history_hours: int = 4,
+        max_items: int = 8000,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self.threshold = float(min(max(threshold, 0.5), 0.99))
+        self.history_hours = max(1, min(int(history_hours), 24))
+        self.max_items = max(200, min(int(max_items), 100000))
+        self.logger = logger
+
+        self._records: deque[_HybridRecord] = deque()
+        self._lock = threading.Lock()
+
+        self._st_model = None
+        self._fuzz = None
+        self._backend_name = "uninitialized"
+        self._last_db_sync_ts = 0
+
+    @property
+    def backend_name(self) -> str:
+        return self._backend_name
+
+    @property
+    def cache_size(self) -> int:
+        with self._lock:
+            return len(self._records)
+
+    def _ensure_backends(self) -> None:
+        if self._backend_name != "uninitialized":
+            return
+
+        semantic_loaded = False
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+
+            model = None
+            for candidate in ("all-MiniLM-L6-v2", "paraphrase-MiniLM-L6-v2"):
+                try:
+                    model = SentenceTransformer(candidate)
+                    break
+                except Exception:
+                    continue
+            if model is not None:
+                self._st_model = model
+                semantic_loaded = True
+        except Exception:
+            semantic_loaded = False
+
+        try:
+            from rapidfuzz import fuzz  # type: ignore
+
+            self._fuzz = fuzz
+        except Exception:
+            self._fuzz = None
+
+        if semantic_loaded:
+            self._backend_name = "hybrid_semantic_tfidf_fuzzy"
+            if self.logger:
+                self.logger.info(
+                    "Hybrid duplicate backend: sentence-transformers + TF-IDF + rapidfuzz"
+                )
+        else:
+            self._backend_name = "hybrid_tfidf_fuzzy_fallback"
+            if self.logger:
+                self.logger.warning(
+                    "sentence-transformers unavailable; semantic score falls back to TF-IDF."
+                )
+
+    def _serialize_embedding(self, embedding: tuple[float, ...] | None) -> bytes | None:
+        if not embedding:
+            return None
+        try:
+            return json.dumps(list(embedding), separators=(",", ":")).encode("utf-8")
+        except Exception:
+            return None
+
+    def _deserialize_embedding(self, blob: bytes | None) -> tuple[float, ...] | None:
+        if not blob:
+            return None
+        try:
+            payload = json.loads(blob.decode("utf-8"))
+            if not isinstance(payload, list):
+                return None
+            values = []
+            for item in payload:
+                try:
+                    values.append(float(item))
+                except Exception:
+                    continue
+            if not values:
+                return None
+            return tuple(values)
+        except Exception:
+            return None
+
+    def _encode_semantic(self, normalized_text: str) -> tuple[float, ...] | None:
+        self._ensure_backends()
+        if self._st_model is None:
+            return None
+        try:
+            vector = self._st_model.encode(  # type: ignore[union-attr]
+                [normalized_text],
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+            )[0]
+            return tuple(float(x) for x in vector.tolist())
+        except Exception:
+            return None
+
+    def _fuzzy_similarity(self, key_a: str, key_b: str) -> float:
+        if not key_a or not key_b:
+            return 0.0
+        if self._fuzz is not None:
+            try:
+                return float(self._fuzz.token_sort_ratio(key_a, key_b)) / 100.0
+            except Exception:
+                pass
+        # stdlib fallback when rapidfuzz is unavailable
+        from difflib import SequenceMatcher
+
+        return SequenceMatcher(None, key_a, key_b).ratio()
+
+    def _prune_locked(self, now_ts: int) -> None:
+        cutoff = now_ts - (self.history_hours * 3600)
+        while self._records and self._records[0].timestamp < cutoff:
+            self._records.popleft()
+        while len(self._records) > self.max_items:
+            self._records.popleft()
+
+    def _sync_from_db_locked(self, now_ts: int, *, force: bool = False) -> None:
+        if not force and self._last_db_sync_ts > 0 and (now_ts - self._last_db_sync_ts) < 20:
+            return
+
+        rows = load_recent_breaking(
+            since_ts=now_ts - (self.history_hours * 3600),
+            limit=self.max_items,
+        )
+        rows = list(reversed(rows))
+        rebuilt: deque[_HybridRecord] = deque()
+        for row in rows:
+            normalized_text = normalize_space(str(row.get("normalized_text") or ""))
+            if len(normalized_text) < 12:
+                continue
+            rebuilt.append(
+                self._build_record(
+                    channel_id=str(row.get("channel_id") or ""),
+                    message_id=int(row.get("message_id") or 0),
+                    normalized_text=normalized_text,
+                    timestamp=int(row.get("timestamp") or now_ts),
+                    text_hash=str(row.get("hash") or ""),
+                    embedding=self._deserialize_embedding(row.get("embedding_blob", b"")),  # type: ignore[arg-type]
+                )
+            )
+        self._records = rebuilt
+        self._prune_locked(now_ts)
+        self._last_db_sync_ts = now_ts
+
+    def _build_record(
+        self,
+        *,
+        channel_id: str,
+        message_id: int,
+        normalized_text: str,
+        timestamp: int,
+        text_hash: str,
+        embedding: tuple[float, ...] | None,
+    ) -> _HybridRecord:
+        tokens = tuple(_tokenize_for_dupe(normalized_text))
+        token_key = " ".join(sorted(tokens))
+        return _HybridRecord(
+            channel_id=str(channel_id),
+            message_id=int(message_id),
+            normalized_text=normalized_text,
+            token_key=token_key,
+            tokens=tokens,
+            embedding=embedding,
+            timestamp=int(timestamp),
+            text_hash=text_hash,
+        )
+
+    def warm_start_from_db(self, *, warm_hours: int = 2) -> None:
+        now_ts = int(time.time())
+        hours = max(1, min(int(warm_hours), self.history_hours))
+        rows = load_recent_breaking(
+            since_ts=now_ts - (hours * 3600),
+            limit=self.max_items,
+        )
+        rows = list(reversed(rows))
+
+        with self._lock:
+            self._ensure_backends()
+            for row in rows:
+                normalized_text = normalize_space(str(row.get("normalized_text") or ""))
+                if len(normalized_text) < 12:
+                    continue
+                record = self._build_record(
+                    channel_id=str(row.get("channel_id") or ""),
+                    message_id=int(row.get("message_id") or 0),
+                    normalized_text=normalized_text,
+                    timestamp=int(row.get("timestamp") or now_ts),
+                    text_hash=str(row.get("hash") or ""),
+                    embedding=self._deserialize_embedding(row.get("embedding_blob", b"")),  # type: ignore[arg-type]
+                )
+                self._records.append(record)
+            self._prune_locked(now_ts)
+            self._last_db_sync_ts = now_ts
+
+    def check_and_store(
+        self,
+        *,
+        channel_id: str,
+        message_id: int,
+        raw_text: str,
+        timestamp: int | None = None,
+    ) -> GlobalDuplicateResult:
+        normalized_text, text_hash = build_dupe_fingerprint(raw_text)
+        if len(normalized_text) < 12:
+            return GlobalDuplicateResult(
+                duplicate=False,
+                final_score=0.0,
+                semantic_score=0.0,
+                tfidf_score=0.0,
+                fuzzy_score=0.0,
+                normalized_text=normalized_text,
+                text_hash=text_hash,
+            )
+
+        now_ts = int(timestamp if timestamp is not None else time.time())
+        self._ensure_backends()
+        embedding = self._encode_semantic(normalized_text)
+        current_tokens = tuple(_tokenize_for_dupe(normalized_text))
+        current_key = " ".join(sorted(current_tokens))
+
+        best_score = 0.0
+        best_semantic = 0.0
+        best_tfidf = 0.0
+        best_fuzzy = 0.0
+        best_record: _HybridRecord | None = None
+
+        with self._lock:
+            self._prune_locked(now_ts)
+            self._sync_from_db_locked(now_ts)
+
+            for record in self._records:
+                if record.channel_id == str(channel_id) and record.message_id == int(message_id):
+                    continue
+
+                if record.text_hash and record.text_hash == text_hash:
+                    best_record = record
+                    best_score = 1.0
+                    best_semantic = 1.0
+                    best_tfidf = 1.0
+                    best_fuzzy = 1.0
+                    break
+
+                tfidf_score = _tfidf_cosine(current_tokens, record.tokens)
+                fuzzy_score = self._fuzzy_similarity(current_key, record.token_key)
+                semantic_score = 0.0
+                if embedding is not None and record.embedding is not None:
+                    semantic_score = _cosine_dense(embedding, record.embedding)
+                else:
+                    semantic_score = tfidf_score
+
+                final_score = (0.5 * semantic_score) + (0.3 * tfidf_score) + (0.2 * fuzzy_score)
+                if final_score > best_score:
+                    best_score = final_score
+                    best_semantic = semantic_score
+                    best_tfidf = tfidf_score
+                    best_fuzzy = fuzzy_score
+                    best_record = record
+
+            if best_score >= self.threshold and best_record is not None:
+                breaking_recent = (
+                    _is_breaking_like(normalized_text)
+                    and (now_ts - int(best_record.timestamp)) <= 1800
+                )
+                return GlobalDuplicateResult(
+                    duplicate=True,
+                    final_score=float(best_score),
+                    semantic_score=float(best_semantic),
+                    tfidf_score=float(best_tfidf),
+                    fuzzy_score=float(best_fuzzy),
+                    normalized_text=normalized_text,
+                    text_hash=text_hash,
+                    matched_channel_id=best_record.channel_id,
+                    matched_message_id=best_record.message_id,
+                    matched_hash=best_record.text_hash,
+                    matched_timestamp=best_record.timestamp,
+                    breaking_duplicate_recent=bool(breaking_recent),
+                )
+
+            # Persist non-duplicate anchor for future matching.
+            new_record = self._build_record(
+                channel_id=str(channel_id),
+                message_id=int(message_id),
+                normalized_text=normalized_text,
+                timestamp=now_ts,
+                text_hash=text_hash,
+                embedding=embedding,
+            )
+            self._records.append(new_record)
+            self._prune_locked(now_ts)
+
+        save_recent_breaking(
+            channel_id=str(channel_id),
+            message_id=int(message_id),
+            normalized_text=normalized_text,
+            embedding_blob=self._serialize_embedding(embedding),
+            timestamp=now_ts,
+            text_hash=text_hash,
+            history_hours=self.history_hours,
+        )
+        return GlobalDuplicateResult(
+            duplicate=False,
+            final_score=float(best_score),
+            semantic_score=float(best_semantic),
+            tfidf_score=float(best_tfidf),
+            fuzzy_score=float(best_fuzzy),
+            normalized_text=normalized_text,
+            text_hash=text_hash,
+        )
+
+    def purge_old_records(self) -> int:
+        now_ts = int(time.time())
+        with self._lock:
+            before = len(self._records)
+            self._prune_locked(now_ts)
+            after = len(self._records)
+        db_pruned = purge_recent_breaking(history_hours=self.history_hours)
+        return int((before - after) + db_pruned)
+
+
+@dataclass
+class DuplicateRuntime:
+    engine: HybridDuplicateEngine
+    logger: logging.Logger
+    merge_instead_of_skip: bool = True
+    source_resolver: Callable[[Any], Awaitable[str]] | None = None
+    merge_callback: Callable[[GlobalDuplicateResult, str], Awaitable[bool]] | None = None
+
+
+_DUPLICATE_RUNTIME: DuplicateRuntime | None = None
+
+
+def configure_duplicate_runtime(runtime: DuplicateRuntime | None) -> None:
+    global _DUPLICATE_RUNTIME
+    _DUPLICATE_RUNTIME = runtime
+
+
+async def is_duplicate_and_handle(event: Any) -> GlobalDuplicateResult:
+    """
+    Global persistent dedupe gate.
+    Call this as the first step in message intake.
+    """
+    runtime = _DUPLICATE_RUNTIME
+    if runtime is None:
+        return GlobalDuplicateResult(
+            duplicate=False,
+            final_score=0.0,
+            semantic_score=0.0,
+            tfidf_score=0.0,
+            fuzzy_score=0.0,
+            normalized_text="",
+            text_hash="",
+        )
+
+    msg = getattr(event, "message", None)
+    if msg is None:
+        return GlobalDuplicateResult(
+            duplicate=False,
+            final_score=0.0,
+            semantic_score=0.0,
+            tfidf_score=0.0,
+            fuzzy_score=0.0,
+            normalized_text="",
+            text_hash="",
+        )
+
+    channel_id = str(getattr(msg, "chat_id", ""))
+    message_id = int(getattr(msg, "id", 0) or 0)
+    raw_text = str(getattr(msg, "message", "") or "").strip()
+    if message_id <= 0 or not raw_text:
+        return GlobalDuplicateResult(
+            duplicate=False,
+            final_score=0.0,
+            semantic_score=0.0,
+            tfidf_score=0.0,
+            fuzzy_score=0.0,
+            normalized_text="",
+            text_hash="",
+        )
+
+    result = await asyncio.to_thread(
+        runtime.engine.check_and_store,
+        channel_id=channel_id,
+        message_id=message_id,
+        raw_text=raw_text,
+        timestamp=int(time.time()),
+    )
+    if not result.duplicate:
+        return result
+
+    source_name = channel_id
+    if runtime.source_resolver is not None:
+        try:
+            source_name = normalize_space(await runtime.source_resolver(msg)) or channel_id
+        except Exception:
+            source_name = channel_id
+    matched_source_name = str(result.matched_channel_id or "unknown")
+
+    merged = False
+    if (
+        result.breaking_duplicate_recent
+        and runtime.merge_instead_of_skip
+        and runtime.merge_callback is not None
+    ):
+        try:
+            merged = bool(await runtime.merge_callback(result, source_name))
+        except Exception:
+            merged = False
+
+    result.merged = merged
+    result.source_name = source_name
+    result.matched_source_name = matched_source_name
+
+    log_structured(
+        runtime.logger,
+        "duplicate_suppressed",
+        level=logging.INFO,
+        incoming_channel=source_name,
+        incoming_channel_id=channel_id,
+        incoming_message_id=message_id,
+        matched_channel=matched_source_name,
+        matched_channel_id=result.matched_channel_id,
+        matched_message_id=result.matched_message_id,
+        matched_timestamp=result.matched_timestamp,
+        score=round(float(result.final_score), 4),
+        semantic=round(float(result.semantic_score), 4),
+        tfidf=round(float(result.tfidf_score), 4),
+        fuzzy=round(float(result.fuzzy_score), 4),
+        threshold=round(float(runtime.engine.threshold), 4),
+        breaking_recent=bool(result.breaking_duplicate_recent),
+        merged=bool(merged),
+    )
+    return result
