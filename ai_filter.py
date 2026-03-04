@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict, deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import httpx
 
@@ -292,6 +293,19 @@ def _include_source_tags() -> bool:
     return False
 
 
+def _streaming_enabled() -> bool:
+    raw = getattr(config, "STREAMING_ENABLED", True)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        lowered = raw.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(raw)
+
+
 def _summary_system_prompt() -> str:
     language = _resolve_output_language()
     return (
@@ -330,11 +344,12 @@ def _build_codex_payload(
     instructions: str,
     *,
     verbosity: str = "medium",
+    stream: bool = True,
 ) -> dict:
     payload: dict[str, object] = {
         "model": _resolve_codex_model(),
         "store": False,
-        "stream": True,
+        "stream": bool(stream),
         "instructions": instructions,
         "input": [
             {
@@ -348,12 +363,8 @@ def _build_codex_payload(
     return payload
 
 
-def _extract_completed_text(event: dict) -> str:
-    response = event.get("response")
-    if not isinstance(response, dict):
-        return ""
-
-    outputs = response.get("output")
+def _extract_response_output_text(response_payload: dict) -> str:
+    outputs = response_payload.get("output")
     if not isinstance(outputs, list):
         return ""
 
@@ -377,55 +388,14 @@ def _extract_completed_text(event: dict) -> str:
     return "".join(chunks).strip()
 
 
-def _parse_sse_body(raw_text: str) -> str:
-    deltas: list[str] = []
-    completed_text = ""
-
-    for chunk in raw_text.split("\n\n"):
-        lines = [line for line in chunk.splitlines() if line.startswith("data:")]
-        if not lines:
-            continue
-
-        data = "\n".join(line[5:].strip() for line in lines).strip()
-        if not data or data == "[DONE]":
-            continue
-
-        try:
-            event = json.loads(data)
-        except json.JSONDecodeError:
-            continue
-
-        event_type = str(event.get("type") or "")
-        if event_type == "response.output_text.delta":
-            delta = event.get("delta")
-            if isinstance(delta, str):
-                deltas.append(delta)
-            continue
-
-        if event_type == "response.refusal.delta":
-            delta = event.get("delta")
-            if isinstance(delta, str):
-                deltas.append(delta)
-            continue
-
-        if event_type == "response.failed":
-            err = event.get("response", {}).get("error", {})
-            message = ""
-            if isinstance(err, dict):
-                message = str(err.get("message") or "")
-            raise _CodexApiError(message or "Codex response failed.")
-
-        if event_type == "error":
-            message = str(event.get("message") or event.get("code") or "").strip()
-            raise _CodexApiError(message or "Codex backend returned error event.")
-
-        if event_type in {"response.completed", "response.done"} and not completed_text:
-            completed_text = _extract_completed_text(event)
-
-    merged = "".join(deltas).strip()
-    if merged:
-        return merged
-    return completed_text.strip()
+def _extract_completed_text(event: dict) -> str:
+    response = event.get("response")
+    if isinstance(response, dict):
+        return _extract_response_output_text(response)
+    # Some payloads can arrive as direct response body.
+    if isinstance(event, dict) and event.get("output") is not None:
+        return _extract_response_output_text(event)
+    return ""
 
 
 def _raise_codex_http_error(response: httpx.Response) -> None:
@@ -455,7 +425,184 @@ def _raise_codex_http_error(response: httpx.Response) -> None:
     raise _CodexApiError(message or f"Codex backend error: HTTP {response.status_code}")
 
 
-async def _call_codex(
+@dataclass
+class CodexStreamMetrics:
+    total_chars: int = 0
+    delta_events: int = 0
+    started_at: float = 0.0
+    ended_at: float = 0.0
+
+    @property
+    def elapsed(self) -> float:
+        if self.ended_at <= self.started_at:
+            return 0.0
+        return self.ended_at - self.started_at
+
+    @property
+    def tokens_per_second(self) -> float:
+        elapsed = self.elapsed
+        if elapsed <= 0:
+            return 0.0
+        return float(estimate_tokens_rough("x" * self.total_chars)) / elapsed
+
+
+class _StreamingCodexResponse:
+    def __init__(
+        self,
+        *,
+        cleaned: str,
+        auth_context: Dict[str, str],
+        instructions: str,
+        verbosity: str,
+    ) -> None:
+        self._cleaned = cleaned
+        self._auth_context = auth_context
+        self._instructions = instructions
+        self._verbosity = verbosity
+
+        self._client: httpx.AsyncClient | None = None
+        self._stream_ctx = None
+        self._response: httpx.Response | None = None
+
+        self.full_text = ""
+        self.metrics = CodexStreamMetrics()
+        self._iterated = False
+
+    async def __aenter__(self) -> "_StreamingCodexResponse":
+        access_token = self._auth_context["access_token"]
+        account_id = self._auth_context["account_id"]
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "chatgpt-account-id": account_id,
+            "OpenAI-Beta": "responses=experimental",
+            "originator": _resolve_codex_originator(),
+            "accept": "text/event-stream",
+            "content-type": "application/json",
+            "user-agent": "tg-news-userbot/1.0",
+        }
+        payload = _build_codex_payload(
+            self._cleaned,
+            instructions=self._instructions,
+            verbosity=self._verbosity,
+            stream=True,
+        )
+
+        timeout = httpx.Timeout(90.0, connect=20.0)
+        self._client = httpx.AsyncClient(timeout=timeout)
+        self._stream_ctx = self._client.stream(
+            "POST",
+            _resolve_codex_url(),
+            headers=headers,
+            json=payload,
+        )
+        self._response = await self._stream_ctx.__aenter__()
+        if self._response.status_code >= 400:
+            body = await self._response.aread()
+            error_response = httpx.Response(
+                status_code=self._response.status_code,
+                headers=self._response.headers,
+                content=body,
+                request=self._response.request,
+            )
+            await self.__aexit__(None, None, None)
+            _raise_codex_http_error(error_response)
+
+        self.metrics.started_at = time.time()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.metrics.ended_at = time.time()
+        if self._stream_ctx is not None:
+            await self._stream_ctx.__aexit__(exc_type, exc, tb)
+            self._stream_ctx = None
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+        self._response = None
+
+    async def __aiter__(self) -> AsyncIterator[str]:
+        if self._iterated:
+            return
+        self._iterated = True
+        if self._response is None:
+            return
+
+        data_lines: list[str] = []
+        completed_text = ""
+
+        async for line in self._response.aiter_lines():
+            if line == "":
+                if not data_lines:
+                    continue
+                event_data = "\n".join(data_lines).strip()
+                data_lines = []
+                if not event_data or event_data == "[DONE]":
+                    continue
+
+                try:
+                    event = json.loads(event_data)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = str(event.get("type") or "")
+                if event_type in {"response.output_text.delta", "response.refusal.delta"}:
+                    delta = event.get("delta")
+                    if isinstance(delta, str) and delta:
+                        self.full_text += delta
+                        self.metrics.total_chars += len(delta)
+                        self.metrics.delta_events += 1
+                        yield delta
+                    continue
+
+                if event_type == "response.failed":
+                    err = event.get("response", {}).get("error", {})
+                    message = ""
+                    if isinstance(err, dict):
+                        message = str(err.get("message") or "")
+                    raise _CodexApiError(message or "Codex response failed.")
+
+                if event_type == "error":
+                    message = str(event.get("message") or event.get("code") or "").strip()
+                    raise _CodexApiError(message or "Codex backend returned error event.")
+
+                if event_type in {"response.completed", "response.done"}:
+                    maybe = _extract_completed_text(event)
+                    if maybe:
+                        completed_text = maybe
+                continue
+
+            if line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+
+        if not self.full_text and completed_text:
+            self.full_text = completed_text
+            self.metrics.total_chars = len(completed_text)
+
+
+def streaming_codex_response(
+    cleaned: str,
+    auth_context: Dict[str, str],
+    instructions: str,
+    *,
+    verbosity: str = "medium",
+) -> _StreamingCodexResponse:
+    return _StreamingCodexResponse(
+        cleaned=cleaned,
+        auth_context=auth_context,
+        instructions=instructions,
+        verbosity=verbosity,
+    )
+
+
+def _extract_response_text_from_json(payload: dict) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    if payload.get("response") and isinstance(payload.get("response"), dict):
+        return _extract_response_output_text(payload["response"])
+    return _extract_response_output_text(payload)
+
+
+async def _call_codex_non_stream(
     cleaned: str,
     auth_context: Dict[str, str],
     instructions: str,
@@ -464,31 +611,69 @@ async def _call_codex(
 ) -> str:
     access_token = auth_context["access_token"]
     account_id = auth_context["account_id"]
-
     headers = {
         "Authorization": f"Bearer {access_token}",
         "chatgpt-account-id": account_id,
         "OpenAI-Beta": "responses=experimental",
         "originator": _resolve_codex_originator(),
-        "accept": "text/event-stream",
+        "accept": "application/json",
         "content-type": "application/json",
         "user-agent": "tg-news-userbot/1.0",
     }
-
     payload = _build_codex_payload(
         cleaned,
         instructions=instructions,
         verbosity=verbosity,
+        stream=False,
     )
     timeout = httpx.Timeout(90.0, connect=20.0)
     async with httpx.AsyncClient(timeout=timeout) as http:
         response = await http.post(_resolve_codex_url(), headers=headers, json=payload)
-
     if response.status_code >= 400:
         _raise_codex_http_error(response)
+    try:
+        data = response.json()
+    except Exception:
+        return ""
+    return _extract_response_text_from_json(data).strip()
 
-    parsed = _parse_sse_body(response.text)
-    return parsed.strip()
+
+async def _call_codex(
+    cleaned: str,
+    auth_context: Dict[str, str],
+    instructions: str,
+    *,
+    verbosity: str = "medium",
+    on_token: Callable[[str], Awaitable[None]] | None = None,
+) -> str:
+    if _streaming_enabled():
+        try:
+            fragments: list[str] = []
+            async with streaming_codex_response(
+                cleaned,
+                auth_context,
+                instructions,
+                verbosity=verbosity,
+            ) as stream:
+                async for delta in stream:
+                    fragments.append(delta)
+                    if on_token is not None:
+                        await on_token(delta)
+
+                parsed = "".join(fragments).strip() or stream.full_text.strip()
+                if parsed:
+                    return parsed
+        except (_CodexAuthError, _CodexRateLimitError):
+            raise
+        except Exception as exc:
+            LOGGER.debug("Streaming path failed, falling back to non-stream: %s", exc)
+
+    return await _call_codex_non_stream(
+        cleaned,
+        auth_context,
+        instructions,
+        verbosity=verbosity,
+    )
 
 
 async def codex_chat_completion(
@@ -1206,6 +1391,8 @@ async def summarize_breaking_headline(
 async def create_digest_summary(
     posts: List[Dict[str, object]],
     auth_manager: AuthManager | None = None,
+    *,
+    on_token: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """
     Build one editorial digest from queued posts.
@@ -1234,6 +1421,9 @@ async def create_digest_summary(
         return quiet_text
 
     prefer_json = bool(getattr(config, "DIGEST_PREFER_JSON_OUTPUT", True))
+    # JSON mode streams poorly for live UX; force markdown when streaming edits are enabled.
+    if on_token is not None:
+        prefer_json = False
     importance_scoring = bool(getattr(config, "DIGEST_IMPORTANCE_SCORING", True))
     include_links = bool(getattr(config, "DIGEST_INCLUDE_READ_MORE_LINKS", True))
     output_language = _resolve_output_language()
@@ -1261,11 +1451,21 @@ async def create_digest_summary(
     )
 
     try:
-        content = await _call_codex(user_payload, auth_context, instructions=prompt)
+        content = await _call_codex(
+            user_payload,
+            auth_context,
+            instructions=prompt,
+            on_token=on_token,
+        )
     except _CodexAuthError:
         try:
             auth_context = await manager.refresh_auth_context()
-            content = await _call_codex(user_payload, auth_context, instructions=prompt)
+            content = await _call_codex(
+                user_payload,
+                auth_context,
+                instructions=prompt,
+                on_token=on_token,
+            )
         except Exception:
             return local_fallback_digest(posts, interval_minutes=interval_minutes)
     except _CodexRateLimitError as exc:
@@ -1305,7 +1505,12 @@ async def create_digest_summary(
             include_source_tags=_include_source_tags(),
         )
         try:
-            content = await _call_codex(user_payload, auth_context, instructions=markdown_prompt)
+            content = await _call_codex(
+                user_payload,
+                auth_context,
+                instructions=markdown_prompt,
+                on_token=on_token,
+            )
         except Exception:
             return local_fallback_digest(posts, interval_minutes=interval_minutes)
 
@@ -1322,6 +1527,7 @@ async def generate_answer_from_context(
     auth_manager: AuthManager | None = None,
     *,
     conversation_history: Sequence[Dict[str, str]] | None = None,
+    on_token: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """
     Generate a conversational query answer from recent Telegram context messages.
@@ -1380,6 +1586,7 @@ async def generate_answer_from_context(
             auth_context,
             instructions=prompt,
             verbosity="low" if not detailed else "medium",
+            on_token=on_token,
         )
     except _CodexAuthError:
         try:
@@ -1389,6 +1596,7 @@ async def generate_answer_from_context(
                 auth_context,
                 instructions=prompt,
                 verbosity="low" if not detailed else "medium",
+                on_token=on_token,
             )
         except Exception:
             return _fallback_query_answer(context_messages, detailed=detailed)

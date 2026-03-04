@@ -42,6 +42,7 @@ Rules for headlines:
 - No speculation beyond provided text.
 - If sources conflict, include uncertainty in the same line.
 - Add [Read more](url) only when a reliable link is present and useful.
+- Keep markdown valid (no broken/unclosed formatting).
 
 Quiet mode:
 - If nothing important remains after filtering, output exactly:
@@ -128,7 +129,8 @@ Hard rules:
 6) For high-impact developments, use severity emoji:
    - 🔥 high impact / urgent escalation
    - ⚠️ medium impact / meaningful update
-7) If no relevant evidence exists, output exactly:
+7) Keep markdown well-formed and avoid unclosed formatting.
+8) If no relevant evidence exists, output exactly:
    NO_MATCH_SENTINEL
 
 Default style:

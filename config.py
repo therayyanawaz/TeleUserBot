@@ -213,3 +213,11 @@ QUERY_DEFAULT_HOURS_BACK = _env_int("QUERY_DEFAULT_HOURS_BACK", 24)  # type: int
 # Optional chat allowlist for query interface (chat IDs as integers/strings).
 # If empty, query mode only accepts outgoing private chats (e.g., Saved Messages).
 QUERY_ALLOWED_CHAT_IDS = _env_list("QUERY_ALLOWED_CHAT_IDS", [])  # type: list[str]
+
+# -----------------------------------------------------------------------------
+# Streaming UX
+# -----------------------------------------------------------------------------
+STREAMING_ENABLED = _env_bool("STREAMING_ENABLED", True)  # type: bool
+STREAM_EDIT_INTERVAL_MS = _env_int("STREAM_EDIT_INTERVAL_MS", 400)  # type: int
+STREAM_MAX_CHARS_PER_EDIT = _env_int("STREAM_MAX_CHARS_PER_EDIT", 120)  # type: int
+STREAM_TYPING_ACTION = _env_bool("STREAM_TYPING_ACTION", True)  # type: bool

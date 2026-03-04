@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter, deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -162,6 +163,37 @@ def log_structured(
         **fields,
     }
     logger.log(level, json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def make_stream_markdown_preview(text: str) -> str:
+    """
+    Best-effort markdown safety for partial streamed text.
+    Prevents common broken rendering while editing progressively.
+    """
+    value = text or ""
+    if not value:
+        return value
+
+    # Avoid hanging incomplete markdown links.
+    if value.count("[") > value.count("]"):
+        cut = value.rfind("[")
+        if cut >= 0:
+            value = value[:cut]
+    if value.count("(") > value.count(")") and "](" in value:
+        cut = value.rfind("](")
+        if cut >= 0:
+            value = value[:cut]
+
+    # Balance simple markdown markers for partial render.
+    for marker in ("**", "__", "`"):
+        if marker == "`":
+            if value.count(marker) % 2 == 1:
+                value += marker
+        else:
+            if value.count(marker) % 2 == 1:
+                value += marker
+
+    return value.rstrip()
 
 
 class NearDuplicateDetector:
@@ -528,3 +560,159 @@ async def search_recent_messages(
         reverse=True,
     )
     return ordered[:resolved_max]
+
+
+@dataclass
+class LiveStreamStats:
+    total_chars: int
+    estimated_tokens: int
+    duration_seconds: float
+    tokens_per_second: float
+    edit_count: int
+    message_count: int
+
+
+class LiveTelegramStreamer:
+    """
+    Incremental message editor for token streaming UX.
+
+    The streamer edits one placeholder message repeatedly and can emit
+    continuation messages when final text exceeds Telegram-safe length.
+    """
+
+    def __init__(
+        self,
+        *,
+        send_message,
+        edit_message,
+        get_message_id,
+        placeholder_text: str,
+        edit_interval_ms: int = 400,
+        max_chars_per_edit: int = 120,
+        typing_action_cb=None,
+        typing_enabled: bool = True,
+        max_message_chars: int = 3900,
+    ) -> None:
+        self._send_message = send_message
+        self._edit_message = edit_message
+        self._get_message_id = get_message_id
+        self._typing_action_cb = typing_action_cb
+        self._typing_enabled = bool(typing_enabled)
+        self._placeholder_text = placeholder_text
+        self._edit_interval = max(0.1, float(edit_interval_ms) / 1000.0)
+        self._max_chars_per_edit = max(40, min(int(max_chars_per_edit), 800))
+        self._max_message_chars = max(1200, min(int(max_message_chars), 3900))
+
+        self._full_text = ""
+        self._rendered_chars = 0
+        self._last_edit_ts = 0.0
+        self._edit_count = 0
+        self._started_ts = 0.0
+
+        self._primary_ref = None
+        self._all_refs: list[Any] = []
+        self._typing_task: asyncio.Task | None = None
+        self._closed = False
+
+    async def start(self, *, initial_ref: Any | None = None) -> Any:
+        self._started_ts = time.time()
+        if initial_ref is None:
+            self._primary_ref = await self._send_message(self._placeholder_text, None)
+        else:
+            self._primary_ref = initial_ref
+
+        self._all_refs = [self._primary_ref]
+        if self._typing_enabled and self._typing_action_cb is not None:
+            self._typing_task = asyncio.create_task(self._typing_loop(), name="live-typing")
+        return self._primary_ref
+
+    async def _typing_loop(self) -> None:
+        try:
+            while not self._closed:
+                try:
+                    await self._typing_action_cb()
+                except Exception:
+                    pass
+                await asyncio.sleep(4.0)
+        except asyncio.CancelledError:
+            return
+
+    async def push(self, delta: str) -> None:
+        if self._closed:
+            return
+        if not delta:
+            return
+        self._full_text += delta
+
+        now = time.time()
+        if now - self._last_edit_ts < self._edit_interval:
+            return
+        await self._flush_partial(force=False)
+
+    async def _flush_partial(self, *, force: bool) -> None:
+        if self._primary_ref is None or self._closed:
+            return
+
+        if force:
+            target = len(self._full_text)
+        else:
+            target = min(len(self._full_text), self._rendered_chars + self._max_chars_per_edit)
+            if target <= self._rendered_chars:
+                return
+
+        preview = self._full_text[:target]
+        safe_preview = make_stream_markdown_preview(preview)
+        if target < len(self._full_text):
+            safe_preview = safe_preview.rstrip() + " ..."
+
+        if not safe_preview.strip():
+            return
+
+        self._primary_ref = await self._edit_message(self._primary_ref, safe_preview)
+        self._edit_count += 1
+        self._rendered_chars = target
+        self._last_edit_ts = time.time()
+
+    async def finalize(self, final_text: str | None = None) -> LiveStreamStats:
+        if final_text is not None:
+            self._full_text = final_text
+
+        cleaned_final = (self._full_text or "").rstrip()
+        cleaned_final = re.sub(r"\s+\.\.\.$", "", cleaned_final).strip()
+        if not cleaned_final:
+            cleaned_final = "No matching information found in recent updates."
+
+        chunks = split_markdown_chunks(cleaned_final, max_chars=self._max_message_chars)
+        if not chunks:
+            chunks = [cleaned_final]
+
+        if self._primary_ref is None:
+            self._primary_ref = await self._send_message(chunks[0], None)
+            self._all_refs = [self._primary_ref]
+        else:
+            self._primary_ref = await self._edit_message(self._primary_ref, chunks[0])
+            self._all_refs = [self._primary_ref]
+            self._edit_count += 1
+
+        reply_to = self._get_message_id(self._primary_ref)
+        for extra in chunks[1:]:
+            ref = await self._send_message(extra, reply_to)
+            self._all_refs.append(ref)
+            reply_to = self._get_message_id(ref)
+
+        self._closed = True
+        if self._typing_task is not None:
+            self._typing_task.cancel()
+            await asyncio.gather(self._typing_task, return_exceptions=True)
+            self._typing_task = None
+
+        elapsed = max(0.001, time.time() - self._started_ts)
+        est_tokens = estimate_tokens_rough(cleaned_final)
+        return LiveStreamStats(
+            total_chars=len(cleaned_final),
+            estimated_tokens=est_tokens,
+            duration_seconds=elapsed,
+            tokens_per_second=float(est_tokens) / elapsed,
+            edit_count=self._edit_count,
+            message_count=len(self._all_refs),
+        )

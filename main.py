@@ -13,7 +13,7 @@ import urllib.parse
 from collections import defaultdict, deque
 from datetime import datetime
 import importlib
-from typing import Deque, Dict, List, Tuple
+from typing import Deque, Dict, List, Sequence, Tuple
 import uuid
 
 import httpx
@@ -60,6 +60,7 @@ from db import (
 )
 from prompts import quiet_period_message
 from utils import (
+    LiveTelegramStreamer,
     NearDuplicateDetector,
     build_telegram_message_link,
     estimate_tokens_rough,
@@ -404,6 +405,32 @@ def _query_allowed_chat_ids() -> set[str]:
         if text:
             allowed.add(text)
     return allowed
+
+
+def _is_streaming_enabled() -> bool:
+    return _bool_flag(getattr(config, "STREAMING_ENABLED", True), True)
+
+
+def _stream_edit_interval_ms() -> int:
+    raw = getattr(config, "STREAM_EDIT_INTERVAL_MS", 400)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 400
+    return max(200, min(value, 2000))
+
+
+def _stream_max_chars_per_edit() -> int:
+    raw = getattr(config, "STREAM_MAX_CHARS_PER_EDIT", 120)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 120
+    return max(60, min(value, 800))
+
+
+def _stream_typing_action_enabled() -> bool:
+    return _bool_flag(getattr(config, "STREAM_TYPING_ACTION", True), True)
 
 
 def _breaking_keywords() -> List[str]:
@@ -1078,6 +1105,26 @@ async def _is_echo_duplicate(
 
 
 async def _send_text(text: str) -> None:
+    await _send_text_with_ref(text)
+
+
+def _message_ref_id(ref: object) -> int | None:
+    if isinstance(ref, Message):
+        return int(ref.id or 0) or None
+    if isinstance(ref, dict):
+        try:
+            value = int(ref.get("message_id", 0))
+            return value or None
+        except Exception:
+            return None
+    try:
+        value = int(getattr(ref, "id", 0) or 0)
+        return value or None
+    except Exception:
+        return None
+
+
+async def _send_text_with_ref(text: str, reply_to: int | None = None) -> object:
     if _destination_uses_bot_api():
         data = {
             "chat_id": _require_bot_destination_chat_id(),
@@ -1085,22 +1132,60 @@ async def _send_text(text: str) -> None:
             "disable_web_page_preview": "true",
             "parse_mode": "Markdown",
         }
+        if reply_to:
+            data["reply_to_message_id"] = str(reply_to)
         try:
-            await _bot_api_request("sendMessage", data=data)
+            result = await _bot_api_request("sendMessage", data=data)
+            return result
         except Exception:
             # Markdown can fail on malformed AI output; fallback to plain text.
             data.pop("parse_mode", None)
-            await _bot_api_request("sendMessage", data=data)
-        return
+            return await _bot_api_request("sendMessage", data=data)
 
     tg = _require_client()
-    await _call_with_floodwait(
+    sent = await _call_with_floodwait(
         tg.send_message,
         _require_destination_peer(),
         text,
+        reply_to=reply_to,
         parse_mode="md",
         link_preview=False,
     )
+    return sent
+
+
+async def _edit_sent_text(ref: object, text: str) -> object:
+    if _destination_uses_bot_api():
+        message_id = _message_ref_id(ref)
+        if not message_id:
+            raise RuntimeError("Cannot edit Bot API message without message_id.")
+
+        data = {
+            "chat_id": _require_bot_destination_chat_id(),
+            "message_id": str(message_id),
+            "text": _to_bot_text(text) or "",
+            "disable_web_page_preview": "true",
+            "parse_mode": "Markdown",
+        }
+        try:
+            result = await _bot_api_request("editMessageText", data=data)
+            # Bot API can return `True` for some cases; keep original ref for continuity.
+            if isinstance(result, dict):
+                return result
+            return ref
+        except Exception:
+            data.pop("parse_mode", None)
+            result = await _bot_api_request("editMessageText", data=data)
+            if isinstance(result, dict):
+                return result
+            return ref
+
+    if not isinstance(ref, Message):
+        raise RuntimeError("Telethon edit requires Message reference.")
+    try:
+        return await ref.edit(text, parse_mode="md", link_preview=False)
+    except Exception:
+        return await ref.edit(text, parse_mode=None, link_preview=False)
 
 
 async def _send_single_media(msg: Message, caption: str | None) -> None:
@@ -1576,7 +1661,26 @@ async def _flush_digest_queue_once() -> None:
         )
 
         try:
-            digest_body = await create_digest_summary(posts, _require_auth_manager())
+            stream_stats = None
+            if _is_streaming_enabled():
+                streamer = LiveTelegramStreamer(
+                    send_message=lambda text, reply_to: _send_text_with_ref(text, reply_to=reply_to),
+                    edit_message=_edit_sent_text,
+                    get_message_id=lambda ref: _message_ref_id(ref) or 0,
+                    placeholder_text="Generating digest... ⏳",
+                    edit_interval_ms=_stream_edit_interval_ms(),
+                    max_chars_per_edit=_stream_max_chars_per_edit(),
+                    typing_enabled=False,
+                )
+                await streamer.start()
+                digest_body = await create_digest_summary(
+                    posts,
+                    _require_auth_manager(),
+                    on_token=streamer.push,
+                )
+            else:
+                digest_body = await create_digest_summary(posts, _require_auth_manager())
+
             if not digest_body.strip():
                 digest_body = quiet_period_message(max(1, _digest_interval_seconds() // 60))
 
@@ -1594,7 +1698,10 @@ async def _flush_digest_queue_once() -> None:
                 total_updates=len(posts),
                 sources=source_names,
             )
-            await _send_digest_message(digest_message)
+            if _is_streaming_enabled():
+                stream_stats = await streamer.finalize(digest_message)
+            else:
+                await _send_digest_message(digest_message)
 
             acked = ack_digest_batch(batch_id)
             set_last_digest_timestamp(int(time.time()))
@@ -1608,6 +1715,11 @@ async def _flush_digest_queue_once() -> None:
                 acked=acked,
                 pending_after=count_pending(),
                 response_chars=len(digest_body),
+                stream_enabled=_is_streaming_enabled(),
+                stream_edits=(stream_stats.edit_count if stream_stats else 0),
+                stream_tokens_per_second=(
+                    round(stream_stats.tokens_per_second, 3) if stream_stats else 0.0
+                ),
             )
         except asyncio.CancelledError:
             restore_digest_batch(batch_id)
@@ -2172,6 +2284,73 @@ async def _safe_reply_markdown(
                 return None
 
 
+async def _send_query_typing(event: events.NewMessage.Event) -> None:
+    if not _stream_typing_action_enabled():
+        return
+    tg = _require_client()
+    try:
+        peer = await event.get_input_chat()
+        await _call_with_floodwait(
+            tg,
+            functions.messages.SetTypingRequest(
+                peer=peer,
+                action=types.SendMessageTypingAction(),
+            ),
+        )
+    except Exception:
+        LOGGER.debug("Query typing action failed.", exc_info=True)
+
+
+async def _stream_query_answer(
+    event: events.NewMessage.Event,
+    *,
+    progress_message: Message,
+    query_text: str,
+    results: List[Dict[str, object]],
+    history: Sequence[Dict[str, str]],
+) -> tuple[str, object]:
+    async def _send_query_message(text: str, reply_to: int | None):
+        return await event.reply(
+            text,
+            reply_to=reply_to,
+            parse_mode="md",
+            link_preview=False,
+        )
+
+    async def _edit_query_message(ref: object, text: str):
+        edited = await _safe_reply_markdown(
+            event,
+            text,
+            edit_message=ref if isinstance(ref, Message) else None,
+        )
+        return edited or ref
+
+    streamer = LiveTelegramStreamer(
+        send_message=_send_query_message,
+        edit_message=_edit_query_message,
+        get_message_id=lambda ref: _message_ref_id(ref) or 0,
+        placeholder_text="Thinking... ⏳",
+        edit_interval_ms=_stream_edit_interval_ms(),
+        max_chars_per_edit=_stream_max_chars_per_edit(),
+        typing_action_cb=lambda: _send_query_typing(event),
+        typing_enabled=_stream_typing_action_enabled(),
+    )
+    await streamer.start(initial_ref=progress_message)
+
+    answer = await generate_answer_from_context(
+        query=query_text,
+        context_messages=results,
+        auth_manager=_require_auth_manager(),
+        conversation_history=history,
+        on_token=streamer.push,
+    )
+    if not answer.strip():
+        answer = "No matching information found in recent updates."
+
+    stats = await streamer.finalize(answer)
+    return answer, stats
+
+
 async def _on_query_message(event: events.NewMessage.Event) -> None:
     if not _is_query_mode_enabled():
         return
@@ -2222,17 +2401,33 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
             logger=LOGGER,
         )
 
-        history = list(_query_history_for_sender(sender_id))
-        answer = await generate_answer_from_context(
-            query=cleaned_query,
-            context_messages=results,
-            auth_manager=_require_auth_manager(),
-            conversation_history=history,
+        await _safe_reply_markdown(
+            event,
+            f"Found {len(results)} messages -> analyzing... ⏳",
+            edit_message=progress,
         )
-        if not answer.strip():
-            answer = "No matching information found in recent updates."
 
-        await _safe_reply_markdown(event, answer, edit_message=progress)
+        history = list(_query_history_for_sender(sender_id))
+        if _is_streaming_enabled():
+            answer, stream_stats = await _stream_query_answer(
+                event,
+                progress_message=progress,
+                query_text=cleaned_query,
+                results=results,
+                history=history,
+            )
+        else:
+            answer = await generate_answer_from_context(
+                query=cleaned_query,
+                context_messages=results,
+                auth_manager=_require_auth_manager(),
+                conversation_history=history,
+            )
+            if not answer.strip():
+                answer = "No matching information found in recent updates."
+            await _safe_reply_markdown(event, answer, edit_message=progress)
+            stream_stats = None
+
         _append_query_history(sender_id, text, answer)
         log_structured(
             LOGGER,
@@ -2243,6 +2438,11 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
             hours_back=parsed_hours,
             messages_found=len(results),
             response_chars=len(answer),
+            stream_enabled=_is_streaming_enabled(),
+            stream_edits=(stream_stats.edit_count if stream_stats else 0),
+            stream_tokens_per_second=(
+                round(stream_stats.tokens_per_second, 3) if stream_stats else 0.0
+            ),
         )
     except Exception as exc:
         LOGGER.exception("Query handling failed.")
