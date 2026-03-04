@@ -158,7 +158,7 @@ DIGEST_MAX_TOKENS = _env_int("DIGEST_MAX_TOKENS", 18000)  # type: int
 CODEX_MODEL_CONTEXT_TOKENS = _env_int("CODEX_MODEL_CONTEXT_TOKENS", 200000)  # type: int
 DIGEST_CONTEXT_FRACTION = _env_float("DIGEST_CONTEXT_FRACTION", 0.75)  # type: float
 DIGEST_MIN_POST_LENGTH = _env_int("DIGEST_MIN_POST_LENGTH", 12)  # type: int
-DIGEST_MAX_LINES = _env_int("DIGEST_MAX_LINES", 25)  # type: int
+DIGEST_MAX_LINES = _env_int("DIGEST_MAX_LINES", 12)  # type: int
 DIGEST_PREFER_JSON_OUTPUT = _env_bool("DIGEST_PREFER_JSON_OUTPUT", True)  # type: bool
 OUTPUT_LANGUAGE = _env_str("OUTPUT_LANGUAGE", "English")  # type: str
 
@@ -177,7 +177,7 @@ IMMEDIATE_HIGH = _env_bool("IMMEDIATE_HIGH", True)  # type: bool
 # Include importance indicators (★★★/★★/★) in output style.
 DIGEST_IMPORTANCE_SCORING = _env_bool("DIGEST_IMPORTANCE_SCORING", True)  # type: bool
 
-# Allow AI to include [Read more](...) links when message links are available.
+# Allow AI to include HTML read-more links when message links are available.
 DIGEST_INCLUDE_READ_MORE_LINKS = _env_bool("DIGEST_INCLUDE_READ_MORE_LINKS", True)  # type: bool
 
 # Include source/channel tags in outbound messages.
@@ -216,6 +216,9 @@ QUERY_DEFAULT_HOURS_BACK = _env_int("QUERY_DEFAULT_HOURS_BACK", 24)  # type: int
 # Optional chat allowlist for query interface (chat IDs as integers/strings).
 # If empty, query mode only accepts outgoing private chats (e.g., Saved Messages).
 QUERY_ALLOWED_CHAT_IDS = _env_list("QUERY_ALLOWED_CHAT_IDS", [])  # type: list[str]
+# Optional explicit query peer allowlist (user IDs as ints/strings). If set, query
+# is allowed only when target peer ID is listed or when chat is Saved Messages.
+QUERY_ALLOWED_PEER_IDS = _env_list("QUERY_ALLOWED_PEER_IDS", [])  # type: list[str]
 
 # -----------------------------------------------------------------------------
 # Streaming UX
@@ -224,3 +227,12 @@ STREAMING_ENABLED = _env_bool("STREAMING_ENABLED", True)  # type: bool
 STREAM_EDIT_INTERVAL_MS = _env_int("STREAM_EDIT_INTERVAL_MS", 400)  # type: int
 STREAM_MAX_CHARS_PER_EDIT = _env_int("STREAM_MAX_CHARS_PER_EDIT", 120)  # type: int
 STREAM_TYPING_ACTION = _env_bool("STREAM_TYPING_ACTION", True)  # type: bool
+
+# -----------------------------------------------------------------------------
+# Message Rendering
+# -----------------------------------------------------------------------------
+ENABLE_HTML_FORMATTING = _env_bool("ENABLE_HTML_FORMATTING", True)  # type: bool
+# Enable branded premium emoji replacement via tg-emoji tags.
+ENABLE_PREMIUM_EMOJI = _env_bool("ENABLE_PREMIUM_EMOJI", True)  # type: bool
+# JSON file containing emoji -> custom_emoji_id map for Nezami pack.
+PREMIUM_EMOJI_MAP_FILE = _env_str("PREMIUM_EMOJI_MAP_FILE", "nezami_emoji_map.json")  # type: str

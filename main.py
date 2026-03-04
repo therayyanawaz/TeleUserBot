@@ -58,6 +58,7 @@ from db import (
 )
 from prompts import quiet_period_message
 from utils import (
+    apply_premium_emoji_html,
     LiveTelegramStreamer,
     DuplicateRuntime,
     GlobalDuplicateResult,
@@ -69,13 +70,16 @@ from utils import (
     format_eta,
     format_ts,
     is_duplicate_and_handle,
+    load_custom_emoji_map,
     log_structured,
     normalize_space,
     parse_daily_times,
     parse_time_filter_from_query,
+    sanitize_telegram_html,
     search_recent_messages,
     seconds_until_next_daily_time,
-    split_markdown_chunks,
+    split_html_chunks,
+    strip_telegram_html,
 )
 
 
@@ -102,6 +106,7 @@ auth_manager: AuthManager | None = None
 destination_peer = None
 bot_destination_token: str | None = None
 bot_destination_chat_id: str | None = None
+premium_emoji_map: Dict[str, str] = {}
 
 # (channel_id, grouped_id) -> [messages]
 album_buffers: Dict[Tuple[str, int], List[Message]] = defaultdict(list)
@@ -393,6 +398,38 @@ def _include_source_tags() -> bool:
     return _bool_flag(getattr(config, "INCLUDE_SOURCE_TAGS", False), False)
 
 
+def _is_html_formatting_enabled() -> bool:
+    return _bool_flag(getattr(config, "ENABLE_HTML_FORMATTING", True), True)
+
+
+def _is_premium_emoji_enabled() -> bool:
+    return _bool_flag(getattr(config, "ENABLE_PREMIUM_EMOJI", True), True)
+
+
+def _premium_emoji_map_path() -> str:
+    raw = str(getattr(config, "PREMIUM_EMOJI_MAP_FILE", "nezami_emoji_map.json") or "").strip()
+    return raw or "nezami_emoji_map.json"
+
+
+def _load_premium_emoji_map() -> None:
+    global premium_emoji_map
+    if not _is_premium_emoji_enabled():
+        premium_emoji_map = {}
+        return
+    premium_emoji_map = load_custom_emoji_map(_premium_emoji_map_path(), logger=LOGGER)
+
+
+def _render_outbound_text(text: str | None) -> str | None:
+    if text is None:
+        return None
+    value = str(text)
+    if _is_html_formatting_enabled():
+        value = sanitize_telegram_html(value)
+        if premium_emoji_map:
+            value = apply_premium_emoji_html(value, premium_emoji_map)
+    return value
+
+
 def _is_query_mode_enabled() -> bool:
     return _bool_flag(getattr(config, "QUERY_MODE_ENABLED", True), True)
 
@@ -413,6 +450,21 @@ def _query_default_hours_back() -> int:
     except Exception:
         value = 24
     return max(1, min(value, 24 * 30))
+
+
+def _query_allowed_peer_ids() -> set[int]:
+    raw = getattr(config, "QUERY_ALLOWED_PEER_IDS", [])
+    if not isinstance(raw, list):
+        return set()
+    allowed: set[int] = set()
+    for item in raw:
+        try:
+            value = int(str(item).strip())
+        except Exception:
+            continue
+        if value > 0:
+            allowed.add(value)
+    return allowed
 
 
 async def _resolve_query_bot_user_id() -> int | None:
@@ -901,15 +953,18 @@ def _filename_for_bot_media(msg: Message, index: int) -> str:
 
 
 def _format_summary_text(source_title: str, summary: str) -> str:
+    safe_source = sanitize_telegram_html(source_title)
+    safe_summary = sanitize_telegram_html(summary)
     if _include_source_tags():
-        return f"📰 **{source_title}**\n\n{summary.strip()}"
-    return f"📰 **Update**\n\n{summary.strip()}"
+        return f"<b>📰 {safe_source}</b><br><br>{safe_summary}"
+    return f"<b>📰 Update</b><br><br>{safe_summary}"
 
 
 def _format_source_label(source_title: str) -> str:
+    safe_source = sanitize_telegram_html(source_title)
     if _include_source_tags():
-        return f"📰 **{source_title}**"
-    return "📰 **Update**"
+        return f"<b>📰 {safe_source}</b>"
+    return "<b>📰 Update</b>"
 
 
 def _to_bot_text(text: str | None, max_len: int | None = None) -> str | None:
@@ -917,8 +972,8 @@ def _to_bot_text(text: str | None, max_len: int | None = None) -> str | None:
         return None
     cleaned = text.strip()
     if max_len is not None and len(cleaned) > max_len:
-        return cleaned[: max_len - 3].rstrip() + "..."
-    return cleaned
+        cleaned = cleaned[: max_len - 3].rstrip() + "..."
+    return _render_outbound_text(cleaned) if _is_html_formatting_enabled() else cleaned
 
 
 def _extract_addlist_hash(folder_invite_link: str) -> str:
@@ -1072,9 +1127,11 @@ def _severity_emoji(level: str) -> str:
 
 def _format_breaking_text(source_title: str, headline: str) -> str:
     clean_headline = normalize_space(headline)
+    safe_headline = sanitize_telegram_html(clean_headline)
+    safe_source = sanitize_telegram_html(source_title)
     if _include_source_tags():
-        return f"🔥 **BREAKING • {source_title}**\n\n{clean_headline}"
-    return f"🔥 **BREAKING**\n\n{clean_headline}"
+        return f"<b>🔥 BREAKING • {safe_source}</b><br><br>{safe_headline}"
+    return f"<b>🔥 BREAKING</b><br><br>{safe_headline}"
 
 
 def _cleanup_breaking_refs(now_ts: int | None = None) -> None:
@@ -1142,7 +1199,7 @@ async def _merge_duplicate_breaking(
         return True
 
     suffix = ", ".join(extra_sources[:6])
-    merged_text = f"{base_text}\n\n_(also reported by {suffix})_"
+    merged_text = f"{base_text}<br><br><i>(also reported by {sanitize_telegram_html(suffix)})</i>"
     if len(merged_text) > 3900:
         merged_text = merged_text[:3897].rstrip() + "..."
 
@@ -1228,12 +1285,13 @@ def _message_ref_id(ref: object) -> int | None:
 
 
 async def _send_text_with_ref(text: str, reply_to: int | None = None) -> object:
+    payload_text = _render_outbound_text(text) if _is_html_formatting_enabled() else text
     if _destination_uses_bot_api():
         data = {
             "chat_id": _require_bot_destination_chat_id(),
-            "text": _to_bot_text(text) or "",
+            "text": _to_bot_text(payload_text) or "",
             "disable_web_page_preview": "true",
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML" if _is_html_formatting_enabled() else "Markdown",
         }
         if reply_to:
             data["reply_to_message_id"] = str(reply_to)
@@ -1241,23 +1299,28 @@ async def _send_text_with_ref(text: str, reply_to: int | None = None) -> object:
             result = await _bot_api_request("sendMessage", data=data)
             return result
         except Exception:
-            # Markdown can fail on malformed AI output; fallback to plain text.
+            # If HTML parse fails, strip tags and retry as plain text.
             data.pop("parse_mode", None)
+            fallback_text = (
+                strip_telegram_html(payload_text) if _is_html_formatting_enabled() else payload_text
+            )
+            data["text"] = _to_bot_text(fallback_text) or ""
             return await _bot_api_request("sendMessage", data=data)
 
     tg = _require_client()
     sent = await _call_with_floodwait(
         tg.send_message,
         _require_destination_peer(),
-        text,
+        payload_text,
         reply_to=reply_to,
-        parse_mode="md",
+        parse_mode="html" if _is_html_formatting_enabled() else "md",
         link_preview=False,
     )
     return sent
 
 
 async def _edit_sent_text(ref: object, text: str) -> object:
+    payload_text = _render_outbound_text(text) if _is_html_formatting_enabled() else text
     if _destination_uses_bot_api():
         message_id = _message_ref_id(ref)
         if not message_id:
@@ -1266,9 +1329,9 @@ async def _edit_sent_text(ref: object, text: str) -> object:
         data = {
             "chat_id": _require_bot_destination_chat_id(),
             "message_id": str(message_id),
-            "text": _to_bot_text(text) or "",
+            "text": _to_bot_text(payload_text) or "",
             "disable_web_page_preview": "true",
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML" if _is_html_formatting_enabled() else "Markdown",
         }
         try:
             result = await _bot_api_request("editMessageText", data=data)
@@ -1278,6 +1341,10 @@ async def _edit_sent_text(ref: object, text: str) -> object:
             return ref
         except Exception:
             data.pop("parse_mode", None)
+            fallback_text = (
+                strip_telegram_html(payload_text) if _is_html_formatting_enabled() else payload_text
+            )
+            data["text"] = _to_bot_text(fallback_text) or ""
             result = await _bot_api_request("editMessageText", data=data)
             if isinstance(result, dict):
                 return result
@@ -1286,12 +1353,22 @@ async def _edit_sent_text(ref: object, text: str) -> object:
     if not isinstance(ref, Message):
         raise RuntimeError("Telethon edit requires Message reference.")
     try:
-        return await ref.edit(text, parse_mode="md", link_preview=False)
+        return await ref.edit(
+            payload_text,
+            parse_mode="html" if _is_html_formatting_enabled() else "md",
+            link_preview=False,
+        )
     except Exception:
-        return await ref.edit(text, parse_mode=None, link_preview=False)
+        fallback_text = (
+            strip_telegram_html(payload_text) if _is_html_formatting_enabled() else payload_text
+        )
+        return await ref.edit(fallback_text, parse_mode=None, link_preview=False)
 
 
 async def _send_single_media(msg: Message, caption: str | None) -> object:
+    safe_caption = (
+        _render_outbound_text(caption or "") if (caption and _is_html_formatting_enabled()) else caption
+    )
     if _destination_uses_bot_api():
         raw = await msg.download_media(file=bytes)
         if raw is None:
@@ -1310,8 +1387,8 @@ async def _send_single_media(msg: Message, caption: str | None) -> object:
         }[media_type]
         data = {
             "chat_id": _require_bot_destination_chat_id(),
-            "caption": _to_bot_text(caption, max_len=1024) or "",
-            "parse_mode": "Markdown",
+            "caption": _to_bot_text(safe_caption, max_len=1024) or "",
+            "parse_mode": "HTML" if _is_html_formatting_enabled() else "Markdown",
         }
         files = {
             upload_field: (
@@ -1324,6 +1401,13 @@ async def _send_single_media(msg: Message, caption: str | None) -> object:
             return await _bot_api_request(method_map[media_type], data=data, files=files)
         except Exception:
             data.pop("parse_mode", None)
+            if safe_caption:
+                fallback_caption = (
+                    strip_telegram_html(safe_caption)
+                    if _is_html_formatting_enabled()
+                    else safe_caption
+                )
+                data["caption"] = _to_bot_text(fallback_caption, max_len=1024) or ""
             return await _bot_api_request(method_map[media_type], data=data, files=files)
 
     tg = _require_client()
@@ -1332,8 +1416,8 @@ async def _send_single_media(msg: Message, caption: str | None) -> object:
             tg.send_file,
             _require_destination_peer(),
             msg.media,
-            caption=caption,
-            parse_mode="md",
+            caption=safe_caption,
+            parse_mode="html" if _is_html_formatting_enabled() else "md",
         )
     except ChatForwardsRestrictedError:
         raw = await msg.download_media(file=bytes)
@@ -1343,20 +1427,23 @@ async def _send_single_media(msg: Message, caption: str | None) -> object:
             tg.send_file,
             _require_destination_peer(),
             raw,
-            caption=caption,
-            parse_mode="md",
+            caption=safe_caption,
+            parse_mode="html" if _is_html_formatting_enabled() else "md",
         )
 
 
 async def _send_album(messages: List[Message], caption: str | None) -> None:
+    safe_caption = (
+        _render_outbound_text(caption or "") if (caption and _is_html_formatting_enabled()) else caption
+    )
     if _destination_uses_bot_api():
         if not messages:
-            if caption:
-                await _send_text(caption)
+            if safe_caption:
+                await _send_text(safe_caption)
             return
 
         if len(messages) == 1:
-            await _send_single_media(messages[0], caption)
+            await _send_single_media(messages[0], safe_caption)
             return
 
         media_entries: List[dict] = []
@@ -1376,8 +1463,8 @@ async def _send_album(messages: List[Message], caption: str | None) -> None:
                 "application/octet-stream",
             )
             item = {"type": media_type, "media": f"attach://{field_name}"}
-            if idx == 0 and caption:
-                item["caption"] = _to_bot_text(caption, max_len=1024) or ""
+            if idx == 0 and safe_caption:
+                item["caption"] = _to_bot_text(safe_caption, max_len=1024) or ""
             media_entries.append(item)
 
         if not media_entries:
@@ -1385,26 +1472,37 @@ async def _send_album(messages: List[Message], caption: str | None) -> None:
 
         if len(media_entries) == 1:
             only_msg = downloaded_messages[0]
-            await _send_single_media(only_msg, caption)
+            await _send_single_media(only_msg, safe_caption)
             return
 
         data = {
             "chat_id": _require_bot_destination_chat_id(),
             "media": json.dumps(media_entries),
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML" if _is_html_formatting_enabled() else "Markdown",
         }
         try:
             await _bot_api_request("sendMediaGroup", data=data, files=files)
         except Exception:
             data.pop("parse_mode", None)
+            if safe_caption and media_entries:
+                fallback_caption = (
+                    strip_telegram_html(safe_caption)
+                    if _is_html_formatting_enabled()
+                    else safe_caption
+                )
+                media_entries[0]["caption"] = _to_bot_text(
+                    fallback_caption,
+                    max_len=1024,
+                ) or ""
+                data["media"] = json.dumps(media_entries)
             await _bot_api_request("sendMediaGroup", data=data, files=files)
         return
 
     tg = _require_client()
     media_items = [m.media for m in messages if m.media]
     if not media_items:
-        if caption:
-            await _send_text(caption)
+        if safe_caption:
+            await _send_text(safe_caption)
         return
 
     try:
@@ -1412,8 +1510,8 @@ async def _send_album(messages: List[Message], caption: str | None) -> None:
             tg.send_file,
             _require_destination_peer(),
             media_items,
-            caption=caption,
-            parse_mode="md",
+            caption=safe_caption,
+            parse_mode="html" if _is_html_formatting_enabled() else "md",
         )
     except ChatForwardsRestrictedError:
         downloaded = []
@@ -1427,8 +1525,8 @@ async def _send_album(messages: List[Message], caption: str | None) -> None:
             tg.send_file,
             _require_destination_peer(),
             downloaded,
-            caption=caption,
-            parse_mode="md",
+            caption=safe_caption,
+            parse_mode="html" if _is_html_formatting_enabled() else "md",
         )
 
 
@@ -1649,9 +1747,9 @@ def _format_digest_message(
     sources: List[str],
 ) -> str:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    header = f"📰 **Daily Digest • {timestamp} • {total_updates} updates**"
+    header = f"<b>📰 Daily Digest • {timestamp} • {total_updates} updates</b>"
     _ = sources
-    return f"{header}\n\n{digest_body.strip()}"
+    return sanitize_telegram_html(f"{header}<br><br>{digest_body.strip()}")
 
 
 def _effective_interval_seconds() -> int:
@@ -1697,7 +1795,7 @@ async def _run_post_processors(text: str, context: Dict[str, object]) -> str:
 
 
 async def _send_digest_message(text: str) -> None:
-    chunks = split_markdown_chunks(text, max_chars=_digest_send_chunk_size())
+    chunks = split_html_chunks(text, max_chars=_digest_send_chunk_size())
     delay = _digest_send_delay_seconds()
     for idx, chunk in enumerate(chunks):
         await _send_text(chunk)
@@ -1758,6 +1856,7 @@ async def _flush_digest_queue_once() -> None:
                     edit_interval_ms=_stream_edit_interval_ms(),
                     max_chars_per_edit=_stream_max_chars_per_edit(),
                     typing_enabled=False,
+                    html_mode=_is_html_formatting_enabled(),
                 )
                 await streamer.start()
                 digest_body = await create_digest_summary(
@@ -2290,24 +2389,33 @@ def _digest_status_text() -> str:
     detector_backend = dupe_detector.backend_name if dupe_detector is not None else "disabled"
 
     return (
-        f"🧠 **Digest Status**\n"
-        f"- Mode: `{mode}`\n"
-        f"- Pending queue: `{pending}`\n"
-        f"- In-flight queue: `{inflight}`\n"
-        f"- Last digest: `{format_ts(last_ts)}`\n"
-        f"- Next run in: `{next_eta}`\n"
-        f"- Interval base: `{_digest_interval_seconds() // 60}m`\n"
-        f"- Dedupe: `{dupe_state}` ({detector_backend})\n"
-        f"- Severity router: `{severity_state}`\n"
-        f"- Query mode: `{query_state}`\n"
-        f"- Quota health: `{quota.get('status', 'unknown')}`\n"
-        f"- Recent 429 (1h): `{quota.get('recent_429_count', 0)}` / threshold `{threshold}`"
+        "<b>🧠 Digest Status</b><br>"
+        f"• Mode: <code>{mode}</code><br>"
+        f"• Pending queue: <code>{pending}</code><br>"
+        f"• In-flight queue: <code>{inflight}</code><br>"
+        f"• Last digest: <code>{format_ts(last_ts)}</code><br>"
+        f"• Next run in: <code>{next_eta}</code><br>"
+        f"• Interval base: <code>{_digest_interval_seconds() // 60}m</code><br>"
+        f"• Dedupe: <code>{dupe_state}</code> ({sanitize_telegram_html(detector_backend)})<br>"
+        f"• Severity router: <code>{severity_state}</code><br>"
+        f"• Query mode: <code>{query_state}</code><br>"
+        f"• HTML formatting: <code>{'on' if _is_html_formatting_enabled() else 'off'}</code><br>"
+        f"• Quota health: <code>{quota.get('status', 'unknown')}</code><br>"
+        f"• Recent 429 (1h): <code>{quota.get('recent_429_count', 0)}</code> / "
+        f"threshold <code>{threshold}</code>"
     )
 
 
 async def _on_digest_status_command(event: events.NewMessage.Event) -> None:
     try:
-        await event.reply(_digest_status_text(), parse_mode="md", link_preview=False)
+        status_text = _digest_status_text()
+        if _is_html_formatting_enabled():
+            status_text = _render_outbound_text(status_text) or status_text
+        await event.reply(
+            status_text,
+            parse_mode="html" if _is_html_formatting_enabled() else None,
+            link_preview=False,
+        )
     except Exception:
         LOGGER.exception("Failed sending /digest_status response.")
 
@@ -2341,20 +2449,38 @@ async def _safe_reply_markdown(
     *,
     edit_message: Message | None = None,
 ) -> Message | None:
+    payload_text = _render_outbound_text(text) if _is_html_formatting_enabled() else text
     while True:
         try:
             if edit_message is not None:
-                return await edit_message.edit(text, parse_mode="md", link_preview=False)
-            return await event.reply(text, parse_mode="md", link_preview=False)
+                return await edit_message.edit(
+                    payload_text,
+                    parse_mode="html" if _is_html_formatting_enabled() else "md",
+                    link_preview=False,
+                )
+            return await event.reply(
+                payload_text,
+                parse_mode="html" if _is_html_formatting_enabled() else "md",
+                link_preview=False,
+            )
         except FloodWaitError as exc:
             wait_seconds = int(exc.seconds) + 1
             LOGGER.warning("FloodWait while replying to query: sleeping %ss", wait_seconds)
             await asyncio.sleep(wait_seconds)
         except Exception:
             try:
+                fallback_text = (
+                    strip_telegram_html(payload_text)
+                    if _is_html_formatting_enabled()
+                    else text
+                )
                 if edit_message is not None:
-                    return await edit_message.edit(text, parse_mode=None, link_preview=False)
-                return await event.reply(text, parse_mode=None, link_preview=False)
+                    return await edit_message.edit(
+                        fallback_text,
+                        parse_mode=None,
+                        link_preview=False,
+                    )
+                return await event.reply(fallback_text, parse_mode=None, link_preview=False)
             except FloodWaitError as exc:
                 wait_seconds = int(exc.seconds) + 1
                 LOGGER.warning("FloodWait while replying to query: sleeping %ss", wait_seconds)
@@ -2391,9 +2517,9 @@ async def _stream_query_answer(
 ) -> tuple[str, object]:
     async def _send_query_message(text: str, reply_to: int | None):
         return await event.reply(
-            text,
+            _render_outbound_text(text) if _is_html_formatting_enabled() else text,
             reply_to=reply_to,
-            parse_mode="md",
+            parse_mode="html" if _is_html_formatting_enabled() else "md",
             link_preview=False,
         )
 
@@ -2414,6 +2540,7 @@ async def _stream_query_answer(
         max_chars_per_edit=_stream_max_chars_per_edit(),
         typing_action_cb=lambda: _send_query_typing(event),
         typing_enabled=_stream_typing_action_enabled(),
+        html_mode=_is_html_formatting_enabled(),
     )
     await streamer.start(initial_ref=progress_message)
 
@@ -2472,6 +2599,16 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
     # Allowed context #2: private chat with user's own bot account (if configured).
     bot_user_id = await _resolve_query_bot_user_id()
     is_own_bot_pm = bot_user_id is not None and target_user_id == bot_user_id
+
+    # Optional hard allowlist of peer IDs.
+    allowed_peer_ids = _query_allowed_peer_ids()
+    if allowed_peer_ids and (target_user_id not in allowed_peer_ids) and not is_saved_messages:
+        LOGGER.debug(
+            "Query ignored: target peer not in QUERY_ALLOWED_PEER_IDS chat_id=%s peer_user_id=%s",
+            getattr(msg, "chat_id", None),
+            target_user_id,
+        )
+        return
 
     if not (is_saved_messages or is_own_bot_pm):
         LOGGER.debug(
@@ -2659,6 +2796,10 @@ def _startup_health_check() -> None:
         dupe_detection=_is_dupe_detection_enabled(),
         severity_routing=_is_severity_routing_enabled(),
         query_mode=_is_query_mode_enabled(),
+        html_formatting=_is_html_formatting_enabled(),
+        premium_emoji=_is_premium_emoji_enabled(),
+        premium_emoji_count=len(premium_emoji_map),
+        query_allowed_peer_count=len(_query_allowed_peer_ids()),
         pending=pending,
         inflight=inflight,
         last_digest_ts=last_ts,
@@ -2666,7 +2807,7 @@ def _startup_health_check() -> None:
         quota_health=get_quota_health(),
     )
     LOGGER.info(
-        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s",
+        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s html=%s premium_emoji=%s map=%s",
         mode,
         pending,
         inflight,
@@ -2674,6 +2815,9 @@ def _startup_health_check() -> None:
         _is_dupe_detection_enabled(),
         _is_severity_routing_enabled(),
         _is_query_mode_enabled(),
+        _is_html_formatting_enabled(),
+        _is_premium_emoji_enabled(),
+        len(premium_emoji_map),
     )
 
 
@@ -2682,6 +2826,7 @@ async def main() -> None:
 
     _prompt_for_missing_config()
     _validate_config()
+    _load_premium_emoji_map()
     init_db()
     await _init_dupe_detector()
     _startup_health_check()

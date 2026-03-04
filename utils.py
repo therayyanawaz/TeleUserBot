@@ -6,10 +6,12 @@ import asyncio
 from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from html import escape as _escape_html, unescape as _unescape_html
 import hashlib
 import json
 import logging
 import math
+from pathlib import Path
 import re
 import threading
 import time
@@ -63,6 +65,291 @@ def split_markdown_chunks(text: str, max_chars: int = 3600) -> List[str]:
     if remaining:
         chunks.append(remaining)
     return chunks
+
+
+def split_html_chunks(text: str, max_chars: int = 3600) -> List[str]:
+    """Split long HTML text into Telegram-safe chunks."""
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: List[str] = []
+    remaining = text
+    while len(remaining) > max_chars:
+        cut = remaining.rfind("\n", 0, max_chars)
+        if cut < int(max_chars * 0.5):
+            cut = remaining.rfind("<br>", 0, max_chars)
+        if cut < int(max_chars * 0.5):
+            cut = remaining.rfind(" ", 0, max_chars)
+        if cut < int(max_chars * 0.5):
+            cut = max_chars
+        if cut <= 0:
+            cut = max_chars
+
+        part = remaining[:cut].rstrip()
+        if part:
+            chunks.append(part)
+        remaining = remaining[cut:].lstrip()
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+_ALLOWED_HTML_TAGS = {
+    "b",
+    "i",
+    "u",
+    "s",
+    "tg-spoiler",
+    "tg-emoji",
+    "code",
+    "pre",
+    "blockquote",
+    "a",
+}
+_HTML_TAG_RE = re.compile(r"</?([a-zA-Z0-9-]+)([^>]*)>")
+_HTML_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_HTML_EMOJI_ID_RE = re.compile(
+    r"""emoji-id\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""",
+    re.IGNORECASE,
+)
+_HTML_HREF_RE = re.compile(
+    r"""href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""",
+    re.IGNORECASE,
+)
+_HTML_CLASS_RE = re.compile(
+    r"""class\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""",
+    re.IGNORECASE,
+)
+
+
+def _normalize_markdownish(text: str) -> str:
+    value = text or ""
+    # Lightweight markdown-to-plain cleanup before HTML rendering.
+    value = re.sub(r"\*\*(.*?)\*\*", r"\1", value, flags=re.DOTALL)
+    value = re.sub(r"__(.*?)__", r"\1", value, flags=re.DOTALL)
+    value = re.sub(r"`{1,3}(.*?)`{1,3}", r"\1", value, flags=re.DOTALL)
+    value = re.sub(r"\[(.*?)\]\((https?://[^\s)]+)\)", r"\1 (\2)", value)
+    return value
+
+
+def sanitize_telegram_html(text: str) -> str:
+    """
+    Allow only Telegram-safe HTML tags and escape everything else.
+    """
+    value = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    value = _normalize_markdownish(value)
+    value = _HTML_BR_RE.sub("\n", value)
+    if not value:
+        return ""
+
+    placeholders: dict[str, str] = {}
+    idx = 0
+
+    def _token(html_value: str) -> str:
+        nonlocal idx
+        marker = f"__TGHTML_{idx}__"
+        placeholders[marker] = html_value
+        idx += 1
+        return marker
+
+    def _replace_tag(match: re.Match[str]) -> str:
+        raw_tag = match.group(1) or ""
+        attrs = match.group(2) or ""
+        tag = raw_tag.lower()
+        full = match.group(0)
+        is_closing = full.startswith("</")
+        is_self_close = full.endswith("/>")
+
+        if tag not in _ALLOWED_HTML_TAGS:
+            return ""
+
+        if is_closing:
+            return _token(f"</{tag}>")
+
+        if tag == "a":
+            href_match = _HTML_HREF_RE.search(attrs)
+            href = ""
+            if href_match:
+                href = (href_match.group(1) or href_match.group(2) or href_match.group(3) or "").strip()
+            if not href:
+                return ""
+            safe_href = href if href.startswith(("http://", "https://", "tg://")) else ""
+            if not safe_href:
+                return ""
+            return _token(f'<a href="{_escape_html(safe_href, quote=True)}">')
+
+        if tag == "tg-emoji":
+            emoji_match = _HTML_EMOJI_ID_RE.search(attrs)
+            emoji_id = ""
+            if emoji_match:
+                emoji_id = (
+                    emoji_match.group(1)
+                    or emoji_match.group(2)
+                    or emoji_match.group(3)
+                    or ""
+                ).strip()
+            if not emoji_id.isdigit():
+                return ""
+            return _token(f'<tg-emoji emoji-id="{emoji_id}">')
+
+        if tag == "pre":
+            class_match = _HTML_CLASS_RE.search(attrs)
+            class_name = ""
+            if class_match:
+                class_name = (
+                    class_match.group(1) or class_match.group(2) or class_match.group(3) or ""
+                ).strip()
+            if class_name and re.fullmatch(r"language-[a-zA-Z0-9_+-]+", class_name):
+                return _token(f'<pre class="{_escape_html(class_name, quote=True)}">')
+            return _token("<pre>")
+
+        if tag in {"b", "i", "u", "s", "tg-spoiler", "code", "blockquote"}:
+            return _token(f"<{tag}>")
+
+        if is_self_close:
+            return _token(f"<{tag}>")
+        return _token(f"<{tag}>")
+
+    value = _HTML_TAG_RE.sub(_replace_tag, value)
+    value = _escape_html(value, quote=False)
+    for marker, html_tag in placeholders.items():
+        value = value.replace(marker, html_tag)
+
+    value = re.sub(r"[ \t]+\n", "\n", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
+
+
+def strip_telegram_html(text: str) -> str:
+    """
+    Convert Telegram HTML-like text into plain text.
+    Useful as a fallback when parse_mode HTML is rejected by Telegram.
+    """
+    value = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not value:
+        return ""
+
+    value = _HTML_BR_RE.sub("\n", value)
+    value = re.sub(r"</?[a-zA-Z0-9-]+(?:\s+[^>]*)?>", "", value)
+    value = _unescape_html(value)
+    value = re.sub(r"[ \t]+\n", "\n", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
+
+
+def load_custom_emoji_map(
+    path: str | Path,
+    *,
+    logger: logging.Logger | None = None,
+) -> dict[str, str]:
+    """
+    Load emoji->custom_emoji_id map from JSON.
+
+    Supported file shapes:
+    - {"🔥": "123", "✅": "456"}
+    - {"emoji_map": {"🔥": "123"}}
+    - [{"emoji": "🔥", "custom_emoji_id": "123"}]
+    """
+    p = Path(path).expanduser()
+    if not p.exists():
+        if logger:
+            logger.warning("Premium emoji map not found: %s", p)
+        return {}
+
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        if logger:
+            logger.exception("Failed to parse premium emoji map: %s", p)
+        return {}
+
+    raw_map: dict[str, str] = {}
+    if isinstance(payload, dict):
+        candidate = payload.get("emoji_map")
+        if isinstance(candidate, dict):
+            for k, v in candidate.items():
+                raw_map[str(k)] = str(v)
+        else:
+            for k, v in payload.items():
+                raw_map[str(k)] = str(v)
+    elif isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            emoji = str(item.get("emoji", "")).strip()
+            custom_id = str(item.get("custom_emoji_id", "")).strip()
+            if emoji and custom_id:
+                raw_map[emoji] = custom_id
+
+    cleaned: dict[str, str] = {}
+    for emoji, custom_id in raw_map.items():
+        e = str(emoji or "").strip()
+        cid = str(custom_id or "").strip()
+        if not e or not cid.isdigit():
+            continue
+        cleaned[e] = cid
+
+    if logger:
+        logger.info("Loaded %s premium emoji mappings from %s", len(cleaned), p)
+    return cleaned
+
+
+def apply_premium_emoji_html(text: str, emoji_map: dict[str, str]) -> str:
+    """
+    Replace mapped standard emojis with Telegram Premium <tg-emoji> tags.
+    """
+    if not text or not emoji_map:
+        return text
+
+    keys = [k for k in emoji_map.keys() if k]
+    if not keys:
+        return text
+
+    # Preserve already-rendered custom emoji blocks.
+    placeholders: dict[str, str] = {}
+    idx = 0
+
+    def _protect_block(match: re.Match[str]) -> str:
+        nonlocal idx
+        marker = f"__TGEMOJI_BLOCK_{idx}__"
+        placeholders[marker] = match.group(0)
+        idx += 1
+        return marker
+
+    protected = re.sub(
+        r"<tg-emoji\b[^>]*>.*?</tg-emoji>",
+        _protect_block,
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    pattern = re.compile("|".join(re.escape(k) for k in sorted(keys, key=len, reverse=True)))
+
+    def _replace_segment(segment: str) -> str:
+        def _replace(match: re.Match[str]) -> str:
+            raw = match.group(0)
+            custom_id = emoji_map.get(raw)
+            if not custom_id:
+                return raw
+            return f'<tg-emoji emoji-id="{custom_id}">{raw}</tg-emoji>'
+
+        return pattern.sub(_replace, segment)
+
+    parts = re.split(r"(<[^>]+>)", protected)
+    rebuilt: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith("<") and part.endswith(">"):
+            rebuilt.append(part)
+            continue
+        rebuilt.append(_replace_segment(part))
+
+    value = "".join(rebuilt)
+    for marker, block in placeholders.items():
+        value = value.replace(marker, block)
+    return value
 
 
 def format_ts(ts: int | None) -> str:
@@ -168,35 +455,27 @@ def log_structured(
     logger.log(level, json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
-def make_stream_markdown_preview(text: str) -> str:
+def make_stream_html_preview(text: str) -> str:
     """
-    Best-effort markdown safety for partial streamed text.
-    Prevents common broken rendering while editing progressively.
+    Best-effort HTML safety for partial streamed text.
+    It trims incomplete entities/tags and then sanitizes.
     """
     value = text or ""
     if not value:
         return value
 
-    # Avoid hanging incomplete markdown links.
-    if value.count("[") > value.count("]"):
-        cut = value.rfind("[")
-        if cut >= 0:
-            value = value[:cut]
-    if value.count("(") > value.count(")") and "](" in value:
-        cut = value.rfind("](")
-        if cut >= 0:
-            value = value[:cut]
+    last_amp = value.rfind("&")
+    last_semi = value.rfind(";")
+    if last_amp > last_semi:
+        value = value[:last_amp]
 
-    # Balance simple markdown markers for partial render.
-    for marker in ("**", "__", "`"):
-        if marker == "`":
-            if value.count(marker) % 2 == 1:
-                value += marker
-        else:
-            if value.count(marker) % 2 == 1:
-                value += marker
+    last_lt = value.rfind("<")
+    last_gt = value.rfind(">")
+    if last_lt > last_gt:
+        value = value[:last_lt]
 
-    return value.rstrip()
+    safe = sanitize_telegram_html(value)
+    return safe.rstrip()
 
 
 class NearDuplicateDetector:
@@ -595,12 +874,14 @@ class LiveTelegramStreamer:
         typing_action_cb=None,
         typing_enabled: bool = True,
         max_message_chars: int = 3900,
+        html_mode: bool = True,
     ) -> None:
         self._send_message = send_message
         self._edit_message = edit_message
         self._get_message_id = get_message_id
         self._typing_action_cb = typing_action_cb
         self._typing_enabled = bool(typing_enabled)
+        self._html_mode = bool(html_mode)
         self._placeholder_text = placeholder_text
         self._edit_interval = max(0.1, float(edit_interval_ms) / 1000.0)
         self._max_chars_per_edit = max(40, min(int(max_chars_per_edit), 800))
@@ -664,7 +945,10 @@ class LiveTelegramStreamer:
                 return
 
         preview = self._full_text[:target]
-        safe_preview = make_stream_markdown_preview(preview)
+        if self._html_mode:
+            safe_preview = make_stream_html_preview(preview)
+        else:
+            safe_preview = preview.rstrip()
         if target < len(self._full_text):
             safe_preview = safe_preview.rstrip() + " ..."
 
@@ -682,10 +966,16 @@ class LiveTelegramStreamer:
 
         cleaned_final = (self._full_text or "").rstrip()
         cleaned_final = re.sub(r"\s+\.\.\.$", "", cleaned_final).strip()
+        if self._html_mode:
+            cleaned_final = sanitize_telegram_html(cleaned_final)
         if not cleaned_final:
-            cleaned_final = "No matching information found in recent updates."
+            cleaned_final = "<b>🟢 No relevant information found.</b>" if self._html_mode else "No relevant information found."
 
-        chunks = split_markdown_chunks(cleaned_final, max_chars=self._max_message_chars)
+        chunks = (
+            split_html_chunks(cleaned_final, max_chars=self._max_message_chars)
+            if self._html_mode
+            else split_markdown_chunks(cleaned_final, max_chars=self._max_message_chars)
+        )
         if not chunks:
             chunks = [cleaned_final]
 
