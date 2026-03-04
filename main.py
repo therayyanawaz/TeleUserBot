@@ -118,6 +118,8 @@ query_conversation_history: Dict[int, Deque[Dict[str, str]]] = defaultdict(
     lambda: deque(maxlen=20)
 )
 breaking_delivery_refs: Dict[str, Dict[str, object]] = {}
+query_allowed_bot_user_id: int | None = None
+query_bot_user_id_checked: bool = False
 
 ALBUM_WAIT_SECONDS = 1.5
 ENV_PATH = Path(__file__).with_name(".env")
@@ -413,17 +415,41 @@ def _query_default_hours_back() -> int:
     return max(1, min(value, 24 * 30))
 
 
-def _query_allowed_chat_ids() -> set[str]:
-    raw = getattr(config, "QUERY_ALLOWED_CHAT_IDS", [])
-    if not isinstance(raw, list):
-        return set()
+async def _resolve_query_bot_user_id() -> int | None:
+    global query_allowed_bot_user_id, query_bot_user_id_checked
+    if query_bot_user_id_checked:
+        return query_allowed_bot_user_id
 
-    allowed: set[str] = set()
-    for item in raw:
-        text = str(item).strip()
-        if text:
-            allowed.add(text)
-    return allowed
+    query_bot_user_id_checked = True
+    token = _bot_destination_token_from_config()
+    if not token or not _looks_like_bot_token(token):
+        query_allowed_bot_user_id = None
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as http:
+            response = await http.get(f"https://api.telegram.org/bot{token}/getMe")
+        if response.status_code != 200:
+            query_allowed_bot_user_id = None
+            return None
+
+        payload = response.json()
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            query_allowed_bot_user_id = None
+            return None
+
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            query_allowed_bot_user_id = None
+            return None
+
+        bot_id = int(result.get("id") or 0)
+        query_allowed_bot_user_id = bot_id if bot_id > 0 else None
+        return query_allowed_bot_user_id
+    except Exception:
+        LOGGER.debug("Unable to resolve own bot identity for query filtering.", exc_info=True)
+        query_allowed_bot_user_id = None
+        return None
 
 
 def _is_streaming_enabled() -> bool:
@@ -2286,13 +2312,6 @@ async def _on_digest_status_command(event: events.NewMessage.Event) -> None:
         LOGGER.exception("Failed sending /digest_status response.")
 
 
-def _is_query_chat_allowed(event: events.NewMessage.Event, chat_id: str) -> bool:
-    allowed = _query_allowed_chat_ids()
-    if allowed:
-        return chat_id in allowed
-    return bool(getattr(event, "is_private", False))
-
-
 def _is_query_text_ignored(text: str) -> bool:
     if not text:
         return True
@@ -2420,17 +2439,49 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
     if msg is None or not getattr(msg, "out", False):
         return
 
+    # Fast text-level filter first to avoid expensive entity/network checks.
     text = normalize_space(str(msg.message or ""))
     if _is_query_text_ignored(text):
         return
 
-    chat_id = str(getattr(msg, "chat_id", "") or "")
-    if not _is_query_chat_allowed(event, chat_id):
+    # Strict peer filter:
+    # - only private user peers are considered query-safe
+    # - immediately drop channels/groups/supergroups
+    peer = getattr(msg, "peer_id", None)
+    if not isinstance(peer, types.PeerUser):
+        LOGGER.debug(
+            "Query ignored: unsupported peer type=%s chat_id=%s",
+            type(peer).__name__,
+            getattr(msg, "chat_id", None),
+        )
         return
 
     sender_id = int(getattr(msg, "sender_id", 0) or 0)
-    if sender_id <= 0:
-        sender_id = 0
+    target_user_id = int(getattr(peer, "user_id", 0) or 0)
+    if sender_id <= 0 or target_user_id <= 0:
+        LOGGER.debug(
+            "Query ignored: invalid sender/target sender_id=%s target_user_id=%s",
+            sender_id,
+            target_user_id,
+        )
+        return
+
+    # Allowed context #1: Saved Messages (self-chat).
+    is_saved_messages = target_user_id == sender_id
+
+    # Allowed context #2: private chat with user's own bot account (if configured).
+    bot_user_id = await _resolve_query_bot_user_id()
+    is_own_bot_pm = bot_user_id is not None and target_user_id == bot_user_id
+
+    if not (is_saved_messages or is_own_bot_pm):
+        LOGGER.debug(
+            "Query ignored: private chat is not Saved Messages or own bot peer chat_id=%s peer_user_id=%s",
+            getattr(msg, "chat_id", None),
+            target_user_id,
+        )
+        return
+
+    chat_id = str(getattr(msg, "chat_id", "") or "")
 
     now = time.time()
     last = query_last_request_ts.get(sender_id, 0.0)
