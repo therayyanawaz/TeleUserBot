@@ -230,7 +230,6 @@ QUERY_ALLOWED_PEER_IDS = _env_list("QUERY_ALLOWED_PEER_IDS", [])  # type: list[s
 STREAMING_ENABLED = _env_bool("STREAMING_ENABLED", True)  # type: bool
 STREAM_EDIT_INTERVAL_MS = _env_int("STREAM_EDIT_INTERVAL_MS", 400)  # type: int
 STREAM_MAX_CHARS_PER_EDIT = _env_int("STREAM_MAX_CHARS_PER_EDIT", 120)  # type: int
-STREAM_TYPING_ACTION = _env_bool("STREAM_TYPING_ACTION", True)  # type: bool
 
 # -----------------------------------------------------------------------------
 # Message Rendering

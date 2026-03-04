@@ -429,13 +429,17 @@ def _load_premium_emoji_map() -> None:
     premium_emoji_map = load_custom_emoji_map(_premium_emoji_map_path(), logger=LOGGER)
 
 
-def _render_outbound_text(text: str | None) -> str | None:
+def _render_outbound_text(
+    text: str | None,
+    *,
+    allow_premium_tags: bool = False,
+) -> str | None:
     if text is None:
         return None
     value = str(text)
     if _is_html_formatting_enabled():
         value = sanitize_telegram_html(value)
-        if premium_emoji_map:
+        if allow_premium_tags and premium_emoji_map:
             value = apply_premium_emoji_html(value, premium_emoji_map)
     return value
 
@@ -534,10 +538,6 @@ def _stream_max_chars_per_edit() -> int:
     except Exception:
         value = 120
     return max(60, min(value, 800))
-
-
-def _stream_typing_action_enabled() -> bool:
-    return _bool_flag(getattr(config, "STREAM_TYPING_ACTION", True), True)
 
 
 def _breaking_keywords() -> List[str]:
@@ -1012,7 +1012,22 @@ def _to_bot_text(text: str | None, max_len: int | None = None) -> str | None:
     cleaned = text.strip()
     if max_len is not None and len(cleaned) > max_len:
         cleaned = cleaned[: max_len - 3].rstrip() + "..."
-    return _render_outbound_text(cleaned) if _is_html_formatting_enabled() else cleaned
+    return (
+        _render_outbound_text(cleaned, allow_premium_tags=True)
+        if _is_html_formatting_enabled()
+        else cleaned
+    )
+
+
+def _to_plain_text(text: str | None, max_len: int | None = None) -> str | None:
+    if text is None:
+        return None
+    cleaned = text.strip()
+    if _is_html_formatting_enabled():
+        cleaned = strip_telegram_html(cleaned)
+    if max_len is not None and len(cleaned) > max_len:
+        cleaned = cleaned[: max_len - 3].rstrip() + "..."
+    return cleaned
 
 
 def _extract_addlist_hash(folder_invite_link: str) -> str:
@@ -1382,8 +1397,12 @@ def _is_session_db_locked_error(exc: BaseException) -> bool:
 
 
 async def _send_text_with_ref(text: str, reply_to: int | None = None) -> object:
-    payload_text = _render_outbound_text(text) if _is_html_formatting_enabled() else text
     if _destination_uses_bot_api():
+        payload_text = (
+            _render_outbound_text(text, allow_premium_tags=True)
+            if _is_html_formatting_enabled()
+            else text
+        )
         data = {
             "chat_id": _require_bot_destination_chat_id(),
             "text": _to_bot_text(payload_text) or "",
@@ -1401,10 +1420,15 @@ async def _send_text_with_ref(text: str, reply_to: int | None = None) -> object:
             fallback_text = (
                 strip_telegram_html(payload_text) if _is_html_formatting_enabled() else payload_text
             )
-            data["text"] = _to_bot_text(fallback_text) or ""
+            data["text"] = _to_plain_text(fallback_text) or ""
             return await _bot_api_request("sendMessage", data=data)
 
     tg = _require_client()
+    payload_text = (
+        _render_outbound_text(text, allow_premium_tags=False)
+        if _is_html_formatting_enabled()
+        else text
+    )
     sent = await _call_with_floodwait(
         tg.send_message,
         _require_destination_peer(),
@@ -1417,8 +1441,12 @@ async def _send_text_with_ref(text: str, reply_to: int | None = None) -> object:
 
 
 async def _edit_sent_text(ref: object, text: str) -> object:
-    payload_text = _render_outbound_text(text) if _is_html_formatting_enabled() else text
     if _destination_uses_bot_api():
+        payload_text = (
+            _render_outbound_text(text, allow_premium_tags=True)
+            if _is_html_formatting_enabled()
+            else text
+        )
         message_id = _message_ref_id(ref)
         if not message_id:
             raise RuntimeError("Cannot edit Bot API message without message_id.")
@@ -1441,7 +1469,7 @@ async def _edit_sent_text(ref: object, text: str) -> object:
             fallback_text = (
                 strip_telegram_html(payload_text) if _is_html_formatting_enabled() else payload_text
             )
-            data["text"] = _to_bot_text(fallback_text) or ""
+            data["text"] = _to_plain_text(fallback_text) or ""
             result = await _bot_api_request("editMessageText", data=data)
             if isinstance(result, dict):
                 return result
@@ -1449,6 +1477,11 @@ async def _edit_sent_text(ref: object, text: str) -> object:
 
     if not isinstance(ref, Message):
         raise RuntimeError("Telethon edit requires Message reference.")
+    payload_text = (
+        _render_outbound_text(text, allow_premium_tags=False)
+        if _is_html_formatting_enabled()
+        else text
+    )
     try:
         return await ref.edit(
             payload_text,
@@ -1463,10 +1496,12 @@ async def _edit_sent_text(ref: object, text: str) -> object:
 
 
 async def _send_single_media(msg: Message, caption: str | None) -> object:
-    safe_caption = (
-        _render_outbound_text(caption or "") if (caption and _is_html_formatting_enabled()) else caption
-    )
     if _destination_uses_bot_api():
+        safe_caption = (
+            _render_outbound_text(caption or "", allow_premium_tags=True)
+            if (caption and _is_html_formatting_enabled())
+            else caption
+        )
         raw = await msg.download_media(file=bytes)
         if raw is None:
             raise RuntimeError("Failed to download media for bot destination.")
@@ -1504,10 +1539,15 @@ async def _send_single_media(msg: Message, caption: str | None) -> object:
                     if _is_html_formatting_enabled()
                     else safe_caption
                 )
-                data["caption"] = _to_bot_text(fallback_caption, max_len=1024) or ""
+                data["caption"] = _to_plain_text(fallback_caption, max_len=1024) or ""
             return await _bot_api_request(method_map[media_type], data=data, files=files)
 
     tg = _require_client()
+    safe_caption = (
+        _render_outbound_text(caption or "", allow_premium_tags=False)
+        if (caption and _is_html_formatting_enabled())
+        else caption
+    )
     try:
         return await _call_with_floodwait(
             tg.send_file,
@@ -1530,10 +1570,12 @@ async def _send_single_media(msg: Message, caption: str | None) -> object:
 
 
 async def _send_album(messages: List[Message], caption: str | None) -> None:
-    safe_caption = (
-        _render_outbound_text(caption or "") if (caption and _is_html_formatting_enabled()) else caption
-    )
     if _destination_uses_bot_api():
+        safe_caption = (
+            _render_outbound_text(caption or "", allow_premium_tags=True)
+            if (caption and _is_html_formatting_enabled())
+            else caption
+        )
         if not messages:
             if safe_caption:
                 await _send_text(safe_caption)
@@ -1587,7 +1629,7 @@ async def _send_album(messages: List[Message], caption: str | None) -> None:
                     if _is_html_formatting_enabled()
                     else safe_caption
                 )
-                media_entries[0]["caption"] = _to_bot_text(
+                media_entries[0]["caption"] = _to_plain_text(
                     fallback_caption,
                     max_len=1024,
                 ) or ""
@@ -1596,6 +1638,11 @@ async def _send_album(messages: List[Message], caption: str | None) -> None:
         return
 
     tg = _require_client()
+    safe_caption = (
+        _render_outbound_text(caption or "", allow_premium_tags=False)
+        if (caption and _is_html_formatting_enabled())
+        else caption
+    )
     media_items = [m.media for m in messages if m.media]
     if not media_items:
         if safe_caption:
@@ -2564,7 +2611,7 @@ async def _on_digest_status_command(event: events.NewMessage.Event) -> None:
     try:
         status_text = _digest_status_text()
         if _is_html_formatting_enabled():
-            status_text = _render_outbound_text(status_text) or status_text
+            status_text = _render_outbound_text(status_text, allow_premium_tags=False) or status_text
         await event.reply(
             status_text,
             parse_mode="html" if _is_html_formatting_enabled() else None,
@@ -2603,7 +2650,11 @@ async def _safe_reply_markdown(
     *,
     edit_message: Message | None = None,
 ) -> Message | None:
-    payload_text = _render_outbound_text(text) if _is_html_formatting_enabled() else text
+    payload_text = (
+        _render_outbound_text(text, allow_premium_tags=False)
+        if _is_html_formatting_enabled()
+        else text
+    )
     while True:
         try:
             if edit_message is not None:
@@ -2644,23 +2695,6 @@ async def _safe_reply_markdown(
                 return None
 
 
-async def _send_query_typing(event: events.NewMessage.Event) -> None:
-    if not _stream_typing_action_enabled():
-        return
-    tg = _require_client()
-    try:
-        peer = await event.get_input_chat()
-        await _call_with_floodwait(
-            tg,
-            functions.messages.SetTypingRequest(
-                peer=peer,
-                action=types.SendMessageTypingAction(),
-            ),
-        )
-    except Exception:
-        LOGGER.debug("Query typing action failed.", exc_info=True)
-
-
 async def _stream_query_answer(
     event: events.NewMessage.Event,
     *,
@@ -2671,7 +2705,9 @@ async def _stream_query_answer(
 ) -> tuple[str, object]:
     async def _send_query_message(text: str, reply_to: int | None):
         return await event.reply(
-            _render_outbound_text(text) if _is_html_formatting_enabled() else text,
+            _render_outbound_text(text, allow_premium_tags=False)
+            if _is_html_formatting_enabled()
+            else text,
             reply_to=reply_to,
             parse_mode="html" if _is_html_formatting_enabled() else "md",
             link_preview=False,
@@ -2692,8 +2728,7 @@ async def _stream_query_answer(
         placeholder_text="Thinking... ⏳",
         edit_interval_ms=_stream_edit_interval_ms(),
         max_chars_per_edit=_stream_max_chars_per_edit(),
-        typing_action_cb=lambda: _send_query_typing(event),
-        typing_enabled=_stream_typing_action_enabled(),
+        typing_enabled=False,
         html_mode=_is_html_formatting_enabled(),
     )
     await streamer.start(initial_ref=progress_message)
