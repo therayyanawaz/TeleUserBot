@@ -1,0 +1,459 @@
+"""Zero-config OpenAI OAuth (PKCE) token manager for Codex subscription backend."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import json
+import logging
+import os
+import secrets
+import time
+import urllib.parse
+import webbrowser
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import httpx
+
+
+# Public OAuth client constants (same family as Codex CLI OAuth flow).
+OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+OPENAI_ISSUER = "https://auth.openai.com"
+REDIRECT_URI = "http://localhost:1455/auth/callback"
+SCOPES = "openid profile email offline_access"
+AUTH_ENDPOINT = "https://auth.openai.com/oauth/authorize"
+TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token"
+OAUTH_ORIGINATOR = "pi"
+JWT_CLAIM_PATH = "https://api.openai.com/auth"
+
+# Local runtime state storage (outside repo).
+RUNTIME_DIR = Path.home() / ".tg_userbot"
+TOKEN_PATH = RUNTIME_DIR / "auth.json"
+DB_PATH = RUNTIME_DIR / "seen.db"
+ERROR_LOG_PATH = RUNTIME_DIR / "errors.log"
+
+TOKEN_REFRESH_SKEW_SECONDS = 60
+CALLBACK_TIMEOUT_SECONDS = 300
+
+
+class OAuthError(RuntimeError):
+    """Raised for OAuth flow and token lifecycle errors."""
+
+
+@dataclass
+class _CallbackResult:
+    code: Optional[str]
+    state: Optional[str]
+    error: Optional[str]
+    error_description: Optional[str]
+
+
+class _CallbackServer(HTTPServer):
+    callback_result: Optional[_CallbackResult] = None
+
+
+def _base64url_no_padding(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+
+def _base64url_decode(value: str) -> bytes:
+    padding = "=" * ((4 - (len(value) % 4)) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def _decode_jwt_payload(token: str) -> Dict[str, Any]:
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {}
+        payload = json.loads(_base64url_decode(parts[1]).decode("utf-8"))
+        if isinstance(payload, dict):
+            return payload
+        return {}
+    except Exception:
+        return {}
+
+
+def _extract_account_id_from_access_token(access_token: str) -> Optional[str]:
+    payload = _decode_jwt_payload(access_token)
+    auth_claim = payload.get(JWT_CLAIM_PATH)
+    if not isinstance(auth_claim, dict):
+        return None
+    account_id = auth_claim.get("chatgpt_account_id")
+    if isinstance(account_id, str) and account_id.strip():
+        return account_id.strip()
+    return None
+
+
+def _normalize_unix_seconds(raw: Any) -> Optional[int]:
+    try:
+        value = int(raw)
+    except Exception:
+        return None
+    # If milliseconds, convert to seconds.
+    if value > 10_000_000_000:
+        value = value // 1000
+    if value <= 0:
+        return None
+    return value
+
+
+def _generate_code_verifier() -> str:
+    # RFC 7636: high-entropy cryptographic random string (32 bytes -> base64url).
+    return _base64url_no_padding(os.urandom(32))
+
+
+def _generate_code_challenge(code_verifier: str) -> str:
+    digest = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+    return _base64url_no_padding(digest)
+
+
+def _generate_state() -> str:
+    # 16 random bytes in hex format.
+    return secrets.token_hex(16)
+
+
+def _build_callback_handler(expected_path: str):
+    class CallbackHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+        def do_GET(self) -> None:  # noqa: N802
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path != expected_path:
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"Not found.")
+                return
+
+            query = urllib.parse.parse_qs(parsed.query)
+            self.server.callback_result = _CallbackResult(  # type: ignore[attr-defined]
+                code=query.get("code", [None])[0],
+                state=query.get("state", [None])[0],
+                error=query.get("error", [None])[0],
+                error_description=query.get("error_description", [None])[0],
+            )
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(
+                b"<html><body><h3>OpenAI authentication complete.</h3>"
+                b"<p>Return to terminal.</p></body></html>"
+            )
+
+    return CallbackHandler
+
+
+def _wait_for_callback(timeout_seconds: int) -> _CallbackResult:
+    parsed = urllib.parse.urlparse(REDIRECT_URI)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 1455
+    path = parsed.path or "/"
+
+    handler_cls = _build_callback_handler(path)
+    server = _CallbackServer((host, port), handler_cls)
+    server.timeout = 1
+    deadline = time.time() + timeout_seconds
+    try:
+        while time.time() < deadline:
+            server.handle_request()
+            if server.callback_result is not None:
+                return server.callback_result
+    finally:
+        server.server_close()
+
+    raise OAuthError("Timed out waiting for OAuth callback.")
+
+
+def ensure_runtime_dir() -> Path:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(RUNTIME_DIR, 0o700)
+    except OSError:
+        pass
+    return RUNTIME_DIR
+
+
+class AuthManager:
+    """Handles token load, refresh, and full OAuth PKCE login."""
+
+    def __init__(self, logger: Optional[logging.Logger] = None) -> None:
+        self._logger = logger or logging.getLogger(__name__)
+        self._lock = asyncio.Lock()
+        ensure_runtime_dir()
+
+    async def get_access_token(self) -> str:
+        context = await self.get_auth_context()
+        return context["access_token"]
+
+    async def get_auth_context(self) -> Dict[str, str]:
+        """
+        Return auth context needed for Codex subscription backend calls.
+        Keys: access_token, account_id
+        """
+        async with self._lock:
+            token_data = self._load_token_data()
+            if token_data is None:
+                token_data = await self._run_full_oauth_flow()
+            elif self._is_expiring(token_data):
+                token_data = await self._refresh_or_reauth(token_data)
+            elif not token_data.get("access_token"):
+                token_data = await self._refresh_or_reauth(token_data)
+
+            access_token = str(token_data.get("access_token") or "").strip()
+            if not access_token:
+                token_data = await self._run_full_oauth_flow()
+                access_token = token_data["access_token"]
+
+            account_id = str(token_data.get("account_id") or "").strip()
+            if not account_id:
+                inferred = _extract_account_id_from_access_token(access_token)
+                if inferred:
+                    token_data["account_id"] = inferred
+                    account_id = inferred
+
+            if not account_id:
+                token_data = await self._refresh_or_reauth(token_data)
+                access_token = str(token_data.get("access_token") or "").strip()
+                account_id = str(token_data.get("account_id") or "").strip()
+
+            if not access_token:
+                raise OAuthError("Missing access_token after auth flow.")
+            if not account_id:
+                raise OAuthError(
+                    "Missing ChatGPT account_id in OAuth token. "
+                    "Re-authentication required."
+                )
+
+            self._save_token_data(token_data)
+            return {"access_token": access_token, "account_id": account_id}
+
+    async def refresh_token(self) -> str:
+        context = await self.refresh_auth_context()
+        return context["access_token"]
+
+    async def refresh_auth_context(self) -> Dict[str, str]:
+        """Force refresh using refresh_token; fallback to full OAuth if needed."""
+        async with self._lock:
+            token_data = self._load_token_data() or {}
+            token_data = await self._refresh_or_reauth(token_data, allow_reauth=False)
+            self._save_token_data(token_data)
+            return self._token_data_to_context(token_data)
+
+    async def reauthenticate(self) -> str:
+        """Force full OAuth auth flow regardless of existing token state."""
+        context = await self.reauthenticate_context()
+        return context["access_token"]
+
+    async def reauthenticate_context(self) -> Dict[str, str]:
+        async with self._lock:
+            token_data = await self._run_full_oauth_flow()
+            self._save_token_data(token_data)
+            return self._token_data_to_context(token_data)
+
+    def _token_data_to_context(self, token_data: Dict[str, Any]) -> Dict[str, str]:
+        access_token = str(token_data.get("access_token") or "").strip()
+        account_id = str(token_data.get("account_id") or "").strip()
+        if not account_id and access_token:
+            inferred = _extract_account_id_from_access_token(access_token)
+            if inferred:
+                token_data["account_id"] = inferred
+                account_id = inferred
+
+        if not access_token:
+            raise OAuthError("Token state missing access_token.")
+        if not account_id:
+            raise OAuthError("Token state missing account_id.")
+        return {"access_token": access_token, "account_id": account_id}
+
+    def _load_token_data(self) -> Optional[Dict[str, Any]]:
+        if not TOKEN_PATH.exists():
+            return None
+
+        try:
+            data = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            self._logger.exception("Failed to read token file. Full OAuth required.")
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        # Backward-compatible migrations from previous auth.json shapes.
+        if not data.get("access_token") and isinstance(data.get("access"), str):
+            data["access_token"] = data["access"]
+        if not data.get("refresh_token") and isinstance(data.get("refresh"), str):
+            data["refresh_token"] = data["refresh"]
+
+        if not data.get("account_id"):
+            if isinstance(data.get("accountId"), str):
+                data["account_id"] = data["accountId"]
+            elif isinstance(data.get("chatgpt_account_id"), str):
+                data["account_id"] = data["chatgpt_account_id"]
+
+        expires_at = _normalize_unix_seconds(data.get("expires_at"))
+        if expires_at is None:
+            expires_at = _normalize_unix_seconds(data.get("expires"))
+        if expires_at is not None:
+            data["expires_at"] = expires_at
+
+        access_token = str(data.get("access_token") or "").strip()
+        refresh_token = str(data.get("refresh_token") or "").strip()
+        if not access_token and not refresh_token:
+            return None
+
+        if access_token and not data.get("account_id"):
+            inferred = _extract_account_id_from_access_token(access_token)
+            if inferred:
+                data["account_id"] = inferred
+
+        return data
+
+    def _save_token_data(self, token_data: Dict[str, Any]) -> None:
+        ensure_runtime_dir()
+        tmp = TOKEN_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(token_data, indent=2), encoding="utf-8")
+        os.replace(tmp, TOKEN_PATH)
+        try:
+            os.chmod(TOKEN_PATH, 0o600)
+        except OSError:
+            self._logger.warning("Failed to chmod 600 for token file: %s", TOKEN_PATH)
+
+    def _is_expiring(self, token_data: Dict[str, Any]) -> bool:
+        expires_at = _normalize_unix_seconds(token_data.get("expires_at"))
+        if not expires_at:
+            return True
+        return expires_at < int(time.time()) + TOKEN_REFRESH_SKEW_SECONDS
+
+    async def _refresh_or_reauth(
+        self,
+        token_data: Dict[str, Any],
+        *,
+        allow_reauth: bool = True,
+    ) -> Dict[str, Any]:
+        refresh_token = str(token_data.get("refresh_token") or "").strip()
+        if not refresh_token:
+            if allow_reauth:
+                self._logger.info("No refresh token found. Running full OAuth flow.")
+                return await self._run_full_oauth_flow()
+            raise OAuthError("No refresh token available.")
+
+        try:
+            refreshed = await self._refresh_with_token(refresh_token)
+            if not refreshed.get("refresh_token"):
+                refreshed["refresh_token"] = refresh_token
+
+            if not refreshed.get("account_id") and refreshed.get("access_token"):
+                inferred = _extract_account_id_from_access_token(
+                    str(refreshed["access_token"])
+                )
+                if inferred:
+                    refreshed["account_id"] = inferred
+            return refreshed
+        except Exception:
+            if allow_reauth:
+                self._logger.exception("Refresh failed. Running full OAuth flow.")
+                return await self._run_full_oauth_flow()
+            self._logger.exception("Refresh failed.")
+            raise
+
+    async def _run_full_oauth_flow(self) -> Dict[str, Any]:
+        code_verifier = _generate_code_verifier()
+        code_challenge = _generate_code_challenge(code_verifier)
+        state = _generate_state()
+
+        params = {
+            "client_id": OPENAI_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
+            "scope": SCOPES,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+            # Mirrors Codex login hints.
+            "id_token_add_organizations": "true",
+            "codex_cli_simplified_flow": "true",
+            "originator": OAUTH_ORIGINATOR,
+        }
+        auth_url = f"{AUTH_ENDPOINT}?{urllib.parse.urlencode(params)}"
+        self._logger.info("Opening browser for OpenAI OAuth login...")
+        self._logger.info("If browser does not open, visit:\n%s", auth_url)
+        webbrowser.open(auth_url, new=1, autoraise=True)
+
+        callback = await asyncio.to_thread(_wait_for_callback, CALLBACK_TIMEOUT_SECONDS)
+        if callback.error:
+            raise OAuthError(
+                f"OAuth authorize error: {callback.error} "
+                f"{callback.error_description or ''}".strip()
+            )
+        if callback.state != state:
+            raise OAuthError("OAuth state mismatch.")
+        if not callback.code:
+            raise OAuthError("OAuth callback did not include authorization code.")
+
+        token_data = await self._exchange_code_for_tokens(callback.code, code_verifier)
+        if not token_data.get("account_id"):
+            account_id = _extract_account_id_from_access_token(token_data["access_token"])
+            if not account_id:
+                raise OAuthError(
+                    "Could not extract ChatGPT account ID from OAuth access token."
+                )
+            token_data["account_id"] = account_id
+        return token_data
+
+    async def _exchange_code_for_tokens(
+        self, code: str, code_verifier: str
+    ) -> Dict[str, Any]:
+        payload = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "client_id": OPENAI_CLIENT_ID,
+            "code_verifier": code_verifier,
+        }
+        return await self._post_token_payload(payload)
+
+    async def _refresh_with_token(self, refresh_token: str) -> Dict[str, Any]:
+        payload = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": OPENAI_CLIENT_ID,
+        }
+        return await self._post_token_payload(payload)
+
+    async def _post_token_payload(self, payload: Dict[str, str]) -> Dict[str, Any]:
+        async with httpx.AsyncClient(timeout=30) as http:
+            response = await http.post(TOKEN_ENDPOINT, data=payload)
+
+        if response.status_code >= 400:
+            raise OAuthError(
+                f"Token endpoint error {response.status_code}: {response.text}"
+            )
+
+        raw = response.json()
+        access_token = str(raw.get("access_token") or "").strip()
+        refresh_token = str(raw.get("refresh_token") or "").strip()
+        if not access_token:
+            raise OAuthError("Token response missing access_token.")
+
+        expires_in = int(raw.get("expires_in", 3600))
+        account_id = _extract_account_id_from_access_token(access_token)
+
+        token_data: Dict[str, Any] = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "id_token": raw.get("id_token"),
+            "token_type": raw.get("token_type"),
+            "scope": raw.get("scope"),
+            "expires_in": expires_in,
+            "expires_at": int(time.time()) + expires_in,
+            "account_id": account_id,
+            "token_source": "codex_oauth_v1",
+        }
+        return token_data

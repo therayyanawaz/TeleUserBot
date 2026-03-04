@@ -1,0 +1,2221 @@
+"""Telegram News Aggregator userbot entry point."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import time
+import urllib.parse
+from collections import defaultdict
+from datetime import datetime
+import importlib
+from typing import Dict, List, Tuple
+import uuid
+
+import httpx
+from telethon import TelegramClient, events, functions, utils
+from telethon.errors import (
+    ChatForwardsRestrictedError,
+    FloodWaitError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    SessionPasswordNeededError,
+    UserAlreadyParticipantError,
+)
+from telethon.errors.rpcerrorlist import BotMethodInvalidError
+from telethon.tl import types
+from telethon.tl.custom.message import Message
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+
+import config
+from ai_filter import (
+    classify_severity,
+    create_digest_summary,
+    get_quota_health,
+    summarize_breaking_headline,
+    summarize_or_skip,
+)
+from auth import AuthManager, ERROR_LOG_PATH, ensure_runtime_dir
+from db import (
+    ack_digest_batch,
+    claim_digest_batch,
+    count_inflight,
+    count_pending,
+    get_last_digest_timestamp,
+    init_db,
+    is_seen,
+    load_recent_dupe_texts,
+    mark_seen,
+    mark_seen_many,
+    restore_digest_batch,
+    save_dupe_text,
+    save_to_digest_queue,
+    set_last_digest_timestamp,
+)
+from prompts import quiet_period_message
+from utils import (
+    NearDuplicateDetector,
+    build_telegram_message_link,
+    estimate_tokens_rough,
+    format_eta,
+    format_ts,
+    log_structured,
+    normalize_space,
+    parse_daily_times,
+    seconds_until_next_daily_time,
+    split_markdown_chunks,
+)
+
+
+ensure_runtime_dir()
+
+LOGGER = logging.getLogger("tg_news_userbot")
+LOGGER.setLevel(logging.INFO)
+
+_error_handler = logging.FileHandler(ERROR_LOG_PATH)
+_error_handler.setLevel(logging.ERROR)
+_error_handler.setFormatter(
+    logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+)
+LOGGER.addHandler(_error_handler)
+
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.INFO)
+_console_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+LOGGER.addHandler(_console_handler)
+
+
+client: TelegramClient | None = None
+auth_manager: AuthManager | None = None
+destination_peer = None
+bot_destination_token: str | None = None
+bot_destination_chat_id: str | None = None
+
+# (channel_id, grouped_id) -> [messages]
+album_buffers: Dict[Tuple[str, int], List[Message]] = defaultdict(list)
+album_tasks: Dict[Tuple[str, int], asyncio.Task] = {}
+digest_scheduler_task: asyncio.Task | None = None
+source_title_cache: Dict[str, str] = {}
+digest_next_run_ts: float | None = None
+digest_retry_backoff_seconds: int = 0
+digest_loop_lock = asyncio.Lock()
+dupe_detector: NearDuplicateDetector | None = None
+
+ALBUM_WAIT_SECONDS = 1.5
+ENV_PATH = Path(__file__).with_name(".env")
+
+
+def _is_missing_telegram_api_id() -> bool:
+    return not isinstance(config.TELEGRAM_API_ID, int) or config.TELEGRAM_API_ID <= 0
+
+
+def _is_missing_telegram_api_hash() -> bool:
+    return not isinstance(config.TELEGRAM_API_HASH, str) or not config.TELEGRAM_API_HASH.strip()
+
+
+def _is_missing_folder_invite_link() -> bool:
+    link = getattr(config, "FOLDER_INVITE_LINK", "")
+    return (
+        not isinstance(link, str)
+        or not link.strip()
+        or "xxxxxxxxxx" in link
+    )
+
+
+def _is_placeholder_destination(value: str) -> bool:
+    normalized = value.strip().lower()
+    return normalized in {
+        "@mychannel",
+        "mychannel",
+        "@yourchannel",
+        "yourchannel",
+        "@destination",
+        "destination",
+    }
+
+
+def _looks_like_bot_token(value: str) -> bool:
+    return bool(re.fullmatch(r"[0-9]{6,}:[A-Za-z0-9_-]{20,}", value.strip()))
+
+
+def _bot_destination_token_from_config() -> str:
+    token = str(getattr(config, "BOT_DESTINATION_TOKEN", "") or "").strip()
+    if token:
+        return token
+    destination = str(getattr(config, "DESTINATION", "") or "").strip()
+    if _looks_like_bot_token(destination):
+        return destination
+    return ""
+
+
+def _is_bot_destination_mode() -> bool:
+    return bool(_bot_destination_token_from_config())
+
+
+def _is_missing_bot_destination_token() -> bool:
+    token = _bot_destination_token_from_config()
+    return not token or not _looks_like_bot_token(token)
+
+
+def _is_missing_bot_destination_chat_id() -> bool:
+    chat_id = getattr(config, "BOT_DESTINATION_CHAT_ID", "")
+    return not str(chat_id).strip()
+
+
+def _looks_like_addlist_link(value: str) -> bool:
+    normalized = value.strip()
+    if not normalized:
+        return False
+    if normalized.startswith("https://") or normalized.startswith("http://"):
+        parsed = urllib.parse.urlparse(normalized)
+        path = parsed.path.strip("/")
+    else:
+        cleaned = normalized
+        if cleaned.startswith("t.me/"):
+            cleaned = cleaned[len("t.me/") :]
+        elif cleaned.startswith("telegram.me/"):
+            cleaned = cleaned[len("telegram.me/") :]
+        path = cleaned.strip("/")
+    return path.startswith("addlist/")
+
+
+def _normalize_addlist_link(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        return normalized
+    if normalized.startswith("http://") or normalized.startswith("https://"):
+        return normalized
+    if normalized.startswith("t.me/") or normalized.startswith("telegram.me/"):
+        return f"https://{normalized}"
+    return normalized
+
+
+def _manual_source_entries() -> List[str]:
+    combined: List[str] = []
+    for key in ("EXTRA_SOURCES", "SOURCES"):
+        value = getattr(config, key, [])
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                combined.append(item.strip())
+
+    # preserve order and dedupe
+    seen = set()
+    unique = []
+    for item in combined:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
+def _has_manual_sources() -> bool:
+    return len(_manual_source_entries()) > 0
+
+
+def _is_missing_destination() -> bool:
+    if _is_bot_destination_mode():
+        return False
+    return (
+        not isinstance(config.DESTINATION, str)
+        or not config.DESTINATION.strip()
+        or _is_placeholder_destination(config.DESTINATION)
+        or _looks_like_bot_token(config.DESTINATION)
+        or _looks_like_addlist_link(config.DESTINATION)
+    )
+
+
+def _is_digest_mode_enabled() -> bool:
+    raw = getattr(config, "DIGEST_MODE", True)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(raw)
+
+
+def _digest_interval_seconds() -> int:
+    raw = getattr(config, "DIGEST_INTERVAL_MINUTES", 30)
+    try:
+        minutes = int(raw)
+    except Exception:
+        minutes = 30
+    minutes = max(1, min(minutes, 24 * 60))
+    return minutes * 60
+
+
+def _digest_daily_times() -> List[Tuple[int, int]]:
+    raw = getattr(config, "DIGEST_DAILY_TIMES", [])
+    if not isinstance(raw, list):
+        return []
+    values = [str(x) for x in raw]
+    return parse_daily_times(values)
+
+
+def _digest_max_posts() -> int:
+    raw = getattr(config, "DIGEST_MAX_POSTS", 80)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 80
+    return max(1, min(value, 500))
+
+
+def _digest_send_delay_seconds() -> float:
+    raw = getattr(config, "DIGEST_SEND_DELAY_SECONDS", 0.8)
+    try:
+        value = float(raw)
+    except Exception:
+        value = 0.8
+    return max(0.0, min(value, 5.0))
+
+
+def _digest_send_chunk_size() -> int:
+    raw = getattr(config, "DIGEST_SEND_CHUNK_SIZE", 3600)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 3600
+    return max(1000, min(value, 3900))
+
+
+def _digest_retry_base_seconds() -> int:
+    raw = getattr(config, "DIGEST_RETRY_BASE_SECONDS", 30)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 30
+    return max(5, min(value, 600))
+
+
+def _digest_retry_max_seconds() -> int:
+    raw = getattr(config, "DIGEST_RETRY_MAX_SECONDS", 900)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 900
+    return max(30, min(value, 3600))
+
+
+def _digest_429_threshold_per_hour() -> int:
+    raw = getattr(config, "DIGEST_429_THRESHOLD_PER_HOUR", 3)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 3
+    return max(1, min(value, 50))
+
+
+def _bool_flag(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
+def _is_dupe_detection_enabled() -> bool:
+    return _bool_flag(getattr(config, "ENABLE_DUPE_DETECTION", True), True)
+
+
+def _dupe_threshold() -> float:
+    raw = getattr(config, "DUPE_THRESHOLD", 0.83)
+    try:
+        value = float(raw)
+    except Exception:
+        value = 0.83
+    return min(max(value, 0.5), 0.99)
+
+
+def _dupe_cache_size() -> int:
+    raw = getattr(config, "DUPE_CACHE_SIZE", 400)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 400
+    return max(50, min(value, 5000))
+
+
+def _is_severity_routing_enabled() -> bool:
+    return _bool_flag(getattr(config, "ENABLE_SEVERITY_ROUTING", True), True)
+
+
+def _is_immediate_high_enabled() -> bool:
+    return _bool_flag(getattr(config, "IMMEDIATE_HIGH", True), True)
+
+
+def _include_source_tags() -> bool:
+    return _bool_flag(getattr(config, "INCLUDE_SOURCE_TAGS", False), False)
+
+
+def _breaking_keywords() -> List[str]:
+    raw = getattr(config, "BREAKING_NEWS_KEYWORDS", [])
+    if not isinstance(raw, list):
+        return []
+    result: List[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        normalized = item.strip().lower()
+        if normalized:
+            result.append(normalized)
+    return result
+
+
+def _breaking_match_threshold() -> int:
+    raw = getattr(config, "BREAKING_MATCH_THRESHOLD", 1)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 1
+    return max(1, min(value, 10))
+
+
+def _contains_breaking_keyword(text: str) -> bool:
+    keywords = _breaking_keywords()
+    if not keywords:
+        return False
+    lowered = text.lower()
+    hits = sum(1 for keyword in keywords if keyword in lowered)
+    return hits >= _breaking_match_threshold()
+
+
+def _digest_status_command() -> str:
+    raw = str(getattr(config, "DIGEST_STATUS_COMMAND", "/digest_status") or "").strip()
+    return raw or "/digest_status"
+
+
+def _prompt_non_empty(prompt_text: str) -> str:
+    while True:
+        value = input(prompt_text).strip()
+        if value:
+            return value
+        print("Value cannot be empty. Try again.")
+
+
+def _prompt_positive_int(prompt_text: str) -> int:
+    while True:
+        raw = input(prompt_text).strip()
+        try:
+            val = int(raw)
+        except ValueError:
+            print("Please enter a valid integer.")
+            continue
+        if val > 0:
+            return val
+        print("Value must be greater than 0.")
+
+
+def _prompt_phone_number() -> str:
+    while True:
+        phone = input("Telegram phone number (E.164, e.g. +15551234567): ").strip()
+        if not phone:
+            print("Phone number is required.")
+            continue
+        if ":" in phone:
+            print("Bot token is not allowed. Enter your personal phone number.")
+            continue
+        if not re.fullmatch(r"\+?[0-9]{5,20}", phone):
+            print("Invalid phone format. Use digits with optional leading '+'.")
+            continue
+        return phone
+
+
+def _prompt_destination() -> str:
+    while True:
+        value = _prompt_non_empty(
+            "DESTINATION (@channel, chat invite link, 'me', peer ID, or bot token): "
+        )
+        if _looks_like_bot_token(value):
+            config.BOT_DESTINATION_TOKEN = value.strip()
+            print(
+                "Detected bot token. Switching to bot destination mode. "
+                "You will be asked for BOT_DESTINATION_CHAT_ID."
+            )
+            return ""
+        if _looks_like_addlist_link(value):
+            normalized_folder_link = _normalize_addlist_link(value)
+            if _is_missing_folder_invite_link():
+                config.FOLDER_INVITE_LINK = normalized_folder_link
+                _persist_config_updates({"FOLDER_INVITE_LINK": config.FOLDER_INVITE_LINK})
+                print(
+                    "Detected folder addlist link and saved it as FOLDER_INVITE_LINK in .env. "
+                    "Now enter one destination chat/channel."
+                )
+            else:
+                print(
+                    "Destination cannot be a folder addlist link. "
+                    "Use one destination chat/channel, e.g. @my_private_channel or me."
+                )
+            continue
+        return value
+
+
+def _prompt_bot_destination_token() -> str:
+    while True:
+        value = _prompt_non_empty("BOT_DESTINATION_TOKEN: ")
+        if not _looks_like_bot_token(value):
+            print("Invalid bot token format. Expected <digits>:<token>.")
+            continue
+        return value
+
+
+def _prompt_bot_destination_chat_id() -> str:
+    while True:
+        value = _prompt_non_empty("BOT_DESTINATION_CHAT_ID (chat id or @channel): ")
+        if _looks_like_bot_token(value):
+            print("This looks like a token, not a chat ID. Enter chat ID or @channel.")
+            continue
+        return value
+
+
+def _prompt_destination_mode() -> str:
+    while True:
+        raw = input(
+            "Destination mode [1=chat/channel, 2=bot token+chat id] (default 1): "
+        ).strip()
+        if raw in {"", "1", "chat", "channel", "telethon"}:
+            return "chat"
+        if raw in {"2", "bot", "botapi"}:
+            return "bot"
+        print("Invalid choice. Enter 1 or 2.")
+
+
+def _prompt_sources() -> List[str]:
+    while True:
+        raw = input(
+            "Manual sources (comma-separated usernames/links, e.g. @ch1,https://t.me/+abc...): "
+        ).strip()
+        parts = [x.strip() for x in raw.split(",") if x.strip()]
+        if parts:
+            return parts
+        print("Enter at least one source.")
+
+
+def _persist_config_updates(updates: Dict[str, object]) -> None:
+    if not updates:
+        return
+
+    def _serialize_env_value(value: object) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, list):
+            return json.dumps([str(item) for item in value], ensure_ascii=False)
+        return str(value)
+
+    def _format_env_line(key: str, value: object) -> str:
+        serialized = _serialize_env_value(value)
+        if not serialized:
+            return f'{key}=""'
+        if re.fullmatch(r"[A-Za-z0-9_./:+@-]+", serialized):
+            return f"{key}={serialized}"
+        return f"{key}={json.dumps(serialized, ensure_ascii=False)}"
+
+    existing: Dict[str, str] = {}
+    if ENV_PATH.exists():
+        for raw in ENV_PATH.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key:
+                existing[key] = value.strip()
+
+    for key, value in updates.items():
+        existing[key] = _format_env_line(key, value).split("=", 1)[1]
+
+    lines = [
+        "# Auto-generated by TeleUserBot prompts. Override with exported env vars if needed.",
+    ]
+    for key in sorted(existing.keys()):
+        lines.append(f"{key}={existing[key]}")
+    lines.append("")
+
+    tmp_path = ENV_PATH.with_suffix(".tmp")
+    tmp_path.write_text("\n".join(lines), encoding="utf-8")
+    os.replace(tmp_path, ENV_PATH)
+
+
+def _prompt_for_missing_config() -> None:
+    updates_to_persist: Dict[str, object] = {}
+
+    # Auto-recover from common mistake: bot token pasted into DESTINATION.
+    raw_destination = getattr(config, "DESTINATION", "")
+    if isinstance(raw_destination, str) and _looks_like_bot_token(raw_destination):
+        if not str(getattr(config, "BOT_DESTINATION_TOKEN", "")).strip():
+            config.BOT_DESTINATION_TOKEN = raw_destination.strip()
+            updates_to_persist["BOT_DESTINATION_TOKEN"] = config.BOT_DESTINATION_TOKEN
+        config.DESTINATION = ""
+        updates_to_persist["DESTINATION"] = config.DESTINATION
+        print(
+            "Detected bot token in DESTINATION. "
+            "Moved it to BOT_DESTINATION_TOKEN and switched to bot destination mode."
+        )
+
+    # Auto-recover from common mistake: folder addlist pasted into DESTINATION.
+    if isinstance(getattr(config, "DESTINATION", None), str) and _looks_like_addlist_link(
+        config.DESTINATION
+    ):
+        if _is_missing_folder_invite_link():
+            config.FOLDER_INVITE_LINK = _normalize_addlist_link(config.DESTINATION)
+            updates_to_persist["FOLDER_INVITE_LINK"] = config.FOLDER_INVITE_LINK
+        config.DESTINATION = ""
+        updates_to_persist["DESTINATION"] = config.DESTINATION
+        print(
+            "Detected addlist folder link in DESTINATION. "
+            "Moved it to FOLDER_INVITE_LINK and cleared DESTINATION."
+        )
+
+    missing = []
+    if _is_missing_telegram_api_id():
+        missing.append("TELEGRAM_API_ID")
+    if _is_missing_telegram_api_hash():
+        missing.append("TELEGRAM_API_HASH")
+    if _is_bot_destination_mode():
+        if _is_missing_bot_destination_token():
+            missing.append("BOT_DESTINATION_TOKEN")
+        if _is_missing_bot_destination_chat_id():
+            missing.append("BOT_DESTINATION_CHAT_ID")
+    elif _is_missing_destination():
+        missing.append("DESTINATION")
+
+    if missing:
+        print("\nConfig missing values:", ", ".join(missing))
+        if _is_missing_telegram_api_id():
+            config.TELEGRAM_API_ID = _prompt_positive_int("TELEGRAM_API_ID: ")
+            updates_to_persist["TELEGRAM_API_ID"] = config.TELEGRAM_API_ID
+        if _is_missing_telegram_api_hash():
+            config.TELEGRAM_API_HASH = _prompt_non_empty("TELEGRAM_API_HASH: ")
+            updates_to_persist["TELEGRAM_API_HASH"] = config.TELEGRAM_API_HASH
+        if _is_bot_destination_mode() and _is_missing_bot_destination_token():
+            config.BOT_DESTINATION_TOKEN = _prompt_bot_destination_token()
+            updates_to_persist["BOT_DESTINATION_TOKEN"] = config.BOT_DESTINATION_TOKEN
+        if _is_bot_destination_mode() and _is_missing_bot_destination_chat_id():
+            config.BOT_DESTINATION_CHAT_ID = _prompt_bot_destination_chat_id()
+            updates_to_persist["BOT_DESTINATION_CHAT_ID"] = config.BOT_DESTINATION_CHAT_ID
+        if not _is_bot_destination_mode() and _is_missing_destination():
+            mode = _prompt_destination_mode()
+            if mode == "bot":
+                config.BOT_DESTINATION_TOKEN = _prompt_bot_destination_token()
+                config.BOT_DESTINATION_CHAT_ID = _prompt_bot_destination_chat_id()
+                config.DESTINATION = ""
+                updates_to_persist["BOT_DESTINATION_TOKEN"] = config.BOT_DESTINATION_TOKEN
+                updates_to_persist["BOT_DESTINATION_CHAT_ID"] = (
+                    config.BOT_DESTINATION_CHAT_ID
+                )
+                updates_to_persist["DESTINATION"] = config.DESTINATION
+            else:
+                config.DESTINATION = _prompt_destination()
+                updates_to_persist["DESTINATION"] = config.DESTINATION
+                if _is_bot_destination_mode():
+                    updates_to_persist["BOT_DESTINATION_TOKEN"] = str(
+                        getattr(config, "BOT_DESTINATION_TOKEN", "")
+                    )
+                    if _is_missing_bot_destination_chat_id():
+                        config.BOT_DESTINATION_CHAT_ID = _prompt_bot_destination_chat_id()
+                        updates_to_persist["BOT_DESTINATION_CHAT_ID"] = (
+                            config.BOT_DESTINATION_CHAT_ID
+                        )
+
+    if _is_missing_folder_invite_link() and not _has_manual_sources():
+        folder = input(
+            "FOLDER_INVITE_LINK (leave empty to use manual sources only): "
+        ).strip()
+        if folder:
+            config.FOLDER_INVITE_LINK = folder
+            updates_to_persist["FOLDER_INVITE_LINK"] = config.FOLDER_INVITE_LINK
+        else:
+            config.EXTRA_SOURCES = _prompt_sources()
+            updates_to_persist["EXTRA_SOURCES"] = config.EXTRA_SOURCES
+
+    _persist_config_updates(updates_to_persist)
+
+
+def _validate_config() -> None:
+    if _is_missing_telegram_api_id():
+        raise ValueError("Set TELEGRAM_API_ID in environment or .env")
+    if _is_missing_telegram_api_hash():
+        raise ValueError("Set TELEGRAM_API_HASH in environment or .env")
+    if _is_bot_destination_mode():
+        if _is_missing_bot_destination_token():
+            raise ValueError("Set BOT_DESTINATION_TOKEN in environment or .env")
+        if _is_missing_bot_destination_chat_id():
+            raise ValueError("Set BOT_DESTINATION_CHAT_ID in environment or .env")
+    elif _is_missing_destination():
+        raise ValueError("Set DESTINATION in environment or .env")
+    if _is_missing_folder_invite_link() and not _has_manual_sources():
+        raise ValueError(
+            "Set FOLDER_INVITE_LINK or EXTRA_SOURCES/SOURCES in environment or .env"
+        )
+
+
+def _require_client() -> TelegramClient:
+    if client is None:
+        raise RuntimeError("Telegram client not initialized.")
+    return client
+
+
+def _require_auth_manager() -> AuthManager:
+    if auth_manager is None:
+        raise RuntimeError("Auth manager not initialized.")
+    return auth_manager
+
+
+def _require_destination_peer():
+    if destination_peer is None:
+        raise RuntimeError("Destination peer not initialized.")
+    return destination_peer
+
+
+def _require_bot_destination_token() -> str:
+    if not bot_destination_token:
+        raise RuntimeError("Bot destination token not initialized.")
+    return bot_destination_token
+
+
+def _require_bot_destination_chat_id() -> str:
+    if not bot_destination_chat_id:
+        raise RuntimeError("Bot destination chat ID not initialized.")
+    return bot_destination_chat_id
+
+
+def _require_dupe_detector() -> NearDuplicateDetector:
+    if dupe_detector is None:
+        raise RuntimeError("Near-duplicate detector not initialized.")
+    return dupe_detector
+
+
+def _destination_uses_bot_api() -> bool:
+    return bool(bot_destination_token and bot_destination_chat_id)
+
+
+async def _bot_api_request(
+    method: str,
+    *,
+    data: Dict[str, str] | None = None,
+    files: Dict[str, tuple[str, bytes, str]] | None = None,
+) -> object:
+    token = _require_bot_destination_token()
+    url = f"https://api.telegram.org/bot{token}/{method}"
+
+    async with httpx.AsyncClient(timeout=60) as http:
+        for _ in range(4):
+            response = await http.post(url, data=data, files=files)
+            payload = {}
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {}
+
+            if response.status_code == 429 or (
+                isinstance(payload, dict) and payload.get("error_code") == 429
+            ):
+                retry_after = int(
+                    (payload.get("parameters") or {}).get("retry_after", 2)  # type: ignore[union-attr]
+                )
+                await asyncio.sleep(retry_after + 1)
+                continue
+
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Bot API {method} failed: HTTP {response.status_code} {response.text}"
+                )
+
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"Bot API {method} returned invalid response payload.")
+            if not payload.get("ok"):
+                raise RuntimeError(f"Bot API {method} error: {payload}")
+            return payload.get("result")
+
+    raise RuntimeError(f"Bot API {method} failed after retries.")
+
+
+def _infer_chat_id_from_updates(updates: object) -> str | None:
+    if not isinstance(updates, list):
+        return None
+    for update in reversed(updates):
+        if not isinstance(update, dict):
+            continue
+        for key in (
+            "message",
+            "edited_message",
+            "channel_post",
+            "edited_channel_post",
+            "my_chat_member",
+            "chat_member",
+        ):
+            obj = update.get(key)
+            if not isinstance(obj, dict):
+                continue
+            chat = obj.get("chat")
+            if isinstance(chat, dict) and "id" in chat:
+                return str(chat["id"])
+    return None
+
+
+def _media_type_for_bot(msg: Message) -> str:
+    if msg.photo:
+        return "photo"
+    if msg.video:
+        return "video"
+    return "document"
+
+
+def _filename_for_bot_media(msg: Message, index: int) -> str:
+    if msg.photo:
+        return f"photo_{msg.id or index}.jpg"
+    if msg.video:
+        return f"video_{msg.id or index}.mp4"
+    if msg.document and getattr(msg.document, "attributes", None):
+        for attr in msg.document.attributes:
+            if isinstance(attr, types.DocumentAttributeFilename) and attr.file_name:
+                return attr.file_name
+    return f"file_{msg.id or index}.bin"
+
+
+def _format_summary_text(source_title: str, summary: str) -> str:
+    if _include_source_tags():
+        return f"📰 **{source_title}**\n\n{summary.strip()}"
+    return f"📰 **Update**\n\n{summary.strip()}"
+
+
+def _format_source_label(source_title: str) -> str:
+    if _include_source_tags():
+        return f"📰 **{source_title}**"
+    return "📰 **Update**"
+
+
+def _to_bot_text(text: str | None, max_len: int | None = None) -> str | None:
+    if text is None:
+        return None
+    cleaned = text.strip()
+    if max_len is not None and len(cleaned) > max_len:
+        return cleaned[: max_len - 3].rstrip() + "..."
+    return cleaned
+
+
+def _extract_addlist_hash(folder_invite_link: str) -> str:
+    parsed = urllib.parse.urlparse(folder_invite_link.strip())
+    path = parsed.path.strip("/")
+    if path.startswith("addlist/"):
+        invite_hash = path.split("/", 1)[1]
+    else:
+        invite_hash = path.split("/")[-1]
+    if not invite_hash:
+        raise ValueError("Invalid FOLDER_INVITE_LINK format.")
+    return invite_hash
+
+
+def _extract_private_invite_hash(source: str) -> str | None:
+    normalized = source.strip()
+    if normalized.startswith("https://") or normalized.startswith("http://"):
+        parsed = urllib.parse.urlparse(normalized)
+        path = parsed.path.strip("/")
+    else:
+        path = normalized.strip("/")
+
+    if path.startswith("+"):
+        return path[1:] or None
+    if path.startswith("joinchat/"):
+        return path.split("/", 1)[1] or None
+    return None
+
+
+def _extract_public_username(source: str) -> str | None:
+    normalized = source.strip()
+    if not normalized:
+        return None
+    if _looks_like_bot_token(normalized):
+        return None
+
+    if normalized.startswith("@"):
+        return normalized
+
+    if normalized.startswith("https://") or normalized.startswith("http://"):
+        parsed = urllib.parse.urlparse(normalized)
+        path = parsed.path.strip("/")
+        if not path:
+            return None
+        if path.startswith("addlist/") or path.startswith("+") or path.startswith("joinchat/"):
+            return None
+        return path.split("/", 1)[0]
+
+    if "/" not in normalized and " " not in normalized:
+        return normalized
+    return None
+
+
+async def _call_with_floodwait(func, *args, **kwargs):
+    while True:
+        try:
+            return await func(*args, **kwargs)
+        except FloodWaitError as exc:
+            wait_seconds = int(exc.seconds) + 1
+            LOGGER.error("FloodWaitError: sleeping %s second(s).", wait_seconds)
+            await asyncio.sleep(wait_seconds)
+
+
+async def _source_title(msg: Message) -> str:
+    chat = await msg.get_chat()
+    title = getattr(chat, "title", None)
+    if title:
+        return title
+    username = getattr(chat, "username", None)
+    if username:
+        return username
+    return str(msg.chat_id)
+
+
+async def _source_info(msg: Message) -> Tuple[str, str | None]:
+    chat = await msg.get_chat()
+    title = getattr(chat, "title", None)
+    username = getattr(chat, "username", None)
+
+    if isinstance(title, str) and title.strip():
+        source = title.strip()
+    elif isinstance(username, str) and username.strip():
+        source = username.strip()
+    else:
+        source = str(msg.chat_id)
+
+    link = build_telegram_message_link(
+        username=username if isinstance(username, str) else None,
+        chat_id=msg.chat_id,
+        message_id=int(msg.id or 0),
+    )
+    return source, link
+
+
+async def _source_title_from_channel_id(channel_id: str) -> str:
+    cached = source_title_cache.get(channel_id)
+    if cached:
+        return cached
+
+    tg = _require_client()
+    candidates: List[object] = []
+    if channel_id.lstrip("-").isdigit():
+        candidates.append(int(channel_id))
+    candidates.append(channel_id)
+
+    title = channel_id
+    for candidate in candidates:
+        try:
+            entity = await _call_with_floodwait(tg.get_entity, candidate)
+            candidate_title = getattr(entity, "title", None)
+            if isinstance(candidate_title, str) and candidate_title.strip():
+                title = candidate_title.strip()
+                break
+            username = getattr(entity, "username", None)
+            if isinstance(username, str) and username.strip():
+                title = username.strip()
+                break
+        except Exception:
+            continue
+
+    source_title_cache[channel_id] = title
+    return title
+
+
+def _queue_for_digest(
+    channel_id: str,
+    message_id: int,
+    raw_text: str,
+    *,
+    source_name: str | None = None,
+    message_link: str | None = None,
+) -> None:
+    save_to_digest_queue(
+        channel_id=channel_id,
+        message_id=message_id,
+        raw_text=raw_text,
+        timestamp=int(time.time()),
+        source_name=source_name,
+        message_link=message_link,
+    )
+
+
+def _severity_emoji(level: str) -> str:
+    normalized = (level or "").strip().lower()
+    if normalized == "high":
+        return "🔥"
+    if normalized == "medium":
+        return "⚠️"
+    return "ℹ️"
+
+
+def _format_breaking_text(source_title: str, headline: str) -> str:
+    clean_headline = normalize_space(headline)
+    if _include_source_tags():
+        return f"🔥 **BREAKING • {source_title}**\n\n{clean_headline}"
+    return f"🔥 **BREAKING**\n\n{clean_headline}"
+
+
+async def _init_dupe_detector() -> None:
+    global dupe_detector
+
+    if not _is_dupe_detection_enabled():
+        dupe_detector = None
+        return
+
+    try:
+        detector = NearDuplicateDetector(
+            threshold=_dupe_threshold(),
+            max_items=_dupe_cache_size(),
+            logger=LOGGER,
+        )
+        cached = load_recent_dupe_texts(limit=_dupe_cache_size())
+        if cached:
+            await asyncio.to_thread(detector.warm_start, cached)
+
+        dupe_detector = detector
+        log_structured(
+            LOGGER,
+            "dupe_detector_ready",
+            enabled=True,
+            threshold=_dupe_threshold(),
+            cache_size=_dupe_cache_size(),
+            warmed=len(cached),
+            backend=detector.backend_name,
+        )
+    except Exception:
+        dupe_detector = None
+        LOGGER.exception("Failed to initialize near-duplicate detector. Disabling dedupe.")
+
+
+async def _is_echo_duplicate(
+    text: str,
+    *,
+    channel_id: str,
+    message_id: int,
+    source: str,
+) -> tuple[bool, float]:
+    cleaned = normalize_space(text)
+    if not _is_dupe_detection_enabled() or len(cleaned) < 24:
+        return False, 0.0
+
+    if dupe_detector is None:
+        return False, 0.0
+    detector = _require_dupe_detector()
+    is_dupe, score = await asyncio.to_thread(detector.check_and_add, cleaned)
+    if is_dupe:
+        log_structured(
+            LOGGER,
+            "echo_suppressed",
+            channel_id=channel_id,
+            message_id=message_id,
+            source=source,
+            similarity=round(float(score), 4),
+            threshold=_dupe_threshold(),
+        )
+        return True, float(score)
+
+    try:
+        save_dupe_text(cleaned, max_rows=_dupe_cache_size())
+    except Exception:
+        LOGGER.debug("Failed to persist dedupe text cache entry.", exc_info=True)
+    return False, float(score)
+
+
+async def _send_text(text: str) -> None:
+    if _destination_uses_bot_api():
+        data = {
+            "chat_id": _require_bot_destination_chat_id(),
+            "text": _to_bot_text(text) or "",
+            "disable_web_page_preview": "true",
+            "parse_mode": "Markdown",
+        }
+        try:
+            await _bot_api_request("sendMessage", data=data)
+        except Exception:
+            # Markdown can fail on malformed AI output; fallback to plain text.
+            data.pop("parse_mode", None)
+            await _bot_api_request("sendMessage", data=data)
+        return
+
+    tg = _require_client()
+    await _call_with_floodwait(
+        tg.send_message,
+        _require_destination_peer(),
+        text,
+        parse_mode="md",
+        link_preview=False,
+    )
+
+
+async def _send_single_media(msg: Message, caption: str | None) -> None:
+    if _destination_uses_bot_api():
+        raw = await msg.download_media(file=bytes)
+        if raw is None:
+            raise RuntimeError("Failed to download media for bot destination.")
+
+        media_type = _media_type_for_bot(msg)
+        method_map = {
+            "photo": "sendPhoto",
+            "video": "sendVideo",
+            "document": "sendDocument",
+        }
+        upload_field = {
+            "photo": "photo",
+            "video": "video",
+            "document": "document",
+        }[media_type]
+        data = {
+            "chat_id": _require_bot_destination_chat_id(),
+            "caption": _to_bot_text(caption, max_len=1024) or "",
+            "parse_mode": "Markdown",
+        }
+        files = {
+            upload_field: (
+                _filename_for_bot_media(msg, 0),
+                raw,
+                "application/octet-stream",
+            )
+        }
+        try:
+            await _bot_api_request(method_map[media_type], data=data, files=files)
+        except Exception:
+            data.pop("parse_mode", None)
+            await _bot_api_request(method_map[media_type], data=data, files=files)
+        return
+
+    tg = _require_client()
+    try:
+        await _call_with_floodwait(
+            tg.send_file,
+            _require_destination_peer(),
+            msg.media,
+            caption=caption,
+            parse_mode="md",
+        )
+    except ChatForwardsRestrictedError:
+        raw = await msg.download_media(file=bytes)
+        if raw is None:
+            raise RuntimeError("Failed to download restricted media for re-send.")
+        await _call_with_floodwait(
+            tg.send_file,
+            _require_destination_peer(),
+            raw,
+            caption=caption,
+            parse_mode="md",
+        )
+
+
+async def _send_album(messages: List[Message], caption: str | None) -> None:
+    if _destination_uses_bot_api():
+        if not messages:
+            if caption:
+                await _send_text(caption)
+            return
+
+        if len(messages) == 1:
+            await _send_single_media(messages[0], caption)
+            return
+
+        media_entries: List[dict] = []
+        files: Dict[str, tuple[str, bytes, str]] = {}
+        downloaded_messages: List[Message] = []
+        for idx, msg in enumerate(messages):
+            raw = await msg.download_media(file=bytes)
+            if raw is None:
+                continue
+
+            media_type = _media_type_for_bot(msg)
+            field_name = f"file{idx}"
+            downloaded_messages.append(msg)
+            files[field_name] = (
+                _filename_for_bot_media(msg, idx),
+                raw,
+                "application/octet-stream",
+            )
+            item = {"type": media_type, "media": f"attach://{field_name}"}
+            if idx == 0 and caption:
+                item["caption"] = _to_bot_text(caption, max_len=1024) or ""
+            media_entries.append(item)
+
+        if not media_entries:
+            raise RuntimeError("Failed to download album media for bot destination.")
+
+        if len(media_entries) == 1:
+            only_msg = downloaded_messages[0]
+            await _send_single_media(only_msg, caption)
+            return
+
+        data = {
+            "chat_id": _require_bot_destination_chat_id(),
+            "media": json.dumps(media_entries),
+            "parse_mode": "Markdown",
+        }
+        try:
+            await _bot_api_request("sendMediaGroup", data=data, files=files)
+        except Exception:
+            data.pop("parse_mode", None)
+            await _bot_api_request("sendMediaGroup", data=data, files=files)
+        return
+
+    tg = _require_client()
+    media_items = [m.media for m in messages if m.media]
+    if not media_items:
+        if caption:
+            await _send_text(caption)
+        return
+
+    try:
+        await _call_with_floodwait(
+            tg.send_file,
+            _require_destination_peer(),
+            media_items,
+            caption=caption,
+            parse_mode="md",
+        )
+    except ChatForwardsRestrictedError:
+        downloaded = []
+        for msg in messages:
+            blob = await msg.download_media(file=bytes)
+            if blob is not None:
+                downloaded.append(blob)
+        if not downloaded:
+            raise RuntimeError("Failed to download album media for restricted chat.")
+        await _call_with_floodwait(
+            tg.send_file,
+            _require_destination_peer(),
+            downloaded,
+            caption=caption,
+            parse_mode="md",
+        )
+
+
+async def _process_single_message(msg: Message) -> None:
+    channel_id = str(msg.chat_id)
+    if is_seen(channel_id, msg.id):
+        return
+
+    text = (msg.message or "").strip()
+    source = await _source_title(msg)
+
+    if msg.media and not text:
+        await _send_single_media(msg, _format_source_label(source))
+        mark_seen(channel_id, msg.id)
+        return
+
+    if msg.media and text:
+        summary = await summarize_or_skip(text, _require_auth_manager())
+        if summary is None:
+            mark_seen(channel_id, msg.id)
+            return
+        await _send_single_media(msg, _format_summary_text(source, summary))
+        mark_seen(channel_id, msg.id)
+        return
+
+    if not text:
+        mark_seen(channel_id, msg.id)
+        return
+
+    summary = await summarize_or_skip(text, _require_auth_manager())
+    if summary is None:
+        mark_seen(channel_id, msg.id)
+        return
+
+    await _send_text(_format_summary_text(source, summary))
+    mark_seen(channel_id, msg.id)
+
+
+async def _process_album(messages: List[Message]) -> None:
+    if not messages:
+        return
+
+    messages = sorted(messages, key=lambda m: m.id)
+    channel_id = str(messages[0].chat_id)
+    message_ids = [m.id for m in messages]
+
+    if all(is_seen(channel_id, m_id) for m_id in message_ids):
+        return
+
+    source = await _source_title(messages[0])
+    captions = [(m.message or "").strip() for m in messages if (m.message or "").strip()]
+    combined_caption = "\n".join(captions).strip()
+
+    if not combined_caption:
+        await _send_album(messages, _format_source_label(source))
+        mark_seen_many(channel_id, message_ids)
+        return
+
+    summary = await summarize_or_skip(combined_caption, _require_auth_manager())
+    if summary is None:
+        mark_seen_many(channel_id, message_ids)
+        return
+
+    await _send_album(messages, _format_summary_text(source, summary))
+    mark_seen_many(channel_id, message_ids)
+
+
+async def _queue_single_message_for_digest(msg: Message) -> None:
+    channel_id = str(msg.chat_id)
+    if is_seen(channel_id, msg.id):
+        return
+
+    text = (msg.message or "").strip()
+    source, link = await _source_info(msg)
+
+    # Keep the current behavior: media without caption should be forwarded immediately.
+    if msg.media and not text:
+        await _send_single_media(msg, _format_source_label(source))
+        mark_seen(channel_id, msg.id)
+        return
+
+    if not text:
+        mark_seen(channel_id, msg.id)
+        return
+
+    is_dupe, similarity = await _is_echo_duplicate(
+        text,
+        channel_id=channel_id,
+        message_id=msg.id,
+        source=source,
+    )
+    if is_dupe:
+        mark_seen(channel_id, msg.id)
+        return
+
+    severity = "medium"
+    if _is_severity_routing_enabled():
+        severity = await classify_severity(text, _require_auth_manager())
+    elif _contains_breaking_keyword(text):
+        severity = "high"
+
+    if severity == "high" and _is_immediate_high_enabled():
+        headline = await summarize_breaking_headline(text, _require_auth_manager())
+        if not headline:
+            headline = normalize_space(text)
+            if len(headline) > 140:
+                headline = f"{headline[:137].rsplit(' ', 1)[0]}..."
+        payload = _format_breaking_text(source, headline)
+        if msg.media:
+            await _send_single_media(msg, payload)
+        else:
+            await _send_text(payload)
+        mark_seen(channel_id, msg.id)
+        log_structured(
+            LOGGER,
+            "breaking_sent_immediate",
+            channel_id=channel_id,
+            message_id=msg.id,
+            source=source,
+            severity=severity,
+            similarity=round(similarity, 4),
+        )
+        return
+
+    _queue_for_digest(
+        channel_id,
+        msg.id,
+        text,
+        source_name=source,
+        message_link=link,
+    )
+    mark_seen(channel_id, msg.id)
+    log_structured(
+        LOGGER,
+        "digest_item_queued",
+        channel_id=channel_id,
+        message_id=msg.id,
+        source=source,
+        severity=severity,
+        severity_emoji=_severity_emoji(severity),
+        has_link=bool(link),
+        similarity=round(similarity, 4),
+        text_tokens=estimate_tokens_rough(text),
+        pending=count_pending(),
+    )
+
+
+async def _queue_album_for_digest(messages: List[Message]) -> None:
+    if not messages:
+        return
+
+    messages = sorted(messages, key=lambda m: m.id)
+    channel_id = str(messages[0].chat_id)
+    message_ids = [m.id for m in messages]
+
+    if all(is_seen(channel_id, m_id) for m_id in message_ids):
+        return
+
+    source, link = await _source_info(messages[0])
+    captions = [(m.message or "").strip() for m in messages if (m.message or "").strip()]
+    combined_caption = "\n".join(captions).strip()
+
+    # Keep current behavior: media-only albums are forwarded immediately with source label.
+    if not combined_caption:
+        await _send_album(messages, _format_source_label(source))
+        mark_seen_many(channel_id, message_ids)
+        return
+
+    is_dupe, similarity = await _is_echo_duplicate(
+        combined_caption,
+        channel_id=channel_id,
+        message_id=messages[0].id,
+        source=source,
+    )
+    if is_dupe:
+        mark_seen_many(channel_id, message_ids)
+        return
+
+    severity = "medium"
+    if _is_severity_routing_enabled():
+        severity = await classify_severity(combined_caption, _require_auth_manager())
+    elif _contains_breaking_keyword(combined_caption):
+        severity = "high"
+
+    if severity == "high" and _is_immediate_high_enabled():
+        headline = await summarize_breaking_headline(combined_caption, _require_auth_manager())
+        if not headline:
+            headline = normalize_space(combined_caption)
+            if len(headline) > 140:
+                headline = f"{headline[:137].rsplit(' ', 1)[0]}..."
+        await _send_album(messages, _format_breaking_text(source, headline))
+        mark_seen_many(channel_id, message_ids)
+        log_structured(
+            LOGGER,
+            "breaking_album_sent_immediate",
+            channel_id=channel_id,
+            first_message_id=messages[0].id,
+            album_size=len(messages),
+            source=source,
+            severity=severity,
+            similarity=round(similarity, 4),
+        )
+        return
+
+    # Queue one digest item for the entire album (first message ID as queue key).
+    _queue_for_digest(
+        channel_id,
+        messages[0].id,
+        combined_caption,
+        source_name=source,
+        message_link=link,
+    )
+    mark_seen_many(channel_id, message_ids)
+    log_structured(
+        LOGGER,
+        "digest_album_queued",
+        channel_id=channel_id,
+        first_message_id=messages[0].id,
+        album_size=len(messages),
+        source=source,
+        severity=severity,
+        severity_emoji=_severity_emoji(severity),
+        has_link=bool(link),
+        similarity=round(similarity, 4),
+        text_tokens=estimate_tokens_rough(combined_caption),
+        pending=count_pending(),
+    )
+
+
+def _format_digest_message(
+    digest_body: str,
+    total_updates: int,
+    sources: List[str],
+) -> str:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    header = f"📰 **Daily Digest • {timestamp} • {total_updates} updates**"
+    _ = sources
+    return f"{header}\n\n{digest_body.strip()}"
+
+
+def _effective_interval_seconds() -> int:
+    base = _digest_interval_seconds()
+    health = get_quota_health()
+    threshold = _digest_429_threshold_per_hour()
+    multiplier = 2 if int(health.get("recent_429_count", 0)) > threshold else 1
+    return max(60, base * multiplier)
+
+
+def _adaptive_batch_size() -> int:
+    base = _digest_max_posts()
+    health = get_quota_health()
+    scale = float(health.get("batch_scale", 1.0))
+    scaled = int(base * scale)
+    return max(8, min(base, scaled))
+
+
+async def _run_post_processors(text: str, context: Dict[str, object]) -> str:
+    hooks = getattr(config, "DIGEST_POST_PROCESSORS", [])
+    if not isinstance(hooks, list) or not hooks:
+        return text
+
+    current = text
+    for path in hooks:
+        try:
+            target = str(path).strip()
+            if not target or "." not in target:
+                continue
+            module_name, func_name = target.rsplit(".", 1)
+            module = importlib.import_module(module_name)
+            func = getattr(module, func_name, None)
+            if func is None:
+                continue
+            maybe = func(current, context)
+            if asyncio.iscoroutine(maybe):
+                maybe = await maybe
+            if isinstance(maybe, str) and maybe.strip():
+                current = maybe.strip()
+        except Exception:
+            LOGGER.exception("Digest post-processor failed: %s", path)
+    return current
+
+
+async def _send_digest_message(text: str) -> None:
+    chunks = split_markdown_chunks(text, max_chars=_digest_send_chunk_size())
+    delay = _digest_send_delay_seconds()
+    for idx, chunk in enumerate(chunks):
+        await _send_text(chunk)
+        if idx < len(chunks) - 1 and delay > 0:
+            await asyncio.sleep(delay)
+
+
+async def _flush_digest_queue_once() -> None:
+    global digest_retry_backoff_seconds
+
+    async with digest_loop_lock:
+        batch_size = _adaptive_batch_size()
+        batch_id, rows = claim_digest_batch(batch_size)
+        if not rows:
+            return
+
+        pending_before = count_pending() + len(rows)
+        source_names: List[str] = []
+        posts: List[Dict[str, object]] = []
+        for row in rows:
+            source_name = str(row.get("source_name") or "").strip()
+            channel_id = str(row["channel_id"])
+            if not source_name:
+                source_name = await _source_title_from_channel_id(channel_id)
+            if source_name not in source_names:
+                source_names.append(source_name)
+            posts.append(
+                {
+                    "id": int(row["id"]),
+                    "channel_id": channel_id,
+                    "message_id": int(row["message_id"]),
+                    "source_name": source_name,
+                    "raw_text": str(row["raw_text"]),
+                    "message_link": str(row.get("message_link") or ""),
+                    "timestamp": int(row["timestamp"]),
+                }
+            )
+
+        input_token_est = sum(estimate_tokens_rough(str(p["raw_text"])) for p in posts)
+        log_structured(
+            LOGGER,
+            "digest_batch_claimed",
+            pending_before=pending_before,
+            claimed=len(posts),
+            batch_size=batch_size,
+            estimated_tokens=input_token_est,
+            quota_health=get_quota_health(),
+        )
+
+        try:
+            digest_body = await create_digest_summary(posts, _require_auth_manager())
+            if not digest_body.strip():
+                digest_body = quiet_period_message(max(1, _digest_interval_seconds() // 60))
+
+            digest_body = await _run_post_processors(
+                digest_body,
+                {
+                    "batch_id": batch_id,
+                    "posts": posts,
+                    "pending_before": pending_before,
+                },
+            )
+
+            digest_message = _format_digest_message(
+                digest_body=digest_body,
+                total_updates=len(posts),
+                sources=source_names,
+            )
+            await _send_digest_message(digest_message)
+
+            acked = ack_digest_batch(batch_id)
+            set_last_digest_timestamp(int(time.time()))
+            digest_retry_backoff_seconds = 0
+
+            log_structured(
+                LOGGER,
+                "digest_sent",
+                batch_id=batch_id,
+                rows=len(posts),
+                acked=acked,
+                pending_after=count_pending(),
+                response_chars=len(digest_body),
+            )
+        except asyncio.CancelledError:
+            restore_digest_batch(batch_id)
+            raise
+        except Exception as exc:
+            restored = restore_digest_batch(batch_id)
+            base = _digest_retry_base_seconds()
+            max_backoff = _digest_retry_max_seconds()
+            digest_retry_backoff_seconds = (
+                base
+                if digest_retry_backoff_seconds <= 0
+                else min(max_backoff, digest_retry_backoff_seconds * 2)
+            )
+            log_structured(
+                LOGGER,
+                "digest_failed_restored",
+                level=logging.ERROR,
+                batch_id=batch_id,
+                restored=restored,
+                backoff_seconds=digest_retry_backoff_seconds,
+                error=str(exc),
+            )
+            LOGGER.exception("Digest generation/sending failed.")
+
+
+def _compute_next_scheduler_delay_seconds() -> int:
+    if digest_retry_backoff_seconds > 0:
+        return digest_retry_backoff_seconds
+
+    daily_times = _digest_daily_times()
+    if daily_times:
+        return seconds_until_next_daily_time(daily_times)
+    return _effective_interval_seconds()
+
+
+async def run_digest_scheduler() -> None:
+    global digest_next_run_ts
+
+    log_structured(
+        LOGGER,
+        "digest_scheduler_start",
+        mode="digest",
+        pending=count_pending(),
+        inflight=count_inflight(),
+        interval_seconds=_digest_interval_seconds(),
+        daily_times=[f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()],
+        quota_health=get_quota_health(),
+    )
+
+    try:
+        while True:
+            delay = _compute_next_scheduler_delay_seconds()
+            digest_next_run_ts = time.time() + delay
+            await asyncio.sleep(delay)
+            await _flush_digest_queue_once()
+    except asyncio.CancelledError:
+        LOGGER.info("Digest scheduler stopped.")
+        digest_next_run_ts = None
+        return
+
+
+async def _flush_album_after_wait(key: Tuple[str, int]) -> None:
+    try:
+        await asyncio.sleep(ALBUM_WAIT_SECONDS)
+        items = album_buffers.pop(key, [])
+        album_tasks.pop(key, None)
+        if items:
+            if _is_digest_mode_enabled():
+                await _queue_album_for_digest(items)
+            else:
+                await _process_album(items)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        LOGGER.exception("Album processing failed for key=%s", key)
+
+
+async def _resolve_entity_id(chat_obj) -> int | None:
+    tg = _require_client()
+    username = getattr(chat_obj, "username", None)
+    if username:
+        try:
+            entity = await _call_with_floodwait(tg.get_entity, username)
+            return utils.get_peer_id(entity)
+        except Exception:
+            pass
+
+    chat_id = getattr(chat_obj, "id", None)
+    if chat_id is not None:
+        try:
+            entity = await _call_with_floodwait(tg.get_entity, chat_id)
+            return utils.get_peer_id(entity)
+        except Exception:
+            pass
+
+    try:
+        entity = await _call_with_floodwait(tg.get_entity, chat_obj)
+        return utils.get_peer_id(entity)
+    except Exception:
+        return None
+
+
+async def _interactive_user_login(tg: TelegramClient) -> None:
+    """Authenticate this client as a personal user account only."""
+    await tg.connect()
+    if await tg.is_user_authorized():
+        me = await _call_with_floodwait(tg.get_me)
+        if getattr(me, "bot", False):
+            raise RuntimeError(
+                "Session is authenticated as bot. Remove session and login with phone number."
+            )
+        return
+
+    phone = _prompt_phone_number()
+    sent = await _call_with_floodwait(tg.send_code_request, phone)
+    while True:
+        code = _prompt_non_empty("Telegram login code: ")
+        try:
+            await _call_with_floodwait(
+                tg.sign_in,
+                phone=phone,
+                code=code,
+                phone_code_hash=sent.phone_code_hash,
+            )
+            break
+        except SessionPasswordNeededError:
+            password = _prompt_non_empty("Telegram 2FA password: ")
+            await _call_with_floodwait(tg.sign_in, password=password)
+            break
+        except PhoneCodeInvalidError:
+            print("Invalid login code. Try again.")
+        except PhoneCodeExpiredError:
+            print("Code expired. Requesting a new code...")
+            sent = await _call_with_floodwait(tg.send_code_request, phone)
+
+    me = await _call_with_floodwait(tg.get_me)
+    if getattr(me, "bot", False):
+        raise RuntimeError("Bot login detected. Login must be with personal phone number.")
+
+
+async def _ensure_user_account_session() -> None:
+    """Ensure current session is a user account, not a bot session."""
+    global client
+
+    tg = _require_client()
+    await tg.connect()
+
+    if not await tg.is_user_authorized():
+        await _interactive_user_login(tg)
+        return
+
+    me = await _call_with_floodwait(tg.get_me)
+    if not getattr(me, "bot", False):
+        return
+
+    LOGGER.warning(
+        "Detected bot session in userbot.session. Resetting session for user login."
+    )
+    await _call_with_floodwait(tg.log_out)
+    await tg.disconnect()
+
+    client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
+    await _interactive_user_login(client)
+    me = await _call_with_floodwait(client.get_me)
+    if getattr(me, "bot", False):
+        raise RuntimeError(
+            "Still logged in as bot. Delete userbot.session and sign in with phone number."
+        )
+
+
+async def _join_and_resolve_manual_source(source: str) -> int | None:
+    tg = _require_client()
+
+    private_hash = _extract_private_invite_hash(source)
+    if private_hash:
+        import_result = None
+        try:
+            import_result = await _call_with_floodwait(tg, ImportChatInviteRequest(hash=private_hash))
+        except UserAlreadyParticipantError:
+            pass
+        except Exception:
+            LOGGER.debug("ImportChatInviteRequest failed for source=%s", source, exc_info=True)
+
+        if import_result is not None:
+            for chat in getattr(import_result, "chats", []) or []:
+                peer_id = await _resolve_entity_id(chat)
+                if peer_id is not None:
+                    return peer_id
+
+        try:
+            check = await _call_with_floodwait(tg, CheckChatInviteRequest(hash=private_hash))
+            if isinstance(check, types.ChatInviteAlready):
+                return utils.get_peer_id(check.chat)
+        except Exception:
+            pass
+
+    username = _extract_public_username(source)
+    if username:
+        try:
+            await _call_with_floodwait(tg, JoinChannelRequest(username))
+        except UserAlreadyParticipantError:
+            pass
+        except Exception:
+            LOGGER.debug("JoinChannelRequest failed for source=%s", source, exc_info=True)
+
+        try:
+            entity = await _call_with_floodwait(tg.get_entity, username)
+            return utils.get_peer_id(entity)
+        except Exception:
+            LOGGER.debug("Failed resolving entity for source=%s", source, exc_info=True)
+            return None
+
+    return None
+
+
+async def _resolve_destination_input_peer(raw_destination: str):
+    tg = _require_client()
+    value = raw_destination.strip()
+    if not value:
+        raise ValueError("Destination is empty.")
+    if _looks_like_bot_token(value):
+        raise ValueError("Destination cannot be a bot token.")
+    if _looks_like_addlist_link(value):
+        raise ValueError(
+            "Destination cannot be a folder invite link (t.me/addlist/...). "
+            "Use a single chat/channel destination."
+        )
+
+    private_hash = _extract_private_invite_hash(value)
+    if private_hash:
+        try:
+            invite_result = await _call_with_floodwait(
+                tg,
+                ImportChatInviteRequest(hash=private_hash),
+            )
+            for chat in getattr(invite_result, "chats", []) or []:
+                try:
+                    return await _call_with_floodwait(tg.get_input_entity, chat)
+                except Exception:
+                    continue
+        except UserAlreadyParticipantError:
+            pass
+        except Exception:
+            LOGGER.debug("Destination private invite import failed.", exc_info=True)
+
+        try:
+            check = await _call_with_floodwait(tg, CheckChatInviteRequest(hash=private_hash))
+            if isinstance(check, types.ChatInviteAlready):
+                return await _call_with_floodwait(tg.get_input_entity, check.chat)
+        except Exception:
+            LOGGER.debug("Destination private invite resolve failed.", exc_info=True)
+
+    candidates: List[object] = [value]
+    username = _extract_public_username(value)
+    if username:
+        candidates.append(username)
+        if isinstance(username, str) and not username.startswith("@"):
+            candidates.append(f"@{username}")
+
+    if value.lstrip("-").isdigit():
+        candidates.append(int(value))
+
+    seen = set()
+    unique_candidates: List[object] = []
+    for candidate in candidates:
+        marker = repr(candidate)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique_candidates.append(candidate)
+
+    for candidate in unique_candidates:
+        try:
+            return await _call_with_floodwait(tg.get_input_entity, candidate)
+        except Exception:
+            continue
+
+    raise ValueError(f"Cannot resolve destination '{raw_destination}'.")
+
+
+async def _ensure_destination_peer() -> None:
+    global destination_peer, bot_destination_token, bot_destination_chat_id
+
+    if _is_bot_destination_mode():
+        while True:
+            token = _bot_destination_token_from_config()
+            chat_id = str(getattr(config, "BOT_DESTINATION_CHAT_ID", "") or "").strip()
+
+            if not _looks_like_bot_token(token):
+                config.BOT_DESTINATION_TOKEN = _prompt_bot_destination_token()
+                _persist_config_updates({"BOT_DESTINATION_TOKEN": config.BOT_DESTINATION_TOKEN})
+                continue
+
+            if not chat_id:
+                bot_destination_token = token
+                try:
+                    updates = await _bot_api_request("getUpdates", data={"limit": "20"})
+                    inferred_chat_id = _infer_chat_id_from_updates(updates)
+                except Exception:
+                    inferred_chat_id = None
+
+                if inferred_chat_id:
+                    config.BOT_DESTINATION_CHAT_ID = inferred_chat_id
+                    _persist_config_updates(
+                        {"BOT_DESTINATION_CHAT_ID": config.BOT_DESTINATION_CHAT_ID}
+                    )
+                    LOGGER.info(
+                        "Auto-detected BOT_DESTINATION_CHAT_ID=%s from getUpdates.",
+                        inferred_chat_id,
+                    )
+                else:
+                    print(
+                        "BOT_DESTINATION_CHAT_ID not set and auto-detect failed. "
+                        "Open chat with your bot, send /start, then enter chat ID."
+                    )
+                    config.BOT_DESTINATION_CHAT_ID = _prompt_bot_destination_chat_id()
+                    _persist_config_updates(
+                        {"BOT_DESTINATION_CHAT_ID": config.BOT_DESTINATION_CHAT_ID}
+                    )
+                continue
+
+            bot_destination_token = token
+            bot_destination_chat_id = chat_id
+            destination_peer = None
+
+            try:
+                await _bot_api_request("getMe")
+                await _bot_api_request(
+                    "getChat",
+                    data={"chat_id": _require_bot_destination_chat_id()},
+                )
+                LOGGER.info(
+                    "Destination mode: Bot API (chat_id=%s).", _require_bot_destination_chat_id()
+                )
+                return
+            except Exception as exc:
+                LOGGER.error("Invalid bot destination config: %s", exc)
+                print(
+                    "Bot destination check failed. Ensure:\n"
+                    "1) token is valid\n"
+                    "2) BOT_DESTINATION_CHAT_ID is correct\n"
+                    "3) you started the bot or added it to that chat/channel"
+                )
+                config.BOT_DESTINATION_TOKEN = _prompt_bot_destination_token()
+                config.BOT_DESTINATION_CHAT_ID = _prompt_bot_destination_chat_id()
+                _persist_config_updates(
+                    {
+                        "BOT_DESTINATION_TOKEN": config.BOT_DESTINATION_TOKEN,
+                        "BOT_DESTINATION_CHAT_ID": config.BOT_DESTINATION_CHAT_ID,
+                    }
+                )
+        return
+
+    bot_destination_token = None
+    bot_destination_chat_id = None
+    while True:
+        try:
+            destination_peer = await _resolve_destination_input_peer(config.DESTINATION)
+            return
+        except Exception as exc:
+            LOGGER.error("Invalid DESTINATION value '%s': %s", config.DESTINATION, exc)
+            print(
+                "Destination is invalid or inaccessible. "
+                "Use @username, t.me link, private invite link, or peer ID."
+            )
+            config.DESTINATION = _prompt_destination()
+            _persist_config_updates({"DESTINATION": config.DESTINATION})
+
+
+async def setup_sources() -> List[int]:
+    tg = _require_client()
+    resolved_ids: List[int] = []
+
+    folder_link = getattr(config, "FOLDER_INVITE_LINK", "").strip()
+    if folder_link and not _is_missing_folder_invite_link():
+        invite_hash = _extract_addlist_hash(folder_link)
+
+        # Optional dry-run preview using messages.CheckChatInviteRequest.
+        try:
+            await _call_with_floodwait(tg, CheckChatInviteRequest(hash=invite_hash))
+        except Exception:
+            LOGGER.debug("CheckChatInviteRequest dry-run failed for addlist hash.", exc_info=True)
+
+        preview_chats = []
+        peers_for_join = []
+        if hasattr(functions, "chatlists"):
+            try:
+                preview = await _call_with_floodwait(
+                    tg,
+                    functions.chatlists.CheckChatlistInviteRequest(slug=invite_hash),
+                )
+                preview_chats = list(getattr(preview, "chats", []) or [])
+                if isinstance(preview, types.chatlists.ChatlistInvite):
+                    peers_for_join = list(preview.peers)
+                elif isinstance(preview, types.chatlists.ChatlistInviteAlready):
+                    peers_for_join = list(preview.missing_peers)
+            except BotMethodInvalidError:
+                LOGGER.warning(
+                    "Folder invite API unavailable for this session. "
+                    "Continuing with manual sources."
+                )
+            except Exception:
+                LOGGER.exception("Failed to inspect chat folder invite.")
+
+        # Requested behavior: iterate chats and join each public/private source.
+        for chat in preview_chats:
+            username = getattr(chat, "username", None)
+            try:
+                if username:
+                    await _call_with_floodwait(tg, JoinChannelRequest(username))
+                else:
+                    await _call_with_floodwait(tg, ImportChatInviteRequest(hash=invite_hash))
+            except UserAlreadyParticipantError:
+                pass
+            except Exception:
+                LOGGER.debug(
+                    "Join failed for folder chat id=%s", getattr(chat, "id", None), exc_info=True
+                )
+
+        # Folder-native join path for missing peers.
+        if peers_for_join and hasattr(functions, "chatlists"):
+            input_peers = []
+            for peer in peers_for_join:
+                try:
+                    input_peers.append(await _call_with_floodwait(tg.get_input_entity, peer))
+                except Exception:
+                    continue
+
+            if input_peers:
+                try:
+                    await _call_with_floodwait(
+                        tg,
+                        functions.chatlists.JoinChatlistInviteRequest(
+                            slug=invite_hash,
+                            peers=input_peers,
+                        ),
+                    )
+                except UserAlreadyParticipantError:
+                    pass
+                except BotMethodInvalidError:
+                    LOGGER.warning(
+                        "JoinChatlistInviteRequest unavailable for this session. "
+                        "Continuing with already-available sources."
+                    )
+                except Exception:
+                    LOGGER.debug("JoinChatlistInviteRequest failed.", exc_info=True)
+
+        for chat in preview_chats:
+            peer_id = await _resolve_entity_id(chat)
+            if peer_id is not None and peer_id not in resolved_ids:
+                resolved_ids.append(peer_id)
+
+    # Additional manual sources (username/public/private links).
+    for source in _manual_source_entries():
+        peer_id = await _join_and_resolve_manual_source(source)
+        if peer_id is not None and peer_id not in resolved_ids:
+            resolved_ids.append(peer_id)
+
+    config.SOURCES = resolved_ids
+    if folder_link and not _is_missing_folder_invite_link():
+        print(f"✅ Listening to {len(resolved_ids)} channels from folder")
+    return resolved_ids
+
+
+def _digest_status_text() -> str:
+    mode = "DIGEST" if _is_digest_mode_enabled() else "PER_POST"
+    pending = count_pending()
+    inflight = count_inflight()
+    last_ts = get_last_digest_timestamp()
+    next_eta = (
+        format_eta(digest_next_run_ts - time.time()) if digest_next_run_ts is not None else "n/a"
+    )
+    quota = get_quota_health()
+    threshold = _digest_429_threshold_per_hour()
+    dupe_state = "on" if _is_dupe_detection_enabled() else "off"
+    severity_state = "on" if _is_severity_routing_enabled() else "off"
+    detector_backend = dupe_detector.backend_name if dupe_detector is not None else "disabled"
+
+    return (
+        f"🧠 **Digest Status**\n"
+        f"- Mode: `{mode}`\n"
+        f"- Pending queue: `{pending}`\n"
+        f"- In-flight queue: `{inflight}`\n"
+        f"- Last digest: `{format_ts(last_ts)}`\n"
+        f"- Next run in: `{next_eta}`\n"
+        f"- Interval base: `{_digest_interval_seconds() // 60}m`\n"
+        f"- Dedupe: `{dupe_state}` ({detector_backend})\n"
+        f"- Severity router: `{severity_state}`\n"
+        f"- Quota health: `{quota.get('status', 'unknown')}`\n"
+        f"- Recent 429 (1h): `{quota.get('recent_429_count', 0)}` / threshold `{threshold}`"
+    )
+
+
+async def _on_digest_status_command(event: events.NewMessage.Event) -> None:
+    try:
+        await event.reply(_digest_status_text(), parse_mode="md", link_preview=False)
+    except Exception:
+        LOGGER.exception("Failed sending /digest_status response.")
+
+
+async def _on_new_message(event: events.NewMessage.Event) -> None:
+    msg = event.message
+    channel_id = str(msg.chat_id)
+
+    try:
+        if is_seen(channel_id, msg.id):
+            return
+
+        if msg.grouped_id:
+            key = (channel_id, int(msg.grouped_id))
+            album_buffers[key].append(msg)
+            task = album_tasks.get(key)
+            if task and not task.done():
+                task.cancel()
+            album_tasks[key] = asyncio.create_task(_flush_album_after_wait(key))
+            return
+
+        if _is_digest_mode_enabled():
+            await _queue_single_message_for_digest(msg)
+        else:
+            await _process_single_message(msg)
+    except Exception:
+        LOGGER.exception(
+            "Failed processing message channel_id=%s message_id=%s",
+            channel_id,
+            msg.id,
+        )
+
+
+async def _shutdown_client() -> None:
+    global digest_scheduler_task
+
+    if digest_scheduler_task and not digest_scheduler_task.done():
+        digest_scheduler_task.cancel()
+        await asyncio.gather(digest_scheduler_task, return_exceptions=True)
+    digest_scheduler_task = None
+
+    tg = client
+    if tg is None:
+        return
+
+    pending = [task for task in album_tasks.values() if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    album_tasks.clear()
+    album_buffers.clear()
+
+    try:
+        if tg.is_connected():
+            await tg.disconnect()
+    except Exception:
+        LOGGER.exception("Failed during client shutdown.")
+
+
+def _startup_health_check() -> None:
+    mode = "DIGEST" if _is_digest_mode_enabled() else "PER_POST"
+    pending = count_pending()
+    inflight = count_inflight()
+    last_ts = get_last_digest_timestamp()
+    log_structured(
+        LOGGER,
+        "startup_health",
+        mode=mode,
+        dupe_detection=_is_dupe_detection_enabled(),
+        severity_routing=_is_severity_routing_enabled(),
+        pending=pending,
+        inflight=inflight,
+        last_digest_ts=last_ts,
+        last_digest_at=format_ts(last_ts),
+        quota_health=get_quota_health(),
+    )
+    LOGGER.info(
+        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s",
+        mode,
+        pending,
+        inflight,
+        format_ts(last_ts),
+        _is_dupe_detection_enabled(),
+        _is_severity_routing_enabled(),
+    )
+
+
+async def main() -> None:
+    global client, auth_manager, digest_scheduler_task
+
+    _prompt_for_missing_config()
+    _validate_config()
+    init_db()
+    await _init_dupe_detector()
+    _startup_health_check()
+
+    auth_manager = AuthManager(logger=LOGGER)
+    await auth_manager.get_access_token()
+
+    client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
+    await _ensure_user_account_session()
+    await _ensure_destination_peer()
+
+    resolved_sources = await setup_sources()
+    while not resolved_sources:
+        print(
+            "No channels resolved from folder. Add manual sources "
+            "(username/public/private invite links)."
+        )
+        new_sources = _prompt_sources()
+        current = getattr(config, "EXTRA_SOURCES", [])
+        if not isinstance(current, list):
+            current = []
+        current.extend(new_sources)
+        # Preserve order while deduplicating newly added manual sources.
+        deduped: List[str] = []
+        seen = set()
+        for item in current:
+            normalized = str(item).strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        config.EXTRA_SOURCES = deduped
+        _persist_config_updates({"EXTRA_SOURCES": config.EXTRA_SOURCES})
+        resolved_sources = await setup_sources()
+
+    client.add_event_handler(_on_new_message, events.NewMessage(chats=resolved_sources))
+    status_pattern = rf"^{re.escape(_digest_status_command())}(?:\\s+.*)?$"
+    client.add_event_handler(
+        _on_digest_status_command,
+        events.NewMessage(outgoing=True, pattern=status_pattern),
+    )
+
+    me = await client.get_me()
+    LOGGER.info("Userbot started as @%s", getattr(me, "username", "unknown"))
+    if _is_missing_folder_invite_link():
+        LOGGER.info("Listening to %s manually configured channels.", len(resolved_sources))
+    if _is_digest_mode_enabled():
+        digest_scheduler_task = asyncio.create_task(
+            run_digest_scheduler(),
+            name="digest-scheduler",
+        )
+
+    try:
+        await client.run_until_disconnected()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        LOGGER.info("Shutdown requested. Stopping userbot...")
+    finally:
+        await _shutdown_client()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Userbot stopped.")

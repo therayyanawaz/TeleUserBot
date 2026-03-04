@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.tmp/
+
+# Local environment configuration
+.env
+.env.*
+!.env.example
+
+userbot.session
+userbot.session-journal
+
+# Runtime state (stored outside repo by default at ~/.tg_userbot/)
+.tg_userbot/
+~/.tg_userbot/
