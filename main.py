@@ -24,6 +24,7 @@ from telethon import TelegramClient, events, functions, utils
 from telethon.errors import (
     ChatForwardsRestrictedError,
     FloodWaitError,
+    MessageNotModifiedError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
     SessionPasswordNeededError,
@@ -37,7 +38,6 @@ from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInv
 
 import config
 from ai_filter import (
-    classify_severity,
     create_digest_summary,
     generate_answer_from_context,
     get_quota_health,
@@ -49,6 +49,7 @@ from auth import AuthManager, ERROR_LOG_PATH, ensure_runtime_dir
 from db import (
     ack_digest_batch,
     claim_digest_batch,
+    clear_digest_queue,
     count_inflight,
     count_pending,
     get_last_digest_timestamp,
@@ -61,6 +62,7 @@ from db import (
     set_last_digest_timestamp,
 )
 from prompts import quiet_period_message
+from severity_classifier import classify_message_severity
 from utils import (
     apply_premium_emoji_html,
     LiveTelegramStreamer,
@@ -121,6 +123,8 @@ premium_emoji_map: Dict[str, str] = {}
 album_buffers: Dict[Tuple[str, int], List[Message]] = defaultdict(list)
 album_tasks: Dict[Tuple[str, int], asyncio.Task] = {}
 digest_scheduler_task: asyncio.Task | None = None
+daily_digest_scheduler_task: asyncio.Task | None = None
+queue_clear_scheduler_task: asyncio.Task | None = None
 source_title_cache: Dict[str, str] = {}
 digest_next_run_ts: float | None = None
 digest_retry_backoff_seconds: int = 0
@@ -132,6 +136,8 @@ query_conversation_history: Dict[int, Deque[Dict[str, str]]] = defaultdict(
     lambda: deque(maxlen=20)
 )
 breaking_delivery_refs: Dict[str, Dict[str, object]] = {}
+breaking_topic_threads: List[Dict[str, object]] = []
+breaking_topic_lock = asyncio.Lock()
 query_allowed_bot_user_id: int | None = None
 query_bot_user_id_checked: bool = False
 instance_lock_handle = None
@@ -276,21 +282,35 @@ def _is_digest_mode_enabled() -> bool:
 
 
 def _digest_interval_seconds() -> int:
-    raw = getattr(config, "DIGEST_INTERVAL_MINUTES", 30)
+    raw = getattr(config, "DIGEST_INTERVAL_MINUTES", 60)
     try:
         minutes = int(raw)
     except Exception:
-        minutes = 30
+        minutes = 60
     minutes = max(1, min(minutes, 24 * 60))
     return minutes * 60
 
 
 def _digest_daily_times() -> List[Tuple[int, int]]:
-    raw = getattr(config, "DIGEST_DAILY_TIMES", [])
+    raw = getattr(config, "DIGEST_DAILY_TIMES", ["00:00"])
     if not isinstance(raw, list):
         return []
     values = [str(x) for x in raw]
     return parse_daily_times(values)
+
+
+def _digest_queue_clear_interval_seconds() -> int:
+    raw = getattr(config, "DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES", 10)
+    try:
+        minutes = int(raw)
+    except Exception:
+        minutes = 10
+    minutes = max(1, min(minutes, 24 * 60))
+    return minutes * 60
+
+
+def _digest_queue_clear_include_inflight() -> bool:
+    return _bool_flag(getattr(config, "DIGEST_QUEUE_CLEAR_INCLUDE_INFLIGHT", True), True)
 
 
 def _digest_max_posts() -> int:
@@ -561,6 +581,49 @@ def _breaking_match_threshold() -> int:
     except Exception:
         value = 1
     return max(1, min(value, 10))
+
+
+def _is_breaking_topic_threads_enabled() -> bool:
+    return _bool_flag(getattr(config, "ENABLE_BREAKING_TOPIC_THREADS", True), True)
+
+
+def _breaking_topic_window_seconds() -> int:
+    raw = getattr(config, "BREAKING_TOPIC_WINDOW_MINUTES", 180)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 180
+    return max(10 * 60, min(value * 60, 24 * 60 * 60))
+
+
+def _breaking_topic_min_overlap() -> int:
+    raw = getattr(config, "BREAKING_TOPIC_MIN_OVERLAP", 2)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 2
+    return max(1, min(value, 8))
+
+
+def _breaking_topic_min_ratio() -> float:
+    raw = getattr(config, "BREAKING_TOPIC_MIN_RATIO", 0.55)
+    try:
+        value = float(raw)
+    except Exception:
+        value = 0.55
+    return min(max(value, 0.1), 1.0)
+
+
+def _breaking_topic_continuity_prefix() -> str:
+    raw = str(
+        getattr(
+            config,
+            "BREAKING_TOPIC_CONTINUITY_PREFIX",
+            "",
+        )
+        or ""
+    ).strip()
+    return raw
 
 
 def _humanized_vital_opinion_enabled() -> bool:
@@ -1179,6 +1242,62 @@ def _severity_emoji(level: str) -> str:
     return "ℹ️"
 
 
+def _reply_to_message_id(msg: Message) -> int:
+    reply = getattr(msg, "reply_to", None)
+    value = int(getattr(reply, "reply_to_msg_id", 0) or 0)
+    return value if value > 0 else 0
+
+
+def _classify_severity_with_breakdown(
+    *,
+    text: str,
+    source: str,
+    channel_id: str,
+    message_id: int,
+    has_media: bool,
+    has_link: bool,
+    reply_to: int,
+    album_size: int = 1,
+) -> tuple[str, float, dict]:
+    payload = {
+        "text": text,
+        "source": source,
+        "channel_id": channel_id,
+        "message_id": message_id,
+        "has_media": bool(has_media),
+        "has_link": bool(has_link),
+        "reply_to": int(reply_to or 0),
+        "timestamp": int(time.time()),
+        "text_tokens": estimate_tokens_rough(text),
+        # Integrates existing runtime setting into deterministic score.
+        "humanized_vital_probability": _humanized_vital_opinion_probability(),
+    }
+    try:
+        severity, score, breakdown = classify_message_severity(payload)
+    except Exception as exc:
+        severity, score = "medium", 0.0
+        breakdown = {
+            "error": f"severity_classifier_failed: {exc}",
+            "fallback": "medium",
+        }
+
+    log_structured(
+        LOGGER,
+        "severity_classified",
+        channel_id=channel_id,
+        message_id=message_id,
+        source=source,
+        severity=severity,
+        score=score,
+        album_size=album_size,
+        has_media=bool(has_media),
+        has_link=bool(has_link),
+        reply_to=int(reply_to or 0),
+        breakdown=breakdown,
+    )
+    return severity, score, breakdown
+
+
 def _format_breaking_text(source_title: str, headline: str, rational_view: str | None = None) -> str:
     clean_headline = normalize_space(headline)
     safe_headline = sanitize_telegram_html(clean_headline)
@@ -1217,6 +1336,169 @@ def _register_breaking_delivery(
         "sources": {primary_source.strip()},
         "ts": now,
     }
+
+
+_BREAKING_TOPIC_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "has",
+    "have",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "was",
+    "were",
+    "with",
+    "after",
+    "before",
+    "near",
+    "over",
+    "under",
+    "says",
+    "said",
+    "reports",
+    "report",
+    "breaking",
+    "urgent",
+    "update",
+    "developing",
+    "live",
+    "news",
+}
+
+
+def _breaking_topic_tokens(text: str) -> set[str]:
+    normalized, _ = build_dupe_fingerprint(text)
+    if not normalized:
+        return set()
+    tokens = set(re.findall(r"[a-z0-9]{3,}", normalized))
+    return {token for token in tokens if token not in _BREAKING_TOPIC_STOPWORDS}
+
+
+def _breaking_topic_similarity(
+    left_tokens: set[str],
+    right_tokens: set[str],
+) -> tuple[int, float]:
+    if not left_tokens or not right_tokens:
+        return 0, 0.0
+    overlap = len(left_tokens & right_tokens)
+    if overlap <= 0:
+        return 0, 0.0
+    ratio = overlap / max(1, min(len(left_tokens), len(right_tokens)))
+    return overlap, ratio
+
+
+def _cleanup_breaking_topic_threads_locked(now_ts: int | None = None) -> None:
+    now = int(now_ts if now_ts is not None else time.time())
+    cutoff = now - _breaking_topic_window_seconds()
+    breaking_topic_threads[:] = [
+        entry
+        for entry in breaking_topic_threads
+        if int(entry.get("ts", 0)) >= cutoff and int(entry.get("message_id", 0)) > 0
+    ]
+    max_items = 300
+    if len(breaking_topic_threads) > max_items:
+        breaking_topic_threads.sort(key=lambda item: int(item.get("ts", 0)), reverse=True)
+        del breaking_topic_threads[max_items:]
+
+
+async def _resolve_breaking_topic_reply(topic_seed: str) -> int | None:
+    if not _is_breaking_topic_threads_enabled():
+        return None
+    tokens = _breaking_topic_tokens(topic_seed)
+    if len(tokens) < _breaking_topic_min_overlap():
+        return None
+
+    now = int(time.time())
+    best_message_id: int | None = None
+    best_overlap = 0
+    best_ratio = 0.0
+    best_ts = 0
+    min_overlap = _breaking_topic_min_overlap()
+    min_ratio = _breaking_topic_min_ratio()
+
+    async with breaking_topic_lock:
+        _cleanup_breaking_topic_threads_locked(now)
+        for entry in breaking_topic_threads:
+            entry_tokens = entry.get("tokens")
+            if not isinstance(entry_tokens, set):
+                continue
+            overlap, ratio = _breaking_topic_similarity(tokens, entry_tokens)
+            if overlap < min_overlap or ratio < min_ratio:
+                continue
+            entry_ts = int(entry.get("ts", 0))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_ratio = ratio
+                best_ts = entry_ts
+                best_message_id = int(entry.get("message_id", 0)) or None
+            elif overlap == best_overlap and ratio > best_ratio:
+                best_ratio = ratio
+                best_ts = entry_ts
+                best_message_id = int(entry.get("message_id", 0)) or None
+            elif overlap == best_overlap and abs(ratio - best_ratio) < 1e-6:
+                # Prefer more recent thread if score ties.
+                if entry_ts > best_ts:
+                    best_ts = entry_ts
+                    best_message_id = int(entry.get("message_id", 0)) or best_message_id
+
+    return best_message_id
+
+
+async def _register_breaking_topic_thread(
+    *,
+    topic_seed: str,
+    sent_ref: object | None,
+) -> None:
+    if not _is_breaking_topic_threads_enabled():
+        return
+    message_id = _message_ref_id(sent_ref)
+    if not message_id:
+        return
+    tokens = _breaking_topic_tokens(topic_seed)
+    if len(tokens) < _breaking_topic_min_overlap():
+        return
+
+    now = int(time.time())
+    async with breaking_topic_lock:
+        _cleanup_breaking_topic_threads_locked(now)
+        for entry in breaking_topic_threads:
+            if int(entry.get("message_id", 0)) == int(message_id):
+                entry["tokens"] = tokens
+                entry["ts"] = now
+                return
+        breaking_topic_threads.append(
+            {
+                "message_id": int(message_id),
+                "tokens": tokens,
+                "ts": now,
+            }
+        )
+
+
+def _prepend_breaking_continuity(payload: str) -> str:
+    prefix = sanitize_telegram_html(_breaking_topic_continuity_prefix())
+    if not prefix:
+        return payload
+    return f"<i>{prefix}</i><br><br>{payload}"
 
 
 async def _merge_duplicate_breaking(
@@ -1326,6 +1608,12 @@ async def _send_text(text: str) -> None:
 
 
 def _message_ref_id(ref: object) -> int | None:
+    if isinstance(ref, (list, tuple)):
+        for item in ref:
+            value = _message_ref_id(item)
+            if value:
+                return value
+        return None
     if isinstance(ref, Message):
         return int(ref.id or 0) or None
     if isinstance(ref, dict):
@@ -1495,7 +1783,12 @@ async def _edit_sent_text(ref: object, text: str) -> object:
         return await ref.edit(fallback_text, parse_mode=None, link_preview=False)
 
 
-async def _send_single_media(msg: Message, caption: str | None) -> object:
+async def _send_single_media(
+    msg: Message,
+    caption: str | None,
+    *,
+    reply_to: int | None = None,
+) -> object:
     if _destination_uses_bot_api():
         safe_caption = (
             _render_outbound_text(caption or "", allow_premium_tags=True)
@@ -1522,6 +1815,8 @@ async def _send_single_media(msg: Message, caption: str | None) -> object:
             "caption": _to_bot_text(safe_caption, max_len=1024) or "",
             "parse_mode": "HTML" if _is_html_formatting_enabled() else "Markdown",
         }
+        if reply_to:
+            data["reply_to_message_id"] = str(reply_to)
         files = {
             upload_field: (
                 _filename_for_bot_media(msg, 0),
@@ -1555,6 +1850,7 @@ async def _send_single_media(msg: Message, caption: str | None) -> object:
             msg.media,
             caption=safe_caption,
             parse_mode="html" if _is_html_formatting_enabled() else "md",
+            reply_to=reply_to,
         )
     except ChatForwardsRestrictedError:
         raw = await msg.download_media(file=bytes)
@@ -1566,10 +1862,16 @@ async def _send_single_media(msg: Message, caption: str | None) -> object:
             raw,
             caption=safe_caption,
             parse_mode="html" if _is_html_formatting_enabled() else "md",
+            reply_to=reply_to,
         )
 
 
-async def _send_album(messages: List[Message], caption: str | None) -> None:
+async def _send_album(
+    messages: List[Message],
+    caption: str | None,
+    *,
+    reply_to: int | None = None,
+) -> object | None:
     if _destination_uses_bot_api():
         safe_caption = (
             _render_outbound_text(caption or "", allow_premium_tags=True)
@@ -1578,12 +1880,11 @@ async def _send_album(messages: List[Message], caption: str | None) -> None:
         )
         if not messages:
             if safe_caption:
-                await _send_text(safe_caption)
+                return await _send_text_with_ref(safe_caption, reply_to=reply_to)
             return
 
         if len(messages) == 1:
-            await _send_single_media(messages[0], safe_caption)
-            return
+            return await _send_single_media(messages[0], safe_caption, reply_to=reply_to)
 
         media_entries: List[dict] = []
         files: Dict[str, tuple[str, bytes, str]] = {}
@@ -1604,6 +1905,7 @@ async def _send_album(messages: List[Message], caption: str | None) -> None:
             item = {"type": media_type, "media": f"attach://{field_name}"}
             if idx == 0 and safe_caption:
                 item["caption"] = _to_bot_text(safe_caption, max_len=1024) or ""
+                item["parse_mode"] = "HTML" if _is_html_formatting_enabled() else "Markdown"
             media_entries.append(item)
 
         if not media_entries:
@@ -1611,18 +1913,17 @@ async def _send_album(messages: List[Message], caption: str | None) -> None:
 
         if len(media_entries) == 1:
             only_msg = downloaded_messages[0]
-            await _send_single_media(only_msg, safe_caption)
-            return
+            return await _send_single_media(only_msg, safe_caption, reply_to=reply_to)
 
         data = {
             "chat_id": _require_bot_destination_chat_id(),
             "media": json.dumps(media_entries),
-            "parse_mode": "HTML" if _is_html_formatting_enabled() else "Markdown",
         }
+        if reply_to:
+            data["reply_to_message_id"] = str(reply_to)
         try:
-            await _bot_api_request("sendMediaGroup", data=data, files=files)
+            return await _bot_api_request("sendMediaGroup", data=data, files=files)
         except Exception:
-            data.pop("parse_mode", None)
             if safe_caption and media_entries:
                 fallback_caption = (
                     strip_telegram_html(safe_caption)
@@ -1633,8 +1934,9 @@ async def _send_album(messages: List[Message], caption: str | None) -> None:
                     fallback_caption,
                     max_len=1024,
                 ) or ""
+                media_entries[0].pop("parse_mode", None)
                 data["media"] = json.dumps(media_entries)
-            await _bot_api_request("sendMediaGroup", data=data, files=files)
+            return await _bot_api_request("sendMediaGroup", data=data, files=files)
         return
 
     tg = _require_client()
@@ -1646,16 +1948,17 @@ async def _send_album(messages: List[Message], caption: str | None) -> None:
     media_items = [m.media for m in messages if m.media]
     if not media_items:
         if safe_caption:
-            await _send_text(safe_caption)
+            return await _send_text_with_ref(safe_caption, reply_to=reply_to)
         return
 
     try:
-        await _call_with_floodwait(
+        return await _call_with_floodwait(
             tg.send_file,
             _require_destination_peer(),
             media_items,
             caption=safe_caption,
             parse_mode="html" if _is_html_formatting_enabled() else "md",
+            reply_to=reply_to,
         )
     except ChatForwardsRestrictedError:
         downloaded = []
@@ -1665,12 +1968,13 @@ async def _send_album(messages: List[Message], caption: str | None) -> None:
                 downloaded.append(blob)
         if not downloaded:
             raise RuntimeError("Failed to download album media for restricted chat.")
-        await _call_with_floodwait(
+        return await _call_with_floodwait(
             tg.send_file,
             _require_destination_peer(),
             downloaded,
             caption=safe_caption,
             parse_mode="html" if _is_html_formatting_enabled() else "md",
+            reply_to=reply_to,
         )
 
 
@@ -1757,8 +2061,18 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
         return
 
     severity = "medium"
+    severity_score = 0.0
+    severity_breakdown: dict = {}
     if _is_severity_routing_enabled():
-        severity = await classify_severity(text, _require_auth_manager())
+        severity, severity_score, severity_breakdown = _classify_severity_with_breakdown(
+            text=text,
+            source=source,
+            channel_id=channel_id,
+            message_id=msg.id,
+            has_media=bool(msg.media),
+            has_link=bool(link),
+            reply_to=_reply_to_message_id(msg),
+        )
     elif _contains_breaking_keyword(text):
         severity = "high"
 
@@ -1773,17 +2087,19 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
         if _should_attach_vital_opinion(text):
             rational_view = await summarize_vital_rational_view(text, _require_auth_manager())
         payload = _format_breaking_text(source, headline, rational_view)
+        topic_seed = f"{headline}\n{text}"
+        reply_to = await _resolve_breaking_topic_reply(topic_seed)
         if msg.media:
-            await _send_single_media(msg, payload)
-            sent_ref = None
+            sent_ref = await _send_single_media(msg, payload, reply_to=reply_to)
         else:
-            sent_ref = await _send_text_with_ref(payload)
+            sent_ref = await _send_text_with_ref(payload, reply_to=reply_to)
             _register_breaking_delivery(
                 text_hash=text_hash,
                 ref=sent_ref,
                 base_text=payload,
                 primary_source=source,
             )
+        await _register_breaking_topic_thread(topic_seed=topic_seed, sent_ref=sent_ref)
         mark_seen(channel_id, msg.id)
         log_structured(
             LOGGER,
@@ -1792,8 +2108,11 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
             message_id=msg.id,
             source=source,
             severity=severity,
+            severity_score=severity_score,
             rational_view=bool(rational_view),
             dedupe_hash=text_hash,
+            reply_to=reply_to or 0,
+            severity_breakdown=severity_breakdown,
         )
         return
 
@@ -1812,10 +2131,12 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
         message_id=msg.id,
         source=source,
         severity=severity,
+        severity_score=severity_score,
         severity_emoji=_severity_emoji(severity),
         has_link=bool(link),
         text_tokens=estimate_tokens_rough(text),
         pending=count_pending(),
+        severity_breakdown=severity_breakdown,
     )
 
 
@@ -1841,8 +2162,19 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
         return
 
     severity = "medium"
+    severity_score = 0.0
+    severity_breakdown: dict = {}
     if _is_severity_routing_enabled():
-        severity = await classify_severity(combined_caption, _require_auth_manager())
+        severity, severity_score, severity_breakdown = _classify_severity_with_breakdown(
+            text=combined_caption,
+            source=source,
+            channel_id=channel_id,
+            message_id=messages[0].id,
+            has_media=True,
+            has_link=bool(link),
+            reply_to=_reply_to_message_id(messages[0]),
+            album_size=len(messages),
+        )
     elif _contains_breaking_keyword(combined_caption):
         severity = "high"
 
@@ -1858,7 +2190,11 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
                 combined_caption,
                 _require_auth_manager(),
             )
-        await _send_album(messages, _format_breaking_text(source, headline, rational_view))
+        payload = _format_breaking_text(source, headline, rational_view)
+        topic_seed = f"{headline}\n{combined_caption}"
+        reply_to = await _resolve_breaking_topic_reply(topic_seed)
+        sent_ref = await _send_album(messages, payload, reply_to=reply_to)
+        await _register_breaking_topic_thread(topic_seed=topic_seed, sent_ref=sent_ref)
         mark_seen_many(channel_id, message_ids)
         log_structured(
             LOGGER,
@@ -1868,7 +2204,10 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
             album_size=len(messages),
             source=source,
             severity=severity,
+            severity_score=severity_score,
             rational_view=bool(rational_view),
+            reply_to=reply_to or 0,
+            severity_breakdown=severity_breakdown,
         )
         return
 
@@ -1889,10 +2228,12 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
         album_size=len(messages),
         source=source,
         severity=severity,
+        severity_score=severity_score,
         severity_emoji=_severity_emoji(severity),
         has_link=bool(link),
         text_tokens=estimate_tokens_rough(combined_caption),
         pending=count_pending(),
+        severity_breakdown=severity_breakdown,
     )
 
 
@@ -2089,10 +2430,6 @@ async def _flush_digest_queue_once() -> None:
 def _compute_next_scheduler_delay_seconds() -> int:
     if digest_retry_backoff_seconds > 0:
         return digest_retry_backoff_seconds
-
-    daily_times = _digest_daily_times()
-    if daily_times:
-        return seconds_until_next_daily_time(daily_times)
     return _effective_interval_seconds()
 
 
@@ -2102,7 +2439,7 @@ async def run_digest_scheduler() -> None:
     log_structured(
         LOGGER,
         "digest_scheduler_start",
-        mode="digest",
+        mode="hourly_digest",
         pending=count_pending(),
         inflight=count_inflight(),
         interval_seconds=_digest_interval_seconds(),
@@ -2119,6 +2456,54 @@ async def run_digest_scheduler() -> None:
     except asyncio.CancelledError:
         LOGGER.info("Digest scheduler stopped.")
         digest_next_run_ts = None
+        return
+
+
+async def run_daily_digest_scheduler() -> None:
+    daily_times = _digest_daily_times()
+    if not daily_times:
+        return
+
+    log_structured(
+        LOGGER,
+        "daily_digest_scheduler_start",
+        daily_times=[f"{h:02d}:{m:02d}" for h, m in daily_times],
+    )
+    try:
+        while True:
+            delay = seconds_until_next_daily_time(daily_times)
+            await asyncio.sleep(delay)
+            await _flush_digest_queue_once()
+    except asyncio.CancelledError:
+        LOGGER.info("Daily digest scheduler stopped.")
+        return
+
+
+async def run_digest_queue_clear_scheduler() -> None:
+    interval = _digest_queue_clear_interval_seconds()
+    include_inflight = _digest_queue_clear_include_inflight()
+
+    log_structured(
+        LOGGER,
+        "digest_queue_clear_scheduler_start",
+        interval_seconds=interval,
+        include_inflight=include_inflight,
+    )
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            async with digest_loop_lock:
+                deleted = clear_digest_queue(include_inflight=include_inflight)
+            log_structured(
+                LOGGER,
+                "digest_queue_cleared",
+                deleted=deleted,
+                include_inflight=include_inflight,
+                pending_after=count_pending(),
+                inflight_after=count_inflight(),
+            )
+    except asyncio.CancelledError:
+        LOGGER.info("Digest queue clear scheduler stopped.")
         return
 
 
@@ -2588,6 +2973,9 @@ def _digest_status_text() -> str:
     severity_state = "on" if _is_severity_routing_enabled() else "off"
     query_state = "on" if _is_query_mode_enabled() else "off"
     detector_backend = dupe_detector.backend_name if dupe_detector is not None else "disabled"
+    daily_labels = [f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()]
+    daily_display = ", ".join(daily_labels) if daily_labels else "off"
+    queue_clear_every = _digest_queue_clear_interval_seconds() // 60
 
     return (
         "<b>🧠 Digest Status</b><br>"
@@ -2597,6 +2985,8 @@ def _digest_status_text() -> str:
         f"• Last digest: <code>{format_ts(last_ts)}</code><br>"
         f"• Next run in: <code>{next_eta}</code><br>"
         f"• Interval base: <code>{_digest_interval_seconds() // 60}m</code><br>"
+        f"• Daily digest times: <code>{sanitize_telegram_html(daily_display)}</code><br>"
+        f"• Queue clear every: <code>{queue_clear_every}m</code><br>"
         f"• Dedupe: <code>{dupe_state}</code> ({sanitize_telegram_html(detector_backend)})<br>"
         f"• Severity router: <code>{severity_state}</code><br>"
         f"• Query mode: <code>{query_state}</code><br>"
@@ -2655,6 +3045,12 @@ async def _safe_reply_markdown(
         if _is_html_formatting_enabled()
         else text
     )
+    if not str(payload_text or "").strip():
+        payload_text = (
+            "<b>🟢 No relevant information found.</b>"
+            if _is_html_formatting_enabled()
+            else "No relevant information found."
+        )
     while True:
         try:
             if edit_message is not None:
@@ -2668,6 +3064,8 @@ async def _safe_reply_markdown(
                 parse_mode="html" if _is_html_formatting_enabled() else "md",
                 link_preview=False,
             )
+        except MessageNotModifiedError:
+            return edit_message
         except FloodWaitError as exc:
             wait_seconds = int(exc.seconds) + 1
             LOGGER.warning("FloodWait while replying to query: sleeping %ss", wait_seconds)
@@ -2679,6 +3077,14 @@ async def _safe_reply_markdown(
                     if _is_html_formatting_enabled()
                     else text
                 )
+                fallback_text = (fallback_text or "").strip()
+                if not fallback_text:
+                    fallback_text = "No relevant information found."
+                # Force valid UTF-8 safe payload before plain-text send/edit.
+                fallback_text = fallback_text.encode("utf-8", errors="replace").decode(
+                    "utf-8",
+                    errors="replace",
+                )
                 if edit_message is not None:
                     return await edit_message.edit(
                         fallback_text,
@@ -2686,6 +3092,8 @@ async def _safe_reply_markdown(
                         link_preview=False,
                     )
                 return await event.reply(fallback_text, parse_mode=None, link_preview=False)
+            except MessageNotModifiedError:
+                return edit_message
             except FloodWaitError as exc:
                 wait_seconds = int(exc.seconds) + 1
                 LOGGER.warning("FloodWait while replying to query: sleeping %ss", wait_seconds)
@@ -2946,13 +3354,25 @@ async def _on_new_message(event: events.NewMessage.Event) -> None:
 
 
 async def _shutdown_client() -> None:
-    global digest_scheduler_task
+    global digest_scheduler_task, daily_digest_scheduler_task, queue_clear_scheduler_task
     configure_duplicate_runtime(None)
+    breaking_delivery_refs.clear()
+    breaking_topic_threads.clear()
 
     if digest_scheduler_task and not digest_scheduler_task.done():
         digest_scheduler_task.cancel()
         await asyncio.gather(digest_scheduler_task, return_exceptions=True)
     digest_scheduler_task = None
+
+    if daily_digest_scheduler_task and not daily_digest_scheduler_task.done():
+        daily_digest_scheduler_task.cancel()
+        await asyncio.gather(daily_digest_scheduler_task, return_exceptions=True)
+    daily_digest_scheduler_task = None
+
+    if queue_clear_scheduler_task and not queue_clear_scheduler_task.done():
+        queue_clear_scheduler_task.cancel()
+        await asyncio.gather(queue_clear_scheduler_task, return_exceptions=True)
+    queue_clear_scheduler_task = None
 
     tg = client
     if tg is None:
@@ -2996,6 +3416,11 @@ def _startup_health_check() -> None:
         humanized_vital_opinion=_humanized_vital_opinion_enabled(),
         humanized_vital_probability=_humanized_vital_opinion_probability(),
         query_allowed_peer_count=len(_query_allowed_peer_ids()),
+        breaking_topic_threads=_is_breaking_topic_threads_enabled(),
+        digest_interval_minutes=_digest_interval_seconds() // 60,
+        digest_daily_times=[f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()],
+        digest_queue_clear_minutes=_digest_queue_clear_interval_seconds() // 60,
+        digest_queue_clear_inflight=_digest_queue_clear_include_inflight(),
         pending=pending,
         inflight=inflight,
         last_digest_ts=last_ts,
@@ -3003,7 +3428,7 @@ def _startup_health_check() -> None:
         quota_health=get_quota_health(),
     )
     LOGGER.info(
-        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f",
+        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%sm",
         mode,
         pending,
         inflight,
@@ -3016,11 +3441,16 @@ def _startup_health_check() -> None:
         len(premium_emoji_map),
         _humanized_vital_opinion_enabled(),
         _humanized_vital_opinion_probability(),
+        _is_breaking_topic_threads_enabled(),
+        _digest_interval_seconds() // 60,
+        ",".join(f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()) or "off",
+        _digest_queue_clear_interval_seconds() // 60,
     )
 
 
 async def main() -> None:
-    global client, auth_manager, digest_scheduler_task, instance_lock_handle
+    global client, auth_manager, digest_scheduler_task
+    global daily_digest_scheduler_task, queue_clear_scheduler_task, instance_lock_handle
 
     _prompt_for_missing_config()
     _validate_config()
@@ -3090,6 +3520,15 @@ async def main() -> None:
                 digest_scheduler_task = asyncio.create_task(
                     run_digest_scheduler(),
                     name="digest-scheduler",
+                )
+                if _digest_daily_times():
+                    daily_digest_scheduler_task = asyncio.create_task(
+                        run_daily_digest_scheduler(),
+                        name="daily-digest-scheduler",
+                    )
+                queue_clear_scheduler_task = asyncio.create_task(
+                    run_digest_queue_clear_scheduler(),
+                    name="digest-queue-clear-scheduler",
                 )
 
             try:

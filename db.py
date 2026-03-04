@@ -319,6 +319,16 @@ def load_and_clear_digest_queue(limit: int | None = None) -> List[Dict[str, obje
     return rows
 
 
+def clear_digest_queue(*, include_inflight: bool = True) -> int:
+    """Delete queued digest rows. Used by periodic queue purge policy."""
+    with _transaction() as conn:
+        if include_inflight:
+            cur = conn.execute("DELETE FROM digest_queue")
+        else:
+            cur = conn.execute("DELETE FROM digest_queue WHERE processed = 0")
+        return int(cur.rowcount or 0)
+
+
 def count_pending() -> int:
     with _connect() as conn:
         cur = conn.execute(

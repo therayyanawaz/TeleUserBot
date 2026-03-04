@@ -151,8 +151,10 @@ CODEX_ORIGINATOR = _env_str("CODEX_ORIGINATOR", "pi")  # type: str
 # Digest Mode Core
 # -----------------------------------------------------------------------------
 DIGEST_MODE = _env_bool("DIGEST_MODE", True)  # type: bool
-DIGEST_INTERVAL_MINUTES = _env_int("DIGEST_INTERVAL_MINUTES", 30)  # type: int
-DIGEST_DAILY_TIMES = _env_list("DIGEST_DAILY_TIMES", [])  # type: list[str]
+DIGEST_INTERVAL_MINUTES = _env_int("DIGEST_INTERVAL_MINUTES", 60)  # type: int
+DIGEST_DAILY_TIMES = _env_list("DIGEST_DAILY_TIMES", ["00:00"])  # type: list[str]
+DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES = _env_int("DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES", 10)  # type: int
+DIGEST_QUEUE_CLEAR_INCLUDE_INFLIGHT = _env_bool("DIGEST_QUEUE_CLEAR_INCLUDE_INFLIGHT", True)  # type: bool
 DIGEST_MAX_POSTS = _env_int("DIGEST_MAX_POSTS", 80)  # type: int
 DIGEST_MAX_TOKENS = _env_int("DIGEST_MAX_TOKENS", 18000)  # type: int
 CODEX_MODEL_CONTEXT_TOKENS = _env_int("CODEX_MODEL_CONTEXT_TOKENS", 200000)  # type: int
@@ -191,6 +193,15 @@ BREAKING_NEWS_KEYWORDS = _env_list(
     ["breaking", "urgent", "just now"],
 )  # type: list[str]
 BREAKING_MATCH_THRESHOLD = _env_int("BREAKING_MATCH_THRESHOLD", 1)  # type: int
+# Human-like follow-up threading for repeated breaking topics.
+ENABLE_BREAKING_TOPIC_THREADS = _env_bool("ENABLE_BREAKING_TOPIC_THREADS", True)  # type: bool
+BREAKING_TOPIC_WINDOW_MINUTES = _env_int("BREAKING_TOPIC_WINDOW_MINUTES", 180)  # type: int
+BREAKING_TOPIC_MIN_OVERLAP = _env_int("BREAKING_TOPIC_MIN_OVERLAP", 2)  # type: int
+BREAKING_TOPIC_MIN_RATIO = _env_float("BREAKING_TOPIC_MIN_RATIO", 0.55)  # type: float
+BREAKING_TOPIC_CONTINUITY_PREFIX = _env_str(
+    "BREAKING_TOPIC_CONTINUITY_PREFIX",
+    "",
+)  # type: str
 # Optional humanized rational viewpoint for vital/high-severity alerts.
 HUMANIZED_VITAL_OPINION_ENABLED = _env_bool("HUMANIZED_VITAL_OPINION_ENABLED", True)  # type: bool
 HUMANIZED_VITAL_OPINION_PROBABILITY = _env_float("HUMANIZED_VITAL_OPINION_PROBABILITY", 0.35)  # type: float
