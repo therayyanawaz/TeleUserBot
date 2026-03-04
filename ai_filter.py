@@ -15,7 +15,13 @@ import httpx
 
 import config
 from auth import AuthManager
-from prompts import build_digest_input_block, build_digest_system_prompt, quiet_period_message
+from prompts import (
+    QUERY_NO_MATCH_TEXT,
+    build_digest_input_block,
+    build_digest_system_prompt,
+    build_query_system_prompt,
+    quiet_period_message,
+)
 from utils import estimate_tokens_rough as _estimate_tokens_rough
 from utils import normalize_space
 
@@ -901,6 +907,94 @@ def local_fallback_digest(posts: Sequence[Dict[str, object]], *, interval_minute
     return quiet_period_message(interval_minutes)
 
 
+def _query_requests_detail(query: str) -> bool:
+    lowered = query.lower()
+    hints = (
+        "in detail",
+        "detailed",
+        "full report",
+        "deep dive",
+        "full analysis",
+        "comprehensive",
+    )
+    return any(hint in lowered for hint in hints)
+
+
+def _query_context_token_budget() -> int:
+    raw = getattr(config, "DIGEST_MAX_TOKENS", 18000)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 18000
+    return max(4000, min(value, 18000))
+
+
+def _build_query_context_lines(
+    context_messages: Sequence[Dict[str, object]],
+    *,
+    token_budget: int,
+) -> tuple[list[str], int]:
+    lines: list[str] = []
+    used = 0
+    seen = set()
+
+    for idx, item in enumerate(context_messages, start=1):
+        text = normalize_space(str(item.get("text") or ""))
+        if not text:
+            continue
+        signature = _cache_key(text.lower())
+        if signature in seen:
+            continue
+        seen.add(signature)
+
+        source = normalize_space(str(item.get("source") or "unknown"))
+        date_label = normalize_space(str(item.get("date") or "unknown-time"))
+        link = normalize_space(str(item.get("link") or ""))
+        if len(text) > 900:
+            text = f"{text[:897].rsplit(' ', 1)[0]}..."
+
+        line = f"{idx}. [{source}] ({date_label}) {text}"
+        if link.startswith("http"):
+            line += f" | link={link}"
+
+        line_tokens = estimate_tokens_rough(line) + 10
+        if lines and used + line_tokens > token_budget:
+            break
+        lines.append(line)
+        used += line_tokens
+
+    return lines, used
+
+
+def _fallback_query_answer(
+    context_messages: Sequence[Dict[str, object]],
+    *,
+    detailed: bool,
+) -> str:
+    if not context_messages:
+        return QUERY_NO_MATCH_TEXT
+
+    selected = context_messages[: (6 if detailed else 3)]
+    lines = []
+    for item in selected:
+        text = normalize_space(str(item.get("text") or ""))
+        if not text:
+            continue
+        if len(text) > 180:
+            text = f"{text[:177].rsplit(' ', 1)[0]}..."
+        source = normalize_space(str(item.get("source") or "Source"))
+        link = normalize_space(str(item.get("link") or ""))
+        prefix = "🔥" if _severity_from_text_heuristic(text) == "high" else "⚠️"
+        line = f"- {prefix} {text} [{source}]"
+        if link.startswith("http"):
+            line += f" [link]({link})"
+        lines.append(line)
+
+    if not lines:
+        return QUERY_NO_MATCH_TEXT
+    return "\n".join(lines)
+
+
 async def summarize_or_skip(text: str, auth_manager: AuthManager) -> Optional[str]:
     cleaned = text.strip()
     if not cleaned or len(cleaned) < 10:
@@ -1221,4 +1315,95 @@ async def create_digest_summary(
         max_lines=max_lines,
     )
 
-    return local_fallback_digest(posts, interval_minutes=interval_minutes)
+
+async def generate_answer_from_context(
+    query: str,
+    context_messages: Sequence[Dict[str, object]],
+    auth_manager: AuthManager | None = None,
+    *,
+    conversation_history: Sequence[Dict[str, str]] | None = None,
+) -> str:
+    """
+    Generate a conversational query answer from recent Telegram context messages.
+    """
+    question = normalize_space(query)
+    if not question:
+        return QUERY_NO_MATCH_TEXT
+
+    if not context_messages:
+        return QUERY_NO_MATCH_TEXT
+
+    manager = auth_manager or AuthManager(logger=LOGGER)
+    detailed = _query_requests_detail(question)
+    output_language = _resolve_output_language()
+
+    # Reserve room for prompt + answer generation.
+    context_budget = max(2000, _query_context_token_budget() - 2600)
+    context_lines, used_tokens = _build_query_context_lines(
+        context_messages,
+        token_budget=context_budget,
+    )
+    if not context_lines:
+        return QUERY_NO_MATCH_TEXT
+
+    history_lines: list[str] = []
+    if conversation_history:
+        for turn in list(conversation_history)[-10:]:
+            role = normalize_space(str(turn.get("role") or ""))
+            content = normalize_space(str(turn.get("content") or ""))
+            if role and content:
+                if len(content) > 280:
+                    content = f"{content[:277].rsplit(' ', 1)[0]}..."
+                history_lines.append(f"- {role}: {content}")
+
+    payload_parts = [
+        f"User query:\n{question}",
+        "Context metadata:",
+        f"- Context messages provided: {len(context_messages)}",
+        f"- Context lines included: {len(context_lines)}",
+        f"- Estimated context tokens: {used_tokens}",
+    ]
+    if history_lines:
+        payload_parts.extend(["", "Conversation history (recent):", *history_lines])
+    payload_parts.extend(["", "Evidence messages:", *context_lines])
+    user_payload = "\n".join(payload_parts)
+
+    prompt = build_query_system_prompt(
+        output_language=output_language,
+        detailed=detailed,
+    )
+
+    try:
+        auth_context = await manager.get_auth_context()
+        content = await _call_codex(
+            user_payload,
+            auth_context,
+            instructions=prompt,
+            verbosity="low" if not detailed else "medium",
+        )
+    except _CodexAuthError:
+        try:
+            auth_context = await manager.refresh_auth_context()
+            content = await _call_codex(
+                user_payload,
+                auth_context,
+                instructions=prompt,
+                verbosity="low" if not detailed else "medium",
+            )
+        except Exception:
+            return _fallback_query_answer(context_messages, detailed=detailed)
+    except _CodexRateLimitError:
+        return _fallback_query_answer(context_messages, detailed=detailed)
+    except (httpx.HTTPError, _CodexApiError, ValueError):
+        return _fallback_query_answer(context_messages, detailed=detailed)
+    except Exception:
+        return _fallback_query_answer(context_messages, detailed=detailed)
+
+    cleaned = normalize_space(content)
+    if not cleaned:
+        return _fallback_query_answer(context_messages, detailed=detailed)
+
+    if QUERY_NO_MATCH_TEXT.lower() in cleaned.lower():
+        return QUERY_NO_MATCH_TEXT
+
+    return content.strip()

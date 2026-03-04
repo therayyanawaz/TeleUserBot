@@ -204,3 +204,12 @@ DIGEST_429_THRESHOLD_PER_HOUR = _env_int("DIGEST_429_THRESHOLD_PER_HOUR", 3)  # 
 DIGEST_STATUS_COMMAND = _env_str("DIGEST_STATUS_COMMAND", "/digest_status")  # type: str
 DIGEST_POST_PROCESSORS = _env_list("DIGEST_POST_PROCESSORS", [])  # type: list[str]
 
+# -----------------------------------------------------------------------------
+# Query Assistant Mode
+# -----------------------------------------------------------------------------
+QUERY_MODE_ENABLED = _env_bool("QUERY_MODE_ENABLED", True)  # type: bool
+QUERY_MAX_MESSAGES = _env_int("QUERY_MAX_MESSAGES", 50)  # type: int
+QUERY_DEFAULT_HOURS_BACK = _env_int("QUERY_DEFAULT_HOURS_BACK", 24)  # type: int
+# Optional chat allowlist for query interface (chat IDs as integers/strings).
+# If empty, query mode only accepts outgoing private chats (e.g., Saved Messages).
+QUERY_ALLOWED_CHAT_IDS = _env_list("QUERY_ALLOWED_CHAT_IDS", [])  # type: list[str]

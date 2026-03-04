@@ -1,16 +1,17 @@
-"""Shared utility helpers for digest routing, token budgeting, and logging."""
+"""Shared utility helpers for digest routing, token budgeting, logging, and query search."""
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter, deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import math
 import re
 import threading
 import time
-from typing import Iterable, List, Sequence, Tuple
+from typing import Any, Iterable, List, Sequence, Tuple
 
 
 def estimate_tokens_rough(text: str) -> int:
@@ -322,3 +323,208 @@ class NearDuplicateDetector:
         if limit is None or limit <= 0:
             return values
         return values[-int(limit) :]
+
+
+def parse_time_filter_from_query(query: str, default_hours: int = 24) -> tuple[int, str]:
+    """
+    Parse time constraints from natural-language query.
+
+    Supported examples:
+    - "last 24 hours", "past 6h", "3d", "today", "yesterday"
+    """
+    text = normalize_space(query)
+    lowered = text.lower()
+
+    hours_back = max(1, int(default_hours))
+    cleanup_patterns: list[str] = []
+
+    # explicit relative windows
+    patterns = [
+        r"\b(?:last|past)\s+(\d{1,3})\s*(?:hours?|hrs?|h)\b",
+        r"\b(\d{1,3})\s*(?:hours?|hrs?|h)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            hours_back = max(1, min(24 * 30, int(match.group(1))))
+            cleanup_patterns.append(pattern)
+            break
+
+    day_patterns = [
+        r"\b(?:last|past)\s+(\d{1,2})\s*(?:days?|d)\b",
+        r"\b(\d{1,2})\s*(?:days?|d)\b",
+    ]
+    for pattern in day_patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            hours_back = max(24, min(24 * 30, int(match.group(1)) * 24))
+            cleanup_patterns.append(pattern)
+            break
+
+    # calendar-style shortcuts
+    if re.search(r"\byesterday\b", lowered):
+        hours_back = max(hours_back, 48)
+        cleanup_patterns.append(r"\byesterday\b")
+    if re.search(r"\btoday\b", lowered):
+        now_local = datetime.now()
+        hours_back = max(hours_back, now_local.hour + 1)
+        cleanup_patterns.append(r"\btoday\b")
+
+    cleaned = text
+    for pattern in cleanup_patterns:
+        cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+    cleaned = normalize_space(cleaned)
+    if not cleaned:
+        cleaned = text
+
+    return hours_back, cleaned
+
+
+async def search_recent_messages(
+    client: Any,
+    monitored_chats: Sequence[int | str],
+    query: str,
+    *,
+    max_messages: int = 50,
+    default_hours_back: int = 24,
+    logger: logging.Logger | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Search recent Telegram posts across monitored chats.
+
+    Strategy:
+    1) server-side fuzzy search (`iter_messages(search=...)`) per chat
+    2) fallback to scanning recent chat history if server search returns no matches
+    """
+    if not monitored_chats:
+        return []
+
+    from telethon.errors import FloodWaitError
+
+    resolved_max = max(20, min(int(max_messages), 60))
+    hours_back, cleaned_query = parse_time_filter_from_query(query, default_hours_back)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+
+    keyword_terms = {
+        token for token in re.findall(r"[a-z0-9]{3,}", cleaned_query.lower()) if token
+    }
+
+    stage_limit = max(10, min(60, resolved_max // max(1, min(len(monitored_chats), resolved_max)) + 8))
+    fallback_limit = max(30, min(120, stage_limit * 3))
+
+    collected: dict[tuple[str, int], dict[str, Any]] = {}
+
+    def _extract_message_text(msg: Any) -> str:
+        return normalize_space(str(getattr(msg, "message", "") or ""))
+
+    async def _append_message(msg: Any, *, strict_keyword_filter: bool) -> None:
+        message_id = int(getattr(msg, "id", 0) or 0)
+        if message_id <= 0:
+            return
+
+        chat_id_raw = getattr(msg, "chat_id", None)
+        if chat_id_raw is None:
+            return
+        chat_id = str(chat_id_raw)
+        dedupe_key = (chat_id, message_id)
+        if dedupe_key in collected:
+            return
+
+        dt = getattr(msg, "date", None)
+        if not isinstance(dt, datetime):
+            return
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if dt < cutoff:
+            return
+
+        text_value = _extract_message_text(msg)
+        if not text_value:
+            return
+
+        if strict_keyword_filter and keyword_terms:
+            lowered_text = text_value.lower()
+            if not any(term in lowered_text for term in keyword_terms):
+                return
+
+        chat_obj = getattr(msg, "chat", None)
+        username = getattr(chat_obj, "username", None) if chat_obj is not None else None
+        source = (
+            normalize_space(str(getattr(chat_obj, "title", "") or ""))
+            or normalize_space(str(username or ""))
+            or chat_id
+        )
+        link = build_telegram_message_link(
+            username=username if isinstance(username, str) else None,
+            chat_id=chat_id,
+            message_id=message_id,
+        ) or ""
+
+        collected[dedupe_key] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "timestamp": int(dt.timestamp()),
+            "date": dt.isoformat(),
+            "source": source,
+            "text": text_value,
+            "link": link,
+        }
+
+    async def _scan_chat(
+        chat_ref: int | str,
+        *,
+        search_text: str | None,
+        limit: int,
+        strict_keyword_filter: bool,
+    ) -> None:
+        while True:
+            try:
+                kwargs: dict[str, Any] = {"limit": int(limit)}
+                if search_text:
+                    kwargs["search"] = search_text
+
+                async for msg in client.iter_messages(chat_ref, **kwargs):
+                    await _append_message(msg, strict_keyword_filter=strict_keyword_filter)
+                    if len(collected) >= resolved_max:
+                        return
+                return
+            except FloodWaitError as exc:
+                wait_seconds = int(getattr(exc, "seconds", 1)) + 1
+                if logger:
+                    logger.warning("FloodWait during query search: sleeping %ss", wait_seconds)
+                await asyncio.sleep(wait_seconds)
+            except Exception:
+                if logger:
+                    logger.debug("Query search failed for chat=%s", chat_ref, exc_info=True)
+                return
+
+    # Stage 1: server-side fuzzy search
+    search_text = cleaned_query if cleaned_query else query
+    for chat_ref in monitored_chats:
+        await _scan_chat(
+            chat_ref,
+            search_text=search_text,
+            limit=stage_limit,
+            strict_keyword_filter=False,
+        )
+        if len(collected) >= resolved_max:
+            break
+
+    # Stage 2: fallback scan if no results
+    if not collected:
+        for chat_ref in monitored_chats:
+            await _scan_chat(
+                chat_ref,
+                search_text=None,
+                limit=fallback_limit,
+                strict_keyword_filter=True,
+            )
+            if len(collected) >= resolved_max:
+                break
+
+    ordered = sorted(
+        collected.values(),
+        key=lambda item: int(item.get("timestamp", 0)),
+        reverse=True,
+    )
+    return ordered[:resolved_max]

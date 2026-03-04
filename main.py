@@ -10,10 +10,10 @@ from pathlib import Path
 import re
 import time
 import urllib.parse
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 import importlib
-from typing import Dict, List, Tuple
+from typing import Deque, Dict, List, Tuple
 import uuid
 
 import httpx
@@ -36,6 +36,7 @@ import config
 from ai_filter import (
     classify_severity,
     create_digest_summary,
+    generate_answer_from_context,
     get_quota_health,
     summarize_breaking_headline,
     summarize_or_skip,
@@ -67,6 +68,8 @@ from utils import (
     log_structured,
     normalize_space,
     parse_daily_times,
+    parse_time_filter_from_query,
+    search_recent_messages,
     seconds_until_next_daily_time,
     split_markdown_chunks,
 )
@@ -105,6 +108,11 @@ digest_next_run_ts: float | None = None
 digest_retry_backoff_seconds: int = 0
 digest_loop_lock = asyncio.Lock()
 dupe_detector: NearDuplicateDetector | None = None
+monitored_source_chat_ids: List[int] = []
+query_last_request_ts: Dict[int, float] = {}
+query_conversation_history: Dict[int, Deque[Dict[str, str]]] = defaultdict(
+    lambda: deque(maxlen=20)
+)
 
 ALBUM_WAIT_SECONDS = 1.5
 ENV_PATH = Path(__file__).with_name(".env")
@@ -361,6 +369,41 @@ def _is_immediate_high_enabled() -> bool:
 
 def _include_source_tags() -> bool:
     return _bool_flag(getattr(config, "INCLUDE_SOURCE_TAGS", False), False)
+
+
+def _is_query_mode_enabled() -> bool:
+    return _bool_flag(getattr(config, "QUERY_MODE_ENABLED", True), True)
+
+
+def _query_max_messages() -> int:
+    raw = getattr(config, "QUERY_MAX_MESSAGES", 50)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 50
+    return max(20, min(value, 60))
+
+
+def _query_default_hours_back() -> int:
+    raw = getattr(config, "QUERY_DEFAULT_HOURS_BACK", 24)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 24
+    return max(1, min(value, 24 * 30))
+
+
+def _query_allowed_chat_ids() -> set[str]:
+    raw = getattr(config, "QUERY_ALLOWED_CHAT_IDS", [])
+    if not isinstance(raw, list):
+        return set()
+
+    allowed: set[str] = set()
+    for item in raw:
+        text = str(item).strip()
+        if text:
+            allowed.add(text)
+    return allowed
 
 
 def _breaking_keywords() -> List[str]:
@@ -1935,6 +1978,8 @@ async def _ensure_destination_peer() -> None:
 
 
 async def setup_sources() -> List[int]:
+    global monitored_source_chat_ids
+
     tg = _require_client()
     resolved_ids: List[int] = []
 
@@ -2024,6 +2069,7 @@ async def setup_sources() -> List[int]:
             resolved_ids.append(peer_id)
 
     config.SOURCES = resolved_ids
+    monitored_source_chat_ids = list(resolved_ids)
     if folder_link and not _is_missing_folder_invite_link():
         print(f"✅ Listening to {len(resolved_ids)} channels from folder")
     return resolved_ids
@@ -2041,6 +2087,7 @@ def _digest_status_text() -> str:
     threshold = _digest_429_threshold_per_hour()
     dupe_state = "on" if _is_dupe_detection_enabled() else "off"
     severity_state = "on" if _is_severity_routing_enabled() else "off"
+    query_state = "on" if _is_query_mode_enabled() else "off"
     detector_backend = dupe_detector.backend_name if dupe_detector is not None else "disabled"
 
     return (
@@ -2053,6 +2100,7 @@ def _digest_status_text() -> str:
         f"- Interval base: `{_digest_interval_seconds() // 60}m`\n"
         f"- Dedupe: `{dupe_state}` ({detector_backend})\n"
         f"- Severity router: `{severity_state}`\n"
+        f"- Query mode: `{query_state}`\n"
         f"- Quota health: `{quota.get('status', 'unknown')}`\n"
         f"- Recent 429 (1h): `{quota.get('recent_429_count', 0)}` / threshold `{threshold}`"
     )
@@ -2063,6 +2111,154 @@ async def _on_digest_status_command(event: events.NewMessage.Event) -> None:
         await event.reply(_digest_status_text(), parse_mode="md", link_preview=False)
     except Exception:
         LOGGER.exception("Failed sending /digest_status response.")
+
+
+def _is_query_chat_allowed(event: events.NewMessage.Event, chat_id: str) -> bool:
+    allowed = _query_allowed_chat_ids()
+    if allowed:
+        return chat_id in allowed
+    return bool(getattr(event, "is_private", False))
+
+
+def _is_query_text_ignored(text: str) -> bool:
+    if not text:
+        return True
+    if len(text) < 8:
+        return True
+    if text.startswith("/") or text.startswith("!"):
+        return True
+    return False
+
+
+def _query_history_for_sender(sender_id: int) -> Deque[Dict[str, str]]:
+    return query_conversation_history[sender_id]
+
+
+def _append_query_history(sender_id: int, query_text: str, answer_text: str) -> None:
+    history = _query_history_for_sender(sender_id)
+    history.append({"role": "user", "content": normalize_space(query_text)})
+    trimmed_answer = normalize_space(answer_text)
+    if len(trimmed_answer) > 800:
+        trimmed_answer = f"{trimmed_answer[:797].rsplit(' ', 1)[0]}..."
+    history.append({"role": "assistant", "content": trimmed_answer})
+
+
+async def _safe_reply_markdown(
+    event: events.NewMessage.Event,
+    text: str,
+    *,
+    edit_message: Message | None = None,
+) -> Message | None:
+    while True:
+        try:
+            if edit_message is not None:
+                return await edit_message.edit(text, parse_mode="md", link_preview=False)
+            return await event.reply(text, parse_mode="md", link_preview=False)
+        except FloodWaitError as exc:
+            wait_seconds = int(exc.seconds) + 1
+            LOGGER.warning("FloodWait while replying to query: sleeping %ss", wait_seconds)
+            await asyncio.sleep(wait_seconds)
+        except Exception:
+            try:
+                if edit_message is not None:
+                    return await edit_message.edit(text, parse_mode=None, link_preview=False)
+                return await event.reply(text, parse_mode=None, link_preview=False)
+            except FloodWaitError as exc:
+                wait_seconds = int(exc.seconds) + 1
+                LOGGER.warning("FloodWait while replying to query: sleeping %ss", wait_seconds)
+                await asyncio.sleep(wait_seconds)
+            except Exception:
+                LOGGER.exception("Failed to send query response message.")
+                return None
+
+
+async def _on_query_message(event: events.NewMessage.Event) -> None:
+    if not _is_query_mode_enabled():
+        return
+
+    msg = event.message
+    if msg is None or not getattr(msg, "out", False):
+        return
+
+    text = normalize_space(str(msg.message or ""))
+    if _is_query_text_ignored(text):
+        return
+
+    chat_id = str(getattr(msg, "chat_id", "") or "")
+    if not _is_query_chat_allowed(event, chat_id):
+        return
+
+    sender_id = int(getattr(msg, "sender_id", 0) or 0)
+    if sender_id <= 0:
+        sender_id = 0
+
+    now = time.time()
+    last = query_last_request_ts.get(sender_id, 0.0)
+    if now - last < 10:
+        wait_seconds = int(max(1.0, 10 - (now - last)))
+        await _safe_reply_markdown(
+            event,
+            f"Please wait {wait_seconds}s before your next query.",
+        )
+        return
+    query_last_request_ts[sender_id] = now
+
+    progress = await _safe_reply_markdown(event, "Searching your channels... ⏳")
+    if progress is None:
+        return
+
+    try:
+        parsed_hours, cleaned_query = parse_time_filter_from_query(
+            text,
+            _query_default_hours_back(),
+        )
+
+        results = await search_recent_messages(
+            _require_client(),
+            monitored_source_chat_ids,
+            cleaned_query,
+            max_messages=_query_max_messages(),
+            default_hours_back=parsed_hours,
+            logger=LOGGER,
+        )
+
+        history = list(_query_history_for_sender(sender_id))
+        answer = await generate_answer_from_context(
+            query=cleaned_query,
+            context_messages=results,
+            auth_manager=_require_auth_manager(),
+            conversation_history=history,
+        )
+        if not answer.strip():
+            answer = "No matching information found in recent updates."
+
+        await _safe_reply_markdown(event, answer, edit_message=progress)
+        _append_query_history(sender_id, text, answer)
+        log_structured(
+            LOGGER,
+            "query_answered",
+            sender_id=sender_id,
+            chat_id=chat_id,
+            query_length=len(text),
+            hours_back=parsed_hours,
+            messages_found=len(results),
+            response_chars=len(answer),
+        )
+    except Exception as exc:
+        LOGGER.exception("Query handling failed.")
+        await _safe_reply_markdown(
+            event,
+            "No matching information found in recent updates.",
+            edit_message=progress,
+        )
+        log_structured(
+            LOGGER,
+            "query_failed",
+            level=logging.ERROR,
+            sender_id=sender_id,
+            chat_id=chat_id,
+            error=str(exc),
+        )
 
 
 async def _on_new_message(event: events.NewMessage.Event) -> None:
@@ -2132,6 +2328,7 @@ def _startup_health_check() -> None:
         mode=mode,
         dupe_detection=_is_dupe_detection_enabled(),
         severity_routing=_is_severity_routing_enabled(),
+        query_mode=_is_query_mode_enabled(),
         pending=pending,
         inflight=inflight,
         last_digest_ts=last_ts,
@@ -2139,13 +2336,14 @@ def _startup_health_check() -> None:
         quota_health=get_quota_health(),
     )
     LOGGER.info(
-        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s",
+        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s",
         mode,
         pending,
         inflight,
         format_ts(last_ts),
         _is_dupe_detection_enabled(),
         _is_severity_routing_enabled(),
+        _is_query_mode_enabled(),
     )
 
 
@@ -2195,6 +2393,11 @@ async def main() -> None:
         _on_digest_status_command,
         events.NewMessage(outgoing=True, pattern=status_pattern),
     )
+    if _is_query_mode_enabled():
+        client.add_event_handler(
+            _on_query_message,
+            events.NewMessage(outgoing=True),
+        )
 
     me = await client.get_me()
     LOGGER.info("Userbot started as @%s", getattr(me, "username", "unknown"))
