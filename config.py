@@ -164,8 +164,11 @@ OUTPUT_LANGUAGE = _env_str("OUTPUT_LANGUAGE", "English")  # type: str
 
 # Semantic echo suppression at intake.
 ENABLE_DUPE_DETECTION = _env_bool("ENABLE_DUPE_DETECTION", True)  # type: bool
-DUPE_THRESHOLD = _env_float("DUPE_THRESHOLD", 0.83)  # type: float
+DUPE_ENABLED = _env_bool("DUPE_ENABLED", ENABLE_DUPE_DETECTION)  # type: bool
+DUPE_THRESHOLD = _env_float("DUPE_THRESHOLD", 0.87)  # type: float
 DUPE_CACHE_SIZE = _env_int("DUPE_CACHE_SIZE", 400)  # type: int
+DUPE_HISTORY_HOURS = _env_int("DUPE_HISTORY_HOURS", 4)  # type: int
+DUPE_MERGE_INSTEAD_OF_SKIP = _env_bool("DUPE_MERGE_INSTEAD_OF_SKIP", True)  # type: bool
 
 # Severity router for real-time high-priority events.
 ENABLE_SEVERITY_ROUTING = _env_bool("ENABLE_SEVERITY_ROUTING", True)  # type: bool
