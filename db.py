@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import sqlite3
 import re
+import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
@@ -105,6 +105,21 @@ def init_db() -> None:
         )
 
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recent_breaking (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                normalized_text TEXT NOT NULL,
+                embedding_blob BLOB,
+                timestamp INTEGER NOT NULL,
+                hash TEXT NOT NULL,
+                UNIQUE(channel_id, message_id)
+            )
+            """
+        )
+
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_digest_queue_pending "
             "ON digest_queue(processed, timestamp, id)"
         )
@@ -115,6 +130,14 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_dupe_text_cache_last_seen "
             "ON dupe_text_cache(last_seen)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recent_breaking_timestamp "
+            "ON recent_breaking(timestamp)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recent_breaking_hash "
+            "ON recent_breaking(hash)"
         )
 
 
@@ -416,5 +439,96 @@ def load_recent_dupe_texts(limit: int = 400) -> List[str]:
             LIMIT ?
             """,
             (resolved_limit,),
-        ).fetchall()
+    ).fetchall()
     return [str(row["text_norm"]) for row in rows if row["text_norm"]]
+
+
+def save_recent_breaking(
+    *,
+    channel_id: str,
+    message_id: int,
+    normalized_text: str,
+    embedding_blob: bytes | None,
+    timestamp: int | None = None,
+    text_hash: str,
+    history_hours: int = 4,
+) -> int:
+    """
+    Persist one dedupe candidate and prune records older than history window.
+    """
+    cleaned = re.sub(r"\s+", " ", (normalized_text or "").strip())
+    if not cleaned:
+        return 0
+
+    ts = int(timestamp if timestamp is not None else time.time())
+    hours = max(1, min(int(history_hours), 24))
+    cutoff = ts - (hours * 3600)
+
+    with _transaction() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO recent_breaking (
+                channel_id,
+                message_id,
+                normalized_text,
+                embedding_blob,
+                timestamp,
+                hash
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(channel_id),
+                int(message_id),
+                cleaned,
+                embedding_blob,
+                ts,
+                str(text_hash),
+            ),
+        )
+        pruned = conn.execute(
+            "DELETE FROM recent_breaking WHERE timestamp < ?",
+            (cutoff,),
+        )
+    return int(pruned.rowcount or 0)
+
+
+def purge_recent_breaking(*, history_hours: int = 4) -> int:
+    now = int(time.time())
+    hours = max(1, min(int(history_hours), 24))
+    cutoff = now - (hours * 3600)
+    with _transaction() as conn:
+        cur = conn.execute(
+            "DELETE FROM recent_breaking WHERE timestamp < ?",
+            (cutoff,),
+        )
+    return int(cur.rowcount or 0)
+
+
+def load_recent_breaking(*, since_ts: int, limit: int = 10000) -> List[Dict[str, object]]:
+    resolved_limit = max(1, min(int(limit), 50000))
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, channel_id, message_id, normalized_text, embedding_blob, timestamp, hash
+            FROM recent_breaking
+            WHERE timestamp >= ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """,
+            (int(since_ts), resolved_limit),
+        ).fetchall()
+
+    out: List[Dict[str, object]] = []
+    for row in rows:
+        out.append(
+            {
+                "id": int(row["id"]),
+                "channel_id": str(row["channel_id"]),
+                "message_id": int(row["message_id"]),
+                "normalized_text": str(row["normalized_text"] or ""),
+                "embedding_blob": bytes(row["embedding_blob"] or b""),
+                "timestamp": int(row["timestamp"]),
+                "hash": str(row["hash"] or ""),
+            }
+        )
+    return out
