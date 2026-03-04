@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
 import re
+import sqlite3
 import time
 import urllib.parse
 from collections import defaultdict, deque
@@ -39,6 +42,7 @@ from ai_filter import (
     generate_answer_from_context,
     get_quota_health,
     summarize_breaking_headline,
+    summarize_vital_rational_view,
     summarize_or_skip,
 )
 from auth import AuthManager, ERROR_LOG_PATH, ensure_runtime_dir
@@ -81,6 +85,11 @@ from utils import (
     split_html_chunks,
     strip_telegram_html,
 )
+
+try:
+    import fcntl
+except Exception:  # pragma: no cover - non-Unix fallback
+    fcntl = None  # type: ignore[assignment]
 
 
 ensure_runtime_dir()
@@ -125,6 +134,7 @@ query_conversation_history: Dict[int, Deque[Dict[str, str]]] = defaultdict(
 breaking_delivery_refs: Dict[str, Dict[str, object]] = {}
 query_allowed_bot_user_id: int | None = None
 query_bot_user_id_checked: bool = False
+instance_lock_handle = None
 
 ALBUM_WAIT_SECONDS = 1.5
 ENV_PATH = Path(__file__).with_name(".env")
@@ -551,6 +561,35 @@ def _breaking_match_threshold() -> int:
     except Exception:
         value = 1
     return max(1, min(value, 10))
+
+
+def _humanized_vital_opinion_enabled() -> bool:
+    return _bool_flag(getattr(config, "HUMANIZED_VITAL_OPINION_ENABLED", True), True)
+
+
+def _humanized_vital_opinion_probability() -> float:
+    raw = getattr(config, "HUMANIZED_VITAL_OPINION_PROBABILITY", 0.35)
+    try:
+        value = float(raw)
+    except Exception:
+        value = 0.35
+    return min(max(value, 0.0), 1.0)
+
+
+def _should_attach_vital_opinion(text: str) -> bool:
+    if not _humanized_vital_opinion_enabled():
+        return False
+    probability = _humanized_vital_opinion_probability()
+    if probability <= 0:
+        return False
+    if probability >= 1:
+        return True
+    normalized = normalize_space(text).lower()
+    if not normalized:
+        return False
+    digest = hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()
+    bucket = int(digest[:8], 16) / 0xFFFFFFFF
+    return bucket < probability
 
 
 def _contains_breaking_keyword(text: str) -> bool:
@@ -1125,13 +1164,16 @@ def _severity_emoji(level: str) -> str:
     return "ℹ️"
 
 
-def _format_breaking_text(source_title: str, headline: str) -> str:
+def _format_breaking_text(source_title: str, headline: str, rational_view: str | None = None) -> str:
     clean_headline = normalize_space(headline)
     safe_headline = sanitize_telegram_html(clean_headline)
     safe_source = sanitize_telegram_html(source_title)
+    rational_part = ""
+    if rational_view:
+        rational_part = f"<br><br><i>{sanitize_telegram_html(rational_view)}</i>"
     if _include_source_tags():
-        return f"<b>🔥 BREAKING • {safe_source}</b><br><br>{safe_headline}"
-    return f"<b>🔥 BREAKING</b><br><br>{safe_headline}"
+        return f"<b>🔥 BREAKING • {safe_source}</b><br><br>{safe_headline}{rational_part}"
+    return f"<b>🔥 BREAKING</b><br><br>{safe_headline}{rational_part}"
 
 
 def _cleanup_breaking_refs(now_ts: int | None = None) -> None:
@@ -1282,6 +1324,61 @@ def _message_ref_id(ref: object) -> int | None:
         return value or None
     except Exception:
         return None
+
+
+def _acquire_instance_lock():
+    """
+    Ensure only one process uses the Telethon session DB at a time.
+    """
+    lock_path = ensure_runtime_dir() / "userbot.lock"
+    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        owner = ""
+        try:
+            handle.seek(0)
+            owner = handle.read().strip()
+        except Exception:
+            owner = ""
+        handle.close()
+        owner_msg = f" (lock owner PID: {owner})" if owner else ""
+        raise RuntimeError(
+            "Another TeleUserBot instance is already running. "
+            f"Stop it before starting a new one{owner_msg}."
+        )
+    except Exception:
+        handle.close()
+        raise
+
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()))
+        handle.flush()
+        os.fsync(handle.fileno())
+    except Exception:
+        # Lock is held; metadata write failure is non-fatal.
+        pass
+
+    return handle
+
+
+def _release_instance_lock(handle) -> None:
+    if handle is None:
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    with contextlib.suppress(Exception):
+        handle.close()
+
+
+def _is_session_db_locked_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "database is locked" in str(exc).lower()
 
 
 async def _send_text_with_ref(text: str, reply_to: int | None = None) -> object:
@@ -1625,7 +1722,10 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
             headline = normalize_space(text)
             if len(headline) > 140:
                 headline = f"{headline[:137].rsplit(' ', 1)[0]}..."
-        payload = _format_breaking_text(source, headline)
+        rational_view: str | None = None
+        if _should_attach_vital_opinion(text):
+            rational_view = await summarize_vital_rational_view(text, _require_auth_manager())
+        payload = _format_breaking_text(source, headline, rational_view)
         if msg.media:
             await _send_single_media(msg, payload)
             sent_ref = None
@@ -1645,6 +1745,7 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
             message_id=msg.id,
             source=source,
             severity=severity,
+            rational_view=bool(rational_view),
             dedupe_hash=text_hash,
         )
         return
@@ -1704,7 +1805,13 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
             headline = normalize_space(combined_caption)
             if len(headline) > 140:
                 headline = f"{headline[:137].rsplit(' ', 1)[0]}..."
-        await _send_album(messages, _format_breaking_text(source, headline))
+        rational_view: str | None = None
+        if _should_attach_vital_opinion(combined_caption):
+            rational_view = await summarize_vital_rational_view(
+                combined_caption,
+                _require_auth_manager(),
+            )
+        await _send_album(messages, _format_breaking_text(source, headline, rational_view))
         mark_seen_many(channel_id, message_ids)
         log_structured(
             LOGGER,
@@ -1714,6 +1821,7 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
             album_size=len(messages),
             source=source,
             severity=severity,
+            rational_view=bool(rational_view),
         )
         return
 
@@ -2008,42 +2116,79 @@ async def _resolve_entity_id(chat_obj) -> int | None:
         return None
 
 
+async def _connect_client_with_lock_guard(
+    tg: TelegramClient,
+    *,
+    retries: int = 3,
+    retry_delay_seconds: float = 1.5,
+) -> None:
+    """
+    Connect Telethon client with friendly handling for locked SQLite session DB.
+    """
+    attempts = max(1, int(retries))
+    for attempt in range(attempts):
+        try:
+            await tg.connect()
+            return
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "database is locked" not in message:
+                raise
+            if attempt + 1 < attempts:
+                await asyncio.sleep(retry_delay_seconds * (attempt + 1))
+                continue
+            raise RuntimeError(
+                "Telethon session database is locked. "
+                "Another bot instance is likely running. "
+                "Stop the other process, then run again."
+            ) from exc
+
+
 async def _interactive_user_login(tg: TelegramClient) -> None:
     """Authenticate this client as a personal user account only."""
-    await tg.connect()
-    if await tg.is_user_authorized():
+    try:
+        await _connect_client_with_lock_guard(tg)
+        if await tg.is_user_authorized():
+            me = await _call_with_floodwait(tg.get_me)
+            if getattr(me, "bot", False):
+                raise RuntimeError(
+                    "Session is authenticated as bot. Remove session and login with phone number."
+                )
+            return
+
+        phone = _prompt_phone_number()
+        sent = await _call_with_floodwait(tg.send_code_request, phone)
+        while True:
+            code = _prompt_non_empty("Telegram login code: ")
+            try:
+                await _call_with_floodwait(
+                    tg.sign_in,
+                    phone=phone,
+                    code=code,
+                    phone_code_hash=sent.phone_code_hash,
+                )
+                break
+            except SessionPasswordNeededError:
+                password = _prompt_non_empty("Telegram 2FA password: ")
+                await _call_with_floodwait(tg.sign_in, password=password)
+                break
+            except PhoneCodeInvalidError:
+                print("Invalid login code. Try again.")
+            except PhoneCodeExpiredError:
+                print("Code expired. Requesting a new code...")
+                sent = await _call_with_floodwait(tg.send_code_request, phone)
+
         me = await _call_with_floodwait(tg.get_me)
         if getattr(me, "bot", False):
+            raise RuntimeError("Bot login detected. Login must be with personal phone number.")
+    except sqlite3.OperationalError as exc:
+        if _is_session_db_locked_error(exc):
             raise RuntimeError(
-                "Session is authenticated as bot. Remove session and login with phone number."
-            )
-        return
-
-    phone = _prompt_phone_number()
-    sent = await _call_with_floodwait(tg.send_code_request, phone)
-    while True:
-        code = _prompt_non_empty("Telegram login code: ")
-        try:
-            await _call_with_floodwait(
-                tg.sign_in,
-                phone=phone,
-                code=code,
-                phone_code_hash=sent.phone_code_hash,
-            )
-            break
-        except SessionPasswordNeededError:
-            password = _prompt_non_empty("Telegram 2FA password: ")
-            await _call_with_floodwait(tg.sign_in, password=password)
-            break
-        except PhoneCodeInvalidError:
-            print("Invalid login code. Try again.")
-        except PhoneCodeExpiredError:
-            print("Code expired. Requesting a new code...")
-            sent = await _call_with_floodwait(tg.send_code_request, phone)
-
-    me = await _call_with_floodwait(tg.get_me)
-    if getattr(me, "bot", False):
-        raise RuntimeError("Bot login detected. Login must be with personal phone number.")
+                "Telethon session database is locked. "
+                "Another bot instance is likely running. "
+                "Stop the other process, then run again."
+            ) from exc
+        raise
 
 
 async def _ensure_user_account_session() -> None:
@@ -2051,29 +2196,38 @@ async def _ensure_user_account_session() -> None:
     global client
 
     tg = _require_client()
-    await tg.connect()
+    try:
+        await _connect_client_with_lock_guard(tg)
 
-    if not await tg.is_user_authorized():
-        await _interactive_user_login(tg)
-        return
+        if not await tg.is_user_authorized():
+            await _interactive_user_login(tg)
+            return
 
-    me = await _call_with_floodwait(tg.get_me)
-    if not getattr(me, "bot", False):
-        return
+        me = await _call_with_floodwait(tg.get_me)
+        if not getattr(me, "bot", False):
+            return
 
-    LOGGER.warning(
-        "Detected bot session in userbot.session. Resetting session for user login."
-    )
-    await _call_with_floodwait(tg.log_out)
-    await tg.disconnect()
-
-    client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
-    await _interactive_user_login(client)
-    me = await _call_with_floodwait(client.get_me)
-    if getattr(me, "bot", False):
-        raise RuntimeError(
-            "Still logged in as bot. Delete userbot.session and sign in with phone number."
+        LOGGER.warning(
+            "Detected bot session in userbot.session. Resetting session for user login."
         )
+        await _call_with_floodwait(tg.log_out)
+        await tg.disconnect()
+
+        client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
+        await _interactive_user_login(client)
+        me = await _call_with_floodwait(client.get_me)
+        if getattr(me, "bot", False):
+            raise RuntimeError(
+                "Still logged in as bot. Delete userbot.session and sign in with phone number."
+            )
+    except sqlite3.OperationalError as exc:
+        if _is_session_db_locked_error(exc):
+            raise RuntimeError(
+                "Telethon session database is locked. "
+                "Another bot instance is likely running. "
+                "Stop the other process, then run again."
+            ) from exc
+        raise
 
 
 async def _join_and_resolve_manual_source(source: str) -> int | None:
@@ -2780,7 +2934,12 @@ async def _shutdown_client() -> None:
     try:
         if tg.is_connected():
             await tg.disconnect()
-    except Exception:
+    except Exception as exc:
+        if _is_session_db_locked_error(exc):
+            LOGGER.warning(
+                "Skipped session flush on shutdown because session DB is locked by another process."
+            )
+            return
         LOGGER.exception("Failed during client shutdown.")
 
 
@@ -2799,6 +2958,8 @@ def _startup_health_check() -> None:
         html_formatting=_is_html_formatting_enabled(),
         premium_emoji=_is_premium_emoji_enabled(),
         premium_emoji_count=len(premium_emoji_map),
+        humanized_vital_opinion=_humanized_vital_opinion_enabled(),
+        humanized_vital_probability=_humanized_vital_opinion_probability(),
         query_allowed_peer_count=len(_query_allowed_peer_ids()),
         pending=pending,
         inflight=inflight,
@@ -2807,7 +2968,7 @@ def _startup_health_check() -> None:
         quota_health=get_quota_health(),
     )
     LOGGER.info(
-        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s html=%s premium_emoji=%s map=%s",
+        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f",
         mode,
         pending,
         inflight,
@@ -2818,78 +2979,96 @@ def _startup_health_check() -> None:
         _is_html_formatting_enabled(),
         _is_premium_emoji_enabled(),
         len(premium_emoji_map),
+        _humanized_vital_opinion_enabled(),
+        _humanized_vital_opinion_probability(),
     )
 
 
 async def main() -> None:
-    global client, auth_manager, digest_scheduler_task
+    global client, auth_manager, digest_scheduler_task, instance_lock_handle
 
     _prompt_for_missing_config()
     _validate_config()
-    _load_premium_emoji_map()
-    init_db()
-    await _init_dupe_detector()
-    _startup_health_check()
-
-    auth_manager = AuthManager(logger=LOGGER)
-    await auth_manager.get_access_token()
-
-    client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
-    await _ensure_user_account_session()
-    await _ensure_destination_peer()
-
-    resolved_sources = await setup_sources()
-    while not resolved_sources:
-        print(
-            "No channels resolved from folder. Add manual sources "
-            "(username/public/private invite links)."
-        )
-        new_sources = _prompt_sources()
-        current = getattr(config, "EXTRA_SOURCES", [])
-        if not isinstance(current, list):
-            current = []
-        current.extend(new_sources)
-        # Preserve order while deduplicating newly added manual sources.
-        deduped: List[str] = []
-        seen = set()
-        for item in current:
-            normalized = str(item).strip()
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            deduped.append(normalized)
-        config.EXTRA_SOURCES = deduped
-        _persist_config_updates({"EXTRA_SOURCES": config.EXTRA_SOURCES})
-        resolved_sources = await setup_sources()
-
-    client.add_event_handler(_on_new_message, events.NewMessage(chats=resolved_sources))
-    status_pattern = rf"^{re.escape(_digest_status_command())}(?:\\s+.*)?$"
-    client.add_event_handler(
-        _on_digest_status_command,
-        events.NewMessage(outgoing=True, pattern=status_pattern),
-    )
-    if _is_query_mode_enabled():
-        client.add_event_handler(
-            _on_query_message,
-            events.NewMessage(outgoing=True),
-        )
-
-    me = await client.get_me()
-    LOGGER.info("Userbot started as @%s", getattr(me, "username", "unknown"))
-    if _is_missing_folder_invite_link():
-        LOGGER.info("Listening to %s manually configured channels.", len(resolved_sources))
-    if _is_digest_mode_enabled():
-        digest_scheduler_task = asyncio.create_task(
-            run_digest_scheduler(),
-            name="digest-scheduler",
-        )
 
     try:
-        await client.run_until_disconnected()
-    except (asyncio.CancelledError, KeyboardInterrupt):
-        LOGGER.info("Shutdown requested. Stopping userbot...")
+        instance_lock_handle = _acquire_instance_lock()
+    except RuntimeError as exc:
+        LOGGER.error("%s", exc)
+        print(exc)
+        return
+
+    try:
+        try:
+            _load_premium_emoji_map()
+            init_db()
+            await _init_dupe_detector()
+            _startup_health_check()
+
+            auth_manager = AuthManager(logger=LOGGER)
+            await auth_manager.get_access_token()
+
+            client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
+            await _ensure_user_account_session()
+            await _ensure_destination_peer()
+
+            resolved_sources = await setup_sources()
+            while not resolved_sources:
+                print(
+                    "No channels resolved from folder. Add manual sources "
+                    "(username/public/private invite links)."
+                )
+                new_sources = _prompt_sources()
+                current = getattr(config, "EXTRA_SOURCES", [])
+                if not isinstance(current, list):
+                    current = []
+                current.extend(new_sources)
+                # Preserve order while deduplicating newly added manual sources.
+                deduped: List[str] = []
+                seen = set()
+                for item in current:
+                    normalized = str(item).strip()
+                    if not normalized or normalized in seen:
+                        continue
+                    seen.add(normalized)
+                    deduped.append(normalized)
+                config.EXTRA_SOURCES = deduped
+                _persist_config_updates({"EXTRA_SOURCES": config.EXTRA_SOURCES})
+                resolved_sources = await setup_sources()
+
+            client.add_event_handler(_on_new_message, events.NewMessage(chats=resolved_sources))
+            status_pattern = rf"^{re.escape(_digest_status_command())}(?:\\s+.*)?$"
+            client.add_event_handler(
+                _on_digest_status_command,
+                events.NewMessage(outgoing=True, pattern=status_pattern),
+            )
+            if _is_query_mode_enabled():
+                client.add_event_handler(
+                    _on_query_message,
+                    events.NewMessage(outgoing=True),
+                )
+
+            me = await client.get_me()
+            LOGGER.info("Userbot started as @%s", getattr(me, "username", "unknown"))
+            if _is_missing_folder_invite_link():
+                LOGGER.info("Listening to %s manually configured channels.", len(resolved_sources))
+            if _is_digest_mode_enabled():
+                digest_scheduler_task = asyncio.create_task(
+                    run_digest_scheduler(),
+                    name="digest-scheduler",
+                )
+
+            try:
+                await client.run_until_disconnected()
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                LOGGER.info("Shutdown requested. Stopping userbot...")
+        except RuntimeError as exc:
+            LOGGER.error("%s", exc)
+            print(exc)
+        finally:
+            await _shutdown_client()
     finally:
-        await _shutdown_client()
+        _release_instance_lock(instance_lock_handle)
+        instance_lock_handle = None
 
 
 if __name__ == "__main__":

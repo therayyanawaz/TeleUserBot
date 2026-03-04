@@ -191,6 +191,10 @@ BREAKING_NEWS_KEYWORDS = _env_list(
     ["breaking", "urgent", "just now"],
 )  # type: list[str]
 BREAKING_MATCH_THRESHOLD = _env_int("BREAKING_MATCH_THRESHOLD", 1)  # type: int
+# Optional humanized rational viewpoint for vital/high-severity alerts.
+HUMANIZED_VITAL_OPINION_ENABLED = _env_bool("HUMANIZED_VITAL_OPINION_ENABLED", True)  # type: bool
+HUMANIZED_VITAL_OPINION_PROBABILITY = _env_float("HUMANIZED_VITAL_OPINION_PROBABILITY", 0.35)  # type: float
+HUMANIZED_VITAL_OPINION_MAX_WORDS = _env_int("HUMANIZED_VITAL_OPINION_MAX_WORDS", 20)  # type: int
 
 # -----------------------------------------------------------------------------
 # Reliability / Delivery / Retry

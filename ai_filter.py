@@ -24,7 +24,7 @@ from prompts import (
     quiet_period_message,
 )
 from utils import estimate_tokens_rough as _estimate_tokens_rough
-from utils import normalize_space
+from utils import normalize_space, sanitize_telegram_html
 
 
 CACHE_MAX_ITEMS = 2048
@@ -38,6 +38,7 @@ LOGGER = logging.getLogger("tg_news_userbot.ai_filter")
 _SUMMARY_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
 _SEVERITY_CACHE: "OrderedDict[str, str]" = OrderedDict()
 _HEADLINE_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
+_VITAL_VIEW_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
 _QUOTA_WARNING_LOGGED = False
 
 # Quota health tracking: capture recent 429/rate-limit events.
@@ -145,6 +146,20 @@ def _headline_cache_set(key: str, value: Optional[str]) -> None:
         _HEADLINE_CACHE.popitem(last=False)
 
 
+def _vital_view_cache_get(key: str) -> Optional[Optional[str]]:
+    if key not in _VITAL_VIEW_CACHE:
+        return None
+    _VITAL_VIEW_CACHE.move_to_end(key)
+    return _VITAL_VIEW_CACHE[key]
+
+
+def _vital_view_cache_set(key: str, value: Optional[str]) -> None:
+    _VITAL_VIEW_CACHE[key] = value
+    _VITAL_VIEW_CACHE.move_to_end(key)
+    while len(_VITAL_VIEW_CACHE) > CACHE_MAX_ITEMS:
+        _VITAL_VIEW_CACHE.popitem(last=False)
+
+
 def _likely_noise(text: str) -> bool:
     lower = text.lower()
     spam_terms = (
@@ -190,7 +205,7 @@ def _fallback_summary(text: str) -> Optional[str]:
             compact = f"{compact[:277].rsplit(' ', 1)[0]}..."
         candidates = [compact]
 
-    return "\n".join(candidates[:3])
+    return sanitize_telegram_html("<br>".join(candidates[:3]))
 
 
 def _severity_from_text_heuristic(text: str) -> Literal["high", "medium", "low"]:
@@ -312,7 +327,9 @@ def _summary_system_prompt() -> str:
         "You are a strict news filter.\n"
         f"Always write output in {language}.\n"
         f"If the input is in another language, translate it into {language} while summarizing.\n"
-        "If this message is real news or useful info, return a 2-3 line summary.\n"
+        "Output must be Telegram HTML only.\n"
+        "Allowed tags: <b>, <i>, <u>, <s>, <tg-spoiler>, <code>, <pre>, <blockquote>, <a href>, <br>.\n"
+        "If this message is real news or useful info, return a 2-3 line HTML summary.\n"
         "If it is spam, ads, promotional, or noise, reply only: SKIP"
     )
 
@@ -336,6 +353,22 @@ def _breaking_headline_prompt() -> str:
         f"Output language must be {language}. Translate if needed.\n"
         "Return exactly one short sentence (8-18 words) with facts only.\n"
         "No prefix, no markdown, no source tag, no explanation."
+    )
+
+
+def _vital_rational_view_prompt() -> str:
+    language = _resolve_output_language()
+    try:
+        max_words = int(getattr(config, "HUMANIZED_VITAL_OPINION_MAX_WORDS", 20))
+    except Exception:
+        max_words = 20
+    max_words = max(10, min(max_words, 30))
+    return (
+        "You write concise, rational public-interest context for urgent news.\n"
+        f"Output language must be {language}. Translate if needed.\n"
+        f"Return exactly one sentence (max {max_words} words), neutral and evidence-aware.\n"
+        "Start with: Why it matters: \n"
+        "Do not speculate. Do not take sides. No hashtags. No markdown."
     )
 
 
@@ -695,12 +728,12 @@ def _resolve_digest_max_posts() -> int:
 
 
 def _resolve_digest_max_lines() -> int:
-    raw = getattr(config, "DIGEST_MAX_LINES", 25)
+    raw = getattr(config, "DIGEST_MAX_LINES", 12)
     try:
         value = int(raw)
     except Exception:
-        value = 25
-    return max(8, min(value, 60))
+        value = 12
+    return max(3, min(value, 12))
 
 
 def _resolve_digest_token_budget() -> int:
@@ -794,7 +827,7 @@ def _severity_emoji(value: Any) -> str:
     return "ℹ️"
 
 
-def _json_digest_to_markdown(payload: Dict[str, Any], *, interval_minutes: int, max_lines: int) -> str:
+def _json_digest_to_html(payload: Dict[str, Any], *, interval_minutes: int, max_lines: int) -> str:
     quiet = bool(payload.get("quiet"))
     if quiet:
         return quiet_period_message(interval_minutes)
@@ -844,12 +877,12 @@ def _json_digest_to_markdown(payload: Dict[str, Any], *, interval_minutes: int, 
                 sources = item.get("sources")
                 if isinstance(sources, list) and sources:
                     source_tag_value = normalize_space(str(sources[0]))
-            source_tag = f" [{source_tag_value}]" if source_tag_value else ""
+            source_tag = f" <i>[{source_tag_value}]</i>" if source_tag_value else ""
 
         read_more = normalize_space(str(item.get("read_more") or ""))
         read_more_part = ""
         if read_more.startswith("http") and bool(getattr(config, "DIGEST_INCLUDE_READ_MORE_LINKS", True)):
-            read_more_part = f" [Read more]({read_more})"
+            read_more_part = f' <a href="{read_more}">Read more</a>'
 
         line = f"{emoji} {headline}{source_tag}{read_more_part}".strip()
         lines.append(line)
@@ -860,10 +893,10 @@ def _json_digest_to_markdown(payload: Dict[str, Any], *, interval_minutes: int, 
     if not lines:
         return quiet_period_message(interval_minutes)
 
-    return "\n".join(lines[:max_lines])
+    return sanitize_telegram_html("<br>".join(lines[:max_lines]))
 
 
-def _markdown_digest_cleanup(text: str, *, interval_minutes: int, max_lines: int) -> str:
+def _html_digest_cleanup(text: str, *, interval_minutes: int, max_lines: int) -> str:
     cleaned = (text or "").strip()
     if not cleaned:
         return quiet_period_message(interval_minutes)
@@ -875,16 +908,15 @@ def _markdown_digest_cleanup(text: str, *, interval_minutes: int, max_lines: int
     if normalize_space(cleaned) == quiet:
         return quiet
 
-    lines_raw = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
+    text_lines = re.sub(r"<br\s*/?>", "\n", cleaned, flags=re.IGNORECASE)
+    lines_raw = [line.rstrip() for line in text_lines.splitlines() if line.strip()]
     lines: List[str] = []
     include_sources = _include_source_tags()
     for raw in lines_raw:
-        line = raw.strip()
+        line = re.sub(r"</?[^>]+>", "", raw).strip()
         line = re.sub(r"^[-*•]\s*", "", line)
         line = line.strip()
         if not line:
-            continue
-        if line.startswith("**") and line.endswith("**"):
             continue
         if not line.startswith(("🔥", "⚠️", "ℹ️")):
             # Force compact headline line format when model drifts.
@@ -894,13 +926,13 @@ def _markdown_digest_cleanup(text: str, *, interval_minutes: int, max_lines: int
         if len(line) > 220:
             line = f"{line[:217].rsplit(' ', 1)[0]}..."
         if not include_sources:
-            # Remove bracketed source tags while preserving markdown links.
+            # Remove bracketed source tags.
             line = re.sub(r"\s\[[^\]]+\](?!\()", "", line).strip()
         lines.append(line)
     if not lines:
         return quiet_period_message(interval_minutes)
 
-    return "\n".join(lines[:max_lines])
+    return sanitize_telegram_html("<br>".join(lines[:max_lines]))
 
 
 def _post_source(post: Dict[str, object]) -> str:
@@ -1015,10 +1047,10 @@ def _rule_based_fallback_digest(
         emoji = "🔥" if severity == "high" else ("⚠️" if severity == "medium" else "ℹ️")
         line = f"{emoji} {title}"
         if include_sources:
-            line += f" [{source}]"
+            line += f" <i>[{source}]</i>"
         link = _post_link(post)
         if include_links and link:
-            line += f" [Read more]({link})"
+            line += f' <a href="{link}">Read more</a>'
 
         top.append(line)
         if len(top) >= max_items:
@@ -1026,7 +1058,7 @@ def _rule_based_fallback_digest(
 
     if not top:
         return ""
-    return "\n".join(top)
+    return sanitize_telegram_html("<br>".join(top))
 
 
 def _tiny_local_digest(posts: Sequence[Dict[str, object]], *, max_items: int = 6) -> str:
@@ -1046,11 +1078,11 @@ def _tiny_local_digest(posts: Sequence[Dict[str, object]], *, max_items: int = 6
         emoji = "🔥" if severity == "high" else ("⚠️" if severity == "medium" else "ℹ️")
         line = f"{emoji} {short}"
         if include_sources:
-            line += f" [{source}]"
+            line += f" <i>[{source}]</i>"
         lines.append(line)
         if len(lines) >= max_items:
             break
-    return "\n".join(lines) if lines else ""
+    return sanitize_telegram_html("<br>".join(lines)) if lines else ""
 
 
 def _minimal_digest(posts: Sequence[Dict[str, object]], *, max_items: int = 4) -> str:
@@ -1066,7 +1098,7 @@ def _minimal_digest(posts: Sequence[Dict[str, object]], *, max_items: int = 4) -
             break
     if not snippets:
         return ""
-    return "\n".join(snippets)
+    return sanitize_telegram_html("<br>".join(snippets))
 
 
 def local_fallback_digest(posts: Sequence[Dict[str, object]], *, interval_minutes: int) -> str:
@@ -1170,14 +1202,14 @@ def _fallback_query_answer(
         source = normalize_space(str(item.get("source") or "Source"))
         link = normalize_space(str(item.get("link") or ""))
         prefix = "🔥" if _severity_from_text_heuristic(text) == "high" else "⚠️"
-        line = f"- {prefix} {text} [{source}]"
+        line = f"• {prefix} {text} <i>[{source}]</i>"
         if link.startswith("http"):
-            line += f" [link]({link})"
+            line += f' <a href="{link}">source</a>'
         lines.append(line)
 
     if not lines:
         return QUERY_NO_MATCH_TEXT
-    return "\n".join(lines)
+    return sanitize_telegram_html("<b>Latest updates</b><br>" + "<br>".join(lines))
 
 
 async def summarize_or_skip(text: str, auth_manager: AuthManager) -> Optional[str]:
@@ -1244,8 +1276,9 @@ async def summarize_or_skip(text: str, auth_manager: AuthManager) -> Optional[st
         _cache_set(key, None)
         return None
 
-    _cache_set(key, content)
-    return content
+    safe = sanitize_telegram_html(content)
+    _cache_set(key, safe)
+    return safe
 
 
 def _normalize_severity_label(text: str) -> Literal["high", "medium", "low"] | None:
@@ -1333,6 +1366,40 @@ def _cleanup_headline(raw: str) -> str:
     return text
 
 
+def _cleanup_vital_view(raw: str) -> str:
+    text = normalize_space(raw)
+    if not text:
+        return ""
+    text = re.sub(r"^[*`#>\-\s]+", "", text).strip()
+    text = re.sub(r"</?[^>]+>", "", text).strip()
+    if "\n" in text:
+        text = text.splitlines()[0].strip()
+    if not text.lower().startswith("why it matters:"):
+        text = f"Why it matters: {text}"
+    try:
+        max_words = int(getattr(config, "HUMANIZED_VITAL_OPINION_MAX_WORDS", 20))
+    except Exception:
+        max_words = 20
+    max_words = max(10, min(max_words, 30))
+    words = text.split()
+    if len(words) > max_words:
+        text = " ".join(words[: max_words - 1]).rstrip(".,;:") + "..."
+    return text
+
+
+def _fallback_vital_view(text: str) -> str:
+    lowered = text.lower()
+    if any(k in lowered for k in ("killed", "dead", "casualt", "injur")):
+        return "Why it matters: Casualty reports can rapidly escalate security and humanitarian risk."
+    if any(k in lowered for k in ("nuclear", "reactor", "power plant")):
+        return "Why it matters: Any incident near nuclear infrastructure raises regional safety concerns."
+    if any(k in lowered for k in ("missile", "drone", "airstrike", "strike", "explosion")):
+        return "Why it matters: Military exchanges increase escalation risk and can trigger rapid retaliation."
+    if any(k in lowered for k in ("evacu", "airspace", "closed", "emergency")):
+        return "Why it matters: Official restrictions often signal broader disruption in the coming hours."
+    return "Why it matters: This may affect regional stability; verify updates across multiple reliable sources."
+
+
 async def summarize_breaking_headline(
     text: str,
     auth_manager: AuthManager,
@@ -1388,6 +1455,58 @@ async def summarize_breaking_headline(
     return fallback
 
 
+async def summarize_vital_rational_view(
+    text: str,
+    auth_manager: AuthManager,
+) -> Optional[str]:
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+
+    key = _cache_key(f"vital_view::{cleaned}")
+    cached = _vital_view_cache_get(key)
+    if cached is not None or key in _VITAL_VIEW_CACHE:
+        return cached
+
+    compact = cleaned if len(cleaned) <= 2200 else f"{cleaned[:2197].rsplit(' ', 1)[0]}..."
+    fallback = _cleanup_vital_view(_fallback_vital_view(cleaned))
+
+    try:
+        auth_context = await auth_manager.get_auth_context()
+        raw = await _call_codex(
+            compact,
+            auth_context,
+            instructions=_vital_rational_view_prompt(),
+            verbosity="low",
+        )
+    except _CodexAuthError:
+        try:
+            auth_context = await auth_manager.refresh_auth_context()
+            raw = await _call_codex(
+                compact,
+                auth_context,
+                instructions=_vital_rational_view_prompt(),
+                verbosity="low",
+            )
+        except Exception:
+            _vital_view_cache_set(key, fallback)
+            return fallback
+    except (_CodexRateLimitError, httpx.HTTPError, _CodexApiError, ValueError):
+        _vital_view_cache_set(key, fallback)
+        return fallback
+    except Exception:
+        _vital_view_cache_set(key, fallback)
+        return fallback
+
+    view = _cleanup_vital_view(raw)
+    if view:
+        _vital_view_cache_set(key, view)
+        return view
+
+    _vital_view_cache_set(key, fallback)
+    return fallback
+
+
 async def create_digest_summary(
     posts: List[Dict[str, object]],
     auth_manager: AuthManager | None = None,
@@ -1397,7 +1516,7 @@ async def create_digest_summary(
     """
     Build one editorial digest from queued posts.
 
-    Returns markdown digest body or the exact quiet-period sentence.
+    Returns Telegram-HTML digest body or the exact quiet-period sentence.
     """
     interval_minutes = int(max(1, int(getattr(config, "DIGEST_INTERVAL_MINUTES", 30))))
     quiet_text = quiet_period_message(interval_minutes)
@@ -1490,7 +1609,7 @@ async def create_digest_summary(
     if prefer_json:
         parsed = _try_parse_digest_json(content)
         if parsed is not None:
-            return _json_digest_to_markdown(
+            return _json_digest_to_html(
                 parsed,
                 interval_minutes=interval_minutes,
                 max_lines=max_lines,
@@ -1514,7 +1633,7 @@ async def create_digest_summary(
         except Exception:
             return local_fallback_digest(posts, interval_minutes=interval_minutes)
 
-    return _markdown_digest_cleanup(
+    return _html_digest_cleanup(
         content,
         interval_minutes=interval_minutes,
         max_lines=max_lines,
@@ -1611,7 +1730,11 @@ async def generate_answer_from_context(
     if not cleaned:
         return _fallback_query_answer(context_messages, detailed=detailed)
 
-    if QUERY_NO_MATCH_TEXT.lower() in cleaned.lower():
+    plain_cleaned = re.sub(r"</?[^>]+>", "", cleaned).lower()
+    if QUERY_NO_MATCH_TEXT.lower() in cleaned.lower() or "no relevant information found" in plain_cleaned:
         return QUERY_NO_MATCH_TEXT
 
-    return content.strip()
+    safe = sanitize_telegram_html(content.strip())
+    if not safe:
+        return QUERY_NO_MATCH_TEXT
+    return safe
