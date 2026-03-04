@@ -50,22 +50,25 @@ from db import (
     get_last_digest_timestamp,
     init_db,
     is_seen,
-    load_recent_dupe_texts,
     mark_seen,
     mark_seen_many,
     restore_digest_batch,
-    save_dupe_text,
     save_to_digest_queue,
     set_last_digest_timestamp,
 )
 from prompts import quiet_period_message
 from utils import (
     LiveTelegramStreamer,
-    NearDuplicateDetector,
+    DuplicateRuntime,
+    GlobalDuplicateResult,
+    HybridDuplicateEngine,
+    build_dupe_fingerprint,
     build_telegram_message_link,
+    configure_duplicate_runtime,
     estimate_tokens_rough,
     format_eta,
     format_ts,
+    is_duplicate_and_handle,
     log_structured,
     normalize_space,
     parse_daily_times,
@@ -108,12 +111,13 @@ source_title_cache: Dict[str, str] = {}
 digest_next_run_ts: float | None = None
 digest_retry_backoff_seconds: int = 0
 digest_loop_lock = asyncio.Lock()
-dupe_detector: NearDuplicateDetector | None = None
+dupe_detector: HybridDuplicateEngine | None = None
 monitored_source_chat_ids: List[int] = []
 query_last_request_ts: Dict[int, float] = {}
 query_conversation_history: Dict[int, Deque[Dict[str, str]]] = defaultdict(
     lambda: deque(maxlen=20)
 )
+breaking_delivery_refs: Dict[str, Dict[str, object]] = {}
 
 ALBUM_WAIT_SECONDS = 1.5
 ENV_PATH = Path(__file__).with_name(".env")
@@ -339,15 +343,16 @@ def _bool_flag(value: object, default: bool) -> bool:
 
 
 def _is_dupe_detection_enabled() -> bool:
-    return _bool_flag(getattr(config, "ENABLE_DUPE_DETECTION", True), True)
+    raw = getattr(config, "DUPE_ENABLED", getattr(config, "ENABLE_DUPE_DETECTION", True))
+    return _bool_flag(raw, True)
 
 
 def _dupe_threshold() -> float:
-    raw = getattr(config, "DUPE_THRESHOLD", 0.83)
+    raw = getattr(config, "DUPE_THRESHOLD", 0.87)
     try:
         value = float(raw)
     except Exception:
-        value = 0.83
+        value = 0.87
     return min(max(value, 0.5), 0.99)
 
 
@@ -358,6 +363,20 @@ def _dupe_cache_size() -> int:
     except Exception:
         value = 400
     return max(50, min(value, 5000))
+
+
+def _dupe_history_hours() -> int:
+    raw = getattr(config, "DUPE_HISTORY_HOURS", 4)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 4
+    return max(1, min(value, 24))
+
+
+def _dupe_merge_instead_of_skip() -> bool:
+    raw = getattr(config, "DUPE_MERGE_INSTEAD_OF_SKIP", True)
+    return _bool_flag(raw, True)
 
 
 def _is_severity_routing_enabled() -> bool:
@@ -767,12 +786,6 @@ def _require_bot_destination_chat_id() -> str:
     return bot_destination_chat_id
 
 
-def _require_dupe_detector() -> NearDuplicateDetector:
-    if dupe_detector is None:
-        raise RuntimeError("Near-duplicate detector not initialized.")
-    return dupe_detector
-
-
 def _destination_uses_bot_api() -> bool:
     return bool(bot_destination_token and bot_destination_chat_id)
 
@@ -1038,70 +1051,134 @@ def _format_breaking_text(source_title: str, headline: str) -> str:
     return f"🔥 **BREAKING**\n\n{clean_headline}"
 
 
+def _cleanup_breaking_refs(now_ts: int | None = None) -> None:
+    now = int(now_ts if now_ts is not None else time.time())
+    cutoff = now - 1800
+    stale = [key for key, value in breaking_delivery_refs.items() if int(value.get("ts", 0)) < cutoff]
+    for key in stale:
+        breaking_delivery_refs.pop(key, None)
+
+
+def _register_breaking_delivery(
+    *,
+    text_hash: str,
+    ref: object | None,
+    base_text: str,
+    primary_source: str,
+) -> None:
+    if not text_hash or ref is None:
+        return
+    now = int(time.time())
+    _cleanup_breaking_refs(now)
+    breaking_delivery_refs[text_hash] = {
+        "ref": ref,
+        "base_text": base_text.strip(),
+        "primary_source": primary_source.strip(),
+        "sources": {primary_source.strip()},
+        "ts": now,
+    }
+
+
+async def _merge_duplicate_breaking(
+    result: GlobalDuplicateResult,
+    source_name: str,
+) -> bool:
+    if not _dupe_merge_instead_of_skip():
+        return False
+    if not result.matched_hash:
+        return False
+
+    now = int(time.time())
+    _cleanup_breaking_refs(now)
+    entry = breaking_delivery_refs.get(result.matched_hash)
+    if not entry:
+        return False
+
+    base_text = str(entry.get("base_text") or "").strip()
+    if not base_text:
+        return False
+
+    sources = entry.get("sources")
+    if not isinstance(sources, set):
+        sources = {str(entry.get("primary_source") or "").strip()}
+    clean_source = source_name.strip()
+    if not clean_source:
+        clean_source = "another channel"
+    if clean_source in sources:
+        return True
+    sources.add(clean_source)
+
+    primary_source = str(entry.get("primary_source") or "").strip()
+    extra_sources = [src for src in sorted(sources) if src and src != primary_source]
+    if not extra_sources:
+        entry["sources"] = sources
+        entry["ts"] = now
+        return True
+
+    suffix = ", ".join(extra_sources[:6])
+    merged_text = f"{base_text}\n\n_(also reported by {suffix})_"
+    if len(merged_text) > 3900:
+        merged_text = merged_text[:3897].rstrip() + "..."
+
+    try:
+        updated_ref = await _edit_sent_text(entry.get("ref"), merged_text)
+    except Exception:
+        LOGGER.debug("Failed to merge duplicate breaking edit.", exc_info=True)
+        return False
+
+    entry["ref"] = updated_ref
+    entry["sources"] = sources
+    entry["ts"] = now
+    breaking_delivery_refs[result.matched_hash] = entry
+    return True
+
+
 async def _init_dupe_detector() -> None:
     global dupe_detector
 
     if not _is_dupe_detection_enabled():
         dupe_detector = None
+        configure_duplicate_runtime(None)
         return
 
     try:
-        detector = NearDuplicateDetector(
+        detector = HybridDuplicateEngine(
             threshold=_dupe_threshold(),
-            max_items=_dupe_cache_size(),
+            history_hours=_dupe_history_hours(),
+            max_items=max(_dupe_cache_size() * 10, 2000),
             logger=LOGGER,
         )
-        cached = load_recent_dupe_texts(limit=_dupe_cache_size())
-        if cached:
-            await asyncio.to_thread(detector.warm_start, cached)
+        await asyncio.to_thread(
+            detector.warm_start_from_db,
+            warm_hours=min(2, _dupe_history_hours()),
+        )
+        await asyncio.to_thread(detector.purge_old_records)
 
         dupe_detector = detector
+        configure_duplicate_runtime(
+            DuplicateRuntime(
+                engine=detector,
+                logger=LOGGER,
+                merge_instead_of_skip=_dupe_merge_instead_of_skip(),
+                source_resolver=_source_title,
+                merge_callback=_merge_duplicate_breaking,
+            )
+        )
         log_structured(
             LOGGER,
             "dupe_detector_ready",
             enabled=True,
             threshold=_dupe_threshold(),
-            cache_size=_dupe_cache_size(),
-            warmed=len(cached),
+            cache_size=detector.cache_size,
+            history_hours=_dupe_history_hours(),
+            warm_hours=min(2, _dupe_history_hours()),
+            merge_instead_of_skip=_dupe_merge_instead_of_skip(),
             backend=detector.backend_name,
         )
     except Exception:
         dupe_detector = None
+        configure_duplicate_runtime(None)
         LOGGER.exception("Failed to initialize near-duplicate detector. Disabling dedupe.")
-
-
-async def _is_echo_duplicate(
-    text: str,
-    *,
-    channel_id: str,
-    message_id: int,
-    source: str,
-) -> tuple[bool, float]:
-    cleaned = normalize_space(text)
-    if not _is_dupe_detection_enabled() or len(cleaned) < 24:
-        return False, 0.0
-
-    if dupe_detector is None:
-        return False, 0.0
-    detector = _require_dupe_detector()
-    is_dupe, score = await asyncio.to_thread(detector.check_and_add, cleaned)
-    if is_dupe:
-        log_structured(
-            LOGGER,
-            "echo_suppressed",
-            channel_id=channel_id,
-            message_id=message_id,
-            source=source,
-            similarity=round(float(score), 4),
-            threshold=_dupe_threshold(),
-        )
-        return True, float(score)
-
-    try:
-        save_dupe_text(cleaned, max_rows=_dupe_cache_size())
-    except Exception:
-        LOGGER.debug("Failed to persist dedupe text cache entry.", exc_info=True)
-    return False, float(score)
 
 
 async def _send_text(text: str) -> None:
@@ -1188,7 +1265,7 @@ async def _edit_sent_text(ref: object, text: str) -> object:
         return await ref.edit(text, parse_mode=None, link_preview=False)
 
 
-async def _send_single_media(msg: Message, caption: str | None) -> None:
+async def _send_single_media(msg: Message, caption: str | None) -> object:
     if _destination_uses_bot_api():
         raw = await msg.download_media(file=bytes)
         if raw is None:
@@ -1218,15 +1295,14 @@ async def _send_single_media(msg: Message, caption: str | None) -> None:
             )
         }
         try:
-            await _bot_api_request(method_map[media_type], data=data, files=files)
+            return await _bot_api_request(method_map[media_type], data=data, files=files)
         except Exception:
             data.pop("parse_mode", None)
-            await _bot_api_request(method_map[media_type], data=data, files=files)
-        return
+            return await _bot_api_request(method_map[media_type], data=data, files=files)
 
     tg = _require_client()
     try:
-        await _call_with_floodwait(
+        return await _call_with_floodwait(
             tg.send_file,
             _require_destination_peer(),
             msg.media,
@@ -1237,7 +1313,7 @@ async def _send_single_media(msg: Message, caption: str | None) -> None:
         raw = await msg.download_media(file=bytes)
         if raw is None:
             raise RuntimeError("Failed to download restricted media for re-send.")
-        await _call_with_floodwait(
+        return await _call_with_floodwait(
             tg.send_file,
             _require_destination_peer(),
             raw,
@@ -1412,16 +1488,6 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
         mark_seen(channel_id, msg.id)
         return
 
-    is_dupe, similarity = await _is_echo_duplicate(
-        text,
-        channel_id=channel_id,
-        message_id=msg.id,
-        source=source,
-    )
-    if is_dupe:
-        mark_seen(channel_id, msg.id)
-        return
-
     severity = "medium"
     if _is_severity_routing_enabled():
         severity = await classify_severity(text, _require_auth_manager())
@@ -1429,6 +1495,7 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
         severity = "high"
 
     if severity == "high" and _is_immediate_high_enabled():
+        _normalized, text_hash = build_dupe_fingerprint(text)
         headline = await summarize_breaking_headline(text, _require_auth_manager())
         if not headline:
             headline = normalize_space(text)
@@ -1437,8 +1504,15 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
         payload = _format_breaking_text(source, headline)
         if msg.media:
             await _send_single_media(msg, payload)
+            sent_ref = None
         else:
-            await _send_text(payload)
+            sent_ref = await _send_text_with_ref(payload)
+            _register_breaking_delivery(
+                text_hash=text_hash,
+                ref=sent_ref,
+                base_text=payload,
+                primary_source=source,
+            )
         mark_seen(channel_id, msg.id)
         log_structured(
             LOGGER,
@@ -1447,7 +1521,7 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
             message_id=msg.id,
             source=source,
             severity=severity,
-            similarity=round(similarity, 4),
+            dedupe_hash=text_hash,
         )
         return
 
@@ -1468,7 +1542,6 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
         severity=severity,
         severity_emoji=_severity_emoji(severity),
         has_link=bool(link),
-        similarity=round(similarity, 4),
         text_tokens=estimate_tokens_rough(text),
         pending=count_pending(),
     )
@@ -1495,16 +1568,6 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
         mark_seen_many(channel_id, message_ids)
         return
 
-    is_dupe, similarity = await _is_echo_duplicate(
-        combined_caption,
-        channel_id=channel_id,
-        message_id=messages[0].id,
-        source=source,
-    )
-    if is_dupe:
-        mark_seen_many(channel_id, message_ids)
-        return
-
     severity = "medium"
     if _is_severity_routing_enabled():
         severity = await classify_severity(combined_caption, _require_auth_manager())
@@ -1527,7 +1590,6 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
             album_size=len(messages),
             source=source,
             severity=severity,
-            similarity=round(similarity, 4),
         )
         return
 
@@ -1550,7 +1612,6 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
         severity=severity,
         severity_emoji=_severity_emoji(severity),
         has_link=bool(link),
-        similarity=round(similarity, 4),
         text_tokens=estimate_tokens_rough(combined_caption),
         pending=count_pending(),
     )
@@ -2469,6 +2530,23 @@ async def _on_new_message(event: events.NewMessage.Event) -> None:
         if is_seen(channel_id, msg.id):
             return
 
+        if _is_dupe_detection_enabled():
+            dupe_result = await is_duplicate_and_handle(event)
+            if dupe_result.duplicate:
+                mark_seen(channel_id, msg.id)
+                if dupe_result.breaking_duplicate_recent:
+                    log_structured(
+                        LOGGER,
+                        "breaking_duplicate_suppressed",
+                        channel_id=channel_id,
+                        message_id=msg.id,
+                        score=round(float(dupe_result.final_score), 4),
+                        matched_channel_id=dupe_result.matched_channel_id,
+                        matched_message_id=dupe_result.matched_message_id,
+                        merged=bool(dupe_result.merged),
+                    )
+                return
+
         if msg.grouped_id:
             key = (channel_id, int(msg.grouped_id))
             album_buffers[key].append(msg)
@@ -2492,6 +2570,7 @@ async def _on_new_message(event: events.NewMessage.Event) -> None:
 
 async def _shutdown_client() -> None:
     global digest_scheduler_task
+    configure_duplicate_runtime(None)
 
     if digest_scheduler_task and not digest_scheduler_task.done():
         digest_scheduler_task.cancel()
