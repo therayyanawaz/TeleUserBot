@@ -155,6 +155,14 @@ DIGEST_INTERVAL_MINUTES = _env_int("DIGEST_INTERVAL_MINUTES", 60)  # type: int
 DIGEST_DAILY_TIMES = _env_list("DIGEST_DAILY_TIMES", ["00:00"])  # type: list[str]
 DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES = _env_int("DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES", 10)  # type: int
 DIGEST_QUEUE_CLEAR_INCLUDE_INFLIGHT = _env_bool("DIGEST_QUEUE_CLEAR_INCLUDE_INFLIGHT", True)  # type: bool
+# Queue cleanup scope:
+# - "inflight": clear only claimed/stuck rows (safe default)
+# - "pending": clear only pending rows (dangerous, may drop unsent news)
+# - "all": clear both pending + inflight (very destructive)
+DIGEST_QUEUE_CLEAR_SCOPE = _env_str("DIGEST_QUEUE_CLEAR_SCOPE", "inflight").lower()  # type: str
+# Daily digest window in hours (midnight digest summarizes this trailing window).
+DIGEST_DAILY_WINDOW_HOURS = _env_int("DIGEST_DAILY_WINDOW_HOURS", 24)  # type: int
+DIGEST_DAILY_MAX_POSTS = _env_int("DIGEST_DAILY_MAX_POSTS", 300)  # type: int
 DIGEST_MAX_POSTS = _env_int("DIGEST_MAX_POSTS", 80)  # type: int
 DIGEST_MAX_TOKENS = _env_int("DIGEST_MAX_TOKENS", 18000)  # type: int
 CODEX_MODEL_CONTEXT_TOKENS = _env_int("CODEX_MODEL_CONTEXT_TOKENS", 200000)  # type: int
@@ -241,6 +249,13 @@ QUERY_ALLOWED_PEER_IDS = _env_list("QUERY_ALLOWED_PEER_IDS", [])  # type: list[s
 STREAMING_ENABLED = _env_bool("STREAMING_ENABLED", True)  # type: bool
 STREAM_EDIT_INTERVAL_MS = _env_int("STREAM_EDIT_INTERVAL_MS", 400)  # type: int
 STREAM_MAX_CHARS_PER_EDIT = _env_int("STREAM_MAX_CHARS_PER_EDIT", 120)  # type: int
+
+# -----------------------------------------------------------------------------
+# Web Server (Replit/UptimeRobot keepalive + future website integration)
+# -----------------------------------------------------------------------------
+ENABLE_WEB_SERVER = _env_bool("ENABLE_WEB_SERVER", True)  # type: bool
+WEB_SERVER_HOST = _env_str("WEB_SERVER_HOST", "0.0.0.0")  # type: str
+WEB_SERVER_PORT = _env_int("WEB_SERVER_PORT", 8080)  # type: int
 
 # -----------------------------------------------------------------------------
 # Message Rendering

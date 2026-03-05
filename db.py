@@ -54,6 +54,23 @@ def _to_rows_dict(rows: Iterable[sqlite3.Row]) -> List[Dict[str, object]]:
     return result
 
 
+def _to_archive_rows_dict(rows: Iterable[sqlite3.Row]) -> List[Dict[str, object]]:
+    result: List[Dict[str, object]] = []
+    for row in rows:
+        result.append(
+            {
+                "id": int(row["id"]),
+                "channel_id": str(row["channel_id"]),
+                "message_id": int(row["message_id"]),
+                "source_name": str(row["source_name"] or ""),
+                "raw_text": str(row["raw_text"]),
+                "message_link": str(row["message_link"] or ""),
+                "timestamp": int(row["timestamp"]),
+            }
+        )
+    return result
+
+
 def init_db() -> None:
     ensure_runtime_dir()
     with _transaction() as conn:
@@ -97,6 +114,22 @@ def init_db() -> None:
 
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS digest_archive (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                source_name TEXT,
+                raw_text TEXT NOT NULL,
+                message_link TEXT,
+                timestamp INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                UNIQUE(channel_id, message_id)
+            )
+            """
+        )
+
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS dupe_text_cache (
                 text_norm TEXT PRIMARY KEY,
                 last_seen INTEGER NOT NULL
@@ -126,6 +159,10 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_digest_queue_batch "
             "ON digest_queue(batch_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_digest_archive_timestamp "
+            "ON digest_archive(timestamp, id)"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_dupe_text_cache_last_seen "
@@ -208,6 +245,26 @@ def save_to_digest_queue(
                 processed,
                 batch_id
             ) VALUES (?, ?, ?, ?, ?, ?, 0, NULL)
+            """,
+            (
+                channel_id,
+                int(message_id),
+                (source_name or "").strip() or None,
+                cleaned,
+                (message_link or "").strip() or None,
+                ts,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO digest_archive (
+                channel_id,
+                message_id,
+                source_name,
+                raw_text,
+                message_link,
+                timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 channel_id,
@@ -321,11 +378,58 @@ def load_and_clear_digest_queue(limit: int | None = None) -> List[Dict[str, obje
 
 def clear_digest_queue(*, include_inflight: bool = True) -> int:
     """Delete queued digest rows. Used by periodic queue purge policy."""
+    resolved_scope = "all" if include_inflight else "pending"
+    return clear_digest_queue_scoped(resolved_scope)
+
+
+def clear_digest_queue_scoped(scope: str) -> int:
+    """
+    Scope options:
+    - all: delete pending + inflight
+    - pending: delete only unprocessed rows
+    - inflight: delete only claimed rows
+    """
+    normalized = (scope or "").strip().lower()
+    if normalized not in {"all", "pending", "inflight"}:
+        normalized = "pending"
+
     with _transaction() as conn:
-        if include_inflight:
+        if normalized == "all":
             cur = conn.execute("DELETE FROM digest_queue")
-        else:
+        elif normalized == "pending":
             cur = conn.execute("DELETE FROM digest_queue WHERE processed = 0")
+        else:
+            cur = conn.execute("DELETE FROM digest_queue WHERE processed = 1")
+        return int(cur.rowcount or 0)
+
+
+def load_archive_since(since_ts: int, limit: int) -> List[Dict[str, object]]:
+    resolved_limit = max(1, int(limit))
+    since = int(max(0, since_ts))
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, channel_id, message_id, source_name, raw_text, message_link, timestamp
+            FROM digest_archive
+            WHERE timestamp >= ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """,
+            (since, resolved_limit),
+        ).fetchall()
+    # Preserve chronological order for digest coherence.
+    out = _to_archive_rows_dict(rows)
+    out.reverse()
+    return out
+
+
+def prune_archive_older_than(cutoff_ts: int) -> int:
+    cutoff = int(max(0, cutoff_ts))
+    with _transaction() as conn:
+        cur = conn.execute(
+            "DELETE FROM digest_archive WHERE timestamp < ?",
+            (cutoff,),
+        )
         return int(cur.rowcount or 0)
 
 

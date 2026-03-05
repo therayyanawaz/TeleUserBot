@@ -1511,6 +1511,7 @@ async def create_digest_summary(
     posts: List[Dict[str, object]],
     auth_manager: AuthManager | None = None,
     *,
+    interval_minutes: int | None = None,
     on_token: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """
@@ -1518,7 +1519,10 @@ async def create_digest_summary(
 
     Returns Telegram-HTML digest body or the exact quiet-period sentence.
     """
-    interval_minutes = int(max(1, int(getattr(config, "DIGEST_INTERVAL_MINUTES", 30))))
+    if interval_minutes is None:
+        interval_minutes = int(max(1, int(getattr(config, "DIGEST_INTERVAL_MINUTES", 30))))
+    else:
+        interval_minutes = int(max(1, interval_minutes))
     quiet_text = quiet_period_message(interval_minutes)
     if not posts:
         return quiet_text

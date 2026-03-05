@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import sys
 import time
 import urllib.parse
 from collections import defaultdict, deque
@@ -49,14 +50,16 @@ from auth import AuthManager, ERROR_LOG_PATH, ensure_runtime_dir
 from db import (
     ack_digest_batch,
     claim_digest_batch,
-    clear_digest_queue,
+    clear_digest_queue_scoped,
     count_inflight,
     count_pending,
     get_last_digest_timestamp,
     init_db,
     is_seen,
+    load_archive_since,
     mark_seen,
     mark_seen_many,
+    prune_archive_older_than,
     restore_digest_batch,
     save_to_digest_queue,
     set_last_digest_timestamp,
@@ -87,6 +90,7 @@ from utils import (
     split_html_chunks,
     strip_telegram_html,
 )
+from web_server import WebStatusServer
 
 try:
     import fcntl
@@ -141,6 +145,11 @@ breaking_topic_lock = asyncio.Lock()
 query_allowed_bot_user_id: int | None = None
 query_bot_user_id_checked: bool = False
 instance_lock_handle = None
+web_status_server: WebStatusServer | None = None
+started_as_username: str = "unknown"
+startup_phase: str = "booting"
+startup_ready: bool = False
+startup_error: str = ""
 
 ALBUM_WAIT_SECONDS = 1.5
 ENV_PATH = Path(__file__).with_name(".env")
@@ -311,6 +320,40 @@ def _digest_queue_clear_interval_seconds() -> int:
 
 def _digest_queue_clear_include_inflight() -> bool:
     return _bool_flag(getattr(config, "DIGEST_QUEUE_CLEAR_INCLUDE_INFLIGHT", True), True)
+
+
+def _digest_queue_clear_scope() -> str:
+    """
+    Queue clear scope:
+    - inflight: clear only stuck claimed rows (safe default)
+    - pending: clear only unsent rows
+    - all: clear everything
+    """
+    raw = str(getattr(config, "DIGEST_QUEUE_CLEAR_SCOPE", "") or "").strip().lower()
+    if raw in {"inflight", "pending", "all"}:
+        return raw
+    # Backward-compat with older include_inflight flag behavior.
+    # Historical setting true used to mean "all", false meant "pending".
+    legacy_include = _digest_queue_clear_include_inflight()
+    return "all" if legacy_include else "pending"
+
+
+def _digest_daily_window_hours() -> int:
+    raw = getattr(config, "DIGEST_DAILY_WINDOW_HOURS", 24)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 24
+    return max(1, min(value, 168))
+
+
+def _digest_daily_max_posts() -> int:
+    raw = getattr(config, "DIGEST_DAILY_MAX_POSTS", 300)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 300
+    return max(10, min(value, 2000))
 
 
 def _digest_max_posts() -> int:
@@ -558,6 +601,37 @@ def _stream_max_chars_per_edit() -> int:
     except Exception:
         value = 120
     return max(60, min(value, 800))
+
+
+def _is_web_server_enabled() -> bool:
+    return _bool_flag(getattr(config, "ENABLE_WEB_SERVER", True), True)
+
+
+def _web_server_host() -> str:
+    raw = str(getattr(config, "WEB_SERVER_HOST", "0.0.0.0") or "").strip()
+    return raw or "0.0.0.0"
+
+
+def _web_server_port() -> int:
+    raw = getattr(config, "WEB_SERVER_PORT", 8080)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 8080
+    return max(1, min(value, 65535))
+
+
+def _should_hold_on_startup_error() -> bool:
+    # In non-interactive deployment (e.g., Replit autoscale), keep process alive
+    # with health/status endpoints so platform health checks don't flap.
+    raw = str(
+        os.getenv(
+            "HOLD_ON_STARTUP_ERROR",
+            "true" if not sys.stdin.isatty() else "false",
+        )
+        or ""
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
 
 
 def _breaking_keywords() -> List[str]:
@@ -824,6 +898,10 @@ def _persist_config_updates(updates: Dict[str, object]) -> None:
 
 
 def _prompt_for_missing_config() -> None:
+    # Deployment/runtime without TTY must not block on interactive prompts.
+    if not sys.stdin.isatty():
+        return
+
     updates_to_persist: Dict[str, object] = {}
 
     # Auto-recover from common mistake: bot token pasted into DESTINATION.
@@ -2241,9 +2319,12 @@ def _format_digest_message(
     digest_body: str,
     total_updates: int,
     sources: List[str],
+    *,
+    title: str = "Digest",
 ) -> str:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    header = f"<b>📰 Daily Digest • {timestamp} • {total_updates} updates</b>"
+    label = sanitize_telegram_html(title.strip() or "Digest")
+    header = f"<b>📰 {label} • {timestamp} • {total_updates} updates</b>"
     _ = sources
     return sanitize_telegram_html(f"{header}<br><br>{digest_body.strip()}")
 
@@ -2379,6 +2460,7 @@ async def _flush_digest_queue_once() -> None:
                 digest_body=digest_body,
                 total_updates=len(posts),
                 sources=source_names,
+                title=f"Hourly Digest (last {max(1, _digest_interval_seconds() // 60)}m)",
             )
             if _is_streaming_enabled():
                 stream_stats = await streamer.finalize(digest_message)
@@ -2427,6 +2509,114 @@ async def _flush_digest_queue_once() -> None:
             LOGGER.exception("Digest generation/sending failed.")
 
 
+async def _send_daily_archive_digest_once() -> None:
+    async with digest_loop_lock:
+        window_hours = _digest_daily_window_hours()
+        interval_minutes = max(1, window_hours * 60)
+        now_ts = int(time.time())
+        since_ts = max(0, now_ts - window_hours * 3600)
+        max_rows = _digest_daily_max_posts()
+        rows = load_archive_since(since_ts, max_rows)
+
+        source_names: List[str] = []
+        posts: List[Dict[str, object]] = []
+        for row in rows:
+            source_name = str(row.get("source_name") or "").strip()
+            channel_id = str(row["channel_id"])
+            if not source_name:
+                source_name = await _source_title_from_channel_id(channel_id)
+            if source_name not in source_names:
+                source_names.append(source_name)
+            posts.append(
+                {
+                    "id": int(row["id"]),
+                    "channel_id": channel_id,
+                    "message_id": int(row["message_id"]),
+                    "source_name": source_name,
+                    "raw_text": str(row["raw_text"]),
+                    "message_link": str(row.get("message_link") or ""),
+                    "timestamp": int(row["timestamp"]),
+                }
+            )
+
+        log_structured(
+            LOGGER,
+            "daily_digest_batch_loaded",
+            window_hours=window_hours,
+            selected=len(posts),
+            max_rows=max_rows,
+        )
+
+        digest_body = ""
+        stream_stats = None
+        try:
+            if _is_streaming_enabled():
+                streamer = LiveTelegramStreamer(
+                    send_message=lambda text, reply_to: _send_text_with_ref(text, reply_to=reply_to),
+                    edit_message=_edit_sent_text,
+                    get_message_id=lambda ref: _message_ref_id(ref) or 0,
+                    placeholder_text="Generating 24h digest... ⏳",
+                    edit_interval_ms=_stream_edit_interval_ms(),
+                    max_chars_per_edit=_stream_max_chars_per_edit(),
+                    typing_enabled=False,
+                    html_mode=_is_html_formatting_enabled(),
+                )
+                await streamer.start()
+                digest_body = await create_digest_summary(
+                    posts,
+                    _require_auth_manager(),
+                    interval_minutes=interval_minutes,
+                    on_token=streamer.push,
+                )
+            else:
+                digest_body = await create_digest_summary(
+                    posts,
+                    _require_auth_manager(),
+                    interval_minutes=interval_minutes,
+                )
+
+            if not digest_body.strip():
+                digest_body = quiet_period_message(interval_minutes)
+
+            digest_message = _format_digest_message(
+                digest_body=digest_body,
+                total_updates=len(posts),
+                sources=source_names,
+                title=f"24h Digest (last {window_hours}h)",
+            )
+            if _is_streaming_enabled():
+                stream_stats = await streamer.finalize(digest_message)
+            else:
+                await _send_digest_message(digest_message)
+
+            set_last_digest_timestamp(int(time.time()))
+            log_structured(
+                LOGGER,
+                "daily_digest_sent",
+                window_hours=window_hours,
+                rows=len(posts),
+                response_chars=len(digest_body),
+                stream_enabled=_is_streaming_enabled(),
+                stream_edits=(stream_stats.edit_count if stream_stats else 0),
+                stream_tokens_per_second=(
+                    round(stream_stats.tokens_per_second, 3) if stream_stats else 0.0
+                ),
+            )
+        except Exception:
+            LOGGER.exception("Daily archive digest generation/sending failed.")
+        finally:
+            # Keep rolling history only; 3x window retention provides re-run safety.
+            retention_hours = max(72, window_hours * 3)
+            pruned = prune_archive_older_than(now_ts - retention_hours * 3600)
+            if pruned:
+                log_structured(
+                    LOGGER,
+                    "digest_archive_pruned",
+                    pruned=pruned,
+                    retention_hours=retention_hours,
+                )
+
+
 def _compute_next_scheduler_delay_seconds() -> int:
     if digest_retry_backoff_seconds > 0:
         return digest_retry_backoff_seconds
@@ -2468,12 +2658,13 @@ async def run_daily_digest_scheduler() -> None:
         LOGGER,
         "daily_digest_scheduler_start",
         daily_times=[f"{h:02d}:{m:02d}" for h, m in daily_times],
+        window_hours=_digest_daily_window_hours(),
     )
     try:
         while True:
             delay = seconds_until_next_daily_time(daily_times)
             await asyncio.sleep(delay)
-            await _flush_digest_queue_once()
+            await _send_daily_archive_digest_once()
     except asyncio.CancelledError:
         LOGGER.info("Daily digest scheduler stopped.")
         return
@@ -2481,24 +2672,24 @@ async def run_daily_digest_scheduler() -> None:
 
 async def run_digest_queue_clear_scheduler() -> None:
     interval = _digest_queue_clear_interval_seconds()
-    include_inflight = _digest_queue_clear_include_inflight()
+    scope = _digest_queue_clear_scope()
 
     log_structured(
         LOGGER,
         "digest_queue_clear_scheduler_start",
         interval_seconds=interval,
-        include_inflight=include_inflight,
+        scope=scope,
     )
     try:
         while True:
             await asyncio.sleep(interval)
             async with digest_loop_lock:
-                deleted = clear_digest_queue(include_inflight=include_inflight)
+                deleted = clear_digest_queue_scoped(scope)
             log_structured(
                 LOGGER,
                 "digest_queue_cleared",
                 deleted=deleted,
-                include_inflight=include_inflight,
+                scope=scope,
                 pending_after=count_pending(),
                 inflight_after=count_inflight(),
             )
@@ -2959,6 +3150,46 @@ async def setup_sources() -> List[int]:
     return resolved_ids
 
 
+def _web_status_payload() -> Dict[str, object]:
+    now = time.time()
+    next_in = (
+        max(0, int(digest_next_run_ts - now))
+        if digest_next_run_ts is not None
+        else None
+    )
+    try:
+        last_ts = get_last_digest_timestamp()
+    except Exception:
+        last_ts = None
+    try:
+        pending = count_pending()
+    except Exception:
+        pending = 0
+    try:
+        inflight = count_inflight()
+    except Exception:
+        inflight = 0
+    return {
+        "ok": not bool(startup_error),
+        "ready": bool(startup_ready),
+        "phase": startup_phase,
+        "error": startup_error or None,
+        "service": "NetworkSlutter",
+        "mode": "DIGEST" if _is_digest_mode_enabled() else "PER_POST",
+        "started_as": started_as_username,
+        "timestamp": int(now),
+        "pending_queue": pending,
+        "inflight_queue": inflight,
+        "next_digest_in_seconds": next_in,
+        "last_digest_at": format_ts(last_ts),
+        "sources_monitored": len(monitored_source_chat_ids),
+        "dupe_detection": _is_dupe_detection_enabled(),
+        "severity_routing": _is_severity_routing_enabled(),
+        "query_mode": _is_query_mode_enabled(),
+        "html_formatting": _is_html_formatting_enabled(),
+    }
+
+
 def _digest_status_text() -> str:
     mode = "DIGEST" if _is_digest_mode_enabled() else "PER_POST"
     pending = count_pending()
@@ -2976,6 +3207,8 @@ def _digest_status_text() -> str:
     daily_labels = [f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()]
     daily_display = ", ".join(daily_labels) if daily_labels else "off"
     queue_clear_every = _digest_queue_clear_interval_seconds() // 60
+    queue_clear_scope = _digest_queue_clear_scope()
+    daily_window_hours = _digest_daily_window_hours()
 
     return (
         "<b>🧠 Digest Status</b><br>"
@@ -2986,7 +3219,9 @@ def _digest_status_text() -> str:
         f"• Next run in: <code>{next_eta}</code><br>"
         f"• Interval base: <code>{_digest_interval_seconds() // 60}m</code><br>"
         f"• Daily digest times: <code>{sanitize_telegram_html(daily_display)}</code><br>"
+        f"• Daily window: <code>{daily_window_hours}h</code><br>"
         f"• Queue clear every: <code>{queue_clear_every}m</code><br>"
+        f"• Queue clear scope: <code>{sanitize_telegram_html(queue_clear_scope)}</code><br>"
         f"• Dedupe: <code>{dupe_state}</code> ({sanitize_telegram_html(detector_backend)})<br>"
         f"• Severity router: <code>{severity_state}</code><br>"
         f"• Query mode: <code>{query_state}</code><br>"
@@ -3355,6 +3590,7 @@ async def _on_new_message(event: events.NewMessage.Event) -> None:
 
 async def _shutdown_client() -> None:
     global digest_scheduler_task, daily_digest_scheduler_task, queue_clear_scheduler_task
+    global web_status_server
     configure_duplicate_runtime(None)
     breaking_delivery_refs.clear()
     breaking_topic_threads.clear()
@@ -3373,6 +3609,13 @@ async def _shutdown_client() -> None:
         queue_clear_scheduler_task.cancel()
         await asyncio.gather(queue_clear_scheduler_task, return_exceptions=True)
     queue_clear_scheduler_task = None
+
+    if web_status_server is not None:
+        try:
+            web_status_server.stop()
+        except Exception:
+            LOGGER.exception("Failed stopping web status server.")
+        web_status_server = None
 
     tg = client
     if tg is None:
@@ -3419,8 +3662,13 @@ def _startup_health_check() -> None:
         breaking_topic_threads=_is_breaking_topic_threads_enabled(),
         digest_interval_minutes=_digest_interval_seconds() // 60,
         digest_daily_times=[f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()],
+        digest_daily_window_hours=_digest_daily_window_hours(),
         digest_queue_clear_minutes=_digest_queue_clear_interval_seconds() // 60,
         digest_queue_clear_inflight=_digest_queue_clear_include_inflight(),
+        digest_queue_clear_scope=_digest_queue_clear_scope(),
+        web_server_enabled=_is_web_server_enabled(),
+        web_server_host=_web_server_host(),
+        web_server_port=_web_server_port(),
         pending=pending,
         inflight=inflight,
         last_digest_ts=last_ts,
@@ -3428,7 +3676,7 @@ def _startup_health_check() -> None:
         quota_health=get_quota_health(),
     )
     LOGGER.info(
-        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%sm",
+        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%sm scope=%s web=%s@%s:%s",
         mode,
         pending,
         inflight,
@@ -3445,37 +3693,82 @@ def _startup_health_check() -> None:
         _digest_interval_seconds() // 60,
         ",".join(f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()) or "off",
         _digest_queue_clear_interval_seconds() // 60,
+        _digest_queue_clear_scope(),
+        _is_web_server_enabled(),
+        _web_server_host(),
+        _web_server_port(),
     )
 
 
 async def main() -> None:
     global client, auth_manager, digest_scheduler_task
     global daily_digest_scheduler_task, queue_clear_scheduler_task, instance_lock_handle
-
-    _prompt_for_missing_config()
-    _validate_config()
-
-    try:
-        instance_lock_handle = _acquire_instance_lock()
-    except RuntimeError as exc:
-        LOGGER.error("%s", exc)
-        print(exc)
-        return
+    global web_status_server, started_as_username
+    global startup_phase, startup_ready, startup_error
 
     try:
+        if _is_web_server_enabled():
+            try:
+                web_status_server = WebStatusServer(
+                    host=_web_server_host(),
+                    port=_web_server_port(),
+                    get_status=_web_status_payload,
+                    logger=LOGGER,
+                )
+                web_status_server.start()
+            except Exception:
+                LOGGER.exception("Failed starting web status server.")
+                web_status_server = None
+
+        startup_phase = "config"
         try:
+            _prompt_for_missing_config()
+            _validate_config()
+        except (RuntimeError, ValueError) as exc:
+            startup_error = str(exc)
+            startup_ready = False
+            startup_phase = "error"
+            LOGGER.error("%s", exc)
+            print(exc)
+            if _is_web_server_enabled() and _should_hold_on_startup_error():
+                LOGGER.warning("Holding process alive after config validation error for health visibility.")
+                while True:
+                    await asyncio.sleep(3600)
+            return
+
+        startup_phase = "lock"
+        try:
+            instance_lock_handle = _acquire_instance_lock()
+        except RuntimeError as exc:
+            startup_error = str(exc)
+            startup_ready = False
+            startup_phase = "error"
+            LOGGER.error("%s", exc)
+            print(exc)
+            if _is_web_server_enabled() and _should_hold_on_startup_error():
+                LOGGER.warning("Holding process alive after startup lock error for health visibility.")
+                while True:
+                    await asyncio.sleep(3600)
+            return
+
+        try:
+            startup_phase = "initializing"
             _load_premium_emoji_map()
             init_db()
             await _init_dupe_detector()
             _startup_health_check()
 
+            startup_phase = "auth"
             auth_manager = AuthManager(logger=LOGGER)
             await auth_manager.get_access_token()
 
+            startup_phase = "telegram_login"
             client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
             await _ensure_user_account_session()
+            startup_phase = "destination_setup"
             await _ensure_destination_peer()
 
+            startup_phase = "source_setup"
             resolved_sources = await setup_sources()
             while not resolved_sources:
                 print(
@@ -3500,6 +3793,7 @@ async def main() -> None:
                 _persist_config_updates({"EXTRA_SOURCES": config.EXTRA_SOURCES})
                 resolved_sources = await setup_sources()
 
+            startup_phase = "handlers"
             client.add_event_handler(_on_new_message, events.NewMessage(chats=resolved_sources))
             status_pattern = rf"^{re.escape(_digest_status_command())}(?:\\s+.*)?$"
             client.add_event_handler(
@@ -3513,7 +3807,8 @@ async def main() -> None:
                 )
 
             me = await client.get_me()
-            LOGGER.info("Userbot started as @%s", getattr(me, "username", "unknown"))
+            started_as_username = str(getattr(me, "username", "") or "unknown")
+            LOGGER.info("Userbot started as @%s", started_as_username)
             if _is_missing_folder_invite_link():
                 LOGGER.info("Listening to %s manually configured channels.", len(resolved_sources))
             if _is_digest_mode_enabled():
@@ -3531,16 +3826,38 @@ async def main() -> None:
                     name="digest-queue-clear-scheduler",
                 )
 
+            startup_phase = "running"
+            startup_ready = True
+            startup_error = ""
             try:
                 await client.run_until_disconnected()
             except (asyncio.CancelledError, KeyboardInterrupt):
                 LOGGER.info("Shutdown requested. Stopping userbot...")
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
+            startup_error = str(exc)
+            startup_ready = False
+            startup_phase = "error"
             LOGGER.error("%s", exc)
             print(exc)
+            if _is_web_server_enabled() and _should_hold_on_startup_error():
+                LOGGER.warning("Holding process alive after startup error for health visibility.")
+                while True:
+                    await asyncio.sleep(3600)
+        except Exception as exc:
+            startup_error = str(exc)
+            startup_ready = False
+            startup_phase = "error"
+            LOGGER.exception("Unhandled startup error.")
+            if _is_web_server_enabled() and _should_hold_on_startup_error():
+                LOGGER.warning("Holding process alive after unhandled startup error for health visibility.")
+                while True:
+                    await asyncio.sleep(3600)
+            raise
         finally:
             await _shutdown_client()
     finally:
+        startup_phase = "stopped"
+        startup_ready = False
         _release_instance_lock(instance_lock_handle)
         instance_lock_handle = None
 
