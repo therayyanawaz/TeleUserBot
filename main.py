@@ -3440,7 +3440,12 @@ async def _safe_reply_markdown(
                     parse_mode="html" if _is_html_formatting_enabled() else "md",
                     link_preview=False,
                 )
-            return await event.reply(
+            tg = _require_client()
+            # Query UX: send a standalone assistant-style message in the same chat,
+            # not a Telegram reply-to bubble to the user's own message.
+            return await _call_with_floodwait(
+                tg.send_message,
+                event.chat_id,
                 payload_text,
                 parse_mode="html" if _is_html_formatting_enabled() else "md",
                 link_preview=False,
@@ -3472,7 +3477,14 @@ async def _safe_reply_markdown(
                         parse_mode=None,
                         link_preview=False,
                     )
-                return await event.reply(fallback_text, parse_mode=None, link_preview=False)
+                tg = _require_client()
+                return await _call_with_floodwait(
+                    tg.send_message,
+                    event.chat_id,
+                    fallback_text,
+                    parse_mode=None,
+                    link_preview=False,
+                )
             except MessageNotModifiedError:
                 return edit_message
             except FloodWaitError as exc:
@@ -3493,10 +3505,16 @@ async def _stream_query_answer(
     history: Sequence[Dict[str, str]],
 ) -> tuple[str, object]:
     async def _send_query_message(text: str, reply_to: int | None):
-        return await event.reply(
+        tg = _require_client()
+        payload_text = (
             _render_outbound_text(text, allow_premium_tags=False)
             if _is_html_formatting_enabled()
-            else text,
+            else text
+        )
+        return await _call_with_floodwait(
+            tg.send_message,
+            event.chat_id,
+            payload_text,
             reply_to=reply_to,
             parse_mode="html" if _is_html_formatting_enabled() else "md",
             link_preview=False,
