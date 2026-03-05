@@ -85,6 +85,7 @@ from utils import (
     parse_daily_times,
     parse_time_filter_from_query,
     sanitize_telegram_html,
+    search_recent_news_web,
     search_recent_messages,
     seconds_until_next_daily_time,
     split_html_chunks,
@@ -389,13 +390,9 @@ def _digest_daily_times() -> List[Tuple[int, int]]:
 
 
 def _digest_queue_clear_interval_seconds() -> int:
-    raw = getattr(config, "DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES", 10)
-    try:
-        minutes = int(raw)
-    except Exception:
-        minutes = 10
-    minutes = max(1, min(minutes, 24 * 60))
-    return minutes * 60
+    # Queue clear scheduler is intentionally disabled to preserve full intake flow.
+    # Digest queue should only be drained by hourly digest claiming.
+    return 0
 
 
 def _digest_queue_clear_include_inflight() -> bool:
@@ -539,6 +536,11 @@ def _dupe_merge_instead_of_skip() -> bool:
     return _bool_flag(raw, True)
 
 
+def _dupe_use_sentence_transformers() -> bool:
+    raw = getattr(config, "DUPE_USE_SENTENCE_TRANSFORMERS", False)
+    return _bool_flag(raw, False)
+
+
 def _is_severity_routing_enabled() -> bool:
     return _bool_flag(getattr(config, "ENABLE_SEVERITY_ROUTING", True), True)
 
@@ -607,6 +609,87 @@ def _query_default_hours_back() -> int:
     except Exception:
         value = 24
     return max(1, min(value, 24 * 30))
+
+
+def _is_query_web_fallback_enabled() -> bool:
+    return _bool_flag(getattr(config, "QUERY_WEB_FALLBACK_ENABLED", True), True)
+
+
+def _query_web_min_telegram_results() -> int:
+    raw = getattr(config, "QUERY_WEB_MIN_TELEGRAM_RESULTS", 3)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 3
+    return max(0, min(value, 20))
+
+
+def _query_web_max_results() -> int:
+    raw = getattr(config, "QUERY_WEB_MAX_RESULTS", 12)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 12
+    return max(3, min(value, 40))
+
+
+def _query_web_max_hours_back() -> int:
+    raw = getattr(config, "QUERY_WEB_MAX_HOURS_BACK", 24)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 24
+    return max(1, min(value, 72))
+
+
+def _query_web_require_recent() -> bool:
+    return _bool_flag(getattr(config, "QUERY_WEB_REQUIRE_RECENT", True), True)
+
+
+def _query_web_require_min_sources() -> int:
+    raw = getattr(config, "QUERY_WEB_REQUIRE_MIN_SOURCES", 2)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 2
+    return max(1, min(value, 10))
+
+
+def _query_web_allowed_domains() -> list[str]:
+    raw = getattr(config, "QUERY_WEB_ALLOWED_DOMAINS", [])
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        domain = normalize_space(str(item or "")).lower().lstrip(".")
+        if domain:
+            out.append(domain)
+    return out
+
+
+def _is_high_risk_news_query(query: str) -> bool:
+    lowered = normalize_space(query).lower()
+    if not lowered:
+        return False
+    high_risk_terms = (
+        "leader",
+        "supreme leader",
+        "president",
+        "prime minister",
+        "successor",
+        "succession",
+        "deceased",
+        "died",
+        "dead",
+        "killed",
+        "assassinated",
+        "resigned",
+        "coup",
+        "overthrown",
+        "nuclear plant",
+        "nuclear site",
+    )
+    return any(term in lowered for term in high_risk_terms)
 
 
 def _query_allowed_peer_ids() -> set[int]:
@@ -715,16 +798,34 @@ def _should_hold_on_startup_error() -> bool:
 
 
 def _breaking_keywords() -> List[str]:
+    default_keywords = [
+        "breaking",
+        "urgent",
+        "just now",
+        "alert",
+        "explosion",
+        "strike",
+        "airstrike",
+        "missile",
+        "attack",
+        "air raid",
+        "drone strike",
+        "casualties",
+        "killed",
+        "intercepted",
+    ]
     raw = getattr(config, "BREAKING_NEWS_KEYWORDS", [])
-    if not isinstance(raw, list):
-        return []
     result: List[str] = []
-    for item in raw:
-        if not isinstance(item, str):
-            continue
-        normalized = item.strip().lower()
-        if normalized:
-            result.append(normalized)
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            normalized = item.strip().lower()
+            if normalized and normalized not in result:
+                result.append(normalized)
+    for keyword in default_keywords:
+        if keyword not in result:
+            result.append(keyword)
     return result
 
 
@@ -766,6 +867,15 @@ def _breaking_topic_min_ratio() -> float:
     except Exception:
         value = 0.55
     return min(max(value, 0.1), 1.0)
+
+
+def _breaking_topic_fuzzy_ratio() -> float:
+    raw = getattr(config, "BREAKING_TOPIC_FUZZY_RATIO", 0.72)
+    try:
+        value = float(raw)
+    except Exception:
+        value = 0.72
+    return min(max(value, 0.3), 1.0)
 
 
 def _breaking_topic_continuity_prefix() -> str:
@@ -1257,6 +1367,25 @@ async def _query_bot_api_request(
     raise RuntimeError(f"Bot API {method} failed after retries.")
 
 
+async def _query_bot_send_message(data: Dict[str, str]) -> object:
+    """
+    Send query reply via Bot API.
+    If Telegram rejects reply_to_message_id for this peer, retry once without it.
+    """
+    try:
+        return await _query_bot_api_request("sendMessage", data=data)
+    except RuntimeError as exc:
+        error_text = str(exc).lower()
+        if "message to be replied not found" in error_text and "reply_to_message_id" in data:
+            retry_data = dict(data)
+            retry_data.pop("reply_to_message_id", None)
+            LOGGER.debug(
+                "Bot query reply target not found; retrying sendMessage without reply_to_message_id."
+            )
+            return await _query_bot_api_request("sendMessage", data=retry_data)
+        raise
+
+
 def _infer_chat_id_from_updates(updates: object) -> str | None:
     if not isinstance(updates, list):
         return None
@@ -1545,12 +1674,53 @@ def _classify_severity_with_breakdown(
 
 
 def _format_breaking_text(source_title: str, headline: str, rational_view: str | None = None) -> str:
+    def _clean_rational_view(value: str) -> str:
+        text = normalize_space(str(value or ""))
+        if not text:
+            return ""
+        text = text.rstrip(".")
+        text = re.sub(r"\.\.\.+$", "", text).strip()
+        words = text.split()
+        if words:
+            tail = words[-1].strip(".,;:!?").lower()
+            if tail in {
+                "and",
+                "or",
+                "but",
+                "because",
+                "while",
+                "with",
+                "without",
+                "if",
+                "as",
+                "to",
+                "of",
+                "for",
+                "in",
+                "on",
+                "at",
+                "from",
+                "by",
+                "amid",
+                "pending",
+            }:
+                words.pop()
+                text = " ".join(words).strip()
+        if not text:
+            return ""
+        if not text.lower().startswith("why it matters:"):
+            text = f"Why it matters: {text}"
+        text = text.rstrip(".,;:!?")
+        return f"{text}."
+
     clean_headline = normalize_space(headline)
     safe_headline = sanitize_telegram_html(clean_headline)
     safe_source = sanitize_telegram_html(source_title)
     rational_part = ""
     if rational_view:
-        rational_part = f"<br><br><i>{sanitize_telegram_html(rational_view)}</i>"
+        cleaned_rational = _clean_rational_view(rational_view)
+        if cleaned_rational:
+            rational_part = f"<br><br><i>{sanitize_telegram_html(cleaned_rational)}</i>"
     if _include_source_tags():
         return f"<b>🔥 BREAKING • {safe_source}</b><br><br>{safe_headline}{rational_part}"
     return f"<b>🔥 BREAKING</b><br><br>{safe_headline}{rational_part}"
@@ -1639,6 +1809,11 @@ def _breaking_topic_tokens(text: str) -> set[str]:
     return {token for token in tokens if token not in _BREAKING_TOPIC_STOPWORDS}
 
 
+def _breaking_topic_normalized(text: str) -> str:
+    normalized, _ = build_dupe_fingerprint(text)
+    return normalized
+
+
 def _breaking_topic_similarity(
     left_tokens: set[str],
     right_tokens: set[str],
@@ -1650,6 +1825,14 @@ def _breaking_topic_similarity(
         return 0, 0.0
     ratio = overlap / max(1, min(len(left_tokens), len(right_tokens)))
     return overlap, ratio
+
+
+def _breaking_topic_fuzzy_similarity(left_norm: str, right_norm: str) -> float:
+    if not left_norm or not right_norm:
+        return 0.0
+    from difflib import SequenceMatcher
+
+    return float(SequenceMatcher(None, left_norm, right_norm).ratio())
 
 
 def _cleanup_breaking_topic_threads_locked(now_ts: int | None = None) -> None:
@@ -1670,6 +1853,9 @@ async def _resolve_breaking_topic_reply(topic_seed: str) -> int | None:
     if not _is_breaking_topic_threads_enabled():
         return None
     tokens = _breaking_topic_tokens(topic_seed)
+    current_norm = _breaking_topic_normalized(topic_seed)
+    if not current_norm:
+        return None
     if len(tokens) < _breaking_topic_min_overlap():
         return None
 
@@ -1677,9 +1863,11 @@ async def _resolve_breaking_topic_reply(topic_seed: str) -> int | None:
     best_message_id: int | None = None
     best_overlap = 0
     best_ratio = 0.0
+    best_fuzzy = 0.0
     best_ts = 0
     min_overlap = _breaking_topic_min_overlap()
     min_ratio = _breaking_topic_min_ratio()
+    min_fuzzy = _breaking_topic_fuzzy_ratio()
 
     async with breaking_topic_lock:
         _cleanup_breaking_topic_threads_locked(now)
@@ -1688,19 +1876,34 @@ async def _resolve_breaking_topic_reply(topic_seed: str) -> int | None:
             if not isinstance(entry_tokens, set):
                 continue
             overlap, ratio = _breaking_topic_similarity(tokens, entry_tokens)
-            if overlap < min_overlap or ratio < min_ratio:
+            fuzzy = _breaking_topic_fuzzy_similarity(
+                current_norm,
+                str(entry.get("norm", "") or ""),
+            )
+            passes = (overlap >= min_overlap and ratio >= min_ratio) or (fuzzy >= min_fuzzy)
+            if not passes:
                 continue
             entry_ts = int(entry.get("ts", 0))
             if overlap > best_overlap:
                 best_overlap = overlap
                 best_ratio = ratio
+                best_fuzzy = fuzzy
                 best_ts = entry_ts
                 best_message_id = int(entry.get("message_id", 0)) or None
             elif overlap == best_overlap and ratio > best_ratio:
                 best_ratio = ratio
+                best_fuzzy = fuzzy
                 best_ts = entry_ts
                 best_message_id = int(entry.get("message_id", 0)) or None
-            elif overlap == best_overlap and abs(ratio - best_ratio) < 1e-6:
+            elif overlap == best_overlap and abs(ratio - best_ratio) < 1e-6 and fuzzy > best_fuzzy:
+                best_fuzzy = fuzzy
+                best_ts = entry_ts
+                best_message_id = int(entry.get("message_id", 0)) or best_message_id
+            elif (
+                overlap == best_overlap
+                and abs(ratio - best_ratio) < 1e-6
+                and abs(fuzzy - best_fuzzy) < 1e-6
+            ):
                 # Prefer more recent thread if score ties.
                 if entry_ts > best_ts:
                     best_ts = entry_ts
@@ -1720,6 +1923,9 @@ async def _register_breaking_topic_thread(
     if not message_id:
         return
     tokens = _breaking_topic_tokens(topic_seed)
+    norm = _breaking_topic_normalized(topic_seed)
+    if not norm:
+        return
     if len(tokens) < _breaking_topic_min_overlap():
         return
 
@@ -1729,12 +1935,14 @@ async def _register_breaking_topic_thread(
         for entry in breaking_topic_threads:
             if int(entry.get("message_id", 0)) == int(message_id):
                 entry["tokens"] = tokens
+                entry["norm"] = norm
                 entry["ts"] = now
                 return
         breaking_topic_threads.append(
             {
                 "message_id": int(message_id),
                 "tokens": tokens,
+                "norm": norm,
                 "ts": now,
             }
         )
@@ -1814,6 +2022,7 @@ async def _init_dupe_detector() -> None:
             threshold=_dupe_threshold(),
             history_hours=_dupe_history_hours(),
             max_items=max(_dupe_cache_size() * 10, 2000),
+            use_sentence_transformers=_dupe_use_sentence_transformers(),
             logger=LOGGER,
         )
         await asyncio.to_thread(
@@ -1841,6 +2050,7 @@ async def _init_dupe_detector() -> None:
             history_hours=_dupe_history_hours(),
             warm_hours=min(2, _dupe_history_hours()),
             merge_instead_of_skip=_dupe_merge_instead_of_skip(),
+            use_sentence_transformers=_dupe_use_sentence_transformers(),
             backend=detector.backend_name,
         )
     except Exception:
@@ -2322,6 +2532,12 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
     elif _contains_breaking_keyword(text):
         severity = "high"
 
+    if severity != "high" and _contains_breaking_keyword(text):
+        severity = "high"
+        severity_score = max(float(severity_score), 0.82)
+        severity_breakdown = dict(severity_breakdown or {})
+        severity_breakdown["keyword_override"] = True
+
     if severity == "high" and _is_immediate_high_enabled():
         _normalized, text_hash = build_dupe_fingerprint(text)
         headline = await summarize_breaking_headline(text, _require_auth_manager())
@@ -2423,6 +2639,12 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
         )
     elif _contains_breaking_keyword(combined_caption):
         severity = "high"
+
+    if severity != "high" and _contains_breaking_keyword(combined_caption):
+        severity = "high"
+        severity_score = max(float(severity_score), 0.82)
+        severity_breakdown = dict(severity_breakdown or {})
+        severity_breakdown["keyword_override"] = True
 
     if severity == "high" and _is_immediate_high_enabled():
         headline = await summarize_breaking_headline(combined_caption, _require_auth_manager())
@@ -2840,6 +3062,14 @@ async def run_daily_digest_scheduler() -> None:
 
 async def run_digest_queue_clear_scheduler() -> None:
     interval = _digest_queue_clear_interval_seconds()
+    if interval <= 0:
+        log_structured(
+            LOGGER,
+            "digest_queue_clear_scheduler_disabled",
+            interval_seconds=interval,
+            reason="disabled_in_config",
+        )
+        return
     scope = _digest_queue_clear_scope()
 
     log_structured(
@@ -3398,8 +3628,11 @@ def _digest_status_text() -> str:
     detector_backend = dupe_detector.backend_name if dupe_detector is not None else "disabled"
     daily_labels = [f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()]
     daily_display = ", ".join(daily_labels) if daily_labels else "off"
-    queue_clear_every = _digest_queue_clear_interval_seconds() // 60
-    queue_clear_scope = _digest_queue_clear_scope()
+    queue_clear_interval_seconds = _digest_queue_clear_interval_seconds()
+    queue_clear_every = (
+        f"{queue_clear_interval_seconds // 60}m" if queue_clear_interval_seconds > 0 else "off"
+    )
+    queue_clear_scope = _digest_queue_clear_scope() if queue_clear_interval_seconds > 0 else "disabled"
     daily_window_hours = _digest_daily_window_hours()
 
     return (
@@ -3412,7 +3645,7 @@ def _digest_status_text() -> str:
         f"• Interval base: <code>{_digest_interval_seconds() // 60}m</code><br>"
         f"• Daily digest times: <code>{sanitize_telegram_html(daily_display)}</code><br>"
         f"• Daily window: <code>{daily_window_hours}h</code><br>"
-        f"• Queue clear every: <code>{queue_clear_every}m</code><br>"
+        f"• Queue clear every: <code>{sanitize_telegram_html(str(queue_clear_every))}</code><br>"
         f"• Queue clear scope: <code>{sanitize_telegram_html(queue_clear_scope)}</code><br>"
         f"• Dedupe: <code>{dupe_state}</code> ({sanitize_telegram_html(detector_backend)})<br>"
         f"• Severity router: <code>{severity_state}</code><br>"
@@ -3459,6 +3692,66 @@ def _append_query_history(sender_id: int, query_text: str, answer_text: str) -> 
     if len(trimmed_answer) > 800:
         trimmed_answer = f"{trimmed_answer[:797].rsplit(' ', 1)[0]}..."
     history.append({"role": "assistant", "content": trimmed_answer})
+
+
+def _merge_query_context(
+    telegram_rows: Sequence[Dict[str, object]],
+    web_rows: Sequence[Dict[str, object]],
+    *,
+    limit: int,
+) -> list[Dict[str, object]]:
+    merged: dict[str, Dict[str, object]] = {}
+
+    def _sig(item: Dict[str, object]) -> str:
+        link = normalize_space(str(item.get("link") or ""))
+        if link:
+            return f"link:{link.lower()}"
+        text = normalize_space(str(item.get("text") or ""))
+        if text:
+            return f"text:{hashlib.sha1(text.lower().encode('utf-8')).hexdigest()}"
+        source = normalize_space(str(item.get("source") or ""))
+        date = normalize_space(str(item.get("date") or ""))
+        return f"meta:{source}|{date}"
+
+    for row in list(telegram_rows) + list(web_rows):
+        key = _sig(row)
+        if not key:
+            continue
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = dict(row)
+            continue
+        # Prefer Telegram evidence when both map to same signature.
+        existing_is_web = bool(existing.get("is_web"))
+        row_is_web = bool(row.get("is_web"))
+        if existing_is_web and not row_is_web:
+            merged[key] = dict(row)
+
+    ordered = sorted(
+        merged.values(),
+        key=lambda item: int(item.get("timestamp", 0) or 0),
+        reverse=True,
+    )
+    return ordered[: max(1, int(limit))]
+
+
+def _format_web_results_section(web_rows: Sequence[Dict[str, object]], *, max_items: int = 5) -> str:
+    if not web_rows:
+        return "<i>Web cross-check: no recent trusted web reports found.</i>"
+
+    lines: list[str] = ["<b>Web cross-check</b>"]
+    for item in list(web_rows)[: max(1, int(max_items))]:
+        source = sanitize_telegram_html(normalize_space(str(item.get("source") or "Web")))
+        link = normalize_space(str(item.get("link") or ""))
+        text = normalize_space(str(item.get("text") or ""))
+        if len(text) > 110:
+            text = f"{text[:107].rsplit(' ', 1)[0]}..."
+        text_safe = sanitize_telegram_html(text or "Web report")
+        if link.startswith("http"):
+            lines.append(f'• <a href="{link}">{text_safe}</a> <i>[{source}]</i>')
+        else:
+            lines.append(f"• {text_safe} <i>[{source}]</i>")
+    return "<br>".join(lines)
 
 
 async def _safe_reply_markdown(
@@ -3516,7 +3809,7 @@ async def _safe_reply_markdown(
                 }
                 if reply_to:
                     data["reply_to_message_id"] = str(reply_to)
-                result = await _query_bot_api_request("sendMessage", data=data)
+                result = await _query_bot_send_message(data)
                 return result if isinstance(result, dict) else None
 
             tg = _require_client()
@@ -3583,7 +3876,7 @@ async def _safe_reply_markdown(
                     }
                     if reply_to:
                         data["reply_to_message_id"] = str(reply_to)
-                    result = await _query_bot_api_request("sendMessage", data=data)
+                    result = await _query_bot_send_message(data)
                     return result if isinstance(result, dict) else None
 
                 tg = _require_client()
@@ -3616,6 +3909,7 @@ async def _stream_query_answer(
     prefer_bot_identity: bool = False,
     bot_chat_id: int | None = None,
     root_reply_to: int | None = None,
+    final_suffix_html: str = "",
 ) -> tuple[str, object]:
     async def _send_query_message(text: str, reply_to: int | None):
         effective_reply_to = reply_to if reply_to else root_reply_to
@@ -3658,6 +3952,8 @@ async def _stream_query_answer(
     )
     if not answer.strip():
         answer = "No matching information found in recent updates."
+    if final_suffix_html.strip():
+        answer = f"{answer.strip()}<br><br>{final_suffix_html.strip()}"
 
     stats = await streamer.finalize(answer)
     return answer, stats
@@ -3727,6 +4023,7 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
     # Own bot PM => send via bot identity.
     query_via_bot = bool(is_own_bot_pm and not is_saved_messages)
     query_bot_chat_id = sender_id if query_via_bot else None
+    query_reply_to = None if query_via_bot else int(msg.id or 0)
 
     chat_id = str(getattr(msg, "chat_id", "") or "")
 
@@ -3737,7 +4034,7 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
         await _safe_reply_markdown(
             event,
             f"Please wait {wait_seconds}s before your next query.",
-            reply_to=int(msg.id or 0),
+            reply_to=query_reply_to,
             prefer_bot_identity=query_via_bot,
             bot_chat_id=query_bot_chat_id,
         )
@@ -3746,8 +4043,12 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
 
     progress = await _safe_reply_markdown(
         event,
-        "Searching your channels... ⏳",
-        reply_to=int(msg.id or 0),
+        (
+            "Searching channels + trusted web... ⏳"
+            if _is_query_web_fallback_enabled()
+            else "Searching your channels... ⏳"
+        ),
+        reply_to=query_reply_to,
         prefer_bot_identity=query_via_bot,
         bot_chat_id=query_bot_chat_id,
     )
@@ -3759,8 +4060,9 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
             text,
             _query_default_hours_back(),
         )
+        high_risk_query = _is_high_risk_news_query(cleaned_query)
 
-        results = await search_recent_messages(
+        telegram_results = await search_recent_messages(
             _require_client(),
             monitored_source_chat_ids,
             cleaned_query,
@@ -3769,15 +4071,71 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
             logger=LOGGER,
         )
 
+        web_results: list[dict[str, object]] = []
+        web_fallback_used = False
+        ran_web_search = False
+
+        if _is_query_web_fallback_enabled():
+            ran_web_search = True
+            await _safe_reply_markdown(
+                event,
+                (
+                    "Cross-checking channels with trusted web news... ⏳"
+                    if not high_risk_query
+                    else "High-risk query detected. Cross-checking trusted web news... ⏳"
+                ),
+                edit_message=progress,
+                prefer_bot_identity=query_via_bot,
+                bot_chat_id=query_bot_chat_id,
+            )
+            web_results = await search_recent_news_web(
+                cleaned_query,
+                hours_back=min(parsed_hours, _query_web_max_hours_back()),
+                max_results=_query_web_max_results(),
+                allowed_domains=_query_web_allowed_domains(),
+                require_recent=_query_web_require_recent(),
+                logger=LOGGER,
+            )
+            required_sources = _query_web_require_min_sources()
+            if web_results and required_sources > 1:
+                source_hosts = {
+                    normalize_space(str(item.get("source") or "")).lower()
+                    for item in web_results
+                    if normalize_space(str(item.get("source") or ""))
+                }
+                if len(source_hosts) < required_sources:
+                    LOGGER.info(
+                        "Web fallback rejected for query due to low source diversity (%s < %s).",
+                        len(source_hosts),
+                        required_sources,
+                    )
+                    web_results = []
+            web_fallback_used = bool(web_results)
+
+        results = _merge_query_context(
+            telegram_results,
+            web_results,
+            limit=_query_max_messages(),
+        )
+
         await _safe_reply_markdown(
             event,
-            f"Found {len(results)} messages -> analyzing... ⏳",
+            (
+                f"Found {len(telegram_results)} channel messages"
+                + (f" + {len(web_results)} web reports" if web_results else "")
+                + " -> analyzing... ⏳"
+            ),
             edit_message=progress,
             prefer_bot_identity=query_via_bot,
             bot_chat_id=query_bot_chat_id,
         )
 
         history = list(_query_history_for_sender(sender_id))
+        web_results_section = (
+            _format_web_results_section(web_results)
+            if ran_web_search
+            else ""
+        )
         if _is_streaming_enabled():
             answer, stream_stats = await _stream_query_answer(
                 event,
@@ -3787,7 +4145,8 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
                 history=history,
                 prefer_bot_identity=query_via_bot,
                 bot_chat_id=query_bot_chat_id,
-                root_reply_to=int(msg.id or 0),
+                root_reply_to=query_reply_to,
+                final_suffix_html=web_results_section,
             )
         else:
             answer = await generate_answer_from_context(
@@ -3798,6 +4157,8 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
             )
             if not answer.strip():
                 answer = "No matching information found in recent updates."
+            if web_results_section:
+                answer = f"{answer.strip()}<br><br>{web_results_section}"
             await _safe_reply_markdown(
                 event,
                 answer,
@@ -3816,6 +4177,11 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
             query_length=len(text),
             hours_back=parsed_hours,
             messages_found=len(results),
+            telegram_messages_found=len(telegram_results),
+            web_messages_found=len(web_results),
+            web_fallback_used=web_fallback_used,
+            web_search_ran=ran_web_search,
+            high_risk_query=high_risk_query,
             response_chars=len(answer),
             stream_enabled=_is_streaming_enabled(),
             stream_edits=(stream_stats.edit_count if stream_stats else 0),
@@ -3946,13 +4312,23 @@ def _startup_health_check() -> None:
     pending = count_pending()
     inflight = count_inflight()
     last_ts = get_last_digest_timestamp()
+    queue_clear_interval_seconds = _digest_queue_clear_interval_seconds()
+    queue_clear_minutes = (
+        (queue_clear_interval_seconds // 60) if queue_clear_interval_seconds > 0 else 0
+    )
+    queue_clear_display = (
+        f"{queue_clear_minutes}m" if queue_clear_interval_seconds > 0 else "off"
+    )
+    queue_clear_scope = _digest_queue_clear_scope() if queue_clear_interval_seconds > 0 else "disabled"
     log_structured(
         LOGGER,
         "startup_health",
         mode=mode,
         dupe_detection=_is_dupe_detection_enabled(),
+        dupe_use_sentence_transformers=_dupe_use_sentence_transformers(),
         severity_routing=_is_severity_routing_enabled(),
         query_mode=_is_query_mode_enabled(),
+        query_web_fallback=_is_query_web_fallback_enabled(),
         html_formatting=_is_html_formatting_enabled(),
         premium_emoji=_is_premium_emoji_enabled(),
         premium_emoji_count=len(premium_emoji_map),
@@ -3963,9 +4339,10 @@ def _startup_health_check() -> None:
         digest_interval_minutes=_digest_interval_seconds() // 60,
         digest_daily_times=[f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()],
         digest_daily_window_hours=_digest_daily_window_hours(),
-        digest_queue_clear_minutes=_digest_queue_clear_interval_seconds() // 60,
+        digest_queue_clear_minutes=queue_clear_minutes,
+        digest_queue_clear_enabled=bool(queue_clear_interval_seconds > 0),
         digest_queue_clear_inflight=_digest_queue_clear_include_inflight(),
-        digest_queue_clear_scope=_digest_queue_clear_scope(),
+        digest_queue_clear_scope=queue_clear_scope,
         web_server_enabled=_is_web_server_enabled(),
         web_server_host=_web_server_host(),
         web_server_port=_web_server_port(),
@@ -3976,7 +4353,7 @@ def _startup_health_check() -> None:
         quota_health=get_quota_health(),
     )
     LOGGER.info(
-        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%sm scope=%s web=%s@%s:%s",
+        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s query_web=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%s scope=%s web=%s@%s:%s",
         mode,
         pending,
         inflight,
@@ -3984,6 +4361,7 @@ def _startup_health_check() -> None:
         _is_dupe_detection_enabled(),
         _is_severity_routing_enabled(),
         _is_query_mode_enabled(),
+        _is_query_web_fallback_enabled(),
         _is_html_formatting_enabled(),
         _is_premium_emoji_enabled(),
         len(premium_emoji_map),
@@ -3992,8 +4370,8 @@ def _startup_health_check() -> None:
         _is_breaking_topic_threads_enabled(),
         _digest_interval_seconds() // 60,
         ",".join(f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()) or "off",
-        _digest_queue_clear_interval_seconds() // 60,
-        _digest_queue_clear_scope(),
+        queue_clear_display,
+        queue_clear_scope,
         _is_web_server_enabled(),
         _web_server_host(),
         _web_server_port(),
@@ -4147,11 +4525,23 @@ async def main() -> None:
                         run_daily_digest_scheduler(),
                         name="daily-digest-scheduler",
                     )
-                queue_clear_scheduler_task = asyncio.create_task(
-                    run_digest_queue_clear_scheduler(),
-                    name="digest-queue-clear-scheduler",
-                )
-                _print_cli_status("✓", "Schedulers started (hourly + daily + queue clear)", level="ok")
+                if _digest_queue_clear_interval_seconds() > 0:
+                    queue_clear_scheduler_task = asyncio.create_task(
+                        run_digest_queue_clear_scheduler(),
+                        name="digest-queue-clear-scheduler",
+                    )
+                    _print_cli_status(
+                        "✓",
+                        "Schedulers started (hourly + daily + queue clear)",
+                        level="ok",
+                    )
+                else:
+                    queue_clear_scheduler_task = None
+                    _print_cli_status(
+                        "✓",
+                        "Schedulers started (hourly + daily; queue clear disabled)",
+                        level="ok",
+                    )
 
             startup_phase = "running"
             startup_ready = True

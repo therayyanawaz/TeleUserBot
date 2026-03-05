@@ -6,6 +6,7 @@ import asyncio
 from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html import escape as _escape_html, unescape as _unescape_html
 import hashlib
 import json
@@ -16,7 +17,10 @@ import re
 import threading
 import time
 from typing import Any, Awaitable, Callable, Iterable, List, Sequence, Tuple
+from urllib.parse import quote_plus, urlparse
+import xml.etree.ElementTree as ET
 
+import httpx
 from db import load_recent_breaking, purge_recent_breaking, save_recent_breaking
 
 
@@ -537,26 +541,10 @@ class NearDuplicateDetector:
     def _ensure_backend(self) -> None:
         if self._backend_name != "uninitialized":
             return
-
-        try:
-            from sentence_transformers import SentenceTransformer  # type: ignore
-            import numpy as np  # type: ignore
-
-            self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
-            self._np = np
-            self._backend_name = "sentence_transformers"
-            if self.logger:
-                self.logger.info(
-                    "Near-duplicate detector backend: sentence-transformers/all-MiniLM-L6-v2"
-                )
-            return
-        except Exception as exc:
-            self._backend_name = "tf_cosine_fallback"
-            if self.logger:
-                self.logger.warning(
-                    "sentence-transformers unavailable; using TF cosine fallback for dedupe (%s)",
-                    exc,
-                )
+        # Legacy detector remains no-HF to avoid heavyweight runtime downloads.
+        self._backend_name = "tf_cosine_fallback"
+        if self.logger:
+            self.logger.info("Near-duplicate detector backend: TF cosine fallback (no-HF mode)")
 
     def _tokenize(self, text: str) -> list[str]:
         return re.findall(r"[a-z0-9]{2,}", text.lower())
@@ -866,6 +854,152 @@ async def search_recent_messages(
     return ordered[:resolved_max]
 
 
+def _strip_html_tags(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    return normalize_space(_unescape_html(text))
+
+
+def _domain_allowed(hostname: str, allowed_domains: Sequence[str]) -> bool:
+    host = normalize_space(hostname).lower().lstrip(".")
+    if not host:
+        return False
+    normalized = [normalize_space(item).lower().lstrip(".") for item in allowed_domains if item]
+    if not normalized:
+        return True
+    return any(host == domain or host.endswith(f".{domain}") for domain in normalized)
+
+
+def _parse_pub_datetime(value: str) -> datetime | None:
+    raw = normalize_space(value)
+    if not raw:
+        return None
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+async def search_recent_news_web(
+    query: str,
+    *,
+    hours_back: int = 24,
+    max_results: int = 12,
+    allowed_domains: Sequence[str] | None = None,
+    require_recent: bool = True,
+    logger: logging.Logger | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Strict web-news fallback search (RSS based).
+
+    Uses Bing News RSS endpoint and returns normalized context rows compatible with
+    query answer generation.
+    """
+    text = normalize_space(query)
+    if len(text) < 3:
+        return []
+
+    resolved_hours = max(1, min(int(hours_back), 72))
+    resolved_max = max(3, min(int(max_results), 40))
+    trusted_domains = list(allowed_domains or [])
+
+    # Bing RSS accepts `when:Xh` search hint for recency.
+    search_query = f"{text} when:{resolved_hours}h"
+    url = f"https://www.bing.com/news/search?q={quote_plus(search_query)}&format=RSS"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+    }
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=resolved_hours)
+    dedupe: set[str] = set()
+    rows: list[dict[str, Any]] = []
+
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as http:
+            response = await http.get(url)
+        if response.status_code != 200:
+            if logger:
+                logger.debug("Web fallback RSS status=%s", response.status_code)
+            return []
+
+        try:
+            root = ET.fromstring(response.text)
+        except Exception:
+            if logger:
+                logger.debug("Web fallback RSS parse failure.", exc_info=True)
+            return []
+
+        for item in root.findall(".//item"):
+            title = normalize_space(str(item.findtext("title") or ""))
+            link = normalize_space(str(item.findtext("link") or ""))
+            description = _strip_html_tags(str(item.findtext("description") or ""))
+            pub_raw = normalize_space(str(item.findtext("pubDate") or ""))
+
+            if not title or not link:
+                continue
+            if not link.startswith("http"):
+                continue
+
+            host = normalize_space(str(urlparse(link).hostname or "")).lower()
+            if not _domain_allowed(host, trusted_domains):
+                continue
+
+            pub_dt = _parse_pub_datetime(pub_raw)
+            if require_recent:
+                if pub_dt is None:
+                    continue
+                if pub_dt < cutoff or pub_dt > now + timedelta(minutes=5):
+                    continue
+            if pub_dt is None:
+                pub_dt = now
+
+            source_tag = item.find("source")
+            source_name = normalize_space(source_tag.text if source_tag is not None else "")
+            if not source_name:
+                source_name = host or "web"
+
+            snippet = title
+            if description and description.lower() not in title.lower():
+                snippet = f"{title}. {description}"
+            if len(snippet) > 700:
+                snippet = f"{snippet[:697].rsplit(' ', 1)[0]}..."
+
+            sig = f"{host}|{title.lower()}"
+            if sig in dedupe:
+                continue
+            dedupe.add(sig)
+
+            rows.append(
+                {
+                    "chat_id": "web",
+                    "message_id": 0,
+                    "timestamp": int(pub_dt.timestamp()),
+                    "date": pub_dt.isoformat(),
+                    "source": f"Web:{source_name}",
+                    "text": snippet,
+                    "link": link,
+                    "provider": "bing_news_rss",
+                    "is_web": True,
+                }
+            )
+            if len(rows) >= resolved_max:
+                break
+    except Exception:
+        if logger:
+            logger.debug("Web fallback search failed.", exc_info=True)
+        return []
+
+    rows.sort(key=lambda row: int(row.get("timestamp", 0)), reverse=True)
+    return rows[:resolved_max]
+
+
 @dataclass
 class LiveStreamStats:
     total_chars: int
@@ -1111,6 +1245,29 @@ _BREAKING_HINTS = {
     "rescued",
 }
 
+_GEO_HINTS = {
+    "gaza",
+    "rafah",
+    "beirut",
+    "tehran",
+    "damascus",
+    "aleppo",
+    "kyiv",
+    "odessa",
+    "moscow",
+    "baghdad",
+    "hormuz",
+    "bushehr",
+    "iran",
+    "iraq",
+    "israel",
+    "lebanon",
+    "syria",
+    "yemen",
+    "ukraine",
+    "russia",
+}
+
 _EMOJI_RE = re.compile(
     "["
     "\U0001F1E0-\U0001F1FF"
@@ -1189,6 +1346,65 @@ def _tfidf_cosine(tokens_a: Sequence[str], tokens_b: Sequence[str]) -> float:
     return max(0.0, min(1.0, dot / (norm_a * norm_b)))
 
 
+def _set_jaccard(left: Sequence[str], right: Sequence[str]) -> float:
+    if not left or not right:
+        return 0.0
+    a = set(left)
+    b = set(right)
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if inter <= 0:
+        return 0.0
+    union = len(a | b)
+    if union <= 0:
+        return 0.0
+    return max(0.0, min(1.0, inter / union))
+
+
+def _set_dice(left: Sequence[str], right: Sequence[str]) -> float:
+    if not left or not right:
+        return 0.0
+    a = set(left)
+    b = set(right)
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if inter <= 0:
+        return 0.0
+    return max(0.0, min(1.0, (2.0 * inter) / (len(a) + len(b))))
+
+
+def _token_bigrams(tokens: Sequence[str]) -> tuple[str, ...]:
+    if len(tokens) < 2:
+        return tuple()
+    return tuple(f"{tokens[i]}_{tokens[i + 1]}" for i in range(len(tokens) - 1))
+
+
+def _chargrams(text: str, n: int = 4) -> tuple[str, ...]:
+    compact = re.sub(r"\s+", " ", text or "").strip()
+    if len(compact) < n:
+        return tuple()
+    return tuple(compact[i : i + n] for i in range(len(compact) - n + 1))
+
+
+def _anchor_tokens(tokens: Sequence[str]) -> tuple[str, ...]:
+    anchors: list[str] = []
+    for token in tokens:
+        if not token:
+            continue
+        if token.isdigit():
+            anchors.append(token)
+            continue
+        if token in _BREAKING_HINTS or token in _GEO_HINTS:
+            anchors.append(token)
+            continue
+        # Long lexical anchors often survive paraphrases.
+        if len(token) >= 8:
+            anchors.append(token)
+    return tuple(anchors)
+
+
 def _cosine_dense(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
     if not vec_a or not vec_b or len(vec_a) != len(vec_b):
         return 0.0
@@ -1241,6 +1457,9 @@ class _HybridRecord:
     normalized_text: str
     token_key: str
     tokens: tuple[str, ...]
+    bigrams: tuple[str, ...]
+    chargrams: tuple[str, ...]
+    anchors: tuple[str, ...]
     embedding: tuple[float, ...] | None
     timestamp: int
     text_hash: str
@@ -1250,6 +1469,10 @@ class HybridDuplicateEngine:
     """
     Aggressive hybrid duplicate detector:
     final_score = 0.5 * semantic + 0.3 * tfidf + 0.2 * fuzzy
+
+    Semantic component:
+    - sentence-transformers cosine when enabled
+    - otherwise no-HF semantic proxy (token/bigram/chargram/anchor overlap)
     """
 
     def __init__(
@@ -1258,11 +1481,13 @@ class HybridDuplicateEngine:
         threshold: float = 0.87,
         history_hours: int = 4,
         max_items: int = 8000,
+        use_sentence_transformers: bool = False,
         logger: logging.Logger | None = None,
     ) -> None:
         self.threshold = float(min(max(threshold, 0.5), 0.99))
         self.history_hours = max(1, min(int(history_hours), 24))
         self.max_items = max(200, min(int(max_items), 100000))
+        self.use_sentence_transformers = bool(use_sentence_transformers)
         self.logger = logger
 
         self._records: deque[_HybridRecord] = deque()
@@ -1287,21 +1512,27 @@ class HybridDuplicateEngine:
             return
 
         semantic_loaded = False
-        try:
-            from sentence_transformers import SentenceTransformer  # type: ignore
+        if self.use_sentence_transformers:
+            try:
+                from sentence_transformers import SentenceTransformer  # type: ignore
 
-            model = None
-            for candidate in ("all-MiniLM-L6-v2", "paraphrase-MiniLM-L6-v2"):
-                try:
-                    model = SentenceTransformer(candidate)
-                    break
-                except Exception:
-                    continue
-            if model is not None:
-                self._st_model = model
-                semantic_loaded = True
-        except Exception:
-            semantic_loaded = False
+                model = None
+                for candidate in ("all-MiniLM-L6-v2", "paraphrase-MiniLM-L6-v2"):
+                    try:
+                        model = SentenceTransformer(candidate)
+                        break
+                    except Exception:
+                        continue
+                if model is not None:
+                    self._st_model = model
+                    semantic_loaded = True
+            except Exception as exc:
+                semantic_loaded = False
+                if self.logger:
+                    self.logger.warning(
+                        "sentence-transformers unavailable; using no-HF semantic proxy for dedupe (%s)",
+                        exc,
+                    )
 
         try:
             from rapidfuzz import fuzz  # type: ignore
@@ -1317,10 +1548,10 @@ class HybridDuplicateEngine:
                     "Hybrid duplicate backend: sentence-transformers + TF-IDF + rapidfuzz"
                 )
         else:
-            self._backend_name = "hybrid_tfidf_fuzzy_fallback"
+            self._backend_name = "hybrid_nohf_semproxy_tfidf_fuzzy"
             if self.logger:
-                self.logger.warning(
-                    "sentence-transformers unavailable; semantic score falls back to TF-IDF."
+                self.logger.info(
+                    "Hybrid duplicate backend: no-HF semantic proxy + TF-IDF + rapidfuzz"
                 )
 
     def _serialize_embedding(self, embedding: tuple[float, ...] | None) -> bytes | None:
@@ -1424,15 +1655,54 @@ class HybridDuplicateEngine:
     ) -> _HybridRecord:
         tokens = tuple(_tokenize_for_dupe(normalized_text))
         token_key = " ".join(sorted(tokens))
+        bigrams = _token_bigrams(tokens)
+        chargrams = _chargrams(token_key, n=4)
+        anchors = _anchor_tokens(tokens)
         return _HybridRecord(
             channel_id=str(channel_id),
             message_id=int(message_id),
             normalized_text=normalized_text,
             token_key=token_key,
             tokens=tokens,
+            bigrams=bigrams,
+            chargrams=chargrams,
+            anchors=anchors,
             embedding=embedding,
             timestamp=int(timestamp),
             text_hash=text_hash,
+        )
+
+    def _semantic_proxy_score(
+        self,
+        *,
+        current_tokens: Sequence[str],
+        current_bigrams: Sequence[str],
+        current_chargrams: Sequence[str],
+        current_anchors: Sequence[str],
+        current_key: str,
+        record: _HybridRecord,
+    ) -> tuple[float, float, float, float, float, float]:
+        token_jacc = _set_jaccard(current_tokens, record.tokens)
+        bigram_dice = _set_dice(current_bigrams, record.bigrams)
+        char_jacc = _set_jaccard(current_chargrams, record.chargrams)
+        anchor_dice = _set_dice(current_anchors, record.anchors)
+        order_sim = self._fuzzy_similarity(current_key, record.token_key)
+
+        # Weighted no-HF semantic proxy tuned for paraphrase-heavy news reposts.
+        score = (
+            (0.30 * token_jacc)
+            + (0.25 * bigram_dice)
+            + (0.22 * char_jacc)
+            + (0.15 * anchor_dice)
+            + (0.08 * order_sim)
+        )
+        return (
+            max(0.0, min(1.0, score)),
+            token_jacc,
+            bigram_dice,
+            char_jacc,
+            anchor_dice,
+            order_sim,
         )
 
     def warm_start_from_db(self, *, warm_hours: int = 2) -> None:
@@ -1487,12 +1757,16 @@ class HybridDuplicateEngine:
         embedding = self._encode_semantic(normalized_text)
         current_tokens = tuple(_tokenize_for_dupe(normalized_text))
         current_key = " ".join(sorted(current_tokens))
+        current_bigrams = _token_bigrams(current_tokens)
+        current_chargrams = _chargrams(current_key, n=4)
+        current_anchors = _anchor_tokens(current_tokens)
 
         best_score = 0.0
         best_semantic = 0.0
         best_tfidf = 0.0
         best_fuzzy = 0.0
         best_record: _HybridRecord | None = None
+        effective_threshold = self.threshold
 
         with self._lock:
             self._prune_locked(now_ts)
@@ -1513,12 +1787,45 @@ class HybridDuplicateEngine:
                 tfidf_score = _tfidf_cosine(current_tokens, record.tokens)
                 fuzzy_score = self._fuzzy_similarity(current_key, record.token_key)
                 semantic_score = 0.0
+                token_jacc = 0.0
+                bigram_dice = 0.0
+                char_jacc = 0.0
+                anchor_dice = 0.0
+                order_sim = 0.0
                 if embedding is not None and record.embedding is not None:
                     semantic_score = _cosine_dense(embedding, record.embedding)
                 else:
-                    semantic_score = tfidf_score
+                    (
+                        semantic_score,
+                        token_jacc,
+                        bigram_dice,
+                        char_jacc,
+                        anchor_dice,
+                        order_sim,
+                    ) = self._semantic_proxy_score(
+                        current_tokens=current_tokens,
+                        current_bigrams=current_bigrams,
+                        current_chargrams=current_chargrams,
+                        current_anchors=current_anchors,
+                        current_key=current_key,
+                        record=record,
+                    )
+                    effective_threshold = min(effective_threshold, 0.82)
 
                 final_score = (0.5 * semantic_score) + (0.3 * tfidf_score) + (0.2 * fuzzy_score)
+                # Aggressive boost rules for paraphrased echoes in no-HF mode.
+                if tfidf_score >= 0.72 and fuzzy_score >= 0.88:
+                    final_score = max(final_score, 0.90)
+                if semantic_score >= 0.78 and tfidf_score >= 0.65:
+                    final_score = max(final_score, 0.89)
+                if anchor_dice >= 0.66 and tfidf_score >= 0.62:
+                    final_score = max(final_score, 0.88)
+                if anchor_dice >= 0.50 and token_jacc >= 0.42 and fuzzy_score >= 0.62:
+                    final_score = max(final_score, 0.89)
+                if bigram_dice >= 0.45 and char_jacc >= 0.45 and tfidf_score >= 0.48:
+                    final_score = max(final_score, 0.88)
+                if order_sim >= 0.85 and token_jacc >= 0.40:
+                    final_score = max(final_score, 0.87)
                 if final_score > best_score:
                     best_score = final_score
                     best_semantic = semantic_score
@@ -1526,7 +1833,7 @@ class HybridDuplicateEngine:
                     best_fuzzy = fuzzy_score
                     best_record = record
 
-            if best_score >= self.threshold and best_record is not None:
+            if best_score >= effective_threshold and best_record is not None:
                 breaking_recent = (
                     _is_breaking_like(normalized_text)
                     and (now_ts - int(best_record.timestamp)) <= 1800

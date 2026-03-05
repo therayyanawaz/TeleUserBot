@@ -1137,6 +1137,57 @@ def _query_requests_detail(query: str) -> bool:
     return any(hint in lowered for hint in hints)
 
 
+def _query_is_high_risk(query: str) -> bool:
+    lowered = normalize_space(query).lower()
+    if not lowered:
+        return False
+    terms = (
+        "leader",
+        "supreme leader",
+        "president",
+        "prime minister",
+        "successor",
+        "succession",
+        "deceased",
+        "died",
+        "dead",
+        "killed",
+        "assassinated",
+        "resigned",
+        "coup",
+        "overthrown",
+        "nuclear plant",
+        "nuclear site",
+    )
+    return any(term in lowered for term in terms)
+
+
+def _query_distinct_sources(context_messages: Sequence[Dict[str, object]]) -> int:
+    sources = {
+        normalize_space(str(item.get("source") or "")).lower()
+        for item in context_messages
+        if normalize_space(str(item.get("source") or ""))
+    }
+    return len(sources)
+
+
+def _answer_has_definitive_high_risk_claim(answer: str) -> bool:
+    lowered = normalize_space(re.sub(r"</?[^>]+>", " ", answer or "")).lower()
+    if not lowered:
+        return False
+    markers = (
+        "is dead",
+        "is deceased",
+        "has died",
+        "was killed",
+        "new leader is",
+        "has been appointed",
+        "confirmed dead",
+        "confirmed killed",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 def _query_context_token_budget() -> int:
     raw = getattr(config, "DIGEST_MAX_TOKENS", 18000)
     try:
@@ -1367,6 +1418,46 @@ def _cleanup_headline(raw: str) -> str:
 
 
 def _cleanup_vital_view(raw: str) -> str:
+    def _trim_tail_fragment(value: str) -> str:
+        connectors = {
+            "and",
+            "or",
+            "but",
+            "because",
+            "while",
+            "with",
+            "without",
+            "if",
+            "as",
+            "to",
+            "of",
+            "for",
+            "in",
+            "on",
+            "at",
+            "from",
+            "by",
+            "amid",
+            "pending",
+        }
+        text_value = normalize_space(value)
+        if not text_value:
+            return text_value
+        words = text_value.split()
+        while words:
+            tail = words[-1].strip(".,;:!?").lower()
+            if tail in connectors:
+                words.pop()
+                continue
+            break
+        return " ".join(words).strip()
+
+    def _finalize_sentence(value: str) -> str:
+        text_value = normalize_space(value).rstrip(".,;:!?")
+        if not text_value:
+            return ""
+        return f"{text_value}."
+
     text = normalize_space(raw)
     if not text:
         return ""
@@ -1383,7 +1474,15 @@ def _cleanup_vital_view(raw: str) -> str:
     max_words = max(10, min(max_words, 30))
     words = text.split()
     if len(words) > max_words:
-        text = " ".join(words[: max_words - 1]).rstrip(".,;:") + "..."
+        text = " ".join(words[:max_words])
+    text = _trim_tail_fragment(text)
+    if text.lower().startswith("why it matters:"):
+        detail = normalize_space(text.split(":", 1)[1] if ":" in text else "")
+        if not detail:
+            return _finalize_sentence(_fallback_vital_view(raw))
+    text = _finalize_sentence(text)
+    if not text:
+        return _finalize_sentence(_fallback_vital_view(raw))
     return text
 
 
@@ -1664,7 +1763,14 @@ async def generate_answer_from_context(
 
     manager = auth_manager or AuthManager(logger=LOGGER)
     detailed = _query_requests_detail(question)
+    high_risk_query = _query_is_high_risk(question)
+    distinct_sources = _query_distinct_sources(context_messages)
     output_language = _resolve_output_language()
+
+    # Strict guardrail for high-risk queries (leadership/death/succession):
+    # if evidence diversity is weak, do not produce potentially false claims.
+    if high_risk_query and distinct_sources < 2:
+        return QUERY_NO_MATCH_TEXT
 
     # Reserve room for prompt + answer generation.
     context_budget = max(2000, _query_context_token_budget() - 2600)
@@ -1691,6 +1797,8 @@ async def generate_answer_from_context(
         f"- Context messages provided: {len(context_messages)}",
         f"- Context lines included: {len(context_lines)}",
         f"- Estimated context tokens: {used_tokens}",
+        f"- High-risk query: {'yes' if high_risk_query else 'no'}",
+        f"- Distinct evidence sources: {distinct_sources}",
     ]
     if history_lines:
         payload_parts.extend(["", "Conversation history (recent):", *history_lines])
@@ -1736,6 +1844,9 @@ async def generate_answer_from_context(
 
     plain_cleaned = re.sub(r"</?[^>]+>", "", cleaned).lower()
     if QUERY_NO_MATCH_TEXT.lower() in cleaned.lower() or "no relevant information found" in plain_cleaned:
+        return QUERY_NO_MATCH_TEXT
+
+    if high_risk_query and distinct_sources < 2 and _answer_has_definitive_high_risk_claim(cleaned):
         return QUERY_NO_MATCH_TEXT
 
     safe = sanitize_telegram_html(content.strip())

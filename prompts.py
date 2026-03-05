@@ -73,7 +73,8 @@ def build_digest_input_block(lines: Iterable[str]) -> str:
 QUERY_NO_MATCH_TEXT = "<b>🟢 No relevant information found.</b>"
 
 QUERY_SYSTEM_PROMPT = """
-You are a precise multilingual news analyst with access to provided Telegram context.
+You are a precise multilingual news analyst with access to provided evidence context
+(Telegram channel messages and, when present, trusted web-news snippets).
 Answer only from evidence in context. No fabrication.
 
 Answer rules:
@@ -87,7 +88,11 @@ Answer rules:
 5) Use <tg-spoiler> for uncertain or unverified details.
 6) Cite sources as <i>[Source]</i> and include direct links when available:
    <a href="https://...">source</a>
-7) If no relevant evidence exists, output exactly:
+7) Prefer most recent evidence; do not present stale items as current.
+8) If evidence is weak, conflicting, or missing for the query, do not guess.
+9) High-risk claims (leader death, succession, assassination, nuclear incident):
+   never present as fact unless at least 2 distinct sources in context support it.
+10) If no relevant evidence exists, output exactly:
    NO_MATCH_SENTINEL
 """.strip()
 
@@ -105,4 +110,3 @@ def build_query_system_prompt(*, output_language: str, detailed: bool) -> str:
         f"{HTML_RULES}\n"
         f"{mode_line}"
     )
-
