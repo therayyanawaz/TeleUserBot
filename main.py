@@ -98,6 +98,82 @@ except Exception:  # pragma: no cover - non-Unix fallback
     fcntl = None  # type: ignore[assignment]
 
 
+def _supports_color() -> bool:
+    forced = str(os.getenv("CLI_COLOR", "") or "").strip().lower()
+    if forced in {"1", "true", "yes", "on"}:
+        return True
+    if forced in {"0", "false", "no", "off"}:
+        return False
+    if os.getenv("NO_COLOR"):
+        return False
+    if not sys.stderr.isatty():
+        return False
+    return str(os.getenv("TERM", "") or "").strip().lower() not in {"", "dumb"}
+
+
+_COLOR_ON = _supports_color()
+_C_RESET = "\033[0m"
+_C_BOLD = "\033[1m"
+_C_DIM = "\033[2m"
+_C_CYAN = "\033[36m"
+_C_GREEN = "\033[32m"
+_C_YELLOW = "\033[33m"
+_C_RED = "\033[31m"
+
+
+def _c(text: str, color: str, *, bold: bool = False, dim: bool = False) -> str:
+    if not _COLOR_ON:
+        return text
+    style = ""
+    if bold:
+        style += _C_BOLD
+    if dim:
+        style += _C_DIM
+    return f"{style}{color}{text}{_C_RESET}"
+
+
+def _print_cli_banner() -> None:
+    if not sys.stdin.isatty():
+        return
+    line = "═" * 64
+    print(_c(line, _C_CYAN, bold=True))
+    print(_c("Telegram News Intelligence Userbot", _C_CYAN, bold=True))
+    print(_c("Single entrypoint: python main.py", _C_CYAN, dim=True))
+    print(_c(line, _C_CYAN, bold=True))
+
+
+def _print_cli_status(symbol: str, text: str, *, level: str = "info") -> None:
+    if not sys.stdin.isatty():
+        return
+    color = _C_CYAN
+    if level == "ok":
+        color = _C_GREEN
+    elif level == "warn":
+        color = _C_YELLOW
+    elif level == "error":
+        color = _C_RED
+    print(f"{_c(symbol, color, bold=True)} {text}")
+
+
+class _ColorConsoleFormatter(logging.Formatter):
+    _LEVEL_COLORS = {
+        "DEBUG": _C_DIM,
+        "INFO": _C_CYAN,
+        "WARNING": _C_YELLOW,
+        "ERROR": _C_RED,
+        "CRITICAL": _C_RED,
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        if not _COLOR_ON:
+            return text
+        color = self._LEVEL_COLORS.get(record.levelname, "")
+        if not color:
+            return text
+        return f"{color}{text}{_C_RESET}"
+
+
 ensure_runtime_dir()
 
 LOGGER = logging.getLogger("tg_news_userbot")
@@ -112,7 +188,7 @@ LOGGER.addHandler(_error_handler)
 
 _console_handler = logging.StreamHandler()
 _console_handler.setLevel(logging.INFO)
-_console_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+_console_handler.setFormatter(_ColorConsoleFormatter("%(asctime)s | %(levelname)s | %(message)s"))
 LOGGER.addHandler(_console_handler)
 
 
@@ -3777,6 +3853,7 @@ async def main() -> None:
     global startup_phase, startup_ready, startup_error
 
     try:
+        _print_cli_banner()
         if _is_web_server_enabled():
             try:
                 web_status_server = WebStatusServer(
@@ -3791,15 +3868,18 @@ async def main() -> None:
                 web_status_server = None
 
         startup_phase = "config"
+        _print_cli_status("•", "Validating configuration...", level="info")
         try:
             _prompt_for_missing_config()
             _validate_config()
+            _print_cli_status("✓", "Configuration validated", level="ok")
         except (RuntimeError, ValueError) as exc:
             startup_error = str(exc)
             startup_ready = False
             startup_phase = "error"
             LOGGER.error("%s", exc)
             print(exc)
+            _print_cli_status("✗", "Configuration invalid. Fix values and re-run.", level="error")
             if _is_web_server_enabled() and _should_hold_on_startup_error():
                 LOGGER.warning("Holding process alive after config validation error for health visibility.")
                 while True:
@@ -3807,14 +3887,17 @@ async def main() -> None:
             return
 
         startup_phase = "lock"
+        _print_cli_status("•", "Checking single-instance lock...", level="info")
         try:
             instance_lock_handle = _acquire_instance_lock()
+            _print_cli_status("✓", "Instance lock acquired", level="ok")
         except RuntimeError as exc:
             startup_error = str(exc)
             startup_ready = False
             startup_phase = "error"
             LOGGER.error("%s", exc)
             print(exc)
+            _print_cli_status("✗", "Another instance is already running", level="error")
             if _is_web_server_enabled() and _should_hold_on_startup_error():
                 LOGGER.warning("Holding process alive after startup lock error for health visibility.")
                 while True:
@@ -3827,18 +3910,26 @@ async def main() -> None:
             init_db()
             await _init_dupe_detector()
             _startup_health_check()
+            _print_cli_status("✓", "Database and runtime state ready", level="ok")
 
             startup_phase = "auth"
+            _print_cli_status("•", "Preparing OpenAI auth context...", level="info")
             auth_manager = AuthManager(logger=LOGGER)
             await auth_manager.get_access_token()
+            _print_cli_status("✓", "OpenAI auth ready", level="ok")
 
             startup_phase = "telegram_login"
+            _print_cli_status("•", "Connecting Telegram user session...", level="info")
             client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
             await _ensure_user_account_session()
+            _print_cli_status("✓", "Telegram session authorized", level="ok")
             startup_phase = "destination_setup"
+            _print_cli_status("•", "Validating destination...", level="info")
             await _ensure_destination_peer()
+            _print_cli_status("✓", "Destination ready", level="ok")
 
             startup_phase = "source_setup"
+            _print_cli_status("•", "Resolving source channels...", level="info")
             resolved_sources = await setup_sources()
             while not resolved_sources:
                 if not _is_interactive_runtime():
@@ -3867,6 +3958,7 @@ async def main() -> None:
                 config.EXTRA_SOURCES = deduped
                 _persist_config_updates({"EXTRA_SOURCES": config.EXTRA_SOURCES})
                 resolved_sources = await setup_sources()
+            _print_cli_status("✓", f"Sources ready ({len(resolved_sources)} total)", level="ok")
 
             startup_phase = "handlers"
             client.add_event_handler(_on_new_message, events.NewMessage(chats=resolved_sources))
@@ -3884,6 +3976,11 @@ async def main() -> None:
             me = await client.get_me()
             started_as_username = str(getattr(me, "username", "") or "unknown")
             LOGGER.info("Userbot started as @%s", started_as_username)
+            _print_cli_status(
+                "🚀",
+                f"Running as @{started_as_username} — monitoring {len(resolved_sources)} source(s)",
+                level="ok",
+            )
             if _is_missing_folder_invite_link():
                 LOGGER.info("Listening to %s manually configured channels.", len(resolved_sources))
             if _is_digest_mode_enabled():
@@ -3900,6 +3997,7 @@ async def main() -> None:
                     run_digest_queue_clear_scheduler(),
                     name="digest-queue-clear-scheduler",
                 )
+                _print_cli_status("✓", "Schedulers started (hourly + daily + queue clear)", level="ok")
 
             startup_phase = "running"
             startup_ready = True
@@ -3908,12 +4006,14 @@ async def main() -> None:
                 await client.run_until_disconnected()
             except (asyncio.CancelledError, KeyboardInterrupt):
                 LOGGER.info("Shutdown requested. Stopping userbot...")
+                _print_cli_status("•", "Shutdown requested, stopping...", level="warn")
         except (RuntimeError, ValueError) as exc:
             startup_error = str(exc)
             startup_ready = False
             startup_phase = "error"
             LOGGER.error("%s", exc)
             print(exc)
+            _print_cli_status("✗", "Startup failed", level="error")
             if _is_web_server_enabled() and _should_hold_on_startup_error():
                 LOGGER.warning("Holding process alive after startup error for health visibility.")
                 while True:

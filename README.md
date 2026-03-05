@@ -112,6 +112,17 @@ Bootstrap this secret from your local machine:
 python auth.py bootstrap-env
 ```
 
+One-shot local setup (login + write `.env` automatically):
+
+```bash
+python auth.py setup-env
+```
+
+Optional:
+- `--env-file /path/to/.env` to target a custom env file.
+- `--out /tmp/tg_auth.env` to also export secret lines for cloud secret managers.
+- `--print-secrets` to print full secrets to stdout (sensitive).
+
 It prints:
 - `TG_USERBOT_AUTH_JSON=...`
 - `TG_USERBOT_AUTH_JSON_B64=...`

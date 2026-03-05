@@ -212,6 +212,74 @@ def _serialize_token_for_env(token_data: Dict[str, Any]) -> Tuple[str, str]:
     return json_blob, b64_blob
 
 
+def _env_snippet_from_payload(payload: Dict[str, str]) -> str:
+    return (
+        f"{ENV_AUTH_JSON}={json.dumps(payload['json'])}\n"
+        f"{ENV_AUTH_JSON_B64}={json.dumps(payload['b64'])}\n"
+    )
+
+
+def _extract_env_key(line: str) -> Optional[str]:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    key, _ = stripped.split("=", 1)
+    key = key.strip()
+    if not key:
+        return None
+    return key
+
+
+def _render_env_line(key: str, value: str) -> str:
+    if key == ENV_AUTH_ENV_ONLY:
+        return f"{key}={value}"
+    return f"{key}={json.dumps(value)}"
+
+
+def write_auth_payload_to_env_file(payload: Dict[str, str], env_path: Path) -> Path:
+    """Create/update .env with env-only auth keys from OAuth bootstrap payload."""
+    env_path = env_path.expanduser().resolve()
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not env_path.exists():
+        example_path = env_path.parent / ".env.example"
+        if example_path.exists():
+            env_path.write_text(example_path.read_text(encoding="utf-8"), encoding="utf-8")
+        else:
+            env_path.write_text("", encoding="utf-8")
+
+    original_text = env_path.read_text(encoding="utf-8")
+    original_lines = original_text.splitlines()
+    has_trailing_newline = original_text.endswith("\n")
+
+    updates = {
+        ENV_AUTH_ENV_ONLY: "true",
+        ENV_AUTH_JSON: "",
+        ENV_AUTH_JSON_B64: str(payload.get("b64") or ""),
+    }
+    update_order = [ENV_AUTH_ENV_ONLY, ENV_AUTH_JSON, ENV_AUTH_JSON_B64]
+
+    updated_lines = []
+    seen_keys = set()
+    for line in original_lines:
+        key = _extract_env_key(line)
+        if key in updates:
+            updated_lines.append(_render_env_line(key, updates[key]))
+            seen_keys.add(key)
+            continue
+        updated_lines.append(line)
+
+    for key in update_order:
+        if key not in seen_keys:
+            updated_lines.append(_render_env_line(key, updates[key]))
+
+    out_text = "\n".join(updated_lines)
+    if has_trailing_newline or out_text:
+        out_text += "\n"
+    env_path.write_text(out_text, encoding="utf-8")
+    return env_path
+
+
 def ensure_runtime_dir() -> Path:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -625,13 +693,33 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional path to write env export snippet.",
     )
+
+    setup = sub.add_parser(
+        "setup-env",
+        help="Run local OAuth and write/update .env automatically (all-in-one local setup).",
+    )
+    setup.add_argument(
+        "--env-file",
+        default=".env",
+        help="Path to .env file to create/update. Default: .env in current directory.",
+    )
+    setup.add_argument(
+        "--out",
+        default="",
+        help="Optional path to also write TG_USERBOT_AUTH_JSON/TG_USERBOT_AUTH_JSON_B64 snippet.",
+    )
+    setup.add_argument(
+        "--print-secrets",
+        action="store_true",
+        help="Print full token secrets to stdout (sensitive).",
+    )
     return parser
 
 
 def _run_cli() -> int:
     parser = _build_arg_parser()
     args = parser.parse_args()
-    if args.command != "bootstrap-env":
+    if args.command not in {"bootstrap-env", "setup-env"}:
         parser.print_help()
         return 0
 
@@ -647,12 +735,28 @@ def _run_cli() -> int:
         print(f"Bootstrap failed: {exc}")
         return 1
 
-    snippet = (
-        f"TG_USERBOT_AUTH_JSON={json.dumps(payload['json'])}\n"
-        f"TG_USERBOT_AUTH_JSON_B64={json.dumps(payload['b64'])}\n"
-    )
-    print("\n# Set these as secrets in Replit/server environment:\n")
-    print(snippet)
+    snippet = _env_snippet_from_payload(payload)
+
+    if args.command == "bootstrap-env":
+        print("\n# Set these as secrets in Replit/server environment:\n")
+        print(snippet)
+        print(
+            f"# Token account_id={payload['account_id']} expires_at={payload['expires_at']}"
+        )
+
+        out = str(getattr(args, "out", "") or "").strip()
+        if out:
+            path = Path(out).expanduser().resolve()
+            path.write_text(snippet, encoding="utf-8")
+            print(f"# Wrote env snippet to: {path}")
+        return 0
+
+    env_file = str(getattr(args, "env_file", "") or "").strip() or ".env"
+    env_path = write_auth_payload_to_env_file(payload, Path(env_file))
+    print(f"# Updated env file: {env_path}")
+    print(f"# {ENV_AUTH_ENV_ONLY}=true")
+    print(f"# {ENV_AUTH_JSON}=\"\"")
+    print(f"# {ENV_AUTH_JSON_B64}=SET (len={len(payload['b64'])})")
     print(
         f"# Token account_id={payload['account_id']} expires_at={payload['expires_at']}"
     )
@@ -662,6 +766,10 @@ def _run_cli() -> int:
         path = Path(out).expanduser().resolve()
         path.write_text(snippet, encoding="utf-8")
         print(f"# Wrote env snippet to: {path}")
+
+    if bool(getattr(args, "print_secrets", False)):
+        print("\n# Sensitive values (requested via --print-secrets):\n")
+        print(snippet)
 
     return 0
 
