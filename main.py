@@ -11,7 +11,9 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 from collections import defaultdict, deque
@@ -42,6 +44,7 @@ from ai_filter import (
     create_digest_summary,
     generate_answer_from_context,
     get_quota_health,
+    summarize_media_context,
     summarize_breaking_headline,
     summarize_vital_rational_view,
     summarize_or_skip,
@@ -76,6 +79,7 @@ from utils import (
     build_telegram_message_link,
     configure_duplicate_runtime,
     estimate_tokens_rough,
+    extract_ocr_text_from_image_bytes,
     format_eta,
     format_ts,
     is_duplicate_and_handle,
@@ -559,6 +563,50 @@ def _is_html_formatting_enabled() -> bool:
 
 def _is_premium_emoji_enabled() -> bool:
     return _bool_flag(getattr(config, "ENABLE_PREMIUM_EMOJI", True), True)
+
+
+def _is_media_ocr_enabled() -> bool:
+    return _bool_flag(getattr(config, "ENABLE_MEDIA_OCR", True), True)
+
+
+def _media_ocr_min_chars() -> int:
+    raw = getattr(config, "MEDIA_OCR_MIN_CHARS", 18)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 18
+    return max(8, min(value, 300))
+
+
+def _media_ocr_max_chars() -> int:
+    raw = getattr(config, "MEDIA_OCR_MAX_CHARS", 1600)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 1600
+    return max(200, min(value, 6000))
+
+
+def _media_ocr_max_images_per_album() -> int:
+    raw = getattr(config, "MEDIA_OCR_MAX_IMAGES_PER_ALBUM", 3)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 3
+    return max(1, min(value, 10))
+
+
+def _media_ocr_video_enabled() -> bool:
+    return _bool_flag(getattr(config, "MEDIA_OCR_ENABLE_VIDEO_FRAME", True), True)
+
+
+def _media_ocr_video_max_mb() -> int:
+    raw = getattr(config, "MEDIA_OCR_VIDEO_MAX_MB", 25)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 25
+    return max(5, min(value, 200))
 
 
 def _premium_emoji_map_path() -> str:
@@ -1427,6 +1475,172 @@ def _filename_for_bot_media(msg: Message, index: int) -> str:
             if isinstance(attr, types.DocumentAttributeFilename) and attr.file_name:
                 return attr.file_name
     return f"file_{msg.id or index}.bin"
+
+
+def _message_is_image_media(msg: Message) -> bool:
+    if bool(msg.photo):
+        return True
+    document = getattr(msg, "document", None)
+    if document is None:
+        return False
+    mime = str(getattr(document, "mime_type", "") or "").strip().lower()
+    return mime.startswith("image/")
+
+
+def _message_is_ocr_eligible(msg: Message) -> bool:
+    return _message_is_image_media(msg) or bool(msg.video)
+
+
+def _extract_video_frame_bytes_for_ocr(video_blob: bytes) -> bytes | None:
+    if not video_blob:
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix="tg_ocr_") as tmpdir:
+            in_path = Path(tmpdir) / "input.mp4"
+            out_path = Path(tmpdir) / "frame.jpg"
+            in_path.write_bytes(video_blob)
+
+            commands = [
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(in_path),
+                    "-vf",
+                    "select=eq(n\\,0)",
+                    "-vframes",
+                    "1",
+                    str(out_path),
+                ],
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-ss",
+                    "00:00:01",
+                    "-i",
+                    str(in_path),
+                    "-vframes",
+                    "1",
+                    str(out_path),
+                ],
+            ]
+            for cmd in commands:
+                try:
+                    subprocess.run(
+                        cmd,
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=25,
+                    )
+                except Exception:
+                    continue
+                if out_path.exists() and out_path.stat().st_size > 0:
+                    return out_path.read_bytes()
+    except Exception:
+        return None
+    return None
+
+
+def _media_kind_label(msg: Message) -> str:
+    if bool(msg.photo):
+        return "image"
+    if bool(msg.video):
+        return "video"
+    if _message_is_image_media(msg):
+        return "image"
+    return "media"
+
+
+def _fallback_visual_caption_body(media_kind: str) -> str:
+    kind = sanitize_telegram_html(normalize_space(media_kind) or "media")
+    return (
+        f"• <b>What:</b> Incoming {kind} update.<br>"
+        "• <b>Where:</b> Not confirmed from available evidence.<br>"
+        "• <i>Status:</i> Waiting for clearer verification."
+    )
+
+
+def _is_ocr_text_usable(text: str) -> str:
+    cleaned = normalize_space(text or "")
+    if len(cleaned) < _media_ocr_min_chars():
+        return ""
+    alpha_count = sum(1 for ch in cleaned if ch.isalpha())
+    # Filter OCR garbage like random punctuation/noise.
+    if alpha_count < max(5, int(len(cleaned) * 0.2)):
+        return ""
+    return cleaned
+
+
+async def _ocr_message_text(msg: Message, *, max_chars: int | None = None) -> str:
+    if not _is_media_ocr_enabled():
+        return ""
+    if not msg.media or not _message_is_ocr_eligible(msg):
+        return ""
+
+    max_len = _media_ocr_max_chars() if max_chars is None else max(200, min(int(max_chars), 6000))
+    if bool(msg.video):
+        if not _media_ocr_video_enabled():
+            return ""
+        max_video_bytes = _media_ocr_video_max_mb() * 1024 * 1024
+        file_size = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
+        if file_size > 0 and file_size > max_video_bytes:
+            return ""
+        blob = await msg.download_media(file=bytes)
+        if not blob:
+            return ""
+        frame = await asyncio.to_thread(_extract_video_frame_bytes_for_ocr, blob)
+        if not frame:
+            return ""
+        text = await asyncio.to_thread(
+            extract_ocr_text_from_image_bytes,
+            frame,
+            max_chars=max_len,
+        )
+    else:
+        blob = await msg.download_media(file=bytes)
+        if not blob:
+            return ""
+        text = await asyncio.to_thread(
+            extract_ocr_text_from_image_bytes,
+            blob,
+            max_chars=max_len,
+        )
+    return _is_ocr_text_usable(text)
+
+
+async def _ocr_album_text(messages: List[Message]) -> str:
+    if not _is_media_ocr_enabled():
+        return ""
+    if not messages:
+        return ""
+
+    limit = _media_ocr_max_images_per_album()
+    merged: List[str] = []
+    scanned = 0
+    per_image_chars = max(200, _media_ocr_max_chars() // max(1, limit))
+    for msg in messages:
+        if scanned >= limit:
+            break
+        if not _message_is_ocr_eligible(msg):
+            continue
+        scanned += 1
+        text = await _ocr_message_text(msg, max_chars=per_image_chars)
+        if text:
+            merged.append(text)
+
+    if not merged:
+        return ""
+    combined = normalize_space("\n".join(merged))
+    if len(combined) > _media_ocr_max_chars():
+        combined = f"{combined[: _media_ocr_max_chars() - 3].rsplit(' ', 1)[0]}..."
+    return _is_ocr_text_usable(combined)
 
 
 def _format_summary_text(source_title: str, summary: str) -> str:
@@ -2441,14 +2655,36 @@ async def _process_single_message(msg: Message) -> None:
 
     text = (msg.message or "").strip()
     source = await _source_title(msg)
+    media_kind = _media_kind_label(msg)
 
     if msg.media and not text:
-        await _send_single_media(msg, _format_source_label(source))
-        mark_seen(channel_id, msg.id)
-        return
+        ocr_text = await _ocr_message_text(msg)
+        if ocr_text:
+            text = ocr_text
+            log_structured(
+                LOGGER,
+                "media_ocr_extracted",
+                level=logging.DEBUG,
+                channel_id=channel_id,
+                message_id=msg.id,
+                chars=len(text),
+                source=source,
+            )
+        else:
+            await _send_single_media(
+                msg,
+                _format_summary_text(source, _fallback_visual_caption_body(media_kind)),
+            )
+            mark_seen(channel_id, msg.id)
+            return
 
     if msg.media and text:
-        summary = await summarize_or_skip(text, _require_auth_manager())
+        summary = await summarize_media_context(
+            text,
+            _require_auth_manager(),
+            source=source,
+            media_kind=media_kind,
+        )
         if summary is None:
             mark_seen(channel_id, msg.id)
             return
@@ -2481,15 +2717,38 @@ async def _process_album(messages: List[Message]) -> None:
         return
 
     source = await _source_title(messages[0])
+    media_kind = "album"
     captions = [(m.message or "").strip() for m in messages if (m.message or "").strip()]
     combined_caption = "\n".join(captions).strip()
 
     if not combined_caption:
-        await _send_album(messages, _format_source_label(source))
-        mark_seen_many(channel_id, message_ids)
-        return
+        ocr_text = await _ocr_album_text(messages)
+        if ocr_text:
+            combined_caption = ocr_text
+            log_structured(
+                LOGGER,
+                "album_ocr_extracted",
+                level=logging.DEBUG,
+                channel_id=channel_id,
+                first_message_id=messages[0].id,
+                album_size=len(messages),
+                chars=len(combined_caption),
+                source=source,
+            )
+        else:
+            await _send_album(
+                messages,
+                _format_summary_text(source, _fallback_visual_caption_body(media_kind)),
+            )
+            mark_seen_many(channel_id, message_ids)
+            return
 
-    summary = await summarize_or_skip(combined_caption, _require_auth_manager())
+    summary = await summarize_media_context(
+        combined_caption,
+        _require_auth_manager(),
+        source=source,
+        media_kind=media_kind,
+    )
     if summary is None:
         mark_seen_many(channel_id, message_ids)
         return
@@ -2505,12 +2764,29 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
 
     text = (msg.message or "").strip()
     source, link = await _source_info(msg)
+    media_kind = _media_kind_label(msg)
 
-    # Keep the current behavior: media without caption should be forwarded immediately.
     if msg.media and not text:
-        await _send_single_media(msg, _format_source_label(source))
-        mark_seen(channel_id, msg.id)
-        return
+        ocr_text = await _ocr_message_text(msg)
+        if ocr_text:
+            text = ocr_text
+            log_structured(
+                LOGGER,
+                "media_ocr_extracted",
+                level=logging.DEBUG,
+                channel_id=channel_id,
+                message_id=msg.id,
+                chars=len(text),
+                source=source,
+            )
+        else:
+            # If OCR does not produce reliable text, preserve existing media-only flow.
+            await _send_single_media(
+                msg,
+                _format_summary_text(source, _fallback_visual_caption_body(media_kind)),
+            )
+            mark_seen(channel_id, msg.id)
+            return
 
     if not text:
         mark_seen(channel_id, msg.id)
@@ -2546,7 +2822,17 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
             if len(headline) > 140:
                 headline = f"{headline[:137].rsplit(' ', 1)[0]}..."
         rational_view: str | None = None
-        if _should_attach_vital_opinion(text):
+        if msg.media:
+            media_context = await summarize_media_context(
+                text,
+                _require_auth_manager(),
+                source=source,
+                media_kind=media_kind,
+            )
+            media_context_plain = normalize_space(strip_telegram_html(media_context or ""))
+            if media_context_plain:
+                rational_view = media_context_plain
+        if rational_view is None and _should_attach_vital_opinion(text):
             rational_view = await summarize_vital_rational_view(text, _require_auth_manager())
         payload = _format_breaking_text(source, headline, rational_view)
         topic_seed = f"{headline}\n{text}"
@@ -2614,14 +2900,32 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
         return
 
     source, link = await _source_info(messages[0])
+    media_kind = "album"
     captions = [(m.message or "").strip() for m in messages if (m.message or "").strip()]
     combined_caption = "\n".join(captions).strip()
 
-    # Keep current behavior: media-only albums are forwarded immediately with source label.
     if not combined_caption:
-        await _send_album(messages, _format_source_label(source))
-        mark_seen_many(channel_id, message_ids)
-        return
+        ocr_text = await _ocr_album_text(messages)
+        if ocr_text:
+            combined_caption = ocr_text
+            log_structured(
+                LOGGER,
+                "album_ocr_extracted",
+                level=logging.DEBUG,
+                channel_id=channel_id,
+                first_message_id=messages[0].id,
+                album_size=len(messages),
+                chars=len(combined_caption),
+                source=source,
+            )
+        else:
+            # If no OCR text is available, preserve existing media-only flow.
+            await _send_album(
+                messages,
+                _format_summary_text(source, _fallback_visual_caption_body(media_kind)),
+            )
+            mark_seen_many(channel_id, message_ids)
+            return
 
     severity = "medium"
     severity_score = 0.0
@@ -2653,7 +2957,16 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
             if len(headline) > 140:
                 headline = f"{headline[:137].rsplit(' ', 1)[0]}..."
         rational_view: str | None = None
-        if _should_attach_vital_opinion(combined_caption):
+        media_context = await summarize_media_context(
+            combined_caption,
+            _require_auth_manager(),
+            source=source,
+            media_kind=media_kind,
+        )
+        media_context_plain = normalize_space(strip_telegram_html(media_context or ""))
+        if media_context_plain:
+            rational_view = media_context_plain
+        if rational_view is None and _should_attach_vital_opinion(combined_caption):
             rational_view = await summarize_vital_rational_view(
                 combined_caption,
                 _require_auth_manager(),
@@ -3609,6 +3922,7 @@ def _web_status_payload() -> Dict[str, object]:
         "severity_routing": _is_severity_routing_enabled(),
         "query_mode": _is_query_mode_enabled(),
         "html_formatting": _is_html_formatting_enabled(),
+        "media_ocr": _is_media_ocr_enabled(),
     }
 
 
@@ -3625,6 +3939,7 @@ def _digest_status_text() -> str:
     dupe_state = "on" if _is_dupe_detection_enabled() else "off"
     severity_state = "on" if _is_severity_routing_enabled() else "off"
     query_state = "on" if _is_query_mode_enabled() else "off"
+    ocr_state = "on" if _is_media_ocr_enabled() else "off"
     detector_backend = dupe_detector.backend_name if dupe_detector is not None else "disabled"
     daily_labels = [f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()]
     daily_display = ", ".join(daily_labels) if daily_labels else "off"
@@ -3650,6 +3965,7 @@ def _digest_status_text() -> str:
         f"• Dedupe: <code>{dupe_state}</code> ({sanitize_telegram_html(detector_backend)})<br>"
         f"• Severity router: <code>{severity_state}</code><br>"
         f"• Query mode: <code>{query_state}</code><br>"
+        f"• Media OCR: <code>{ocr_state}</code><br>"
         f"• HTML formatting: <code>{'on' if _is_html_formatting_enabled() else 'off'}</code><br>"
         f"• Quota health: <code>{quota.get('status', 'unknown')}</code><br>"
         f"• Recent 429 (1h): <code>{quota.get('recent_429_count', 0)}</code> / "
@@ -3735,22 +4051,68 @@ def _merge_query_context(
     return ordered[: max(1, int(limit))]
 
 
-def _format_web_results_section(web_rows: Sequence[Dict[str, object]], *, max_items: int = 5) -> str:
-    if not web_rows:
-        return "<i>Web cross-check: no recent trusted web reports found.</i>"
+def _format_evidence_split_section(
+    telegram_rows: Sequence[Dict[str, object]],
+    web_rows: Sequence[Dict[str, object]],
+    *,
+    max_items: int = 4,
+) -> str:
+    limit = max(1, int(max_items))
+    lines: list[str] = ["<b>Evidence Split</b>", "<b>Telegram Providers</b>"]
 
-    lines: list[str] = ["<b>Web cross-check</b>"]
-    for item in list(web_rows)[: max(1, int(max_items))]:
-        source = sanitize_telegram_html(normalize_space(str(item.get("source") or "Web")))
-        link = normalize_space(str(item.get("link") or ""))
+    telegram_seen: set[str] = set()
+    telegram_lines = 0
+    for item in telegram_rows:
+        source_raw = normalize_space(str(item.get("source") or "Telegram"))
+        source_key = source_raw.lower()
+        if source_key in telegram_seen:
+            continue
+        telegram_seen.add(source_key)
+
         text = normalize_space(str(item.get("text") or ""))
-        if len(text) > 110:
-            text = f"{text[:107].rsplit(' ', 1)[0]}..."
-        text_safe = sanitize_telegram_html(text or "Web report")
+        if len(text) > 95:
+            text = f"{text[:92].rsplit(' ', 1)[0]}..."
+        text_safe = sanitize_telegram_html(text or "Matched update")
+        source_safe = sanitize_telegram_html(source_raw)
+        link = normalize_space(str(item.get("link") or ""))
+
         if link.startswith("http"):
-            lines.append(f'• <a href="{link}">{text_safe}</a> <i>[{source}]</i>')
+            lines.append(f'• <i>{source_safe}</i>: <a href="{link}">{text_safe}</a>')
         else:
-            lines.append(f"• {text_safe} <i>[{source}]</i>")
+            lines.append(f"• <i>{source_safe}</i>: {text_safe}")
+        telegram_lines += 1
+        if telegram_lines >= limit:
+            break
+    if telegram_lines == 0:
+        lines.append("• <i>No recent Telegram matches.</i>")
+
+    lines.append("<b>Web Providers</b>")
+    web_seen: set[str] = set()
+    web_lines = 0
+    for item in web_rows:
+        source_raw = normalize_space(str(item.get("source") or "Web"))
+        source_key = source_raw.lower()
+        if source_key in web_seen:
+            continue
+        web_seen.add(source_key)
+
+        text = normalize_space(str(item.get("text") or ""))
+        if len(text) > 95:
+            text = f"{text[:92].rsplit(' ', 1)[0]}..."
+        text_safe = sanitize_telegram_html(text or "Matched report")
+        source_safe = sanitize_telegram_html(source_raw)
+        link = normalize_space(str(item.get("link") or ""))
+
+        if link.startswith("http"):
+            lines.append(f'• <i>{source_safe}</i>: <a href="{link}">{text_safe}</a>')
+        else:
+            lines.append(f"• <i>{source_safe}</i>: {text_safe}")
+        web_lines += 1
+        if web_lines >= limit:
+            break
+    if web_lines == 0:
+        lines.append("• <i>No recent trusted web matches in the selected time window.</i>")
+
     return "<br>".join(lines)
 
 
@@ -4131,10 +4493,9 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
         )
 
         history = list(_query_history_for_sender(sender_id))
-        web_results_section = (
-            _format_web_results_section(web_results)
-            if ran_web_search
-            else ""
+        evidence_split_section = _format_evidence_split_section(
+            telegram_results,
+            web_results if ran_web_search else [],
         )
         if _is_streaming_enabled():
             answer, stream_stats = await _stream_query_answer(
@@ -4146,7 +4507,7 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
                 prefer_bot_identity=query_via_bot,
                 bot_chat_id=query_bot_chat_id,
                 root_reply_to=query_reply_to,
-                final_suffix_html=web_results_section,
+                final_suffix_html=evidence_split_section,
             )
         else:
             answer = await generate_answer_from_context(
@@ -4157,8 +4518,8 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
             )
             if not answer.strip():
                 answer = "No matching information found in recent updates."
-            if web_results_section:
-                answer = f"{answer.strip()}<br><br>{web_results_section}"
+            if evidence_split_section:
+                answer = f"{answer.strip()}<br><br>{evidence_split_section}"
             await _safe_reply_markdown(
                 event,
                 answer,
@@ -4329,6 +4690,7 @@ def _startup_health_check() -> None:
         severity_routing=_is_severity_routing_enabled(),
         query_mode=_is_query_mode_enabled(),
         query_web_fallback=_is_query_web_fallback_enabled(),
+        media_ocr=_is_media_ocr_enabled(),
         html_formatting=_is_html_formatting_enabled(),
         premium_emoji=_is_premium_emoji_enabled(),
         premium_emoji_count=len(premium_emoji_map),
@@ -4353,7 +4715,7 @@ def _startup_health_check() -> None:
         quota_health=get_quota_health(),
     )
     LOGGER.info(
-        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s query_web=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%s scope=%s web=%s@%s:%s",
+        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s query_web=%s ocr=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%s scope=%s web=%s@%s:%s",
         mode,
         pending,
         inflight,
@@ -4362,6 +4724,7 @@ def _startup_health_check() -> None:
         _is_severity_routing_enabled(),
         _is_query_mode_enabled(),
         _is_query_web_fallback_enabled(),
+        _is_media_ocr_enabled(),
         _is_html_formatting_enabled(),
         _is_premium_emoji_enabled(),
         len(premium_emoji_map),
