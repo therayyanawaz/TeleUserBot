@@ -1211,6 +1211,52 @@ async def _bot_api_request(
     raise RuntimeError(f"Bot API {method} failed after retries.")
 
 
+async def _query_bot_api_request(
+    method: str,
+    *,
+    data: Dict[str, str] | None = None,
+) -> object:
+    """
+    Bot API calls used by query assistant replies in own-bot PM context.
+    Uses configured BOT_DESTINATION_TOKEN but allows dynamic chat_id per request.
+    """
+    token = _bot_destination_token_from_config()
+    if not _looks_like_bot_token(token):
+        raise RuntimeError("BOT_DESTINATION_TOKEN is missing/invalid for bot query replies.")
+
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    async with httpx.AsyncClient(timeout=60) as http:
+        for _ in range(4):
+            response = await http.post(url, data=data)
+            payload = {}
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {}
+
+            if response.status_code == 429 or (
+                isinstance(payload, dict) and payload.get("error_code") == 429
+            ):
+                retry_after = int(
+                    (payload.get("parameters") or {}).get("retry_after", 2)  # type: ignore[union-attr]
+                )
+                await asyncio.sleep(retry_after + 1)
+                continue
+
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Bot API {method} failed: HTTP {response.status_code} {response.text}"
+                )
+
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"Bot API {method} returned invalid response payload.")
+            if not payload.get("ok"):
+                raise RuntimeError(f"Bot API {method} error: {payload}")
+            return payload.get("result")
+
+    raise RuntimeError(f"Bot API {method} failed after retries.")
+
+
 def _infer_chat_id_from_updates(updates: object) -> str | None:
     if not isinstance(updates, list):
         return None
@@ -3419,8 +3465,11 @@ async def _safe_reply_markdown(
     event: events.NewMessage.Event,
     text: str,
     *,
-    edit_message: Message | None = None,
-) -> Message | None:
+    edit_message: Message | Dict[str, object] | None = None,
+    reply_to: int | None = None,
+    prefer_bot_identity: bool = False,
+    bot_chat_id: int | None = None,
+) -> Message | Dict[str, object] | None:
     payload_text = (
         _render_outbound_text(text, allow_premium_tags=False)
         if _is_html_formatting_enabled()
@@ -3435,18 +3484,50 @@ async def _safe_reply_markdown(
     while True:
         try:
             if edit_message is not None:
-                return await edit_message.edit(
-                    payload_text,
-                    parse_mode="html" if _is_html_formatting_enabled() else "md",
-                    link_preview=False,
-                )
+                if prefer_bot_identity and isinstance(edit_message, dict):
+                    message_id = int(edit_message.get("message_id", 0) or 0)
+                    if message_id <= 0 or not bot_chat_id:
+                        raise RuntimeError("Cannot edit bot query message without valid ids.")
+                    data = {
+                        "chat_id": str(bot_chat_id),
+                        "message_id": str(message_id),
+                        "text": _to_bot_text(payload_text) or "",
+                        "disable_web_page_preview": "true",
+                        "parse_mode": "HTML" if _is_html_formatting_enabled() else "Markdown",
+                    }
+                    result = await _query_bot_api_request("editMessageText", data=data)
+                    return result if isinstance(result, dict) else edit_message
+                if isinstance(edit_message, Message):
+                    return await edit_message.edit(
+                        payload_text,
+                        parse_mode="html" if _is_html_formatting_enabled() else "md",
+                        link_preview=False,
+                    )
+                raise RuntimeError("Unsupported edit_message type for query response.")
+
+            if prefer_bot_identity:
+                if not bot_chat_id:
+                    raise RuntimeError("Missing bot_chat_id for bot query reply.")
+                data = {
+                    "chat_id": str(bot_chat_id),
+                    "text": _to_bot_text(payload_text) or "",
+                    "disable_web_page_preview": "true",
+                    "parse_mode": "HTML" if _is_html_formatting_enabled() else "Markdown",
+                }
+                if reply_to:
+                    data["reply_to_message_id"] = str(reply_to)
+                result = await _query_bot_api_request("sendMessage", data=data)
+                return result if isinstance(result, dict) else None
+
             tg = _require_client()
-            # Query UX: send a standalone assistant-style message in the same chat,
-            # not a Telegram reply-to bubble to the user's own message.
+            # Query UX:
+            # - Saved Messages: user-account response (can reply_to the query)
+            # - Own bot PM: handled above via Bot API for real bot identity
             return await _call_with_floodwait(
                 tg.send_message,
                 event.chat_id,
                 payload_text,
+                reply_to=reply_to,
                 parse_mode="html" if _is_html_formatting_enabled() else "md",
                 link_preview=False,
             )
@@ -3472,16 +3553,45 @@ async def _safe_reply_markdown(
                     errors="replace",
                 )
                 if edit_message is not None:
-                    return await edit_message.edit(
-                        fallback_text,
-                        parse_mode=None,
-                        link_preview=False,
-                    )
+                    if prefer_bot_identity and isinstance(edit_message, dict):
+                        message_id = int(edit_message.get("message_id", 0) or 0)
+                        if message_id <= 0 or not bot_chat_id:
+                            raise RuntimeError("Cannot edit bot query message without valid ids.")
+                        data = {
+                            "chat_id": str(bot_chat_id),
+                            "message_id": str(message_id),
+                            "text": _to_plain_text(fallback_text) or "",
+                            "disable_web_page_preview": "true",
+                        }
+                        result = await _query_bot_api_request("editMessageText", data=data)
+                        return result if isinstance(result, dict) else edit_message
+                    if isinstance(edit_message, Message):
+                        return await edit_message.edit(
+                            fallback_text,
+                            parse_mode=None,
+                            link_preview=False,
+                        )
+                    raise RuntimeError("Unsupported edit_message type for query response.")
+
+                if prefer_bot_identity:
+                    if not bot_chat_id:
+                        raise RuntimeError("Missing bot_chat_id for bot query reply.")
+                    data = {
+                        "chat_id": str(bot_chat_id),
+                        "text": _to_plain_text(fallback_text) or "",
+                        "disable_web_page_preview": "true",
+                    }
+                    if reply_to:
+                        data["reply_to_message_id"] = str(reply_to)
+                    result = await _query_bot_api_request("sendMessage", data=data)
+                    return result if isinstance(result, dict) else None
+
                 tg = _require_client()
                 return await _call_with_floodwait(
                     tg.send_message,
                     event.chat_id,
                     fallback_text,
+                    reply_to=reply_to,
                     parse_mode=None,
                     link_preview=False,
                 )
@@ -3499,32 +3609,31 @@ async def _safe_reply_markdown(
 async def _stream_query_answer(
     event: events.NewMessage.Event,
     *,
-    progress_message: Message,
+    progress_message: Message | Dict[str, object],
     query_text: str,
     results: List[Dict[str, object]],
     history: Sequence[Dict[str, str]],
+    prefer_bot_identity: bool = False,
+    bot_chat_id: int | None = None,
+    root_reply_to: int | None = None,
 ) -> tuple[str, object]:
     async def _send_query_message(text: str, reply_to: int | None):
-        tg = _require_client()
-        payload_text = (
-            _render_outbound_text(text, allow_premium_tags=False)
-            if _is_html_formatting_enabled()
-            else text
-        )
-        return await _call_with_floodwait(
-            tg.send_message,
-            event.chat_id,
-            payload_text,
-            reply_to=reply_to,
-            parse_mode="html" if _is_html_formatting_enabled() else "md",
-            link_preview=False,
+        effective_reply_to = reply_to if reply_to else root_reply_to
+        return await _safe_reply_markdown(
+            event,
+            text,
+            reply_to=effective_reply_to,
+            prefer_bot_identity=prefer_bot_identity,
+            bot_chat_id=bot_chat_id,
         )
 
     async def _edit_query_message(ref: object, text: str):
         edited = await _safe_reply_markdown(
             event,
             text,
-            edit_message=ref if isinstance(ref, Message) else None,
+            edit_message=ref if isinstance(ref, (Message, dict)) else None,
+            prefer_bot_identity=prefer_bot_identity,
+            bot_chat_id=bot_chat_id,
         )
         return edited or ref
 
@@ -3614,6 +3723,11 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
         )
         return
 
+    # Saved Messages => self response.
+    # Own bot PM => send via bot identity.
+    query_via_bot = bool(is_own_bot_pm and not is_saved_messages)
+    query_bot_chat_id = sender_id if query_via_bot else None
+
     chat_id = str(getattr(msg, "chat_id", "") or "")
 
     now = time.time()
@@ -3623,11 +3737,20 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
         await _safe_reply_markdown(
             event,
             f"Please wait {wait_seconds}s before your next query.",
+            reply_to=int(msg.id or 0),
+            prefer_bot_identity=query_via_bot,
+            bot_chat_id=query_bot_chat_id,
         )
         return
     query_last_request_ts[sender_id] = now
 
-    progress = await _safe_reply_markdown(event, "Searching your channels... ⏳")
+    progress = await _safe_reply_markdown(
+        event,
+        "Searching your channels... ⏳",
+        reply_to=int(msg.id or 0),
+        prefer_bot_identity=query_via_bot,
+        bot_chat_id=query_bot_chat_id,
+    )
     if progress is None:
         return
 
@@ -3650,6 +3773,8 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
             event,
             f"Found {len(results)} messages -> analyzing... ⏳",
             edit_message=progress,
+            prefer_bot_identity=query_via_bot,
+            bot_chat_id=query_bot_chat_id,
         )
 
         history = list(_query_history_for_sender(sender_id))
@@ -3660,6 +3785,9 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
                 query_text=cleaned_query,
                 results=results,
                 history=history,
+                prefer_bot_identity=query_via_bot,
+                bot_chat_id=query_bot_chat_id,
+                root_reply_to=int(msg.id or 0),
             )
         else:
             answer = await generate_answer_from_context(
@@ -3670,7 +3798,13 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
             )
             if not answer.strip():
                 answer = "No matching information found in recent updates."
-            await _safe_reply_markdown(event, answer, edit_message=progress)
+            await _safe_reply_markdown(
+                event,
+                answer,
+                edit_message=progress,
+                prefer_bot_identity=query_via_bot,
+                bot_chat_id=query_bot_chat_id,
+            )
             stream_stats = None
 
         _append_query_history(sender_id, text, answer)
@@ -3695,6 +3829,8 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
             event,
             "No matching information found in recent updates.",
             edit_message=progress,
+            prefer_bot_identity=query_via_bot,
+            bot_chat_id=query_bot_chat_id,
         )
         log_structured(
             LOGGER,
