@@ -1,329 +1,210 @@
-# ⚡ NetworkSlutter — Telegram News Intelligence Engine
+# 🚀 Telegram News Intelligence Userbot
 
-> Human-like war/OSINT intelligence feed powered by your **personal Telegram account**, strict filtering, smart dedupe, and premium-grade digest delivery.
+Production-grade Telegram userbot for high-signal news monitoring, strict duplicate suppression, breaking-event routing, and scheduled digest delivery.
 
----
+## 🎯 What It Does
 
-## ✨ Why This Project
+This project runs on your personal Telegram account (Telethon user session), monitors many source channels/groups, and delivers curated output to one destination.
 
-Most Telegram aggregators become noise cannons.
-**NetworkSlutter** is built to do the opposite:
+Core outcomes:
+- Filters noise and duplicate reposts aggressively
+- Sends only true high-severity items immediately
+- Produces clean scheduled digests instead of spam floods
+- Supports query-style interaction for your own private chats
 
-- 🧠 Keep only high-signal updates
-- 🧹 Kill duplicates and paraphrased echoes
-- 🚨 Send only truly critical breaking alerts immediately
-- 📰 Deliver clean scheduled digests instead of spam floods
-- 🔐 Keep auth/token/session handling secure and persistent
+## ✅ Current Feature Set
 
----
+- **Telethon userbot mode** (personal account, not bot-token polling)
+- **Source intake** from `FOLDER_INVITE_LINK` + `EXTRA_SOURCES`
+- **Media-safe handling** for text, files, captions, and albums (`grouped_id` buffering)
+- **Codex OAuth backend integration** (`https://chatgpt.com/backend-api/codex/responses`)
+- **OAuth env bootstrap** (`TG_USERBOT_AUTH_JSON` / `TG_USERBOT_AUTH_JSON_B64`)
+- **Hybrid dedupe** (semantic + lexical + fuzzy + persistent history)
+- **Severity routing** (high -> immediate, medium/low -> digest queue)
+- **Breaking topic threading** support
+- **Hourly digest** from transactional queue
+- **Daily 24h digest at 00:00** from persistent archive window
+- **Queue cleanup scheduler** every 10 min with configurable scope
+- **Streaming output** with live edits
+- **Telegram HTML output pipeline** + optional premium emoji mapping
+- **Bot API destination fallback** (`BOT_DESTINATION_TOKEN` + `BOT_DESTINATION_CHAT_ID`)
+- **Health web server** for Replit/UptimeRobot (`/`, `/status`, `/health`)
+- **Graceful shutdown + failure-safe queue restore**
 
-## 🧩 Core Features
-
-- 👤 **Telethon userbot mode** (runs on your personal account, not a bot token)
-- 📡 **Live source intake** from Telegram folder invite links (`t.me/addlist/...`) + manual extra sources
-- 🖼️ **Full media support**: text, photo/video/document, albums (`grouped_id` buffering)
-- ⛔ **Forward-restricted chat handling** via re-download + re-send
-- 🧠 **Codex OAuth backend** via PKCE + secure token refresh (no API key in `.env`)
-- 🧮 **Strict multi-factor severity engine** (explainable scoring + source cooldowns)
-- 🧬 **Hybrid dedupe** (semantic + lexical + fuzzy + persistent recent memory)
-- 🧵 **Breaking topic threading** (related breaking updates can reply in-thread)
-- 📰 **Digest mode with transactional SQLite queue**
-- ⏱️ **Schedulers**:
-  - hourly digest
-  - daily digest at `00:00`
-  - queue clear every `10` minutes
-- 💬 **Query assistant mode** (outgoing private queries in allowed peers)
-- 🎬 **Streaming response UX** with incremental edits
-- 🎨 **Telegram HTML formatting + premium emoji mapping support**
-- 🛡️ **Robust runtime behavior**: flood waits, retries, restore on failure, graceful shutdown
-
----
-
-## 🏗️ Architecture At A Glance
+## 🧠 Runtime Flow
 
 ```text
 Telegram Sources
-      |
-      v
-NewMessage Intake (Telethon)
-      |
-      +--> Seen check + Hybrid dedupe
-      |
-      +--> Severity classifier (scored, explainable)
-      |         |
-      |         +--> HIGH -> immediate BREAKING delivery
-      |         |
-      |         +--> MEDIUM/LOW -> SQLite digest_queue
-      |
-      v
-Digest Schedulers
-  - hourly flush
-  - daily 00:00 flush
-  - queue clear every 10m
-      |
-      v
-Codex summary generation (SSE)
-      |
-      v
-Destination delivery
-  - Telethon destination OR Bot API destination
+   -> intake handler
+      -> seen check + hybrid dedupe
+      -> severity classification
+         -> HIGH => immediate breaking send
+         -> MED/LOW => digest_queue insert + digest_archive insert
+
+Schedulers:
+- Hourly digest: claims digest_queue transactionally, summarizes, sends, acks
+- Daily digest (00:00): loads last 24h from digest_archive, summarizes, sends
+- Queue clear (10m): clears by scope (recommended: inflight only)
 ```
 
----
+## 🗂️ Data Persistence
 
-## 📁 Project Layout
+Runtime state is stored in `~/.tg_userbot/`:
+- `seen.db` (SQLite)
+  - `seen_messages`
+  - `digest_queue`
+  - `digest_archive`
+  - `recent_breaking`
+  - `digest_meta`
+- `errors.log`
 
-```text
-TeleUserBot/
-  main.py                # runtime, routing, schedulers, event handlers
-  config.py              # env loader + typed config defaults
-  auth.py                # OAuth PKCE token flow + refresh
-  ai_filter.py           # Codex calls, streaming, summary generation
-  severity_classifier.py # strict multi-factor severity scoring
-  db.py                  # SQLite seen + queue + metadata ops
-  utils.py               # dedupe, formatting, helpers
-  prompts.py             # prompt templates
-  .env.example           # full config template
-  requirements.txt
-  README.md
-```
+Session file is local project file:
+- `userbot.session`
 
-Runtime data is stored outside the repo:
+## ⚙️ Configuration
 
-- `~/.tg_userbot/auth.json` (OAuth tokens)
-- `~/.tg_userbot/seen.db` (queue + seen + runtime meta)
-- `~/.tg_userbot/errors.log` (error traces)
-
----
-
-## 🚀 Quick Start
-
-### 1) Prerequisites
-
-- Python `3.11+`
-- Telegram account
-- Telegram API credentials (`api_id`, `api_hash`) from `https://my.telegram.org`
-
-### 2) Install
-
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Optional for stronger semantic dedupe:
-
-```bash
-pip install sentence-transformers
-```
-
-### 3) Configure
+Copy and edit env:
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` with your values.
-
-### 4) Run
-
-```bash
-python main.py
-```
-
-On first run, the bot will:
-
-1. Prompt for missing required config values
-2. Launch OAuth browser login (PKCE)
-3. Store token securely in `~/.tg_userbot/auth.json`
-4. Start user session and source listeners
-5. Start schedulers (digest + daily + queue clear)
-
----
-
-## 🔧 Minimum Required `.env`
-
-Set at least:
+### Required minimum
 
 - `TELEGRAM_API_ID`
 - `TELEGRAM_API_HASH`
-- source strategy:
+- Source config:
   - `FOLDER_INVITE_LINK` **or** `EXTRA_SOURCES`
-- destination strategy:
-  - `DESTINATION` (Telethon mode) **or**
-  - `BOT_DESTINATION_TOKEN` + `BOT_DESTINATION_CHAT_ID` (Bot API mode)
+- Destination config (choose one):
+  - `DESTINATION`
+  - or `BOT_DESTINATION_TOKEN` + `BOT_DESTINATION_CHAT_ID`
 
----
+### Recommended digest/scheduler settings
 
-## ⏰ Scheduling Defaults (Current)
+```env
+DIGEST_MODE=true
+DIGEST_INTERVAL_MINUTES=60
+DIGEST_DAILY_TIMES=["00:00"]
+DIGEST_DAILY_WINDOW_HOURS=24
+DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES=10
+DIGEST_QUEUE_CLEAR_SCOPE="inflight"
+```
 
-- `DIGEST_MODE=true`
-- `DIGEST_INTERVAL_MINUTES=60` → hourly digest
-- `DIGEST_DAILY_TIMES=["00:00"]` → daily digest at midnight
-- `DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES=10` → queue cleanup every 10 minutes
-- `DIGEST_QUEUE_CLEAR_INCLUDE_INFLIGHT=true`
+`DIGEST_QUEUE_CLEAR_SCOPE` options:
+- `inflight` (recommended): clears only stuck claimed rows
+- `pending`: clears unsent queue rows
+- `all`: clears both pending + inflight (destructive)
 
-Important: frequent queue clearing reduces digest volume. Tune this based on how much history you want in digests.
+## 🔐 OpenAI/Codex Auth Modes
 
----
-
-## 🧠 Severity System (High-Signal First)
-
-The severity engine is now deterministic + explainable:
-
-- source tier weighting
-- urgency phrase/emoji signals
-- style/format behavior
-- contextual/temporal cues
-- negative penalties (recap/analysis/thread/long-form)
-- hard guards + per-source high-rate cooldown
-
-This sharply reduces false “breaking” floods and pushes normal updates into digest.
-
----
-
-## 🧬 Dedupe System
-
-Duplicate killer combines:
-
-- semantic similarity (if `sentence-transformers` available)
-- TF-based lexical similarity
-- fuzzy matching
-- persistent recent-breaking memory
-
-Result: near-duplicate reposts are suppressed aggressively.
-
----
-
-## 📤 Destination Modes
-
-### Mode A: Telethon Destination
+### 1) Env-only mode (recommended for servers/Replit)
 
 Set:
+- `OPENAI_AUTH_ENV_ONLY=true`
+- `TG_USERBOT_AUTH_JSON` **or** `TG_USERBOT_AUTH_JSON_B64`
 
-- `DESTINATION=@your_channel_or_chat`
+This avoids interactive browser login during deploy/runtime.
 
-### Mode B: Bot API Destination
+### 2) Browser OAuth mode (local interactive)
 
 Set:
+- `OPENAI_AUTH_ENV_ONLY=false`
 
-- `BOT_DESTINATION_TOKEN=...`
-- `BOT_DESTINATION_CHAT_ID=...`
+Then first run can perform PKCE browser flow.
 
-Bot mode includes API retry/backoff logic and caption/media fallbacks.
+### Optional auth endpoint overrides
 
----
+- `OPENAI_AUTH_BASE`
+- `OPENAI_AUTH_ENDPOINT`
+- `OPENAI_TOKEN_ENDPOINT`
 
-## 💬 Query Assistant Mode
+## 🏃 Local Run
 
-When enabled, outgoing private queries can trigger AI answers from your monitored source context.
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python main.py
+```
 
-Key controls:
+## ☁️ Replit / Deployment Notes
 
-- `QUERY_MODE_ENABLED=true`
-- `QUERY_MAX_MESSAGES=50`
-- `QUERY_DEFAULT_HOURS_BACK=24`
-- `QUERY_ALLOWED_PEER_IDS=[]`
+Use deployment settings:
+- **Build command:** `pip install -r requirements.txt`
+- **Run command:** `python main.py`
+- **Port:** `8080`
 
----
+Keep health server enabled:
+- `ENABLE_WEB_SERVER=true`
+- `WEB_SERVER_HOST=0.0.0.0`
+- `WEB_SERVER_PORT=8080`
 
-## 🎨 HTML + Premium Emoji Rendering
+Endpoints:
+- `/health`
+- `/status`
+- `/`
 
-Controls:
+For headless environments, keep:
+- `HOLD_ON_STARTUP_ERROR=true`
 
-- `ENABLE_HTML_FORMATTING=true`
-- `ENABLE_PREMIUM_EMOJI=true`
-- `PREMIUM_EMOJI_MAP_FILE="nezami_emoji_map.json"`
+## 🧪 Operational Controls
 
-Custom emoji map file is intentionally gitignored by default in production setups.
-
----
-
-## 🧪 Operational Commands
-
-Use from your account:
-
+In Telegram (outgoing command):
 - `/digest_status`
 
-Returns mode, queue stats, next run ETA, quota health, dedupe/severity state, and scheduler info.
+Shows:
+- mode
+- pending/inflight queue
+- next digest ETA
+- daily window/times
+- queue clear scope
+- quota health and feature flags
 
----
+## 🛡️ Reliability Guarantees
 
-## 🛡️ Reliability & Failure Handling
+- Transactional batch claim/ack/restore for digest queue
+- Exponential backoff on digest failures
+- Flood-wait handling
+- Restricted-forward fallback to re-send
+- Scheduler locking to avoid race conditions
+- Structured logs for queue/severity/digest lifecycle
 
-Built-in protections include:
+## 🧰 Troubleshooting
 
-- Flood wait handling with sleep/retry
-- Restricted-forward fallback via media re-send
-- Digest claim/ack/restore transactions
-- Exponential retry backoff on digest failure
-- Structured event logging
-- Graceful Ctrl+C shutdown of all running tasks
+### No digests arriving
 
----
+Check `/digest_status` and verify:
+- `DIGEST_MODE=true`
+- pending queue increases
+- destination credentials are valid
+- `DIGEST_QUEUE_CLEAR_SCOPE` is not wiping pending data unexpectedly
 
-## 🔐 Security Practices
+### Daily digest empty at midnight
 
-- Never commit `.env`, session files, or OAuth tokens
-- Keep `.env` local and private
-- Rotate any accidentally exposed credentials immediately
-- Restrict destination bot permissions to minimum required
+Daily digest reads from `digest_archive` for the last `DIGEST_DAILY_WINDOW_HOURS`.
+If archive is empty, nothing was ingested in that window.
 
-Gitignored by default:
+### OAuth repeated login prompts
 
+Use env-only secrets on server environments:
+- `OPENAI_AUTH_ENV_ONLY=true`
+- `TG_USERBOT_AUTH_JSON_B64=<...>`
+
+### Telethon session locked
+
+Only one process should use `userbot.session` at a time.
+
+## 🔒 Security Checklist
+
+Never commit:
 - `.env`
 - `userbot.session*`
-- `nezami_emoji_map.json`
-- runtime state directories
+- token material
+- private emoji mapping files (if sensitive)
 
----
+Rotate credentials immediately if exposed.
 
-## 🧯 Troubleshooting
+## 📌 Final Notes
 
-### OAuth login opens repeatedly
-
-- stop all old bot processes
-- retry once
-- if needed, remove `~/.tg_userbot/auth.json` and re-login
-
-### `sentence-transformers unavailable`
-
-Non-fatal. Bot falls back to lexical/fuzzy dedupe.
-
-### Session DB locked
-
-Another bot instance is running. Stop it, then restart.
-
-### No sources resolved
-
-Check folder invite access or add manual entries in `EXTRA_SOURCES`.
-
-### Destination errors
-
-Verify bot token/chat ID or Telethon destination permissions.
-
----
-
-## ⚙️ Production Run Tips
-
-- Run inside `tmux`, `screen`, or `systemd`
-- Keep one process only per session DB
-- Check `/digest_status` after deploys
-- Monitor `~/.tg_userbot/errors.log`
-- Tune severity + schedule based on your signal tolerance
-
----
-
-## 📌 Disclaimer
-
-Use responsibly and follow Telegram/platform/local regulations.
-This project is for personal automation and intelligence monitoring workflows.
-
----
-
-## 💥 Final Note
-
-If your feed still feels noisy, do not loosen dedupe.
-Tighten severity thresholds first, then adjust source tiers.
-Signal quality beats volume. Every time.
+- Server local time controls `DIGEST_DAILY_TIMES` trigger (00:00 means server midnight).
+- For best signal quality, tune source tiers and severity settings before lowering dedupe strictness.
