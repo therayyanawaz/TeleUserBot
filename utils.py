@@ -36,6 +36,39 @@ def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def extract_ocr_text_from_image_bytes(blob: bytes, *, max_chars: int = 1600) -> str:
+    """
+    Best-effort OCR extraction from image bytes.
+    Returns empty string if OCR dependencies/runtime are unavailable.
+    """
+    if not blob:
+        return ""
+    try:
+        from io import BytesIO
+        from PIL import Image  # type: ignore
+        import pytesseract  # type: ignore
+    except Exception:
+        return ""
+
+    try:
+        with Image.open(BytesIO(blob)) as img:
+            try:
+                img = img.convert("L")
+            except Exception:
+                pass
+            raw = pytesseract.image_to_string(img)
+    except Exception:
+        return ""
+
+    text = normalize_space(str(raw or ""))
+    if not text:
+        return ""
+    limit = max(200, min(int(max_chars), 4000))
+    if len(text) > limit:
+        text = f"{text[: limit - 3].rsplit(' ', 1)[0]}..."
+    return text
+
+
 def dedupe_preserve_order(items: Sequence[str]) -> List[str]:
     seen = set()
     out: List[str] = []

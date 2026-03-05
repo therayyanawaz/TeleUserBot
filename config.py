@@ -299,3 +299,20 @@ ENABLE_HTML_FORMATTING = _env_bool("ENABLE_HTML_FORMATTING", True)  # type: bool
 ENABLE_PREMIUM_EMOJI = _env_bool("ENABLE_PREMIUM_EMOJI", True)  # type: bool
 # JSON file containing emoji -> custom_emoji_id map for Nezami pack.
 PREMIUM_EMOJI_MAP_FILE = _env_str("PREMIUM_EMOJI_MAP_FILE", "nezami_emoji_map.json")  # type: str
+
+# -----------------------------------------------------------------------------
+# Media OCR (optional)
+# -----------------------------------------------------------------------------
+# When enabled, image-only posts/albums are OCR-scanned so they can be routed
+# through severity and digest logic instead of always forwarding raw media.
+ENABLE_MEDIA_OCR = _env_bool("ENABLE_MEDIA_OCR", True)  # type: bool
+# Minimum extracted text length to consider OCR usable.
+MEDIA_OCR_MIN_CHARS = _env_int("MEDIA_OCR_MIN_CHARS", 18)  # type: int
+# Maximum OCR text size kept per message/album context.
+MEDIA_OCR_MAX_CHARS = _env_int("MEDIA_OCR_MAX_CHARS", 1600)  # type: int
+# OCR scan cap per album to bound CPU cost.
+MEDIA_OCR_MAX_IMAGES_PER_ALBUM = _env_int("MEDIA_OCR_MAX_IMAGES_PER_ALBUM", 3)  # type: int
+# Enable first-frame OCR for video messages (requires ffmpeg + tesseract).
+MEDIA_OCR_ENABLE_VIDEO_FRAME = _env_bool("MEDIA_OCR_ENABLE_VIDEO_FRAME", True)  # type: bool
+# Skip very large videos for OCR to keep runtime stable.
+MEDIA_OCR_VIDEO_MAX_MB = _env_int("MEDIA_OCR_VIDEO_MAX_MB", 25)  # type: int
