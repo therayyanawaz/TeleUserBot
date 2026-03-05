@@ -9,13 +9,15 @@ import json
 import logging
 import os
 import secrets
+import sys
 import time
 import urllib.parse
 import webbrowser
+import argparse
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
@@ -185,6 +187,31 @@ def _wait_for_callback(timeout_seconds: int) -> _CallbackResult:
     raise OAuthError("Timed out waiting for OAuth callback.")
 
 
+def _callback_from_url(value: str) -> _CallbackResult:
+    parsed = urllib.parse.urlparse((value or "").strip())
+    query = urllib.parse.parse_qs(parsed.query)
+    return _CallbackResult(
+        code=query.get("code", [None])[0],
+        state=query.get("state", [None])[0],
+        error=query.get("error", [None])[0],
+        error_description=query.get("error_description", [None])[0],
+    )
+
+
+def _serialize_token_for_env(token_data: Dict[str, Any]) -> Tuple[str, str]:
+    payload = {
+        "access_token": str(token_data.get("access_token") or ""),
+        "refresh_token": str(token_data.get("refresh_token") or ""),
+        "expires_at": int(_normalize_unix_seconds(token_data.get("expires_at")) or 0),
+        "account_id": str(token_data.get("account_id") or ""),
+        "scope": token_data.get("scope"),
+        "token_type": token_data.get("token_type"),
+    }
+    json_blob = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    b64_blob = base64.b64encode(json_blob.encode("utf-8")).decode("utf-8")
+    return json_blob, b64_blob
+
+
 def ensure_runtime_dir() -> Path:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -223,6 +250,12 @@ class AuthManager:
                     raise OAuthError(
                         "Missing OAuth token in env. Set TG_USERBOT_AUTH_JSON "
                         "or TG_USERBOT_AUTH_JSON_B64."
+                    )
+                if not sys.stdin.isatty():
+                    raise OAuthError(
+                        "No OAuth token in env and interactive browser auth is unavailable "
+                        "(non-interactive runtime). Bootstrap locally, then set "
+                        "TG_USERBOT_AUTH_JSON_B64 in secrets."
                     )
                 token_data = await self._run_full_oauth_flow()
             elif self._is_expiring(token_data):
@@ -460,8 +493,24 @@ class AuthManager:
         self._logger.info("Opening browser for OpenAI OAuth login...")
         self._logger.info("If browser does not open, visit:\n%s", auth_url)
         webbrowser.open(auth_url, new=1, autoraise=True)
+        callback: _CallbackResult
+        try:
+            callback = await asyncio.to_thread(_wait_for_callback, CALLBACK_TIMEOUT_SECONDS)
+        except OAuthError:
+            if not sys.stdin.isatty():
+                raise OAuthError(
+                    "OAuth callback timed out. This runtime cannot complete localhost redirect. "
+                    "Run local bootstrap and set TG_USERBOT_AUTH_JSON_B64 in env."
+                )
+            self._logger.warning(
+                "OAuth callback timed out. Paste the final callback URL from your browser "
+                "(it should start with http://localhost:1455/auth/callback?...)."
+            )
+            pasted = input("Paste callback URL: ").strip()
+            if not pasted:
+                raise OAuthError("OAuth callback URL not provided.")
+            callback = _callback_from_url(pasted)
 
-        callback = await asyncio.to_thread(_wait_for_callback, CALLBACK_TIMEOUT_SECONDS)
         if callback.error:
             raise OAuthError(
                 f"OAuth authorize error: {callback.error} "
@@ -532,3 +581,90 @@ class AuthManager:
             "token_source": "codex_oauth_v1",
         }
         return token_data
+
+
+async def bootstrap_env_oauth_payload(
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, str]:
+    """
+    Run interactive OAuth locally, then return env-ready JSON + base64 payload.
+    Useful for headless/cloud runtimes where localhost callback cannot complete.
+    """
+    prev = os.getenv(ENV_AUTH_ENV_ONLY)
+    os.environ[ENV_AUTH_ENV_ONLY] = "false"
+    try:
+        manager = AuthManager(logger=logger)
+        token_data = await manager._run_full_oauth_flow()
+        manager._save_token_data(token_data)
+        json_blob, b64_blob = _serialize_token_for_env(token_data)
+        return {
+            "json": json_blob,
+            "b64": b64_blob,
+            "account_id": str(token_data.get("account_id") or ""),
+            "expires_at": str(int(_normalize_unix_seconds(token_data.get("expires_at")) or 0)),
+        }
+    finally:
+        if prev is None:
+            os.environ.pop(ENV_AUTH_ENV_ONLY, None)
+        else:
+            os.environ[ENV_AUTH_ENV_ONLY] = prev
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="OpenAI OAuth helpers for TeleUserBot",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    bootstrap = sub.add_parser(
+        "bootstrap-env",
+        help="Run local OAuth and print TG_USERBOT_AUTH_JSON / TG_USERBOT_AUTH_JSON_B64",
+    )
+    bootstrap.add_argument(
+        "--out",
+        default="",
+        help="Optional path to write env export snippet.",
+    )
+    return parser
+
+
+def _run_cli() -> int:
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+    if args.command != "bootstrap-env":
+        parser.print_help()
+        return 0
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+    logger = logging.getLogger("auth-bootstrap")
+
+    try:
+        payload = asyncio.run(bootstrap_env_oauth_payload(logger=logger))
+    except Exception as exc:
+        print(f"Bootstrap failed: {exc}")
+        return 1
+
+    snippet = (
+        f"TG_USERBOT_AUTH_JSON={json.dumps(payload['json'])}\n"
+        f"TG_USERBOT_AUTH_JSON_B64={json.dumps(payload['b64'])}\n"
+    )
+    print("\n# Set these as secrets in Replit/server environment:\n")
+    print(snippet)
+    print(
+        f"# Token account_id={payload['account_id']} expires_at={payload['expires_at']}"
+    )
+
+    out = str(getattr(args, "out", "") or "").strip()
+    if out:
+        path = Path(out).expanduser().resolve()
+        path.write_text(snippet, encoding="utf-8")
+        print(f"# Wrote env snippet to: {path}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_cli())

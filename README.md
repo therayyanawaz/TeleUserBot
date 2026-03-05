@@ -105,12 +105,27 @@ Set:
 
 This avoids interactive browser login during deploy/runtime.
 
+Bootstrap this secret from your local machine:
+
+```bash
+# Run locally (with browser access)
+python auth.py bootstrap-env
+```
+
+It prints:
+- `TG_USERBOT_AUTH_JSON=...`
+- `TG_USERBOT_AUTH_JSON_B64=...`
+
+Set one of them as a Replit/host secret.
+
 ### 2) Browser OAuth mode (local interactive)
 
 Set:
 - `OPENAI_AUTH_ENV_ONLY=false`
 
 Then first run can perform PKCE browser flow.
+
+If callback server times out, `auth.py` now supports manual callback paste in terminal.
 
 ### Optional auth endpoint overrides
 
@@ -146,6 +161,10 @@ Endpoints:
 
 For headless environments, keep:
 - `HOLD_ON_STARTUP_ERROR=true`
+
+Critical for Replit/cloud:
+- Do **not** rely on live browser OAuth in deployment runtime.
+- Use env bootstrap secret (`TG_USERBOT_AUTH_JSON_B64`) generated locally.
 
 ## 🧪 Operational Controls
 
