@@ -1,0 +1,27 @@
+entrypoint = "main.py"
+modules = ["python-3.11"]
+
+[nix]
+channel = "stable-23_11"
+packages = ["python311", "python311Packages.pip", "unzip", "nano"]
+
+[env]
+PYTHONUNBUFFERED = "1"
+
+[agent]
+expertMode = true
+
+[workflows]
+runButton = "run"
+
+[[workflows.workflow]]
+name = "run"
+mode = "sequential"
+author = 55629095
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python main.py"
+
+[[ports]]
+localPort = 8080
