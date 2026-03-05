@@ -265,6 +265,10 @@ def _has_manual_sources() -> bool:
     return len(_manual_source_entries()) > 0
 
 
+def _is_interactive_runtime() -> bool:
+    return sys.stdin.isatty()
+
+
 def _is_missing_destination() -> bool:
     if _is_bot_destination_mode():
         return False
@@ -899,7 +903,7 @@ def _persist_config_updates(updates: Dict[str, object]) -> None:
 
 def _prompt_for_missing_config() -> None:
     # Deployment/runtime without TTY must not block on interactive prompts.
-    if not sys.stdin.isatty():
+    if not _is_interactive_runtime():
         return
 
     updates_to_persist: Dict[str, object] = {}
@@ -997,20 +1001,62 @@ def _prompt_for_missing_config() -> None:
 
 
 def _validate_config() -> None:
+    issues: List[str] = []
+
     if _is_missing_telegram_api_id():
-        raise ValueError("Set TELEGRAM_API_ID in environment or .env")
+        issues.append("Set TELEGRAM_API_ID in environment or .env")
     if _is_missing_telegram_api_hash():
-        raise ValueError("Set TELEGRAM_API_HASH in environment or .env")
+        issues.append("Set TELEGRAM_API_HASH in environment or .env")
+
     if _is_bot_destination_mode():
-        if _is_missing_bot_destination_token():
-            raise ValueError("Set BOT_DESTINATION_TOKEN in environment or .env")
-        if _is_missing_bot_destination_chat_id():
-            raise ValueError("Set BOT_DESTINATION_CHAT_ID in environment or .env")
-    elif _is_missing_destination():
-        raise ValueError("Set DESTINATION in environment or .env")
+        token = _bot_destination_token_from_config()
+        chat_id = str(getattr(config, "BOT_DESTINATION_CHAT_ID", "") or "").strip()
+        if not _looks_like_bot_token(token):
+            issues.append("BOT_DESTINATION_TOKEN is missing or invalid")
+        if not chat_id:
+            issues.append("Set BOT_DESTINATION_CHAT_ID in environment or .env")
+        elif _looks_like_bot_token(chat_id):
+            issues.append("BOT_DESTINATION_CHAT_ID looks like a bot token; set real chat id")
+        elif _looks_like_addlist_link(chat_id):
+            issues.append("BOT_DESTINATION_CHAT_ID cannot be a folder addlist link")
+    else:
+        destination = str(getattr(config, "DESTINATION", "") or "").strip()
+        if _is_missing_destination():
+            issues.append("Set DESTINATION in environment or .env")
+        elif _looks_like_addlist_link(destination):
+            issues.append("DESTINATION cannot be a folder addlist link")
+        elif _looks_like_bot_token(destination):
+            issues.append("DESTINATION cannot be a bot token")
+
     if _is_missing_folder_invite_link() and not _has_manual_sources():
-        raise ValueError(
-            "Set FOLDER_INVITE_LINK or EXTRA_SOURCES/SOURCES in environment or .env"
+        issues.append("Set FOLDER_INVITE_LINK or EXTRA_SOURCES/SOURCES")
+    else:
+        folder_link = str(getattr(config, "FOLDER_INVITE_LINK", "") or "").strip()
+        if folder_link and not _is_missing_folder_invite_link():
+            try:
+                _extract_addlist_hash(_normalize_addlist_link(folder_link))
+            except Exception:
+                issues.append("FOLDER_INVITE_LINK is invalid; expected t.me/addlist/<hash>")
+
+        for source in _manual_source_entries():
+            value = str(source or "").strip()
+            if not value:
+                continue
+            if _looks_like_bot_token(value):
+                issues.append(f"Manual source '{value}' looks like bot token")
+            elif _looks_like_addlist_link(value):
+                issues.append(
+                    f"Manual source '{value}' is addlist link; use FOLDER_INVITE_LINK instead"
+                )
+
+    if issues:
+        bullet = "\n".join(f"- {item}" for item in issues)
+        raise ValueError(f"Configuration validation failed:\n{bullet}")
+
+    if _is_bot_destination_mode() and str(getattr(config, "DESTINATION", "") or "").strip():
+        LOGGER.warning(
+            "Both BOT destination and DESTINATION are set. "
+            "Bot mode will be used and DESTINATION ignored."
         )
 
 
@@ -2769,6 +2815,11 @@ async def _connect_client_with_lock_guard(
 
 async def _interactive_user_login(tg: TelegramClient) -> None:
     """Authenticate this client as a personal user account only."""
+    if not _is_interactive_runtime():
+        raise RuntimeError(
+            "Telegram login requires interactive terminal. "
+            "Create userbot.session locally, then deploy."
+        )
     try:
         await _connect_client_with_lock_guard(tg)
         if await tg.is_user_authorized():
@@ -2967,16 +3018,25 @@ async def _ensure_destination_peer() -> None:
     global destination_peer, bot_destination_token, bot_destination_chat_id
 
     if _is_bot_destination_mode():
+        interactive = _is_interactive_runtime()
         while True:
             token = _bot_destination_token_from_config()
             chat_id = str(getattr(config, "BOT_DESTINATION_CHAT_ID", "") or "").strip()
 
             if not _looks_like_bot_token(token):
+                if not interactive:
+                    raise RuntimeError(
+                        "BOT_DESTINATION_TOKEN is invalid in non-interactive runtime."
+                    )
                 config.BOT_DESTINATION_TOKEN = _prompt_bot_destination_token()
                 _persist_config_updates({"BOT_DESTINATION_TOKEN": config.BOT_DESTINATION_TOKEN})
                 continue
 
             if not chat_id:
+                if not interactive:
+                    raise RuntimeError(
+                        "BOT_DESTINATION_CHAT_ID is missing in non-interactive runtime."
+                    )
                 bot_destination_token = token
                 try:
                     updates = await _bot_api_request("getUpdates", data={"limit": "20"})
@@ -3020,6 +3080,11 @@ async def _ensure_destination_peer() -> None:
                 return
             except Exception as exc:
                 LOGGER.error("Invalid bot destination config: %s", exc)
+                if not interactive:
+                    raise RuntimeError(
+                        "Bot destination validation failed in non-interactive runtime. "
+                        "Check BOT_DESTINATION_TOKEN/BOT_DESTINATION_CHAT_ID and bot access."
+                    ) from exc
                 print(
                     "Bot destination check failed. Ensure:\n"
                     "1) token is valid\n"
@@ -3038,12 +3103,17 @@ async def _ensure_destination_peer() -> None:
 
     bot_destination_token = None
     bot_destination_chat_id = None
+    interactive = _is_interactive_runtime()
     while True:
         try:
             destination_peer = await _resolve_destination_input_peer(config.DESTINATION)
             return
         except Exception as exc:
             LOGGER.error("Invalid DESTINATION value '%s': %s", config.DESTINATION, exc)
+            if not interactive:
+                raise RuntimeError(
+                    f"Cannot resolve DESTINATION '{config.DESTINATION}' in non-interactive runtime."
+                ) from exc
             print(
                 "Destination is invalid or inaccessible. "
                 "Use @username, t.me link, private invite link, or peer ID."
@@ -3771,6 +3841,11 @@ async def main() -> None:
             startup_phase = "source_setup"
             resolved_sources = await setup_sources()
             while not resolved_sources:
+                if not _is_interactive_runtime():
+                    raise RuntimeError(
+                        "No source channels resolved. Set valid FOLDER_INVITE_LINK "
+                        "or EXTRA_SOURCES in environment."
+                    )
                 print(
                     "No channels resolved from folder. Add manual sources "
                     "(username/public/private invite links)."
