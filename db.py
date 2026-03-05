@@ -301,10 +301,14 @@ def claim_digest_batch(limit: int, *, batch_id: str | None = None) -> Tuple[str,
             return "", []
 
         ids = [int(row["id"]) for row in rows]
-        placeholders = ",".join("?" for _ in ids)
-        conn.execute(
-            f"UPDATE digest_queue SET processed = 1, batch_id = ? WHERE id IN ({placeholders})",  # noqa: S608
-            [resolved_batch_id, *ids],
+        conn.executemany(
+            """
+            UPDATE digest_queue
+            SET processed = 1,
+                batch_id = ?
+            WHERE id = ?
+            """,
+            [(resolved_batch_id, row_id) for row_id in ids],
         )
 
         claimed = conn.execute(
