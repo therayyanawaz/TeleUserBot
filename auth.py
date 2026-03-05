@@ -22,11 +22,22 @@ import httpx
 
 # Public OAuth client constants (same family as Codex CLI OAuth flow).
 OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-OPENAI_ISSUER = "https://auth.openai.com"
+DEFAULT_OPENAI_ISSUER = "https://auth.openai.com"
+OPENAI_ISSUER = (
+    str(os.getenv("OPENAI_AUTH_BASE", DEFAULT_OPENAI_ISSUER) or DEFAULT_OPENAI_ISSUER)
+    .strip()
+    .rstrip("/")
+)
 REDIRECT_URI = "http://localhost:1455/auth/callback"
 SCOPES = "openid profile email offline_access"
-AUTH_ENDPOINT = "https://auth.openai.com/oauth/authorize"
-TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token"
+AUTH_ENDPOINT = str(
+    os.getenv("OPENAI_AUTH_ENDPOINT", f"{OPENAI_ISSUER}/oauth/authorize")
+    or f"{OPENAI_ISSUER}/oauth/authorize"
+).strip()
+TOKEN_ENDPOINT = str(
+    os.getenv("OPENAI_TOKEN_ENDPOINT", f"{OPENAI_ISSUER}/oauth/token")
+    or f"{OPENAI_ISSUER}/oauth/token"
+).strip()
 OAUTH_ORIGINATOR = "pi"
 JWT_CLAIM_PATH = "https://api.openai.com/auth"
 
@@ -35,6 +46,9 @@ RUNTIME_DIR = Path.home() / ".tg_userbot"
 TOKEN_PATH = RUNTIME_DIR / "auth.json"
 DB_PATH = RUNTIME_DIR / "seen.db"
 ERROR_LOG_PATH = RUNTIME_DIR / "errors.log"
+ENV_AUTH_JSON = "TG_USERBOT_AUTH_JSON"
+ENV_AUTH_JSON_B64 = "TG_USERBOT_AUTH_JSON_B64"
+ENV_AUTH_ENV_ONLY = "OPENAI_AUTH_ENV_ONLY"
 
 TOKEN_REFRESH_SKEW_SECONDS = 60
 CALLBACK_TIMEOUT_SECONDS = 300
@@ -186,7 +200,12 @@ class AuthManager:
     def __init__(self, logger: Optional[logging.Logger] = None) -> None:
         self._logger = logger or logging.getLogger(__name__)
         self._lock = asyncio.Lock()
+        self._runtime_token_data: Optional[Dict[str, Any]] = None
         ensure_runtime_dir()
+
+    def _is_env_only_mode(self) -> bool:
+        raw = str(os.getenv(ENV_AUTH_ENV_ONLY, "true") or "").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
 
     async def get_access_token(self) -> str:
         context = await self.get_auth_context()
@@ -200,6 +219,11 @@ class AuthManager:
         async with self._lock:
             token_data = self._load_token_data()
             if token_data is None:
+                if self._is_env_only_mode():
+                    raise OAuthError(
+                        "Missing OAuth token in env. Set TG_USERBOT_AUTH_JSON "
+                        "or TG_USERBOT_AUTH_JSON_B64."
+                    )
                 token_data = await self._run_full_oauth_flow()
             elif self._is_expiring(token_data):
                 token_data = await self._refresh_or_reauth(token_data)
@@ -208,6 +232,11 @@ class AuthManager:
 
             access_token = str(token_data.get("access_token") or "").strip()
             if not access_token:
+                if self._is_env_only_mode():
+                    raise OAuthError(
+                        "OAuth access token missing in env payload. "
+                        "Update TG_USERBOT_AUTH_JSON/B64."
+                    )
                 token_data = await self._run_full_oauth_flow()
                 access_token = token_data["access_token"]
 
@@ -253,6 +282,11 @@ class AuthManager:
 
     async def reauthenticate_context(self) -> Dict[str, str]:
         async with self._lock:
+            if self._is_env_only_mode():
+                raise OAuthError(
+                    "Re-authenticate disabled in env-only mode. "
+                    "Update TG_USERBOT_AUTH_JSON/B64 secret and restart."
+                )
             token_data = await self._run_full_oauth_flow()
             self._save_token_data(token_data)
             return self._token_data_to_context(token_data)
@@ -273,18 +307,49 @@ class AuthManager:
         return {"access_token": access_token, "account_id": account_id}
 
     def _load_token_data(self) -> Optional[Dict[str, Any]]:
-        if not TOKEN_PATH.exists():
+        if isinstance(self._runtime_token_data, dict):
+            return dict(self._runtime_token_data)
+
+        env_data = self._load_token_data_from_env()
+        if env_data is not None:
+            self._logger.info("Loaded OAuth token state from env secret.")
+            return env_data
+        return None
+
+    def _load_token_data_from_env(self) -> Optional[Dict[str, Any]]:
+        raw_json = str(os.getenv(ENV_AUTH_JSON, "") or "").strip()
+        raw_b64 = str(os.getenv(ENV_AUTH_JSON_B64, "") or "").strip()
+
+        if not raw_json and raw_b64:
+            try:
+                raw_json = _base64url_decode(raw_b64).decode("utf-8")
+            except Exception:
+                # Fallback to standard base64 form.
+                try:
+                    raw_json = base64.b64decode(raw_b64).decode("utf-8")
+                except Exception:
+                    self._logger.exception(
+                        "Failed to decode %s environment variable.",
+                        ENV_AUTH_JSON_B64,
+                    )
+                    return None
+
+        if not raw_json:
             return None
 
         try:
-            data = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
+            payload = json.loads(raw_json)
         except Exception:
-            self._logger.exception("Failed to read token file. Full OAuth required.")
+            self._logger.exception("Failed to parse %s as JSON.", ENV_AUTH_JSON)
             return None
 
-        if not isinstance(data, dict):
+        if not isinstance(payload, dict):
+            self._logger.error("OAuth env token payload must be a JSON object.")
             return None
 
+        return self._normalize_loaded_token_data(payload)
+
+    def _normalize_loaded_token_data(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # Backward-compatible migrations from previous auth.json shapes.
         if not data.get("access_token") and isinstance(data.get("access"), str):
             data["access_token"] = data["access"]
@@ -316,14 +381,9 @@ class AuthManager:
         return data
 
     def _save_token_data(self, token_data: Dict[str, Any]) -> None:
-        ensure_runtime_dir()
-        tmp = TOKEN_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(token_data, indent=2), encoding="utf-8")
-        os.replace(tmp, TOKEN_PATH)
-        try:
-            os.chmod(TOKEN_PATH, 0o600)
-        except OSError:
-            self._logger.warning("Failed to chmod 600 for token file: %s", TOKEN_PATH)
+        # Env-only mode: keep refreshed token state in memory only.
+        # This avoids writing auth.json to disk in cloud runtimes.
+        self._runtime_token_data = dict(token_data)
 
     def _is_expiring(self, token_data: Dict[str, Any]) -> bool:
         expires_at = _normalize_unix_seconds(token_data.get("expires_at"))
@@ -340,6 +400,11 @@ class AuthManager:
         refresh_token = str(token_data.get("refresh_token") or "").strip()
         if not refresh_token:
             if allow_reauth:
+                if self._is_env_only_mode():
+                    raise OAuthError(
+                        "No refresh_token available in env payload. "
+                        "Update TG_USERBOT_AUTH_JSON/B64."
+                    )
                 self._logger.info("No refresh token found. Running full OAuth flow.")
                 return await self._run_full_oauth_flow()
             raise OAuthError("No refresh token available.")
@@ -358,12 +423,22 @@ class AuthManager:
             return refreshed
         except Exception:
             if allow_reauth:
+                if self._is_env_only_mode():
+                    raise OAuthError(
+                        "OAuth refresh failed in env-only mode. "
+                        "Update TG_USERBOT_AUTH_JSON/B64 and restart."
+                    )
                 self._logger.exception("Refresh failed. Running full OAuth flow.")
                 return await self._run_full_oauth_flow()
             self._logger.exception("Refresh failed.")
             raise
 
     async def _run_full_oauth_flow(self) -> Dict[str, Any]:
+        if self._is_env_only_mode():
+            raise OAuthError(
+                "OAuth browser flow disabled in env-only mode. "
+                "Provide TG_USERBOT_AUTH_JSON or TG_USERBOT_AUTH_JSON_B64."
+            )
         code_verifier = _generate_code_verifier()
         code_challenge = _generate_code_challenge(code_verifier)
         state = _generate_state()
