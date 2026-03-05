@@ -153,12 +153,10 @@ CODEX_ORIGINATOR = _env_str("CODEX_ORIGINATOR", "pi")  # type: str
 DIGEST_MODE = _env_bool("DIGEST_MODE", True)  # type: bool
 DIGEST_INTERVAL_MINUTES = _env_int("DIGEST_INTERVAL_MINUTES", 60)  # type: int
 DIGEST_DAILY_TIMES = _env_list("DIGEST_DAILY_TIMES", ["00:00"])  # type: list[str]
-DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES = _env_int("DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES", 10)  # type: int
+# 0 disables automatic queue clearing (recommended to preserve full flow).
+DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES = _env_int("DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES", 0)  # type: int
 DIGEST_QUEUE_CLEAR_INCLUDE_INFLIGHT = _env_bool("DIGEST_QUEUE_CLEAR_INCLUDE_INFLIGHT", True)  # type: bool
-# Queue cleanup scope:
-# - "inflight": clear only claimed/stuck rows (safe default)
-# - "pending": clear only pending rows (dangerous, may drop unsent news)
-# - "all": clear both pending + inflight (very destructive)
+# Deprecated (runtime queue clear scheduler is disabled to preserve full flow).
 DIGEST_QUEUE_CLEAR_SCOPE = _env_str("DIGEST_QUEUE_CLEAR_SCOPE", "inflight").lower()  # type: str
 # Daily digest window in hours (midnight digest summarizes this trailing window).
 DIGEST_DAILY_WINDOW_HOURS = _env_int("DIGEST_DAILY_WINDOW_HOURS", 24)  # type: int
@@ -179,6 +177,8 @@ DUPE_THRESHOLD = _env_float("DUPE_THRESHOLD", 0.87)  # type: float
 DUPE_CACHE_SIZE = _env_int("DUPE_CACHE_SIZE", 400)  # type: int
 DUPE_HISTORY_HOURS = _env_int("DUPE_HISTORY_HOURS", 4)  # type: int
 DUPE_MERGE_INSTEAD_OF_SKIP = _env_bool("DUPE_MERGE_INSTEAD_OF_SKIP", True)  # type: bool
+# Keep this false for no-HF operation (recommended for lightweight/stable deploys).
+DUPE_USE_SENTENCE_TRANSFORMERS = _env_bool("DUPE_USE_SENTENCE_TRANSFORMERS", False)  # type: bool
 
 # Severity router for real-time high-priority events.
 ENABLE_SEVERITY_ROUTING = _env_bool("ENABLE_SEVERITY_ROUTING", True)  # type: bool
@@ -206,6 +206,8 @@ ENABLE_BREAKING_TOPIC_THREADS = _env_bool("ENABLE_BREAKING_TOPIC_THREADS", True)
 BREAKING_TOPIC_WINDOW_MINUTES = _env_int("BREAKING_TOPIC_WINDOW_MINUTES", 180)  # type: int
 BREAKING_TOPIC_MIN_OVERLAP = _env_int("BREAKING_TOPIC_MIN_OVERLAP", 2)  # type: int
 BREAKING_TOPIC_MIN_RATIO = _env_float("BREAKING_TOPIC_MIN_RATIO", 0.55)  # type: float
+# Fallback fuzzy ratio for paraphrased same-topic follow-ups.
+BREAKING_TOPIC_FUZZY_RATIO = _env_float("BREAKING_TOPIC_FUZZY_RATIO", 0.72)  # type: float
 BREAKING_TOPIC_CONTINUITY_PREFIX = _env_str(
     "BREAKING_TOPIC_CONTINUITY_PREFIX",
     "",
@@ -236,6 +238,38 @@ DIGEST_POST_PROCESSORS = _env_list("DIGEST_POST_PROCESSORS", [])  # type: list[s
 QUERY_MODE_ENABLED = _env_bool("QUERY_MODE_ENABLED", True)  # type: bool
 QUERY_MAX_MESSAGES = _env_int("QUERY_MAX_MESSAGES", 50)  # type: int
 QUERY_DEFAULT_HOURS_BACK = _env_int("QUERY_DEFAULT_HOURS_BACK", 24)  # type: int
+# Optional web fallback when Telegram channel evidence is weak.
+QUERY_WEB_FALLBACK_ENABLED = _env_bool("QUERY_WEB_FALLBACK_ENABLED", True)  # type: bool
+# Trigger web fallback when Telegram matches are below this count.
+QUERY_WEB_MIN_TELEGRAM_RESULTS = _env_int("QUERY_WEB_MIN_TELEGRAM_RESULTS", 3)  # type: int
+# Maximum web evidence items to attach in query context.
+QUERY_WEB_MAX_RESULTS = _env_int("QUERY_WEB_MAX_RESULTS", 12)  # type: int
+# Maximum age window for web evidence (hours).
+QUERY_WEB_MAX_HOURS_BACK = _env_int("QUERY_WEB_MAX_HOURS_BACK", 24)  # type: int
+# Enforce recency filter on web evidence timestamps.
+QUERY_WEB_REQUIRE_RECENT = _env_bool("QUERY_WEB_REQUIRE_RECENT", True)  # type: bool
+# Require at least this many unique web sources before using fallback evidence.
+QUERY_WEB_REQUIRE_MIN_SOURCES = _env_int("QUERY_WEB_REQUIRE_MIN_SOURCES", 2)  # type: int
+# Optional trusted news domains allowlist (empty = accept all news RSS domains).
+QUERY_WEB_ALLOWED_DOMAINS = _env_list(
+    "QUERY_WEB_ALLOWED_DOMAINS",
+    [
+        "reuters.com",
+        "apnews.com",
+        "bbc.com",
+        "aljazeera.com",
+        "cnn.com",
+        "nytimes.com",
+        "washingtonpost.com",
+        "bloomberg.com",
+        "ft.com",
+        "theguardian.com",
+        "dw.com",
+        "france24.com",
+        "aa.com.tr",
+        "npr.org",
+    ],
+)  # type: list[str]
 # Optional chat allowlist for query interface (chat IDs as integers/strings).
 # If empty, query mode only accepts outgoing private chats (e.g., Saved Messages).
 QUERY_ALLOWED_CHAT_IDS = _env_list("QUERY_ALLOWED_CHAT_IDS", [])  # type: list[str]
