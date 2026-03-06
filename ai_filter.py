@@ -25,7 +25,13 @@ from prompts import (
     quiet_period_message,
 )
 from utils import estimate_tokens_rough as _estimate_tokens_rough
-from utils import extract_query_keywords, extract_query_numbers, normalize_space, sanitize_telegram_html
+from utils import (
+    expand_query_terms,
+    extract_query_keywords,
+    extract_query_numbers,
+    normalize_space,
+    sanitize_telegram_html,
+)
 
 
 CACHE_MAX_ITEMS = 2048
@@ -1331,6 +1337,11 @@ def _score_query_context_row(
     lowered_text = text.lower()
     query_keywords = extract_query_keywords(question)
     query_keyword_set = set(query_keywords)
+    expanded_terms = {
+        normalize_space(term).lower()
+        for term in expand_query_terms(question)
+        if normalize_space(term)
+    }
     text_tokens = _query_text_tokens(text)
     query_numbers = set(extract_query_numbers(question))
     text_numbers = _extract_text_numbers(text)
@@ -1339,6 +1350,12 @@ def _score_query_context_row(
     keyword_score = (
         (keyword_hits / max(1, len(query_keyword_set))) * 3.5
         if query_keyword_set
+        else 0.0
+    )
+    alias_hits = sum(1 for term in expanded_terms if term and term in lowered_text)
+    alias_score = (
+        (alias_hits / max(1, len(expanded_terms))) * 4.0
+        if expanded_terms
         else 0.0
     )
 
@@ -1371,6 +1388,7 @@ def _score_query_context_row(
 
     return (
         keyword_score
+        + alias_score
         + number_score
         + direct_phrase_score
         + similarity_score
@@ -1490,7 +1508,7 @@ def _fallback_query_answer(
         prefix = "🔥" if _severity_from_text_heuristic(text) == "high" else "⚠️"
         line = f"• {prefix} {text} <i>[{source}]</i>"
         if link.startswith("http"):
-            line += f' <a href="{link}">source</a>'
+            line += f' <a href="{link}">{source}</a>'
         lines.append(line)
 
     if not lines:

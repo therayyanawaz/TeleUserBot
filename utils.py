@@ -99,6 +99,39 @@ _QUERY_GENERIC_TERMS = {
 }
 
 
+_QUERY_ALIAS_MAP: dict[str, tuple[str, ...]] = {
+    "tehran": ("tehran", "teheran", "تهران"),
+    "iran": ("iran", "iranian", "ایران"),
+    "israel": ("israel", "israeli", "اسرائیل", "اسراییل"),
+    "gaza": ("gaza", "غزه"),
+    "beirut": ("beirut", "بيروت", "بیروت"),
+    "lebanon": ("lebanon", "لبنان"),
+    "damascus": ("damascus", "دمشق"),
+    "syria": ("syria", "syrian", "سوريا", "سوریه"),
+    "baghdad": ("baghdad", "بغداد"),
+    "iraq": ("iraq", "iraqi", "العراق", "عراق"),
+    "erbil": ("erbil", "اربيل", "اربیل"),
+    "basra": ("basra", "البصرة", "بصره", "بصرہ"),
+    "hormuz": ("hormuz", "هرمز", "hormoz"),
+    "dubai": ("dubai", "دبي", "دبی"),
+    "bahrain": ("bahrain", "بحرين", "بحرین"),
+    "telaviv": ("tel aviv", "تل أبيب", "تل‌آویو", "تل ابیب"),
+    "tel": ("tel aviv", "تل أبيب", "تل‌آویو", "تل ابیب"),
+    "haifa": ("haifa", "حيفا", "حیفا"),
+    "yemen": ("yemen", "اليمن", "یمن"),
+    "sanaa": ("sanaa", "صنعاء", "صنعا"),
+    "aden": ("aden", "عدن"),
+    "saada": ("saada", "صعدة", "صعده"),
+    "saudi": ("saudi", "saudi arabia", "السعودية", "سعودی"),
+    "riyadh": ("riyadh", "الرياض", "ریاض"),
+    "uae": ("uae", "united arab emirates", "الإمارات", "امارات"),
+    "emirates": ("uae", "united arab emirates", "الإمارات", "امارات"),
+    "qatar": ("qatar", "قطر"),
+    "jordan": ("jordan", "الأردن", "اردن"),
+    "egypt": ("egypt", "مصر"),
+}
+
+
 def extract_query_keywords(query: str) -> list[str]:
     """
     Extract meaningful subject terms from a natural-language query.
@@ -114,6 +147,8 @@ def extract_query_keywords(query: str) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for token in tokens:
+        if token.isdigit():
+            continue
         if token in _QUERY_GENERIC_TERMS:
             continue
         if token in seen:
@@ -121,6 +156,81 @@ def extract_query_keywords(query: str) -> list[str]:
         seen.add(token)
         out.append(token)
     return out
+
+
+def expand_query_terms(query: str) -> list[str]:
+    """
+    Expand keywords with lightweight multilingual aliases and transliterations.
+    """
+    base_keywords = extract_query_keywords(query)
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _push(value: str) -> None:
+        cleaned = normalize_space(value)
+        if not cleaned:
+            return
+        key = cleaned.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(cleaned)
+
+    for keyword in base_keywords:
+        _push(keyword)
+        alias_values = _QUERY_ALIAS_MAP.get(keyword.lower())
+        if alias_values:
+            for alias in alias_values:
+                _push(alias)
+    return out
+
+
+def build_query_search_variants(query: str, *, broad_query: bool = False) -> list[str | None]:
+    """
+    Build multiple retrieval-friendly search variants from one user query.
+    """
+    normalized = normalize_space(query)
+    expanded_terms = expand_query_terms(query)
+    numbers = extract_query_numbers(query)
+
+    variants: list[str | None] = []
+    seen: set[str] = set()
+
+    def _push(value: str | None) -> None:
+        if value is None:
+            key = "__none__"
+            if key in seen:
+                return
+            seen.add(key)
+            variants.append(None)
+            return
+        cleaned = normalize_space(value)
+        if not cleaned:
+            return
+        key = cleaned.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        variants.append(cleaned)
+
+    if normalized:
+        _push(normalized)
+
+    if expanded_terms:
+        _push(" ".join(expanded_terms[:4]))
+        for term in expanded_terms[:8]:
+            _push(term)
+
+    if numbers:
+        for number in numbers[:4]:
+            _push(number)
+        if expanded_terms:
+            _push(" ".join([*numbers[:2], *expanded_terms[:2]]))
+
+    if broad_query and not expanded_terms and not numbers:
+        _push(None)
+
+    return variants or [None]
 
 
 def extract_query_numbers(query: str) -> list[str]:
@@ -906,15 +1016,21 @@ async def search_recent_messages(
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
 
     broad_query = is_broad_news_query(query)
-    keyword_list = extract_query_keywords(cleaned_query)
+    keyword_list = expand_query_terms(cleaned_query or query)
     keyword_terms = set(keyword_list)
     query_numbers = set(extract_query_numbers(cleaned_query or query))
+    sparse_subject_query = bool(
+        not broad_query and keyword_terms and len(keyword_terms) <= 6 and not query_numbers
+    )
 
     stage_limit = max(10, min(60, resolved_max // max(1, min(len(monitored_chats), resolved_max)) + 8))
     if broad_query and not keyword_terms:
         # Broad recap queries need source diversity more than deep per-chat search.
         stage_limit = max(2, min(4, resolved_max // max(1, len(monitored_chats)) + 1))
     fallback_limit = max(30, min(120, stage_limit * 3))
+    if sparse_subject_query:
+        stage_limit = max(stage_limit, 16)
+        fallback_limit = max(fallback_limit, 90)
 
     collected: dict[tuple[str, int], dict[str, Any]] = {}
 
@@ -1006,33 +1122,10 @@ async def search_recent_messages(
 
     # Stage 1: server-side fuzzy search using multiple variants. Long natural
     # language questions often perform poorly as a single literal search string.
-    search_variants: list[str | None] = []
-    if broad_query and not keyword_terms and not query_numbers:
-        search_variants = [None]
-    else:
-        candidates: list[str] = []
-        primary = cleaned_query if cleaned_query else query
-        if primary:
-            candidates.append(primary)
-        if keyword_list:
-            candidates.append(" ".join(keyword_list[:4]))
-            for token in keyword_list[:3]:
-                if len(token) >= 4:
-                    candidates.append(token)
-        for number in list(query_numbers)[:3]:
-            candidates.append(number)
-        seen_variant: set[str] = set()
-        for value in candidates:
-            cleaned_variant = normalize_space(value)
-            if not cleaned_variant:
-                continue
-            key = cleaned_variant.lower()
-            if key in seen_variant:
-                continue
-            seen_variant.add(key)
-            search_variants.append(cleaned_variant)
-        if not search_variants:
-            search_variants = [None]
+    search_variants = build_query_search_variants(
+        cleaned_query if cleaned_query else query,
+        broad_query=broad_query,
+    )
 
     for search_text in search_variants:
         for chat_ref in monitored_chats:
@@ -1108,8 +1201,8 @@ async def search_recent_news_web(
     """
     Strict web-news fallback search (RSS based).
 
-    Uses Bing News RSS endpoint and returns normalized context rows compatible with
-    query answer generation.
+    Uses multiple RSS-backed news search endpoints and returns normalized context
+    rows compatible with query answer generation.
     """
     text = normalize_space(query)
     if len(text) < 3:
@@ -1119,9 +1212,6 @@ async def search_recent_news_web(
     resolved_max = max(3, min(int(max_results), 40))
     trusted_domains = list(allowed_domains or [])
 
-    # Bing RSS accepts `when:Xh` search hint for recency.
-    search_query = f"{text} when:{resolved_hours}h"
-    url = f"https://www.bing.com/news/search?q={quote_plus(search_query)}&format=RSS"
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -1134,77 +1224,117 @@ async def search_recent_news_web(
     cutoff = now - timedelta(hours=resolved_hours)
     dedupe: set[str] = set()
     rows: list[dict[str, Any]] = []
+    search_variants = [
+        variant for variant in build_query_search_variants(text, broad_query=is_broad_news_query(text))
+        if isinstance(variant, str) and normalize_space(variant)
+    ]
+    if not search_variants:
+        search_variants = [text]
+
+    providers = (
+        (
+            "bing_news_rss",
+            lambda search_query: (
+                f"https://www.bing.com/news/search?q={quote_plus(search_query)}&format=RSS"
+            ),
+        ),
+        (
+            "google_news_rss",
+            lambda search_query: (
+                "https://news.google.com/rss/search"
+                f"?q={quote_plus(search_query)}&hl=en-US&gl=US&ceid=US:en"
+            ),
+        ),
+    )
 
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as http:
-            response = await http.get(url)
-        if response.status_code != 200:
-            if logger:
-                logger.debug("Web fallback RSS status=%s", response.status_code)
-            return []
+            for variant in search_variants[:6]:
+                search_query = f"{variant} when:{resolved_hours}h"
+                for provider_name, build_url in providers:
+                    url = build_url(search_query)
+                    response = await http.get(url)
+                    if response.status_code != 200:
+                        if logger:
+                            logger.debug(
+                                "Web fallback RSS status=%s provider=%s variant=%s",
+                                response.status_code,
+                                provider_name,
+                                variant,
+                            )
+                        continue
 
-        try:
-            root = ET.fromstring(response.text)
-        except Exception:
-            if logger:
-                logger.debug("Web fallback RSS parse failure.", exc_info=True)
-            return []
+                    try:
+                        root = ET.fromstring(response.text)
+                    except Exception:
+                        if logger:
+                            logger.debug(
+                                "Web fallback RSS parse failure provider=%s variant=%s.",
+                                provider_name,
+                                variant,
+                                exc_info=True,
+                            )
+                        continue
 
-        for item in root.findall(".//item"):
-            title = normalize_space(str(item.findtext("title") or ""))
-            link = normalize_space(str(item.findtext("link") or ""))
-            description = _strip_html_tags(str(item.findtext("description") or ""))
-            pub_raw = normalize_space(str(item.findtext("pubDate") or ""))
+                    for item in root.findall(".//item"):
+                        title = normalize_space(str(item.findtext("title") or ""))
+                        link = normalize_space(str(item.findtext("link") or ""))
+                        description = _strip_html_tags(str(item.findtext("description") or ""))
+                        pub_raw = normalize_space(str(item.findtext("pubDate") or ""))
 
-            if not title or not link:
-                continue
-            if not link.startswith("http"):
-                continue
+                        if not title or not link:
+                            continue
+                        if not link.startswith("http"):
+                            continue
 
-            host = normalize_space(str(urlparse(link).hostname or "")).lower()
-            if not _domain_allowed(host, trusted_domains):
-                continue
+                        host = normalize_space(str(urlparse(link).hostname or "")).lower()
+                        if not _domain_allowed(host, trusted_domains):
+                            continue
 
-            pub_dt = _parse_pub_datetime(pub_raw)
-            if require_recent:
-                if pub_dt is None:
-                    continue
-                if pub_dt < cutoff or pub_dt > now + timedelta(minutes=5):
-                    continue
-            if pub_dt is None:
-                pub_dt = now
+                        pub_dt = _parse_pub_datetime(pub_raw)
+                        if require_recent:
+                            if pub_dt is None:
+                                continue
+                            if pub_dt < cutoff or pub_dt > now + timedelta(minutes=5):
+                                continue
+                        if pub_dt is None:
+                            pub_dt = now
 
-            source_tag = item.find("source")
-            source_name = normalize_space(source_tag.text if source_tag is not None else "")
-            if not source_name:
-                source_name = host or "web"
+                        source_tag = item.find("source")
+                        source_name = normalize_space(source_tag.text if source_tag is not None else "")
+                        if not source_name:
+                            source_name = host or "web"
 
-            snippet = title
-            if description and description.lower() not in title.lower():
-                snippet = f"{title}. {description}"
-            if len(snippet) > 700:
-                snippet = f"{snippet[:697].rsplit(' ', 1)[0]}..."
+                        snippet = title
+                        if description and description.lower() not in title.lower():
+                            snippet = f"{title}. {description}"
+                        if len(snippet) > 700:
+                            snippet = f"{snippet[:697].rsplit(' ', 1)[0]}..."
 
-            sig = f"{host}|{title.lower()}"
-            if sig in dedupe:
-                continue
-            dedupe.add(sig)
+                        sig = f"{host}|{title.lower()}"
+                        if sig in dedupe:
+                            continue
+                        dedupe.add(sig)
 
-            rows.append(
-                {
-                    "chat_id": "web",
-                    "message_id": 0,
-                    "timestamp": int(pub_dt.timestamp()),
-                    "date": pub_dt.isoformat(),
-                    "source": f"Web:{source_name}",
-                    "text": snippet,
-                    "link": link,
-                    "provider": "bing_news_rss",
-                    "is_web": True,
-                }
-            )
-            if len(rows) >= resolved_max:
-                break
+                        rows.append(
+                            {
+                                "chat_id": "web",
+                                "message_id": 0,
+                                "timestamp": int(pub_dt.timestamp()),
+                                "date": pub_dt.isoformat(),
+                                "source": f"Web:{source_name}",
+                                "text": snippet,
+                                "link": link,
+                                "provider": provider_name,
+                                "is_web": True,
+                            }
+                        )
+                        if len(rows) >= resolved_max:
+                            break
+                    if len(rows) >= resolved_max:
+                        break
+                if len(rows) >= resolved_max:
+                    break
     except Exception:
         if logger:
             logger.debug("Web fallback search failed.", exc_info=True)

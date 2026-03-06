@@ -58,6 +58,7 @@ from db import (
     init_db,
     is_seen,
     load_archive_since,
+    load_queue_since,
     mark_seen,
     mark_seen_many,
     prune_archive_older_than,
@@ -86,7 +87,9 @@ from utils import (
     normalize_space,
     parse_daily_times,
     parse_time_filter_from_query,
+    expand_query_terms,
     extract_query_keywords,
+    extract_query_numbers,
     sanitize_telegram_html,
     search_recent_news_web,
     search_recent_messages,
@@ -3917,26 +3920,22 @@ def _append_query_history(sender_id: int, query_text: str, answer_text: str) -> 
     history.append({"role": "assistant", "content": trimmed_answer})
 
 
-def _load_archive_query_context(
+def _filter_stored_query_rows(
+    rows: Sequence[Dict[str, object]],
     *,
     query_text: str,
-    hours_back: int,
-    limit: int,
     broad_query: bool,
 ) -> list[Dict[str, object]]:
-    """
-    Pull recent archived updates into query context.
+    expanded_terms = {
+        normalize_space(term).lower()
+        for term in expand_query_terms(query_text)
+        if normalize_space(term)
+    }
+    query_numbers = set(extract_query_numbers(query_text))
 
-    Broad digest-style prompts use archive history as the primary evidence pool.
-    Subject-specific prompts only keep archive rows that mention the extracted
-    query keywords.
-    """
-    since_ts = max(0, int(time.time()) - max(1, int(hours_back)) * 3600)
-    rows = load_archive_since(since_ts, max(1, int(limit)))
-    if not rows:
+    if not broad_query and not expanded_terms and not query_numbers:
         return []
 
-    keywords = set(extract_query_keywords(query_text))
     out: list[Dict[str, object]] = []
     for row in rows:
         text = normalize_space(str(row.get("raw_text") or ""))
@@ -3944,10 +3943,11 @@ def _load_archive_query_context(
             continue
 
         lowered_text = text.lower()
-        if keywords and not any(term in lowered_text for term in keywords):
-            continue
-        if not keywords and not broad_query:
-            continue
+        if not broad_query:
+            keyword_hit = any(term in lowered_text for term in expanded_terms)
+            number_hit = any(number in lowered_text for number in query_numbers)
+            if not keyword_hit and not number_hit:
+                continue
 
         timestamp = int(row.get("timestamp") or 0)
         date_label = (
@@ -3967,6 +3967,41 @@ def _load_archive_query_context(
             }
         )
     return out
+
+
+def _load_queue_query_context(
+    *,
+    query_text: str,
+    hours_back: int,
+    limit: int,
+    broad_query: bool,
+) -> list[Dict[str, object]]:
+    since_ts = max(0, int(time.time()) - max(1, int(hours_back)) * 3600)
+    rows = load_queue_since(since_ts, max(1, int(limit)))
+    if not rows:
+        return []
+    return _filter_stored_query_rows(rows, query_text=query_text, broad_query=broad_query)
+
+
+def _load_archive_query_context(
+    *,
+    query_text: str,
+    hours_back: int,
+    limit: int,
+    broad_query: bool,
+) -> list[Dict[str, object]]:
+    """
+    Pull recent archived updates into query context.
+
+    Broad digest-style prompts use archive history as the primary evidence pool.
+    Subject-specific prompts only keep archive rows that mention the extracted
+    query keywords.
+    """
+    since_ts = max(0, int(time.time()) - max(1, int(hours_back)) * 3600)
+    rows = load_archive_since(since_ts, max(1, int(limit)))
+    if not rows:
+        return []
+    return _filter_stored_query_rows(rows, query_text=query_text, broad_query=broad_query)
 
 
 def _wrap_query_digest_answer(answer: str, *, hours_back: int) -> str:
@@ -4364,7 +4399,22 @@ async def _handle_query_request(
             logger=LOGGER,
         )
 
+        queue_results: list[dict[str, object]] = []
         archive_results: list[dict[str, object]] = []
+        if broad_query or len(telegram_results) < _query_web_min_telegram_results():
+            queue_results = _load_queue_query_context(
+                query_text=effective_query,
+                hours_back=parsed_hours,
+                limit=max(context_limit * 3, 80),
+                broad_query=broad_query,
+            )
+            if queue_results:
+                telegram_results = _merge_query_context(
+                    telegram_results,
+                    queue_results,
+                    limit=max(context_limit, 40),
+                )
+
         if broad_query or len(telegram_results) < _query_web_min_telegram_results():
             archive_results = _load_archive_query_context(
                 query_text=effective_query,
@@ -4512,6 +4562,7 @@ async def _handle_query_request(
             hours_back=parsed_hours,
             messages_found=len(results),
             telegram_messages_found=len(telegram_results),
+            queue_messages_found=len(queue_results),
             archive_messages_found=len(archive_results),
             web_messages_found=len(web_results),
             web_fallback_used=web_fallback_used,

@@ -380,6 +380,32 @@ def load_and_clear_digest_queue(limit: int | None = None) -> List[Dict[str, obje
     return rows
 
 
+def load_queue_since(since_ts: int, limit: int) -> List[Dict[str, object]]:
+    """
+    Load recent digest queue rows for query-time evidence search.
+
+    This intentionally includes both pending and inflight rows because a query
+    should be able to see the freshest posts even if a digest batch has already
+    claimed them but not yet acknowledged/deleted them.
+    """
+    resolved_limit = max(1, int(limit))
+    since = int(max(0, since_ts))
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, channel_id, message_id, source_name, raw_text, message_link, timestamp, processed, batch_id
+            FROM digest_queue
+            WHERE timestamp >= ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """,
+            (since, resolved_limit),
+        ).fetchall()
+    out = _to_rows_dict(rows)
+    out.reverse()
+    return out
+
+
 def clear_digest_queue(*, include_inflight: bool = True) -> int:
     """Delete queued digest rows. Used by periodic queue purge policy."""
     resolved_scope = "all" if include_inflight else "pending"
