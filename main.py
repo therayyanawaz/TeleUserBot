@@ -11,9 +11,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
-import subprocess
 import sys
-import tempfile
 import time
 import urllib.parse
 from collections import defaultdict, deque
@@ -44,7 +42,6 @@ from ai_filter import (
     create_digest_summary,
     generate_answer_from_context,
     get_quota_health,
-    summarize_media_context,
     summarize_breaking_headline,
     summarize_vital_rational_view,
     summarize_or_skip,
@@ -79,15 +76,16 @@ from utils import (
     build_telegram_message_link,
     configure_duplicate_runtime,
     estimate_tokens_rough,
-    extract_ocr_text_from_image_bytes,
     format_eta,
     format_ts,
     is_duplicate_and_handle,
+    is_broad_news_query,
     load_custom_emoji_map,
     log_structured,
     normalize_space,
     parse_daily_times,
     parse_time_filter_from_query,
+    extract_query_keywords,
     sanitize_telegram_html,
     search_recent_news_web,
     search_recent_messages,
@@ -563,50 +561,6 @@ def _is_html_formatting_enabled() -> bool:
 
 def _is_premium_emoji_enabled() -> bool:
     return _bool_flag(getattr(config, "ENABLE_PREMIUM_EMOJI", True), True)
-
-
-def _is_media_ocr_enabled() -> bool:
-    return _bool_flag(getattr(config, "ENABLE_MEDIA_OCR", True), True)
-
-
-def _media_ocr_min_chars() -> int:
-    raw = getattr(config, "MEDIA_OCR_MIN_CHARS", 18)
-    try:
-        value = int(raw)
-    except Exception:
-        value = 18
-    return max(8, min(value, 300))
-
-
-def _media_ocr_max_chars() -> int:
-    raw = getattr(config, "MEDIA_OCR_MAX_CHARS", 1600)
-    try:
-        value = int(raw)
-    except Exception:
-        value = 1600
-    return max(200, min(value, 6000))
-
-
-def _media_ocr_max_images_per_album() -> int:
-    raw = getattr(config, "MEDIA_OCR_MAX_IMAGES_PER_ALBUM", 3)
-    try:
-        value = int(raw)
-    except Exception:
-        value = 3
-    return max(1, min(value, 10))
-
-
-def _media_ocr_video_enabled() -> bool:
-    return _bool_flag(getattr(config, "MEDIA_OCR_ENABLE_VIDEO_FRAME", True), True)
-
-
-def _media_ocr_video_max_mb() -> int:
-    raw = getattr(config, "MEDIA_OCR_VIDEO_MAX_MB", 25)
-    try:
-        value = int(raw)
-    except Exception:
-        value = 25
-    return max(5, min(value, 200))
 
 
 def _premium_emoji_map_path() -> str:
@@ -1477,172 +1431,6 @@ def _filename_for_bot_media(msg: Message, index: int) -> str:
     return f"file_{msg.id or index}.bin"
 
 
-def _message_is_image_media(msg: Message) -> bool:
-    if bool(msg.photo):
-        return True
-    document = getattr(msg, "document", None)
-    if document is None:
-        return False
-    mime = str(getattr(document, "mime_type", "") or "").strip().lower()
-    return mime.startswith("image/")
-
-
-def _message_is_ocr_eligible(msg: Message) -> bool:
-    return _message_is_image_media(msg) or bool(msg.video)
-
-
-def _extract_video_frame_bytes_for_ocr(video_blob: bytes) -> bytes | None:
-    if not video_blob:
-        return None
-    try:
-        with tempfile.TemporaryDirectory(prefix="tg_ocr_") as tmpdir:
-            in_path = Path(tmpdir) / "input.mp4"
-            out_path = Path(tmpdir) / "frame.jpg"
-            in_path.write_bytes(video_blob)
-
-            commands = [
-                [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    "-i",
-                    str(in_path),
-                    "-vf",
-                    "select=eq(n\\,0)",
-                    "-vframes",
-                    "1",
-                    str(out_path),
-                ],
-                [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    "-ss",
-                    "00:00:01",
-                    "-i",
-                    str(in_path),
-                    "-vframes",
-                    "1",
-                    str(out_path),
-                ],
-            ]
-            for cmd in commands:
-                try:
-                    subprocess.run(
-                        cmd,
-                        check=False,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=25,
-                    )
-                except Exception:
-                    continue
-                if out_path.exists() and out_path.stat().st_size > 0:
-                    return out_path.read_bytes()
-    except Exception:
-        return None
-    return None
-
-
-def _media_kind_label(msg: Message) -> str:
-    if bool(msg.photo):
-        return "image"
-    if bool(msg.video):
-        return "video"
-    if _message_is_image_media(msg):
-        return "image"
-    return "media"
-
-
-def _fallback_visual_caption_body(media_kind: str) -> str:
-    kind = sanitize_telegram_html(normalize_space(media_kind) or "media")
-    return (
-        f"• <b>What:</b> Incoming {kind} update.<br>"
-        "• <b>Where:</b> Not confirmed from available evidence.<br>"
-        "• <i>Status:</i> Waiting for clearer verification."
-    )
-
-
-def _is_ocr_text_usable(text: str) -> str:
-    cleaned = normalize_space(text or "")
-    if len(cleaned) < _media_ocr_min_chars():
-        return ""
-    alpha_count = sum(1 for ch in cleaned if ch.isalpha())
-    # Filter OCR garbage like random punctuation/noise.
-    if alpha_count < max(5, int(len(cleaned) * 0.2)):
-        return ""
-    return cleaned
-
-
-async def _ocr_message_text(msg: Message, *, max_chars: int | None = None) -> str:
-    if not _is_media_ocr_enabled():
-        return ""
-    if not msg.media or not _message_is_ocr_eligible(msg):
-        return ""
-
-    max_len = _media_ocr_max_chars() if max_chars is None else max(200, min(int(max_chars), 6000))
-    if bool(msg.video):
-        if not _media_ocr_video_enabled():
-            return ""
-        max_video_bytes = _media_ocr_video_max_mb() * 1024 * 1024
-        file_size = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
-        if file_size > 0 and file_size > max_video_bytes:
-            return ""
-        blob = await msg.download_media(file=bytes)
-        if not blob:
-            return ""
-        frame = await asyncio.to_thread(_extract_video_frame_bytes_for_ocr, blob)
-        if not frame:
-            return ""
-        text = await asyncio.to_thread(
-            extract_ocr_text_from_image_bytes,
-            frame,
-            max_chars=max_len,
-        )
-    else:
-        blob = await msg.download_media(file=bytes)
-        if not blob:
-            return ""
-        text = await asyncio.to_thread(
-            extract_ocr_text_from_image_bytes,
-            blob,
-            max_chars=max_len,
-        )
-    return _is_ocr_text_usable(text)
-
-
-async def _ocr_album_text(messages: List[Message]) -> str:
-    if not _is_media_ocr_enabled():
-        return ""
-    if not messages:
-        return ""
-
-    limit = _media_ocr_max_images_per_album()
-    merged: List[str] = []
-    scanned = 0
-    per_image_chars = max(200, _media_ocr_max_chars() // max(1, limit))
-    for msg in messages:
-        if scanned >= limit:
-            break
-        if not _message_is_ocr_eligible(msg):
-            continue
-        scanned += 1
-        text = await _ocr_message_text(msg, max_chars=per_image_chars)
-        if text:
-            merged.append(text)
-
-    if not merged:
-        return ""
-    combined = normalize_space("\n".join(merged))
-    if len(combined) > _media_ocr_max_chars():
-        combined = f"{combined[: _media_ocr_max_chars() - 3].rsplit(' ', 1)[0]}..."
-    return _is_ocr_text_usable(combined)
-
-
 def _format_summary_text(source_title: str, summary: str) -> str:
     safe_source = sanitize_telegram_html(source_title)
     safe_summary = sanitize_telegram_html(summary)
@@ -1930,11 +1718,41 @@ def _format_breaking_text(source_title: str, headline: str, rational_view: str |
     clean_headline = normalize_space(headline)
     safe_headline = sanitize_telegram_html(clean_headline)
     safe_source = sanitize_telegram_html(source_title)
+    def _normalize_structured_block(value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"^\s*why it matters:\s*", "", text, flags=re.IGNORECASE)
+        text = text.replace("\r", "\n")
+        text = re.sub(r"\n{2,}", "\n", text)
+        # Split compressed bullets into separate lines.
+        if "\n" not in text and "<br>" not in text.lower():
+            text = re.sub(r"\s+•\s*", "<br>• ", text)
+            text = re.sub(
+                r"\s+(What:|Where:|When:|Location:|Status:)",
+                r"<br>• \1",
+                text,
+                flags=re.IGNORECASE,
+            )
+        return sanitize_telegram_html(text)
+
     rational_part = ""
     if rational_view:
-        cleaned_rational = _clean_rational_view(rational_view)
-        if cleaned_rational:
-            rational_part = f"<br><br><i>{sanitize_telegram_html(cleaned_rational)}</i>"
+        lowered = str(rational_view or "").lower()
+        is_structured = (
+            "<b>what:" in lowered
+            or "•" in lowered
+            or "<br>" in lowered
+            or "\n" in str(rational_view or "")
+        )
+        if is_structured:
+            block = _normalize_structured_block(str(rational_view))
+            if block:
+                rational_part = f"<br><br>{block}"
+        else:
+            cleaned_rational = _clean_rational_view(rational_view)
+            if cleaned_rational:
+                rational_part = f"<br><br><i>{sanitize_telegram_html(cleaned_rational)}</i>"
     if _include_source_tags():
         return f"<b>🔥 BREAKING • {safe_source}</b><br><br>{safe_headline}{rational_part}"
     return f"<b>🔥 BREAKING</b><br><br>{safe_headline}{rational_part}"
@@ -2655,36 +2473,14 @@ async def _process_single_message(msg: Message) -> None:
 
     text = (msg.message or "").strip()
     source = await _source_title(msg)
-    media_kind = _media_kind_label(msg)
 
     if msg.media and not text:
-        ocr_text = await _ocr_message_text(msg)
-        if ocr_text:
-            text = ocr_text
-            log_structured(
-                LOGGER,
-                "media_ocr_extracted",
-                level=logging.DEBUG,
-                channel_id=channel_id,
-                message_id=msg.id,
-                chars=len(text),
-                source=source,
-            )
-        else:
-            await _send_single_media(
-                msg,
-                _format_summary_text(source, _fallback_visual_caption_body(media_kind)),
-            )
-            mark_seen(channel_id, msg.id)
-            return
+        await _send_single_media(msg, _format_source_label(source))
+        mark_seen(channel_id, msg.id)
+        return
 
     if msg.media and text:
-        summary = await summarize_media_context(
-            text,
-            _require_auth_manager(),
-            source=source,
-            media_kind=media_kind,
-        )
+        summary = await summarize_or_skip(text, _require_auth_manager())
         if summary is None:
             mark_seen(channel_id, msg.id)
             return
@@ -2717,38 +2513,15 @@ async def _process_album(messages: List[Message]) -> None:
         return
 
     source = await _source_title(messages[0])
-    media_kind = "album"
     captions = [(m.message or "").strip() for m in messages if (m.message or "").strip()]
     combined_caption = "\n".join(captions).strip()
 
     if not combined_caption:
-        ocr_text = await _ocr_album_text(messages)
-        if ocr_text:
-            combined_caption = ocr_text
-            log_structured(
-                LOGGER,
-                "album_ocr_extracted",
-                level=logging.DEBUG,
-                channel_id=channel_id,
-                first_message_id=messages[0].id,
-                album_size=len(messages),
-                chars=len(combined_caption),
-                source=source,
-            )
-        else:
-            await _send_album(
-                messages,
-                _format_summary_text(source, _fallback_visual_caption_body(media_kind)),
-            )
-            mark_seen_many(channel_id, message_ids)
-            return
+        await _send_album(messages, _format_source_label(source))
+        mark_seen_many(channel_id, message_ids)
+        return
 
-    summary = await summarize_media_context(
-        combined_caption,
-        _require_auth_manager(),
-        source=source,
-        media_kind=media_kind,
-    )
+    summary = await summarize_or_skip(combined_caption, _require_auth_manager())
     if summary is None:
         mark_seen_many(channel_id, message_ids)
         return
@@ -2764,29 +2537,11 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
 
     text = (msg.message or "").strip()
     source, link = await _source_info(msg)
-    media_kind = _media_kind_label(msg)
 
     if msg.media and not text:
-        ocr_text = await _ocr_message_text(msg)
-        if ocr_text:
-            text = ocr_text
-            log_structured(
-                LOGGER,
-                "media_ocr_extracted",
-                level=logging.DEBUG,
-                channel_id=channel_id,
-                message_id=msg.id,
-                chars=len(text),
-                source=source,
-            )
-        else:
-            # If OCR does not produce reliable text, preserve existing media-only flow.
-            await _send_single_media(
-                msg,
-                _format_summary_text(source, _fallback_visual_caption_body(media_kind)),
-            )
-            mark_seen(channel_id, msg.id)
-            return
+        await _send_single_media(msg, _format_source_label(source))
+        mark_seen(channel_id, msg.id)
+        return
 
     if not text:
         mark_seen(channel_id, msg.id)
@@ -2822,17 +2577,7 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
             if len(headline) > 140:
                 headline = f"{headline[:137].rsplit(' ', 1)[0]}..."
         rational_view: str | None = None
-        if msg.media:
-            media_context = await summarize_media_context(
-                text,
-                _require_auth_manager(),
-                source=source,
-                media_kind=media_kind,
-            )
-            media_context_plain = normalize_space(strip_telegram_html(media_context or ""))
-            if media_context_plain:
-                rational_view = media_context_plain
-        if rational_view is None and _should_attach_vital_opinion(text):
+        if _should_attach_vital_opinion(text):
             rational_view = await summarize_vital_rational_view(text, _require_auth_manager())
         payload = _format_breaking_text(source, headline, rational_view)
         topic_seed = f"{headline}\n{text}"
@@ -2900,32 +2645,13 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
         return
 
     source, link = await _source_info(messages[0])
-    media_kind = "album"
     captions = [(m.message or "").strip() for m in messages if (m.message or "").strip()]
     combined_caption = "\n".join(captions).strip()
 
     if not combined_caption:
-        ocr_text = await _ocr_album_text(messages)
-        if ocr_text:
-            combined_caption = ocr_text
-            log_structured(
-                LOGGER,
-                "album_ocr_extracted",
-                level=logging.DEBUG,
-                channel_id=channel_id,
-                first_message_id=messages[0].id,
-                album_size=len(messages),
-                chars=len(combined_caption),
-                source=source,
-            )
-        else:
-            # If no OCR text is available, preserve existing media-only flow.
-            await _send_album(
-                messages,
-                _format_summary_text(source, _fallback_visual_caption_body(media_kind)),
-            )
-            mark_seen_many(channel_id, message_ids)
-            return
+        await _send_album(messages, _format_source_label(source))
+        mark_seen_many(channel_id, message_ids)
+        return
 
     severity = "medium"
     severity_score = 0.0
@@ -2957,16 +2683,7 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
             if len(headline) > 140:
                 headline = f"{headline[:137].rsplit(' ', 1)[0]}..."
         rational_view: str | None = None
-        media_context = await summarize_media_context(
-            combined_caption,
-            _require_auth_manager(),
-            source=source,
-            media_kind=media_kind,
-        )
-        media_context_plain = normalize_space(strip_telegram_html(media_context or ""))
-        if media_context_plain:
-            rational_view = media_context_plain
-        if rational_view is None and _should_attach_vital_opinion(combined_caption):
+        if _should_attach_vital_opinion(combined_caption):
             rational_view = await summarize_vital_rational_view(
                 combined_caption,
                 _require_auth_manager(),
@@ -3922,7 +3639,6 @@ def _web_status_payload() -> Dict[str, object]:
         "severity_routing": _is_severity_routing_enabled(),
         "query_mode": _is_query_mode_enabled(),
         "html_formatting": _is_html_formatting_enabled(),
-        "media_ocr": _is_media_ocr_enabled(),
     }
 
 
@@ -3939,7 +3655,6 @@ def _digest_status_text() -> str:
     dupe_state = "on" if _is_dupe_detection_enabled() else "off"
     severity_state = "on" if _is_severity_routing_enabled() else "off"
     query_state = "on" if _is_query_mode_enabled() else "off"
-    ocr_state = "on" if _is_media_ocr_enabled() else "off"
     detector_backend = dupe_detector.backend_name if dupe_detector is not None else "disabled"
     daily_labels = [f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()]
     daily_display = ", ".join(daily_labels) if daily_labels else "off"
@@ -3965,7 +3680,6 @@ def _digest_status_text() -> str:
         f"• Dedupe: <code>{dupe_state}</code> ({sanitize_telegram_html(detector_backend)})<br>"
         f"• Severity router: <code>{severity_state}</code><br>"
         f"• Query mode: <code>{query_state}</code><br>"
-        f"• Media OCR: <code>{ocr_state}</code><br>"
         f"• HTML formatting: <code>{'on' if _is_html_formatting_enabled() else 'off'}</code><br>"
         f"• Quota health: <code>{quota.get('status', 'unknown')}</code><br>"
         f"• Recent 429 (1h): <code>{quota.get('recent_429_count', 0)}</code> / "
@@ -4008,6 +3722,70 @@ def _append_query_history(sender_id: int, query_text: str, answer_text: str) -> 
     if len(trimmed_answer) > 800:
         trimmed_answer = f"{trimmed_answer[:797].rsplit(' ', 1)[0]}..."
     history.append({"role": "assistant", "content": trimmed_answer})
+
+
+def _load_archive_query_context(
+    *,
+    query_text: str,
+    hours_back: int,
+    limit: int,
+    broad_query: bool,
+) -> list[Dict[str, object]]:
+    """
+    Pull recent archived updates into query context.
+
+    Broad digest-style prompts use archive history as the primary evidence pool.
+    Subject-specific prompts only keep archive rows that mention the extracted
+    query keywords.
+    """
+    since_ts = max(0, int(time.time()) - max(1, int(hours_back)) * 3600)
+    rows = load_archive_since(since_ts, max(1, int(limit)))
+    if not rows:
+        return []
+
+    keywords = set(extract_query_keywords(query_text))
+    out: list[Dict[str, object]] = []
+    for row in rows:
+        text = normalize_space(str(row.get("raw_text") or ""))
+        if not text:
+            continue
+
+        lowered_text = text.lower()
+        if keywords and not any(term in lowered_text for term in keywords):
+            continue
+        if not keywords and not broad_query:
+            continue
+
+        timestamp = int(row.get("timestamp") or 0)
+        date_label = (
+            datetime.fromtimestamp(timestamp).astimezone().isoformat()
+            if timestamp > 0
+            else ""
+        )
+        out.append(
+            {
+                "chat_id": str(row.get("channel_id") or ""),
+                "message_id": int(row.get("message_id") or 0),
+                "timestamp": timestamp,
+                "date": date_label,
+                "source": normalize_space(str(row.get("source_name") or "")) or "Archive",
+                "text": text,
+                "link": normalize_space(str(row.get("message_link") or "")),
+            }
+        )
+    return out
+
+
+def _wrap_query_digest_answer(answer: str, *, hours_back: int) -> str:
+    cleaned = normalize_space(answer)
+    if not cleaned:
+        return answer
+    if "no relevant information found" in strip_telegram_html(cleaned).lower():
+        return answer
+    if "no major developments right now" in strip_telegram_html(cleaned).lower():
+        return answer
+    title = f"<b>{max(1, int(hours_back))}-hour digest</b>"
+    return f"{title}<br><br>{answer.strip()}"
 
 
 def _merge_query_context(
@@ -4057,6 +3835,9 @@ def _format_evidence_split_section(
     *,
     max_items: int = 4,
 ) -> str:
+    if not telegram_rows and not web_rows:
+        return ""
+
     limit = max(1, int(max_items))
     lines: list[str] = ["<b>Evidence Split</b>", "<b>Telegram Providers</b>"]
 
@@ -4268,6 +4049,8 @@ async def _stream_query_answer(
     query_text: str,
     results: List[Dict[str, object]],
     history: Sequence[Dict[str, str]],
+    digest_mode: bool = False,
+    digest_hours_back: int | None = None,
     prefer_bot_identity: bool = False,
     bot_chat_id: int | None = None,
     root_reply_to: int | None = None,
@@ -4305,16 +4088,25 @@ async def _stream_query_answer(
     )
     await streamer.start(initial_ref=progress_message)
 
-    answer = await generate_answer_from_context(
-        query=query_text,
-        context_messages=results,
-        auth_manager=_require_auth_manager(),
-        conversation_history=history,
-        on_token=streamer.push,
-    )
+    if digest_mode:
+        answer = await create_digest_summary(
+            list(results),
+            auth_manager=_require_auth_manager(),
+            interval_minutes=max(1, int((digest_hours_back or 1) * 60)),
+            on_token=streamer.push,
+        )
+        answer = _wrap_query_digest_answer(answer, hours_back=digest_hours_back or 1)
+    else:
+        answer = await generate_answer_from_context(
+            query=query_text,
+            context_messages=results,
+            auth_manager=_require_auth_manager(),
+            conversation_history=history,
+            on_token=streamer.push,
+        )
     if not answer.strip():
         answer = "No matching information found in recent updates."
-    if final_suffix_html.strip():
+    if final_suffix_html.strip() and "no relevant information found" not in strip_telegram_html(answer).lower():
         answer = f"{answer.strip()}<br><br>{final_suffix_html.strip()}"
 
     stats = await streamer.finalize(answer)
@@ -4385,7 +4177,10 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
     # Own bot PM => send via bot identity.
     query_via_bot = bool(is_own_bot_pm and not is_saved_messages)
     query_bot_chat_id = sender_id if query_via_bot else None
-    query_reply_to = None if query_via_bot else int(msg.id or 0)
+    # Always try to reply to the triggering user message. In bot-PM mode the Bot
+    # API helper already retries without reply_to_message_id if Telegram rejects
+    # the reference, so this is safe and gives proper reply threading when valid.
+    query_reply_to = int(msg.id or 0) or None
 
     chat_id = str(getattr(msg, "chat_id", "") or "")
 
@@ -4422,22 +4217,50 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
             text,
             _query_default_hours_back(),
         )
-        high_risk_query = _is_high_risk_news_query(cleaned_query)
+        effective_query = text
+        broad_query = is_broad_news_query(text)
+        query_keywords = extract_query_keywords(cleaned_query or text)
+        high_risk_query = _is_high_risk_news_query(effective_query)
+        context_limit = _query_max_messages() * (2 if broad_query else 1)
 
         telegram_results = await search_recent_messages(
             _require_client(),
             monitored_source_chat_ids,
             cleaned_query,
-            max_messages=_query_max_messages(),
+            max_messages=context_limit,
             default_hours_back=parsed_hours,
             logger=LOGGER,
         )
+
+        archive_results: list[dict[str, object]] = []
+        if broad_query or len(telegram_results) < _query_web_min_telegram_results():
+            archive_results = _load_archive_query_context(
+                query_text=effective_query,
+                hours_back=parsed_hours,
+                limit=max(context_limit * 3, 80),
+                broad_query=broad_query,
+            )
+            if archive_results:
+                telegram_results = _merge_query_context(
+                    telegram_results,
+                    archive_results,
+                    limit=max(context_limit, 40),
+                )
 
         web_results: list[dict[str, object]] = []
         web_fallback_used = False
         ran_web_search = False
 
-        if _is_query_web_fallback_enabled():
+        should_run_web_search = bool(
+            _is_query_web_fallback_enabled()
+            and bool(query_keywords)
+            and (
+                high_risk_query
+                or len(telegram_results) < _query_web_min_telegram_results()
+            )
+        )
+
+        if should_run_web_search:
             ran_web_search = True
             await _safe_reply_markdown(
                 event,
@@ -4477,13 +4300,13 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
         results = _merge_query_context(
             telegram_results,
             web_results,
-            limit=_query_max_messages(),
+            limit=max(context_limit, _query_max_messages()),
         )
 
         await _safe_reply_markdown(
             event,
             (
-                f"Found {len(telegram_results)} channel messages"
+                f"Found {len(telegram_results)} evidence items"
                 + (f" + {len(web_results)} web reports" if web_results else "")
                 + " -> analyzing... ⏳"
             ),
@@ -4493,32 +4316,47 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
         )
 
         history = list(_query_history_for_sender(sender_id))
-        evidence_split_section = _format_evidence_split_section(
-            telegram_results,
-            web_results if ran_web_search else [],
-        )
+        evidence_split_section = ""
+        if not broad_query:
+            evidence_split_section = _format_evidence_split_section(
+                telegram_results,
+                web_results if ran_web_search else [],
+            )
         if _is_streaming_enabled():
             answer, stream_stats = await _stream_query_answer(
                 event,
                 progress_message=progress,
-                query_text=cleaned_query,
+                query_text=effective_query,
                 results=results,
                 history=history,
+                digest_mode=broad_query,
+                digest_hours_back=parsed_hours,
                 prefer_bot_identity=query_via_bot,
                 bot_chat_id=query_bot_chat_id,
                 root_reply_to=query_reply_to,
                 final_suffix_html=evidence_split_section,
             )
         else:
-            answer = await generate_answer_from_context(
-                query=cleaned_query,
-                context_messages=results,
-                auth_manager=_require_auth_manager(),
-                conversation_history=history,
-            )
+            if broad_query:
+                answer = await create_digest_summary(
+                    list(results),
+                    auth_manager=_require_auth_manager(),
+                    interval_minutes=max(1, parsed_hours * 60),
+                )
+                answer = _wrap_query_digest_answer(answer, hours_back=parsed_hours)
+            else:
+                answer = await generate_answer_from_context(
+                    query=effective_query,
+                    context_messages=results,
+                    auth_manager=_require_auth_manager(),
+                    conversation_history=history,
+                )
             if not answer.strip():
                 answer = "No matching information found in recent updates."
-            if evidence_split_section:
+            if (
+                evidence_split_section
+                and "no relevant information found" not in strip_telegram_html(answer).lower()
+            ):
                 answer = f"{answer.strip()}<br><br>{evidence_split_section}"
             await _safe_reply_markdown(
                 event,
@@ -4539,9 +4377,11 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
             hours_back=parsed_hours,
             messages_found=len(results),
             telegram_messages_found=len(telegram_results),
+            archive_messages_found=len(archive_results),
             web_messages_found=len(web_results),
             web_fallback_used=web_fallback_used,
             web_search_ran=ran_web_search,
+            broad_query=broad_query,
             high_risk_query=high_risk_query,
             response_chars=len(answer),
             stream_enabled=_is_streaming_enabled(),
@@ -4690,7 +4530,6 @@ def _startup_health_check() -> None:
         severity_routing=_is_severity_routing_enabled(),
         query_mode=_is_query_mode_enabled(),
         query_web_fallback=_is_query_web_fallback_enabled(),
-        media_ocr=_is_media_ocr_enabled(),
         html_formatting=_is_html_formatting_enabled(),
         premium_emoji=_is_premium_emoji_enabled(),
         premium_emoji_count=len(premium_emoji_map),
@@ -4715,7 +4554,7 @@ def _startup_health_check() -> None:
         quota_health=get_quota_health(),
     )
     LOGGER.info(
-        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s query_web=%s ocr=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%s scope=%s web=%s@%s:%s",
+        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s query_web=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%s scope=%s web=%s@%s:%s",
         mode,
         pending,
         inflight,
@@ -4724,7 +4563,6 @@ def _startup_health_check() -> None:
         _is_severity_routing_enabled(),
         _is_query_mode_enabled(),
         _is_query_web_fallback_enabled(),
-        _is_media_ocr_enabled(),
         _is_html_formatting_enabled(),
         _is_premium_emoji_enabled(),
         len(premium_emoji_map),

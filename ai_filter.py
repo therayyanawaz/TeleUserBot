@@ -39,7 +39,6 @@ _SUMMARY_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
 _SEVERITY_CACHE: "OrderedDict[str, str]" = OrderedDict()
 _HEADLINE_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
 _VITAL_VIEW_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
-_MEDIA_CONTEXT_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
 _QUOTA_WARNING_LOGGED = False
 
 # Quota health tracking: capture recent 429/rate-limit events.
@@ -159,20 +158,6 @@ def _vital_view_cache_set(key: str, value: Optional[str]) -> None:
     _VITAL_VIEW_CACHE.move_to_end(key)
     while len(_VITAL_VIEW_CACHE) > CACHE_MAX_ITEMS:
         _VITAL_VIEW_CACHE.popitem(last=False)
-
-
-def _media_context_cache_get(key: str) -> Optional[Optional[str]]:
-    if key not in _MEDIA_CONTEXT_CACHE:
-        return None
-    _MEDIA_CONTEXT_CACHE.move_to_end(key)
-    return _MEDIA_CONTEXT_CACHE[key]
-
-
-def _media_context_cache_set(key: str, value: Optional[str]) -> None:
-    _MEDIA_CONTEXT_CACHE[key] = value
-    _MEDIA_CONTEXT_CACHE.move_to_end(key)
-    while len(_MEDIA_CONTEXT_CACHE) > CACHE_MAX_ITEMS:
-        _MEDIA_CONTEXT_CACHE.popitem(last=False)
 
 
 def _likely_noise(text: str) -> bool:
@@ -387,30 +372,27 @@ def _vital_rational_view_prompt() -> str:
     )
 
 
-def _media_context_prompt() -> str:
-    language = _resolve_output_language()
-    return (
-        "You are a newsroom visual analyst writing captions for incoming media evidence.\n"
-        f"Always output in {language}. Translate source text when needed.\n"
-        "You only have textual evidence (caption, OCR, metadata). Never invent unseen visual facts.\n"
-        "If evidence is spam, promo, noise, or not useful news, reply exactly: SKIP\n"
-        "Otherwise output 2-4 concise Telegram-HTML lines with this structure:\n"
-        "• What: short factual event description.\n"
-        "• Where: confirmed location OR 'Not confirmed'.\n"
-        "• Optional When: time marker if present in evidence.\n"
-        "• Optional Status: verification note (confirmed/unverified based on evidence).\n"
-        "Allowed tags: <b>, <i>, <u>, <code>, <a href>, <br>.\n"
-        "Do not use markdown and do not add extra preface."
-    )
-
-
 def _build_codex_payload(
     text: str,
     instructions: str,
     *,
     verbosity: str = "medium",
     stream: bool = True,
+    image_data_urls: Sequence[str] | None = None,
 ) -> dict:
+    content: list[dict[str, object]] = [{"type": "input_text", "text": text}]
+    if image_data_urls:
+        for data_url in image_data_urls:
+            value = str(data_url or "").strip()
+            if not value:
+                continue
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": value,
+                }
+            )
+
     payload: dict[str, object] = {
         "model": _resolve_codex_model(),
         "store": False,
@@ -419,7 +401,7 @@ def _build_codex_payload(
         "input": [
             {
                 "role": "user",
-                "content": [{"type": "input_text", "text": text}],
+                "content": content,
             }
         ],
         "text": {"verbosity": verbosity},
@@ -519,11 +501,13 @@ class _StreamingCodexResponse:
         auth_context: Dict[str, str],
         instructions: str,
         verbosity: str,
+        image_data_urls: Sequence[str] | None = None,
     ) -> None:
         self._cleaned = cleaned
         self._auth_context = auth_context
         self._instructions = instructions
         self._verbosity = verbosity
+        self._image_data_urls = list(image_data_urls or [])
 
         self._client: httpx.AsyncClient | None = None
         self._stream_ctx = None
@@ -550,6 +534,7 @@ class _StreamingCodexResponse:
             instructions=self._instructions,
             verbosity=self._verbosity,
             stream=True,
+            image_data_urls=self._image_data_urls,
         )
 
         timeout = httpx.Timeout(90.0, connect=20.0)
@@ -650,12 +635,14 @@ def streaming_codex_response(
     instructions: str,
     *,
     verbosity: str = "medium",
+    image_data_urls: Sequence[str] | None = None,
 ) -> _StreamingCodexResponse:
     return _StreamingCodexResponse(
         cleaned=cleaned,
         auth_context=auth_context,
         instructions=instructions,
         verbosity=verbosity,
+        image_data_urls=image_data_urls,
     )
 
 
@@ -673,6 +660,7 @@ async def _call_codex_non_stream(
     instructions: str,
     *,
     verbosity: str = "medium",
+    image_data_urls: Sequence[str] | None = None,
 ) -> str:
     access_token = auth_context["access_token"]
     account_id = auth_context["account_id"]
@@ -690,6 +678,7 @@ async def _call_codex_non_stream(
         instructions=instructions,
         verbosity=verbosity,
         stream=False,
+        image_data_urls=image_data_urls,
     )
     timeout = httpx.Timeout(90.0, connect=20.0)
     async with httpx.AsyncClient(timeout=timeout) as http:
@@ -710,6 +699,7 @@ async def _call_codex(
     *,
     verbosity: str = "medium",
     on_token: Callable[[str], Awaitable[None]] | None = None,
+    image_data_urls: Sequence[str] | None = None,
 ) -> str:
     if _streaming_enabled():
         try:
@@ -719,6 +709,7 @@ async def _call_codex(
                 auth_context,
                 instructions,
                 verbosity=verbosity,
+                image_data_urls=image_data_urls,
             ) as stream:
                 async for delta in stream:
                     fragments.append(delta)
@@ -738,6 +729,7 @@ async def _call_codex(
         auth_context,
         instructions,
         verbosity=verbosity,
+        image_data_urls=image_data_urls,
     )
 
 
@@ -1449,46 +1441,6 @@ def _cleanup_headline(raw: str) -> str:
     return text
 
 
-def _infer_where_fallback(text: str) -> str:
-    cleaned = normalize_space(text)
-    if not cleaned:
-        return "Not confirmed"
-
-    patterns = (
-        r"\b(?:in|near|at|outside|inside|around)\s+([A-Z][\w'/-]+(?:\s+[A-Z][\w'/-]+){0,4})",
-        r"\b(?:in|near|at|outside|inside|around)\s+([A-Za-z][\w'/-]+(?:\s+[A-Za-z][\w'/-]+){0,4})",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, cleaned, flags=re.IGNORECASE)
-        if not match:
-            continue
-        location = normalize_space(match.group(1))
-        if location:
-            return location
-    return "Not confirmed"
-
-
-def _fallback_media_context(text: str, *, source: str, media_kind: str) -> Optional[str]:
-    cleaned = normalize_space(text)
-    if not cleaned or _likely_noise(cleaned):
-        return None
-
-    what = cleaned
-    if len(what) > 180:
-        what = f"{what[:177].rsplit(' ', 1)[0]}..."
-    where = _infer_where_fallback(cleaned)
-
-    lines = [
-        f"• <b>What:</b> {sanitize_telegram_html(what)}",
-        f"• <b>Where:</b> {sanitize_telegram_html(where)}",
-        f"• <i>Status:</i> Unverified, based on incoming {sanitize_telegram_html(media_kind)} evidence.",
-    ]
-    source_clean = normalize_space(source)
-    if source_clean:
-        lines.append(f"• <i>Source:</i> {sanitize_telegram_html(source_clean)}")
-    return sanitize_telegram_html("<br>".join(lines))
-
-
 def _cleanup_vital_view(raw: str) -> str:
     def _trim_tail_fragment(value: str) -> str:
         connectors = {
@@ -1676,69 +1628,6 @@ async def summarize_vital_rational_view(
 
     _vital_view_cache_set(key, fallback)
     return fallback
-
-
-async def summarize_media_context(
-    text: str,
-    auth_manager: AuthManager,
-    *,
-    source: str = "",
-    media_kind: str = "media",
-) -> Optional[str]:
-    cleaned = normalize_space(text)
-    if not cleaned or len(cleaned) < 8:
-        return None
-
-    key = _cache_key(f"media::{source}::{media_kind}::{cleaned}")
-    cached = _media_context_cache_get(key)
-    if cached is not None or key in _MEDIA_CONTEXT_CACHE:
-        return cached
-
-    fallback = _fallback_media_context(cleaned, source=source, media_kind=media_kind)
-    evidence = (
-        f"Source: {normalize_space(source) or 'Unknown'}\n"
-        f"Media type: {normalize_space(media_kind) or 'media'}\n"
-        f"Evidence text:\n{cleaned}"
-    )
-
-    try:
-        auth_context = await auth_manager.get_auth_context()
-        raw = await _call_codex(
-            evidence,
-            auth_context,
-            instructions=_media_context_prompt(),
-            verbosity="low",
-        )
-    except _CodexAuthError:
-        try:
-            auth_context = await auth_manager.refresh_auth_context()
-            raw = await _call_codex(
-                evidence,
-                auth_context,
-                instructions=_media_context_prompt(),
-                verbosity="low",
-            )
-        except Exception:
-            _media_context_cache_set(key, fallback)
-            return fallback
-    except (_CodexRateLimitError, httpx.HTTPError, _CodexApiError, ValueError):
-        _media_context_cache_set(key, fallback)
-        return fallback
-    except Exception:
-        _media_context_cache_set(key, fallback)
-        return fallback
-
-    if not raw:
-        _media_context_cache_set(key, fallback)
-        return fallback
-
-    if normalize_space(raw).upper().startswith("SKIP"):
-        _media_context_cache_set(key, None)
-        return None
-
-    safe = sanitize_telegram_html(raw)
-    _media_context_cache_set(key, safe)
-    return safe
 
 
 async def create_digest_summary(

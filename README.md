@@ -65,7 +65,6 @@ Core dependencies are in `requirements.txt`:
 
 Optional quality/accuracy dependencies are in `requirements.optional.txt`:
 - `sentence-transformers` (optional; disabled by default via `DUPE_USE_SENTENCE_TRANSFORMERS=false`)
-- `Pillow` + `pytesseract` (optional media OCR support for image-only posts)
 
 ## Quick Start (Local)
 
@@ -97,23 +96,10 @@ python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 ```
 
-Optional (sentence-transformers + OCR extras):
+Optional (sentence-transformers only):
 
 ```bash
 pip install -r requirements.optional.txt
-```
-
-If OCR is enabled, install Tesseract binary too:
-
-```bash
-# Ubuntu / Debian
-sudo apt-get update && sudo apt-get install -y tesseract-ocr
-```
-
-For video OCR (first-frame extraction), install ffmpeg:
-
-```bash
-sudo apt-get install -y ffmpeg
 ```
 
 4. Configure environment:
@@ -198,12 +184,6 @@ DIGEST_DAILY_WINDOW_HOURS=24
 DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES=0
 OUTPUT_LANGUAGE="English"
 DUPE_USE_SENTENCE_TRANSFORMERS=false
-ENABLE_MEDIA_OCR=true
-MEDIA_OCR_MIN_CHARS=18
-MEDIA_OCR_MAX_CHARS=1600
-MEDIA_OCR_MAX_IMAGES_PER_ALBUM=3
-MEDIA_OCR_ENABLE_VIDEO_FRAME=true
-MEDIA_OCR_VIDEO_MAX_MB=25
 ```
 
 ## Query Web Fallback (News-only)
@@ -274,14 +254,6 @@ Not an error in no-HF mode. If you explicitly want sentence-transformers:
 ```bash
 source .venv/bin/activate
 pip install -r requirements.optional.txt
-```
-
-### 1b) OCR does not extract text
-
-Install Tesseract system package and keep OCR enabled:
-
-```bash
-sudo apt-get update && sudo apt-get install -y tesseract-ocr
 ```
 
 ### 2) `database is locked` (Telethon session)

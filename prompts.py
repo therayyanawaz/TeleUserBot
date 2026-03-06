@@ -94,6 +94,9 @@ Answer rules:
    never present as fact unless at least 2 distinct sources in context support it.
 10) If no relevant evidence exists, output exactly:
    NO_MATCH_SENTINEL
+11) If the user asks for a digest, recap, or time-window summary, synthesize the
+   strongest developments across the provided evidence instead of expecting
+   literal keyword repetition inside every source item.
 """.strip()
 
 

@@ -36,6 +36,112 @@ def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+_QUERY_GENERIC_TERMS = {
+    "about",
+    "brief",
+    "briefing",
+    "current",
+    "day",
+    "days",
+    "detail",
+    "details",
+    "development",
+    "developments",
+    "digest",
+    "give",
+    "happened",
+    "happening",
+    "headline",
+    "headlines",
+    "hour",
+    "hours",
+    "last",
+    "latest",
+    "news",
+    "now",
+    "past",
+    "present",
+    "query",
+    "recent",
+    "recap",
+    "report",
+    "reports",
+    "roundup",
+    "show",
+    "situation",
+    "status",
+    "subject",
+    "summary",
+    "tell",
+    "today",
+    "update",
+    "updates",
+    "what",
+    "when",
+    "where",
+    "who",
+    "why",
+    "yesterday",
+}
+
+
+def extract_query_keywords(query: str) -> list[str]:
+    """
+    Extract meaningful subject terms from a natural-language query.
+
+    Generic request words like "digest", "latest", "summary", "today" are
+    intentionally removed so broad recap queries do not collapse into useless
+    literal searches.
+    """
+    lowered = normalize_space(query).lower()
+    if not lowered:
+        return []
+    tokens = re.findall(r"[a-z0-9]{3,}", lowered)
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token in _QUERY_GENERIC_TERMS:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
+
+
+def is_broad_news_query(query: str) -> bool:
+    """
+    Detect recap-style prompts that should use broad time-window evidence rather
+    than literal keyword matching.
+    """
+    lowered = normalize_space(query).lower()
+    if not lowered:
+        return False
+
+    recap_markers = (
+        "digest",
+        "summary",
+        "recap",
+        "roundup",
+        "briefing",
+        "what happened",
+        "latest updates",
+        "latest developments",
+        "top updates",
+        "news update",
+    )
+    if any(marker in lowered for marker in recap_markers):
+        return True
+
+    if re.search(r"\b(?:today|yesterday)\b", lowered):
+        return True
+
+    if re.search(r"\b(?:last|past)\s+\d{1,3}\s*(?:hours?|hrs?|h|days?|d)\b", lowered):
+        return not extract_query_keywords(lowered)
+
+    return not extract_query_keywords(lowered)
+
+
 def extract_ocr_text_from_image_bytes(blob: bytes, *, max_chars: int = 1600) -> str:
     """
     Best-effort OCR extraction from image bytes.
@@ -762,11 +868,13 @@ async def search_recent_messages(
     hours_back, cleaned_query = parse_time_filter_from_query(query, default_hours_back)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
 
-    keyword_terms = {
-        token for token in re.findall(r"[a-z0-9]{3,}", cleaned_query.lower()) if token
-    }
+    broad_query = is_broad_news_query(query)
+    keyword_terms = set(extract_query_keywords(cleaned_query))
 
     stage_limit = max(10, min(60, resolved_max // max(1, min(len(monitored_chats), resolved_max)) + 8))
+    if broad_query and not keyword_terms:
+        # Broad recap queries need source diversity more than deep per-chat search.
+        stage_limit = max(2, min(4, resolved_max // max(1, len(monitored_chats)) + 1))
     fallback_limit = max(30, min(120, stage_limit * 3))
 
     collected: dict[tuple[str, int], dict[str, Any]] = {}
@@ -856,7 +964,7 @@ async def search_recent_messages(
                 return
 
     # Stage 1: server-side fuzzy search
-    search_text = cleaned_query if cleaned_query else query
+    search_text = None if broad_query and not keyword_terms else (cleaned_query if cleaned_query else query)
     for chat_ref in monitored_chats:
         await _scan_chat(
             chat_ref,
