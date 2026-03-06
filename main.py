@@ -75,6 +75,7 @@ from utils import (
     GlobalDuplicateResult,
     HybridDuplicateEngine,
     build_dupe_fingerprint,
+    build_query_plan,
     build_telegram_message_link,
     configure_duplicate_runtime,
     estimate_tokens_rough,
@@ -707,6 +708,8 @@ def _query_prefers_web_crosscheck(query: str) -> bool:
     if not lowered:
         return False
     if extract_query_numbers(query):
+        return True
+    if is_broad_news_query(query) and bool(extract_query_keywords(query)):
         return True
     markers = (
         "who died",
@@ -4394,24 +4397,50 @@ async def _handle_query_request(
         return
 
     try:
-        parsed_hours, cleaned_query = parse_time_filter_from_query(
-            text,
-            _query_default_hours_back(),
-        )
-        effective_query = text
-        broad_query = is_broad_news_query(text)
-        query_keywords = extract_query_keywords(cleaned_query or text)
+        plan = build_query_plan(text, default_hours=_query_default_hours_back())
+        parsed_hours = plan.hours_back
+        cleaned_query = plan.cleaned_query
+        effective_query = plan.original_query or text
+        broad_query = plan.broad_query
+        query_keywords = list(plan.keywords)
+        query_numbers = list(plan.numbers)
         high_risk_query = _is_high_risk_news_query(effective_query)
-        context_limit = _query_max_messages() * (2 if broad_query else 1)
+        context_limit = _query_max_messages() * (2 if broad_query or len(query_keywords) <= 2 else 1)
 
-        telegram_results = await search_recent_messages(
-            _require_client(),
-            monitored_source_chat_ids,
-            cleaned_query,
-            max_messages=context_limit,
-            default_hours_back=parsed_hours,
-            logger=LOGGER,
+        preload_web_search = bool(
+            _is_query_web_fallback_enabled()
+            and (broad_query or bool(query_keywords) or bool(query_numbers))
+            and (
+                _query_prefers_web_crosscheck(effective_query)
+                or high_risk_query
+                or broad_query
+            )
         )
+
+        telegram_task = asyncio.create_task(
+            search_recent_messages(
+                _require_client(),
+                monitored_source_chat_ids,
+                cleaned_query,
+                max_messages=context_limit,
+                default_hours_back=parsed_hours,
+                logger=LOGGER,
+            )
+        )
+        web_task: asyncio.Task[list[dict[str, object]]] | None = None
+        if preload_web_search:
+            web_task = asyncio.create_task(
+                search_recent_news_web(
+                    cleaned_query,
+                    hours_back=min(parsed_hours, _query_web_max_hours_back()),
+                    max_results=_query_web_max_results(),
+                    allowed_domains=_query_web_allowed_domains(),
+                    require_recent=_query_web_require_recent(),
+                    logger=LOGGER,
+                )
+            )
+
+        telegram_results = await telegram_task
 
         queue_results: list[dict[str, object]] = []
         archive_results: list[dict[str, object]] = []
@@ -4445,20 +4474,21 @@ async def _handle_query_request(
 
         web_results: list[dict[str, object]] = []
         web_fallback_used = False
-        ran_web_search = False
+        ran_web_search = bool(preload_web_search)
 
         should_run_web_search = bool(
             _is_query_web_fallback_enabled()
-            and (bool(query_keywords) or bool(extract_query_numbers(effective_query)))
+            and (broad_query or bool(query_keywords) or bool(query_numbers))
             and (
                 _query_prefers_web_crosscheck(effective_query)
                 or
                 high_risk_query
+                or broad_query
                 or len(telegram_results) < _query_web_min_telegram_results()
             )
         )
 
-        if should_run_web_search:
+        if should_run_web_search and web_task is None:
             ran_web_search = True
             await _safe_reply_markdown(
                 event_ref,  # type: ignore[arg-type]
@@ -4479,6 +4509,10 @@ async def _handle_query_request(
                 require_recent=_query_web_require_recent(),
                 logger=LOGGER,
             )
+        elif web_task is not None:
+            web_results = await web_task
+
+        if should_run_web_search and web_results:
             required_sources = _query_web_require_min_sources()
             if web_results and required_sources > 1:
                 source_hosts = {
@@ -4493,7 +4527,7 @@ async def _handle_query_request(
                         required_sources,
                     )
                     web_results = []
-            web_fallback_used = bool(web_results)
+        web_fallback_used = bool(web_results)
 
         results = _merge_query_context(
             telegram_results,

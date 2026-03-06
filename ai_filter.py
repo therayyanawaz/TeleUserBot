@@ -29,6 +29,7 @@ from utils import (
     expand_query_terms,
     extract_query_keywords,
     extract_query_numbers,
+    is_broad_news_query,
     normalize_space,
     sanitize_telegram_html,
 )
@@ -1319,6 +1320,69 @@ def _query_text_has_casualty_markers(text: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def _query_source_reliability(item: Dict[str, object]) -> float:
+    source = normalize_space(str(item.get("source") or "")).lower()
+    text = normalize_space(str(item.get("text") or "")).lower()
+    is_web = bool(item.get("is_web"))
+
+    top_tier_web = (
+        "reuters",
+        "associated press",
+        "ap news",
+        "bbc",
+        "al jazeera",
+        "dw",
+        "bloomberg",
+        "financial times",
+        "ft",
+        "npr",
+        "washington post",
+        "new york times",
+        "france24",
+        "the guardian",
+    )
+    mid_tier_web = (
+        "cnn",
+        "cbs",
+        "abc",
+        "fox",
+        "axios",
+        "times of israel",
+        "haaretz",
+        "investing.com",
+    )
+    official_markers = (
+        "ministry",
+        "spokesperson",
+        "official",
+        "army",
+        "idf",
+        "irgc",
+        "ukmto",
+        "centcom",
+    )
+
+    score = 0.0
+    if is_web:
+        if any(marker in source for marker in top_tier_web):
+            score += 1.8
+        elif any(marker in source for marker in mid_tier_web):
+            score += 1.1
+        else:
+            score += 0.35
+    else:
+        if any(marker in source for marker in official_markers) or any(marker in text for marker in official_markers):
+            score += 0.9
+        elif "alert" in source or "report" in source or "news" in source:
+            score += 0.45
+        else:
+            score += 0.2
+
+    if "facebook" in source or "x.com" in source or "twitter" in source:
+        score -= 0.25
+    return score
+
+
 def _score_query_context_row(
     query: str,
     item: Dict[str, object],
@@ -1379,6 +1443,7 @@ def _score_query_context_row(
     source_score = 0.15 if source else 0.0
     if str(item.get("link") or "").startswith("http"):
         source_score += 0.2
+    source_score += _query_source_reliability(item)
 
     timestamp = int(item.get("timestamp") or 0)
     recency_score = 0.0
@@ -1398,18 +1463,15 @@ def _score_query_context_row(
     )
 
 
-def _rank_query_context(
+def _scored_query_context(
     query: str,
     context_messages: Sequence[Dict[str, object]],
-    *,
-    limit: int = 18,
-) -> list[Dict[str, object]]:
+) -> list[tuple[float, Dict[str, object]]]:
     now_ts = int(time.time())
     scored: list[tuple[float, Dict[str, object]]] = []
     for item in context_messages:
         score = _score_query_context_row(query, item, now_ts=now_ts)
         scored.append((score, item))
-
     scored.sort(
         key=lambda pair: (
             pair[0],
@@ -1417,6 +1479,43 @@ def _rank_query_context(
         ),
         reverse=True,
     )
+    return scored
+
+
+def _query_confidence_allows_answer(
+    query: str,
+    scored_rows: Sequence[tuple[float, Dict[str, object]]],
+) -> bool:
+    if not scored_rows:
+        return False
+
+    if is_broad_news_query(query):
+        return len(scored_rows) >= 2
+
+    top_score = float(scored_rows[0][0])
+    distinct_sources = _query_distinct_sources([row for _, row in scored_rows[:6]])
+    exact_number_need = bool(extract_query_numbers(query))
+    identity_query = _query_is_identity_question(query)
+    top_text = normalize_space(str(scored_rows[0][1].get("text") or ""))
+
+    if exact_number_need:
+        top_numbers = _extract_text_numbers(top_text)
+        if not (set(extract_query_numbers(query)) & top_numbers) and top_score < 4.5:
+            return False
+
+    if identity_query:
+        return top_score >= 4.2 or distinct_sources >= 2
+
+    return top_score >= 2.6 or distinct_sources >= 2
+
+
+def _rank_query_context(
+    query: str,
+    context_messages: Sequence[Dict[str, object]],
+    *,
+    limit: int = 18,
+) -> list[Dict[str, object]]:
+    scored = _scored_query_context(query, context_messages)
 
     out: list[Dict[str, object]] = []
     per_source: dict[str, int] = {}
@@ -1466,10 +1565,15 @@ def _build_query_context_lines(
         source = normalize_space(str(item.get("source") or "unknown"))
         date_label = normalize_space(str(item.get("date") or "unknown-time"))
         link = normalize_space(str(item.get("link") or ""))
+        source_reliability = round(_query_source_reliability(item), 2)
+        source_kind = "web" if bool(item.get("is_web")) else "telegram"
         if len(text) > 900:
             text = f"{text[:897].rsplit(' ', 1)[0]}..."
 
-        line = f'{idx}. source_name="{source}" | date="{date_label}" | text="{text}"'
+        line = (
+            f'{idx}. source_name="{source}" | source_kind="{source_kind}" '
+            f'| source_reliability={source_reliability} | date="{date_label}" | text="{text}"'
+        )
         if link.startswith("http"):
             line += f' | url="{link}"'
 
@@ -2017,6 +2121,7 @@ async def generate_answer_from_context(
     detailed = _query_requests_detail(question)
     high_risk_query = _query_is_high_risk(question)
     strict_confirmation_query = _query_requires_multi_source_confirmation(question)
+    scored_context = _scored_query_context(question, context_messages)
     ranked_context = _rank_query_context(question, context_messages, limit=24)
     distinct_sources = _query_distinct_sources(ranked_context[:10] or context_messages)
     output_language = _resolve_output_language()
@@ -2024,6 +2129,8 @@ async def generate_answer_from_context(
     # Strict guardrail for high-risk queries (leadership/death/succession):
     # if evidence diversity is weak, do not produce potentially false claims.
     if strict_confirmation_query and distinct_sources < 2:
+        return QUERY_NO_MATCH_TEXT
+    if not _query_confidence_allows_answer(question, scored_context[:12]):
         return QUERY_NO_MATCH_TEXT
 
     # Reserve room for prompt + answer generation.
@@ -2053,6 +2160,7 @@ async def generate_answer_from_context(
         f"- Context messages ranked for relevance: {len(ranked_context)}",
         f"- Context lines included: {len(context_lines)}",
         f"- Estimated context tokens: {used_tokens}",
+        f"- Top relevance score: {round(float(scored_context[0][0]), 3) if scored_context else 0.0}",
         f"- High-risk query: {'yes' if high_risk_query else 'no'}",
         f"- Strict multi-source confirmation required: {'yes' if strict_confirmation_query else 'no'}",
         f"- Identity-style query: {'yes' if _query_is_identity_question(question) else 'no'}",

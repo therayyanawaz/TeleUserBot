@@ -36,6 +36,39 @@ def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+@dataclass(frozen=True)
+class QueryPlan:
+    original_query: str
+    cleaned_query: str
+    hours_back: int
+    broad_query: bool
+    keywords: tuple[str, ...]
+    expanded_terms: tuple[str, ...]
+    numbers: tuple[str, ...]
+    search_variants: tuple[str | None, ...]
+
+
+def build_query_plan(query: str, *, default_hours: int = 24) -> QueryPlan:
+    original = normalize_space(query)
+    hours_back, cleaned = parse_time_filter_from_query(original, default_hours)
+    effective = cleaned or original
+    broad = is_broad_news_query(original)
+    keywords = tuple(extract_query_keywords(effective))
+    expanded_terms = tuple(expand_query_terms(effective))
+    numbers = tuple(extract_query_numbers(effective))
+    variants = tuple(build_query_search_variants(effective, broad_query=broad))
+    return QueryPlan(
+        original_query=original,
+        cleaned_query=effective,
+        hours_back=hours_back,
+        broad_query=broad,
+        keywords=keywords,
+        expanded_terms=expanded_terms,
+        numbers=numbers,
+        search_variants=variants,
+    )
+
+
 _QUERY_GENERIC_TERMS = {
     "about",
     "after",
@@ -218,14 +251,23 @@ def build_query_search_variants(query: str, *, broad_query: bool = False) -> lis
 
     if expanded_terms:
         _push(" ".join(expanded_terms[:4]))
-        for term in expanded_terms[:8]:
+        if len(expanded_terms) >= 2:
+            _push(" ".join(expanded_terms[:2]))
+        if len(expanded_terms) >= 3:
+            _push(" ".join(expanded_terms[:3]))
+        for term in expanded_terms[:10]:
             _push(term)
+        # Pairwise combinations help lexical search for topical place/event queries.
+        for idx in range(min(len(expanded_terms), 4)):
+            for jdx in range(idx + 1, min(len(expanded_terms), 4)):
+                _push(f"{expanded_terms[idx]} {expanded_terms[jdx]}")
 
     if numbers:
         for number in numbers[:4]:
             _push(number)
         if expanded_terms:
             _push(" ".join([*numbers[:2], *expanded_terms[:2]]))
+            _push(" ".join([*expanded_terms[:2], *numbers[:2]]))
 
     if broad_query and not expanded_terms and not numbers:
         _push(None)
@@ -1054,13 +1096,12 @@ async def search_recent_messages(
     from telethon.errors import FloodWaitError
 
     resolved_max = max(20, min(int(max_messages), 60))
-    hours_back, cleaned_query = parse_time_filter_from_query(query, default_hours_back)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+    plan = build_query_plan(query, default_hours=default_hours_back)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=plan.hours_back)
 
-    broad_query = is_broad_news_query(query)
-    keyword_list = expand_query_terms(cleaned_query or query)
-    keyword_terms = set(keyword_list)
-    query_numbers = set(extract_query_numbers(cleaned_query or query))
+    broad_query = plan.broad_query
+    keyword_terms = set(plan.expanded_terms)
+    query_numbers = set(plan.numbers)
     sparse_subject_query = bool(
         not broad_query and keyword_terms and len(keyword_terms) <= 6 and not query_numbers
     )
@@ -1164,10 +1205,7 @@ async def search_recent_messages(
 
     # Stage 1: server-side fuzzy search using multiple variants. Long natural
     # language questions often perform poorly as a single literal search string.
-    search_variants = build_query_search_variants(
-        cleaned_query if cleaned_query else query,
-        broad_query=broad_query,
-    )
+    search_variants = list(plan.search_variants)
 
     for search_text in search_variants:
         for chat_ref in monitored_chats:
@@ -1290,11 +1328,12 @@ async def search_recent_news_web(
     Uses multiple RSS-backed news search endpoints and returns normalized context
     rows compatible with query answer generation.
     """
-    text = normalize_space(query)
+    plan = build_query_plan(query, default_hours=hours_back)
+    text = plan.cleaned_query
     if len(text) < 3:
         return []
 
-    resolved_hours = max(1, min(int(hours_back), 72))
+    resolved_hours = max(1, min(int(plan.hours_back), 72))
     resolved_max = max(3, min(int(max_results), 40))
     trusted_domains = list(allowed_domains or [])
 
@@ -1311,7 +1350,7 @@ async def search_recent_news_web(
     dedupe: set[str] = set()
     rows: list[dict[str, Any]] = []
     search_variants = [
-        variant for variant in build_query_search_variants(text, broad_query=is_broad_news_query(text))
+        variant for variant in plan.search_variants
         if isinstance(variant, str) and normalize_space(variant)
     ]
     if not search_variants:
