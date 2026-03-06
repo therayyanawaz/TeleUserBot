@@ -1392,6 +1392,47 @@ async def _query_bot_send_message(data: Dict[str, str]) -> object:
         raise
 
 
+def _is_query_bot_webhook_conflict(error: Exception) -> bool:
+    lowered = str(error or "").lower()
+    return "http 409" in lowered and "webhook" in lowered
+
+
+async def _ensure_query_bot_polling_mode() -> bool:
+    """
+    Ensure the query bot can use getUpdates by clearing any active webhook.
+    """
+    try:
+        info = await _query_bot_api_request("getWebhookInfo", data={})
+    except Exception:
+        LOGGER.debug("Failed to inspect bot webhook state for query polling.", exc_info=True)
+        return False
+
+    webhook_url = ""
+    pending_updates = 0
+    if isinstance(info, dict):
+        webhook_url = normalize_space(str(info.get("url") or ""))
+        try:
+            pending_updates = int(info.get("pending_update_count") or 0)
+        except Exception:
+            pending_updates = 0
+
+    if not webhook_url:
+        return True
+
+    LOGGER.warning(
+        "Active webhook detected for query bot (%s, pending=%s). "
+        "Deleting webhook so bot PM query replies can use polling.",
+        webhook_url,
+        pending_updates,
+    )
+    await _query_bot_api_request(
+        "deleteWebhook",
+        data={"drop_pending_updates": "false"},
+    )
+    await asyncio.sleep(0.5)
+    return True
+
+
 async def _resolve_query_bot_reply_target(
     *,
     chat_id: int,
@@ -4550,6 +4591,12 @@ async def run_query_bot_poll_loop() -> None:
     if await _resolve_query_bot_user_id() is None:
         return
 
+    try:
+        await _ensure_query_bot_polling_mode()
+    except Exception:
+        LOGGER.exception("Failed preparing bot query polling mode.")
+        await asyncio.sleep(2.0)
+
     while True:
         try:
             data = {
@@ -4615,7 +4662,17 @@ async def run_query_bot_poll_loop() -> None:
             query_bot_updates_offset = max(query_bot_updates_offset, max_seen_offset)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            if _is_query_bot_webhook_conflict(exc):
+                LOGGER.warning(
+                    "Bot query polling hit active webhook conflict. Retrying after deleting webhook."
+                )
+                try:
+                    await _ensure_query_bot_polling_mode()
+                except Exception:
+                    LOGGER.exception("Failed deleting bot webhook after polling conflict.")
+                    await asyncio.sleep(3.0)
+                continue
             LOGGER.exception("Bot query polling loop failed.")
             await asyncio.sleep(2.0)
 
