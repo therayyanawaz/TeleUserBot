@@ -194,6 +194,18 @@ DIGEST_INCLUDE_READ_MORE_LINKS = _env_bool("DIGEST_INCLUDE_READ_MORE_LINKS", Tru
 INCLUDE_SOURCE_TAGS = _env_bool("INCLUDE_SOURCE_TAGS", False)  # type: bool
 
 # -----------------------------------------------------------------------------
+# Media OCR Translation
+# -----------------------------------------------------------------------------
+# Best-effort OCR for media-only posts. The bot only uses OCR text when it can
+# translate non-English text into English. It does not generate visual
+# descriptions or invented captions.
+MEDIA_TEXT_OCR_ENABLED = _env_bool("MEDIA_TEXT_OCR_ENABLED", True)  # type: bool
+MEDIA_TEXT_OCR_VIDEO_ENABLED = _env_bool("MEDIA_TEXT_OCR_VIDEO_ENABLED", True)  # type: bool
+MEDIA_TEXT_OCR_MIN_CHARS = _env_int("MEDIA_TEXT_OCR_MIN_CHARS", 12)  # type: int
+MEDIA_TEXT_OCR_MAX_CHARS = _env_int("MEDIA_TEXT_OCR_MAX_CHARS", 1600)  # type: int
+MEDIA_TEXT_OCR_VIDEO_MAX_MB = _env_int("MEDIA_TEXT_OCR_VIDEO_MAX_MB", 25)  # type: int
+
+# -----------------------------------------------------------------------------
 # Breaking News Fast Path
 # -----------------------------------------------------------------------------
 BREAKING_NEWS_KEYWORDS = _env_list(

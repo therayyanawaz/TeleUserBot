@@ -13,6 +13,10 @@ Runs on your **Telegram user account** (Telethon), with optional Bot API destina
 
 - Real-time intake from shared folder (`FOLDER_INVITE_LINK`) + extra sources
 - Media-safe processing: text, captioned media, media-only posts, albums
+- OCR translation for media-only posts:
+  - images: only OCR text, only translated when non-English
+  - videos: best-effort first-frame OCR translation
+  - no visual descriptions or invented captions
 - Hybrid duplicate suppression:
   - no-HF semantic proxy (token/bigram/chargram/anchor overlap)
   - TF-IDF cosine
@@ -65,6 +69,7 @@ Core dependencies are in `requirements.txt`:
 
 Optional quality/accuracy dependencies are in `requirements.optional.txt`:
 - `sentence-transformers` (optional; disabled by default via `DUPE_USE_SENTENCE_TRANSFORMERS=false`)
+- `Pillow` and `pytesseract` (optional OCR for image/video frame text)
 
 ## Quick Start (Local)
 
@@ -96,10 +101,17 @@ python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 ```
 
-Optional (sentence-transformers only):
+Optional extras:
 
 ```bash
 pip install -r requirements.optional.txt
+```
+
+If you want OCR translation for media-only posts, also install system packages:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y tesseract-ocr ffmpeg
 ```
 
 4. Configure environment:
@@ -173,6 +185,25 @@ OPENAI_AUTH_ENV_ONLY=false
 ```
 
 First run opens browser, completes PKCE login, stores token in runtime dir.
+
+## Media OCR Translation
+
+Media OCR is intentionally narrow:
+- captioned media keeps using the real Telegram caption text
+- media-only images get a caption only when OCR finds non-English text and translation succeeds
+- media-only videos get a caption only when first-frame OCR finds non-English text and translation succeeds
+- English OCR text is ignored
+- failed OCR/translation adds nothing
+
+Config:
+
+```env
+MEDIA_TEXT_OCR_ENABLED=true
+MEDIA_TEXT_OCR_VIDEO_ENABLED=true
+MEDIA_TEXT_OCR_MIN_CHARS=12
+MEDIA_TEXT_OCR_MAX_CHARS=1600
+MEDIA_TEXT_OCR_VIDEO_MAX_MB=25
+```
 
 ## Recommended Digest Setup
 

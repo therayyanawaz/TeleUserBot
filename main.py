@@ -46,6 +46,7 @@ from ai_filter import (
     summarize_breaking_headline,
     summarize_vital_rational_view,
     summarize_or_skip,
+    translate_ocr_text_to_english,
 )
 from auth import AuthManager, ERROR_LOG_PATH, ensure_runtime_dir
 from db import (
@@ -90,8 +91,10 @@ from utils import (
     parse_daily_times,
     parse_time_filter_from_query,
     expand_query_terms,
+    extract_first_video_frame_bytes,
     extract_query_keywords,
     extract_query_numbers,
+    extract_ocr_text_from_image_bytes,
     sanitize_telegram_html,
     search_recent_news_web,
     search_recent_messages,
@@ -1792,6 +1795,164 @@ async def _source_title_from_channel_id(channel_id: str) -> str:
     return title
 
 
+def _media_text_ocr_enabled() -> bool:
+    return bool(getattr(config, "MEDIA_TEXT_OCR_ENABLED", True))
+
+
+def _media_text_ocr_video_enabled() -> bool:
+    return bool(getattr(config, "MEDIA_TEXT_OCR_VIDEO_ENABLED", True))
+
+
+def _media_text_ocr_min_chars() -> int:
+    try:
+        value = int(getattr(config, "MEDIA_TEXT_OCR_MIN_CHARS", 12))
+    except Exception:
+        value = 12
+    return max(8, min(value, 200))
+
+
+def _media_text_ocr_max_chars() -> int:
+    try:
+        value = int(getattr(config, "MEDIA_TEXT_OCR_MAX_CHARS", 1600))
+    except Exception:
+        value = 1600
+    return max(200, min(value, 4000))
+
+
+def _media_text_ocr_video_max_bytes() -> int:
+    try:
+        value_mb = int(getattr(config, "MEDIA_TEXT_OCR_VIDEO_MAX_MB", 25))
+    except Exception:
+        value_mb = 25
+    value_mb = max(1, min(value_mb, 200))
+    return value_mb * 1024 * 1024
+
+
+def _message_mime_type(msg: Message) -> str:
+    value = getattr(getattr(msg, "file", None), "mime_type", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    value = getattr(getattr(msg, "document", None), "mime_type", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return ""
+
+
+def _message_is_image_ocr_candidate(msg: Message) -> bool:
+    if not getattr(msg, "media", None):
+        return False
+    if msg.photo:
+        return True
+    mime_type = _message_mime_type(msg)
+    return mime_type.startswith("image/")
+
+
+def _message_is_video_ocr_candidate(msg: Message) -> bool:
+    if not getattr(msg, "media", None):
+        return False
+    if msg.video:
+        return True
+    mime_type = _message_mime_type(msg)
+    return mime_type.startswith("video/")
+
+
+def _normalize_media_ocr_text(text: str) -> str:
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return ""
+    if len(cleaned) < _media_text_ocr_min_chars():
+        return ""
+    limit = _media_text_ocr_max_chars()
+    if len(cleaned) > limit:
+        cleaned = f"{cleaned[: limit - 3].rsplit(' ', 1)[0]}..."
+    return cleaned
+
+
+async def _extract_media_ocr_translation(msg: Message) -> str | None:
+    if not _media_text_ocr_enabled():
+        return None
+    if not getattr(msg, "media", None):
+        return None
+
+    ocr_text = ""
+
+    if _message_is_image_ocr_candidate(msg):
+        blob = await msg.download_media(file=bytes)
+        if not blob:
+            return None
+        ocr_text = await asyncio.to_thread(
+            extract_ocr_text_from_image_bytes,
+            blob,
+            max_chars=_media_text_ocr_max_chars(),
+        )
+    elif _message_is_video_ocr_candidate(msg):
+        if not _media_text_ocr_video_enabled():
+            return None
+        media_size = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
+        if media_size and media_size > _media_text_ocr_video_max_bytes():
+            return None
+        blob = await msg.download_media(file=bytes)
+        if not blob:
+            return None
+        frame_blob = await asyncio.to_thread(extract_first_video_frame_bytes, blob)
+        if not frame_blob:
+            return None
+        ocr_text = await asyncio.to_thread(
+            extract_ocr_text_from_image_bytes,
+            frame_blob,
+            max_chars=_media_text_ocr_max_chars(),
+        )
+    else:
+        return None
+
+    normalized = _normalize_media_ocr_text(ocr_text)
+    if not normalized:
+        return None
+
+    translated = await translate_ocr_text_to_english(normalized, _require_auth_manager())
+    if not translated:
+        return None
+    return sanitize_telegram_html(translated)
+
+
+async def _caption_for_media_without_text(msg: Message) -> str | None:
+    """
+    Media-only posts get caption text only when OCR finds non-English text that
+    can be translated. No source-label fallback, no visual descriptions.
+    """
+    return await _extract_media_ocr_translation(msg)
+
+
+async def _caption_for_album_without_text(messages: List[Message]) -> str | None:
+    if not messages or not _media_text_ocr_enabled():
+        return None
+
+    snippets: List[str] = []
+    seen_plain: set[str] = set()
+    for msg in messages:
+        translated = await _extract_media_ocr_translation(msg)
+        if not translated:
+            continue
+        plain = normalize_space(strip_telegram_html(translated)).lower()
+        if not plain or plain in seen_plain:
+            continue
+        seen_plain.add(plain)
+        snippets.append(translated)
+        if len(snippets) >= 3:
+            break
+
+    if not snippets:
+        return None
+
+    combined = "\n\n".join(snippets)
+    limit = min(_media_text_ocr_max_chars(), 1000)
+    plain = strip_telegram_html(combined)
+    if len(plain) <= limit:
+        return combined
+    truncated = plain[: limit - 3].rsplit(" ", 1)[0].rstrip()
+    return sanitize_telegram_html(f"{truncated}...")
+
+
 def _queue_for_digest(
     channel_id: str,
     message_id: int,
@@ -2693,7 +2854,8 @@ async def _process_single_message(msg: Message) -> None:
     source = await _source_title(msg)
 
     if msg.media and not text:
-        await _send_single_media(msg, _format_source_label(source))
+        media_caption = await _caption_for_media_without_text(msg)
+        await _send_single_media(msg, media_caption)
         mark_seen(channel_id, msg.id)
         return
 
@@ -2735,7 +2897,8 @@ async def _process_album(messages: List[Message]) -> None:
     combined_caption = "\n".join(captions).strip()
 
     if not combined_caption:
-        await _send_album(messages, _format_source_label(source))
+        media_caption = await _caption_for_album_without_text(messages)
+        await _send_album(messages, media_caption)
         mark_seen_many(channel_id, message_ids)
         return
 
@@ -2757,7 +2920,8 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
     source, link = await _source_info(msg)
 
     if msg.media and not text:
-        await _send_single_media(msg, _format_source_label(source))
+        media_caption = await _caption_for_media_without_text(msg)
+        await _send_single_media(msg, media_caption)
         mark_seen(channel_id, msg.id)
         return
 
@@ -2874,7 +3038,8 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
     combined_caption = "\n".join(captions).strip()
 
     if not combined_caption:
-        await _send_album(messages, _format_source_label(source))
+        media_caption = await _caption_for_album_without_text(messages)
+        await _send_album(messages, media_caption)
         mark_seen_many(channel_id, message_ids)
         return
 

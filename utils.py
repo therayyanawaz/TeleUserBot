@@ -14,6 +14,8 @@ import logging
 import math
 from pathlib import Path
 import re
+import subprocess
+import tempfile
 import threading
 import time
 from typing import Any, Awaitable, Callable, Iterable, List, Sequence, Tuple
@@ -404,6 +406,61 @@ def extract_ocr_text_from_image_bytes(blob: bytes, *, max_chars: int = 1600) -> 
     if len(text) > limit:
         text = f"{text[: limit - 3].rsplit(' ', 1)[0]}..."
     return text
+
+
+def extract_first_video_frame_bytes(blob: bytes, *, timeout_seconds: int = 20) -> bytes:
+    """
+    Best-effort first-frame extraction from video bytes using ffmpeg.
+    Returns empty bytes if ffmpeg is unavailable or extraction fails.
+    """
+    if not blob:
+        return b""
+
+    input_path = None
+    output_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as src:
+            src.write(blob)
+            input_path = src.name
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as dst:
+            output_path = dst.name
+
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                input_path,
+                "-frames:v",
+                "1",
+                output_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(5, int(timeout_seconds)),
+            check=False,
+        )
+        if proc.returncode != 0:
+            return b""
+        if not output_path:
+            return b""
+        try:
+            return Path(output_path).read_bytes()
+        except Exception:
+            return b""
+    except Exception:
+        return b""
+    finally:
+        for path in (input_path, output_path):
+            if not path:
+                continue
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def dedupe_preserve_order(items: Sequence[str]) -> List[str]:
