@@ -218,6 +218,7 @@ query_last_request_ts: Dict[int, float] = {}
 query_conversation_history: Dict[int, Deque[Dict[str, str]]] = defaultdict(
     lambda: deque(maxlen=20)
 )
+query_bot_updates_offset: int = 0
 breaking_delivery_refs: Dict[str, Dict[str, object]] = {}
 breaking_topic_threads: List[Dict[str, object]] = []
 breaking_topic_lock = asyncio.Lock()
@@ -1386,6 +1387,96 @@ async def _query_bot_send_message(data: Dict[str, str]) -> object:
             )
             return await _query_bot_api_request("sendMessage", data=retry_data)
         raise
+
+
+async def _resolve_query_bot_reply_target(
+    *,
+    chat_id: int,
+    sender_id: int,
+    text: str,
+    max_attempts: int = 5,
+    sleep_seconds: float = 0.35,
+) -> int | None:
+    """
+    Resolve the bot-side message_id for a user query inside the bot PM.
+
+    The outgoing MTProto message id seen by the userbot is not guaranteed to
+    match the Bot API message id visible to the bot. To thread bot replies
+    correctly, inspect recent Bot API updates and match the user's query text.
+    """
+    global query_bot_updates_offset
+
+    normalized_text = normalize_space(text)
+    if not normalized_text:
+        return None
+
+    allowed_updates = json.dumps(["message", "edited_message"], separators=(",", ":"))
+    now_ts = int(time.time())
+
+    for attempt in range(max(1, int(max_attempts))):
+        data = {
+            "timeout": "0",
+            "limit": "50",
+            "allowed_updates": allowed_updates,
+        }
+        if query_bot_updates_offset > 0:
+            data["offset"] = str(query_bot_updates_offset)
+
+        try:
+            updates = await _query_bot_api_request("getUpdates", data=data)
+        except Exception:
+            LOGGER.debug("Failed to resolve bot-side reply target via getUpdates.", exc_info=True)
+            return None
+
+        max_seen_offset = query_bot_updates_offset
+        matched_message_id: int | None = None
+
+        if isinstance(updates, list):
+            for update in reversed(updates):
+                if not isinstance(update, dict):
+                    continue
+                update_id = int(update.get("update_id", 0) or 0)
+                if update_id > 0:
+                    max_seen_offset = max(max_seen_offset, update_id + 1)
+
+                payload = update.get("message") or update.get("edited_message")
+                if not isinstance(payload, dict):
+                    continue
+
+                payload_chat = payload.get("chat")
+                if not isinstance(payload_chat, dict):
+                    continue
+                if int(payload_chat.get("id", 0) or 0) != int(chat_id):
+                    continue
+
+                payload_from = payload.get("from")
+                if not isinstance(payload_from, dict):
+                    continue
+                if int(payload_from.get("id", 0) or 0) != int(sender_id):
+                    continue
+
+                payload_text_raw = payload.get("text") or payload.get("caption") or ""
+                payload_text = normalize_space(str(payload_text_raw or ""))
+                if payload_text != normalized_text:
+                    continue
+
+                payload_date = int(payload.get("date", 0) or 0)
+                if payload_date > 0 and abs(now_ts - payload_date) > 180:
+                    continue
+
+                candidate = int(payload.get("message_id", 0) or 0)
+                if candidate > 0:
+                    matched_message_id = candidate
+                    break
+
+        query_bot_updates_offset = max(query_bot_updates_offset, max_seen_offset)
+        if matched_message_id:
+            return matched_message_id
+
+        if attempt + 1 < max_attempts:
+            await asyncio.sleep(max(0.05, float(sleep_seconds)))
+
+    return None
 
 
 def _infer_chat_id_from_updates(updates: object) -> str | None:
@@ -4181,6 +4272,14 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
     # API helper already retries without reply_to_message_id if Telegram rejects
     # the reference, so this is safe and gives proper reply threading when valid.
     query_reply_to = int(msg.id or 0) or None
+    if query_via_bot and query_bot_chat_id:
+        bot_side_reply_to = await _resolve_query_bot_reply_target(
+            chat_id=query_bot_chat_id,
+            sender_id=sender_id,
+            text=text,
+        )
+        if bot_side_reply_to:
+            query_reply_to = bot_side_reply_to
 
     chat_id = str(getattr(msg, "chat_id", "") or "")
 
