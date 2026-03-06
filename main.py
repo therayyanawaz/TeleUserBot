@@ -1394,8 +1394,8 @@ async def _resolve_query_bot_reply_target(
     chat_id: int,
     sender_id: int,
     text: str,
-    max_attempts: int = 5,
-    sleep_seconds: float = 0.35,
+    max_attempts: int = 8,
+    sleep_seconds: float = 0.45,
 ) -> int | None:
     """
     Resolve the bot-side message_id for a user query inside the bot PM.
@@ -1410,14 +1410,12 @@ async def _resolve_query_bot_reply_target(
     if not normalized_text:
         return None
 
-    allowed_updates = json.dumps(["message", "edited_message"], separators=(",", ":"))
     now_ts = int(time.time())
 
     for attempt in range(max(1, int(max_attempts))):
         data = {
             "timeout": "0",
             "limit": "50",
-            "allowed_updates": allowed_updates,
         }
         if query_bot_updates_offset > 0:
             data["offset"] = str(query_bot_updates_offset)
@@ -1430,6 +1428,8 @@ async def _resolve_query_bot_reply_target(
 
         max_seen_offset = query_bot_updates_offset
         matched_message_id: int | None = None
+        fallback_message_id: int | None = None
+        fallback_message_ts: int = 0
 
         if isinstance(updates, list):
             for update in reversed(updates):
@@ -1455,23 +1455,29 @@ async def _resolve_query_bot_reply_target(
                 if int(payload_from.get("id", 0) or 0) != int(sender_id):
                     continue
 
-                payload_text_raw = payload.get("text") or payload.get("caption") or ""
-                payload_text = normalize_space(str(payload_text_raw or ""))
-                if payload_text != normalized_text:
-                    continue
-
                 payload_date = int(payload.get("date", 0) or 0)
                 if payload_date > 0 and abs(now_ts - payload_date) > 180:
                     continue
 
                 candidate = int(payload.get("message_id", 0) or 0)
-                if candidate > 0:
+                if candidate > 0 and payload_date >= fallback_message_ts:
+                    fallback_message_id = candidate
+                    fallback_message_ts = payload_date
+
+                if candidate <= 0:
+                    continue
+
+                payload_text_raw = payload.get("text") or payload.get("caption") or ""
+                payload_text = normalize_space(str(payload_text_raw or ""))
+                if payload_text == normalized_text:
                     matched_message_id = candidate
                     break
 
         query_bot_updates_offset = max(query_bot_updates_offset, max_seen_offset)
         if matched_message_id:
             return matched_message_id
+        if fallback_message_id:
+            return fallback_message_id
 
         if attempt + 1 < max_attempts:
             await asyncio.sleep(max(0.05, float(sleep_seconds)))
