@@ -699,6 +699,25 @@ def _is_high_risk_news_query(query: str) -> bool:
     return any(term in lowered for term in high_risk_terms)
 
 
+def _query_prefers_web_crosscheck(query: str) -> bool:
+    lowered = normalize_space(query).lower()
+    if not lowered:
+        return False
+    if extract_query_numbers(query):
+        return True
+    markers = (
+        "who died",
+        "who was killed",
+        "who was injured",
+        "casualties",
+        "fatalities",
+        "death toll",
+        "how many killed",
+        "how many injured",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 def _query_allowed_peer_ids() -> set[int]:
     raw = getattr(config, "QUERY_ALLOWED_PEER_IDS", [])
     if not isinstance(raw, list):
@@ -4366,8 +4385,10 @@ async def _handle_query_request(
 
         should_run_web_search = bool(
             _is_query_web_fallback_enabled()
-            and bool(query_keywords)
+            and (bool(query_keywords) or bool(extract_query_numbers(effective_query)))
             and (
+                _query_prefers_web_crosscheck(effective_query)
+                or
                 high_risk_query
                 or len(telegram_results) < _query_web_min_telegram_results()
             )

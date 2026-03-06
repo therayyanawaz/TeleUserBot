@@ -6,6 +6,7 @@ import asyncio
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 import json
 import logging
 import re
@@ -24,7 +25,7 @@ from prompts import (
     quiet_period_message,
 )
 from utils import estimate_tokens_rough as _estimate_tokens_rough
-from utils import normalize_space, sanitize_telegram_html
+from utils import extract_query_keywords, extract_query_numbers, normalize_space, sanitize_telegram_html
 
 
 CACHE_MAX_ITEMS = 2048
@@ -1172,10 +1173,6 @@ def _query_is_high_risk(query: str) -> bool:
         "prime minister",
         "successor",
         "succession",
-        "deceased",
-        "died",
-        "dead",
-        "killed",
         "assassinated",
         "resigned",
         "coup",
@@ -1184,6 +1181,61 @@ def _query_is_high_risk(query: str) -> bool:
         "nuclear site",
     )
     return any(term in lowered for term in terms)
+
+
+def _query_is_identity_question(query: str) -> bool:
+    lowered = normalize_space(query).lower()
+    if not lowered:
+        return False
+    markers = (
+        "who died",
+        "who was killed",
+        "who got killed",
+        "who was injured",
+        "who got injured",
+        "names of the dead",
+        "names of the victims",
+        "victims names",
+        "which people died",
+        "identify the dead",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _query_is_casualty_question(query: str) -> bool:
+    lowered = normalize_space(query).lower()
+    if not lowered:
+        return False
+    terms = (
+        "killed",
+        "dead",
+        "died",
+        "injured",
+        "wounded",
+        "casualties",
+        "fatalities",
+        "victims",
+    )
+    return any(term in lowered for term in terms)
+
+
+def _query_requires_multi_source_confirmation(query: str) -> bool:
+    lowered = normalize_space(query).lower()
+    if not lowered:
+        return False
+    markers = (
+        "supreme leader",
+        "new leader",
+        "successor",
+        "succession",
+        "prime minister",
+        "president",
+        "assassinated",
+        "nuclear plant",
+        "nuclear site",
+        "reactor",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def _query_distinct_sources(context_messages: Sequence[Dict[str, object]]) -> int:
@@ -1212,6 +1264,158 @@ def _answer_has_definitive_high_risk_claim(answer: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def _extract_text_numbers(text: str) -> set[str]:
+    return {token for token in re.findall(r"\b\d{2,6}\b", normalize_space(text))}
+
+
+def _query_text_tokens(text: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]{3,}", normalize_space(text).lower())}
+
+
+def _query_text_has_identity_markers(text: str) -> bool:
+    lowered = normalize_space(text).lower()
+    if not lowered:
+        return False
+    markers = (
+        "identified",
+        "named",
+        "victim",
+        "victims",
+        "children",
+        "women",
+        "journalist",
+        "commander",
+        "official",
+        "funeral",
+        "martyr",
+        "martyrs",
+        "obituary",
+        "name list",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _query_text_has_casualty_markers(text: str) -> bool:
+    lowered = normalize_space(text).lower()
+    if not lowered:
+        return False
+    markers = (
+        "killed",
+        "dead",
+        "died",
+        "injured",
+        "wounded",
+        "casualties",
+        "fatalities",
+        "victims",
+        "death toll",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _score_query_context_row(
+    query: str,
+    item: Dict[str, object],
+    *,
+    now_ts: int,
+) -> float:
+    question = normalize_space(query)
+    if not question:
+        return 0.0
+
+    text = normalize_space(str(item.get("text") or ""))
+    if not text:
+        return 0.0
+
+    lowered_question = question.lower()
+    lowered_text = text.lower()
+    query_keywords = extract_query_keywords(question)
+    query_keyword_set = set(query_keywords)
+    text_tokens = _query_text_tokens(text)
+    query_numbers = set(extract_query_numbers(question))
+    text_numbers = _extract_text_numbers(text)
+
+    keyword_hits = len(query_keyword_set & text_tokens)
+    keyword_score = (
+        (keyword_hits / max(1, len(query_keyword_set))) * 3.5
+        if query_keyword_set
+        else 0.0
+    )
+
+    number_hits = len(query_numbers & text_numbers)
+    number_score = float(number_hits) * 2.5
+    if query_numbers and number_hits == len(query_numbers):
+        number_score += 2.0
+
+    direct_phrase_score = 0.0
+    if lowered_question and lowered_question in lowered_text:
+        direct_phrase_score += 2.0
+    similarity_score = SequenceMatcher(None, lowered_question[:320], lowered_text[:900]).ratio() * 1.8
+
+    intent_score = 0.0
+    if _query_is_identity_question(question) and _query_text_has_identity_markers(text):
+        intent_score += 1.4
+    if _query_is_casualty_question(question) and _query_text_has_casualty_markers(text):
+        intent_score += 1.2
+
+    source = normalize_space(str(item.get("source") or ""))
+    source_score = 0.15 if source else 0.0
+    if str(item.get("link") or "").startswith("http"):
+        source_score += 0.2
+
+    timestamp = int(item.get("timestamp") or 0)
+    recency_score = 0.0
+    if timestamp > 0 and now_ts > 0:
+        age_hours = max(0.0, (now_ts - timestamp) / 3600.0)
+        recency_score = max(0.0, 1.0 - min(age_hours / 48.0, 1.0))
+
+    return (
+        keyword_score
+        + number_score
+        + direct_phrase_score
+        + similarity_score
+        + intent_score
+        + source_score
+        + recency_score
+    )
+
+
+def _rank_query_context(
+    query: str,
+    context_messages: Sequence[Dict[str, object]],
+    *,
+    limit: int = 18,
+) -> list[Dict[str, object]]:
+    now_ts = int(time.time())
+    scored: list[tuple[float, Dict[str, object]]] = []
+    for item in context_messages:
+        score = _score_query_context_row(query, item, now_ts=now_ts)
+        scored.append((score, item))
+
+    scored.sort(
+        key=lambda pair: (
+            pair[0],
+            int(pair[1].get("timestamp", 0) or 0),
+        ),
+        reverse=True,
+    )
+
+    out: list[Dict[str, object]] = []
+    per_source: dict[str, int] = {}
+    for score, item in scored:
+        if score <= 0:
+            continue
+        source = normalize_space(str(item.get("source") or "unknown")).lower()
+        if per_source.get(source, 0) >= 3:
+            continue
+        per_source[source] = per_source.get(source, 0) + 1
+        out.append(item)
+        if len(out) >= max(6, int(limit)):
+            break
+
+    return out if out else list(context_messages[: max(6, int(limit))])
+
+
 def _query_context_token_budget() -> int:
     raw = getattr(config, "DIGEST_MAX_TOKENS", 18000)
     try:
@@ -1222,6 +1426,7 @@ def _query_context_token_budget() -> int:
 
 
 def _build_query_context_lines(
+    query: str,
     context_messages: Sequence[Dict[str, object]],
     *,
     token_budget: int,
@@ -1229,8 +1434,9 @@ def _build_query_context_lines(
     lines: list[str] = []
     used = 0
     seen = set()
+    ranked_messages = _rank_query_context(query, context_messages, limit=24)
 
-    for idx, item in enumerate(context_messages, start=1):
+    for idx, item in enumerate(ranked_messages, start=1):
         text = normalize_space(str(item.get("text") or ""))
         if not text:
             continue
@@ -1245,9 +1451,9 @@ def _build_query_context_lines(
         if len(text) > 900:
             text = f"{text[:897].rsplit(' ', 1)[0]}..."
 
-        line = f"{idx}. [{source}] ({date_label}) {text}"
+        line = f'{idx}. source_name="{source}" | date="{date_label}" | text="{text}"'
         if link.startswith("http"):
-            line += f" | link={link}"
+            line += f' | url="{link}"'
 
         line_tokens = estimate_tokens_rough(line) + 10
         if lines and used + line_tokens > token_budget:
@@ -1259,6 +1465,7 @@ def _build_query_context_lines(
 
 
 def _fallback_query_answer(
+    query: str,
     context_messages: Sequence[Dict[str, object]],
     *,
     detailed: bool,
@@ -1266,8 +1473,12 @@ def _fallback_query_answer(
     if not context_messages:
         return QUERY_NO_MATCH_TEXT
 
-    selected = context_messages[: (6 if detailed else 3)]
+    selected = _rank_query_context(query, context_messages, limit=(8 if detailed else 4))
+    selected = selected[: (6 if detailed else 4)]
     lines = []
+    intro_title = "Latest updates"
+    if _query_is_identity_question(query):
+        intro_title = "Best available answer"
     for item in selected:
         text = normalize_space(str(item.get("text") or ""))
         if not text:
@@ -1284,7 +1495,7 @@ def _fallback_query_answer(
 
     if not lines:
         return QUERY_NO_MATCH_TEXT
-    return sanitize_telegram_html("<b>Latest updates</b><br>" + "<br>".join(lines))
+    return sanitize_telegram_html(f"<b>{intro_title}</b><br>" + "<br>".join(lines))
 
 
 async def summarize_or_skip(text: str, auth_manager: AuthManager) -> Optional[str]:
@@ -1788,18 +1999,21 @@ async def generate_answer_from_context(
     manager = auth_manager or AuthManager(logger=LOGGER)
     detailed = _query_requests_detail(question)
     high_risk_query = _query_is_high_risk(question)
-    distinct_sources = _query_distinct_sources(context_messages)
+    strict_confirmation_query = _query_requires_multi_source_confirmation(question)
+    ranked_context = _rank_query_context(question, context_messages, limit=24)
+    distinct_sources = _query_distinct_sources(ranked_context[:10] or context_messages)
     output_language = _resolve_output_language()
 
     # Strict guardrail for high-risk queries (leadership/death/succession):
     # if evidence diversity is weak, do not produce potentially false claims.
-    if high_risk_query and distinct_sources < 2:
+    if strict_confirmation_query and distinct_sources < 2:
         return QUERY_NO_MATCH_TEXT
 
     # Reserve room for prompt + answer generation.
     context_budget = max(2000, _query_context_token_budget() - 2600)
     context_lines, used_tokens = _build_query_context_lines(
-        context_messages,
+        question,
+        ranked_context,
         token_budget=context_budget,
     )
     if not context_lines:
@@ -1819,9 +2033,13 @@ async def generate_answer_from_context(
         f"User query:\n{question}",
         "Context metadata:",
         f"- Context messages provided: {len(context_messages)}",
+        f"- Context messages ranked for relevance: {len(ranked_context)}",
         f"- Context lines included: {len(context_lines)}",
         f"- Estimated context tokens: {used_tokens}",
         f"- High-risk query: {'yes' if high_risk_query else 'no'}",
+        f"- Strict multi-source confirmation required: {'yes' if strict_confirmation_query else 'no'}",
+        f"- Identity-style query: {'yes' if _query_is_identity_question(question) else 'no'}",
+        f"- Casualty-style query: {'yes' if _query_is_casualty_question(question) else 'no'}",
         f"- Distinct evidence sources: {distinct_sources}",
     ]
     if history_lines:
@@ -1854,23 +2072,23 @@ async def generate_answer_from_context(
                 on_token=on_token,
             )
         except Exception:
-            return _fallback_query_answer(context_messages, detailed=detailed)
+            return _fallback_query_answer(question, ranked_context, detailed=detailed)
     except _CodexRateLimitError:
-        return _fallback_query_answer(context_messages, detailed=detailed)
+        return _fallback_query_answer(question, ranked_context, detailed=detailed)
     except (httpx.HTTPError, _CodexApiError, ValueError):
-        return _fallback_query_answer(context_messages, detailed=detailed)
+        return _fallback_query_answer(question, ranked_context, detailed=detailed)
     except Exception:
-        return _fallback_query_answer(context_messages, detailed=detailed)
+        return _fallback_query_answer(question, ranked_context, detailed=detailed)
 
     cleaned = normalize_space(content)
     if not cleaned:
-        return _fallback_query_answer(context_messages, detailed=detailed)
+        return _fallback_query_answer(question, ranked_context, detailed=detailed)
 
     plain_cleaned = re.sub(r"</?[^>]+>", "", cleaned).lower()
     if QUERY_NO_MATCH_TEXT.lower() in cleaned.lower() or "no relevant information found" in plain_cleaned:
         return QUERY_NO_MATCH_TEXT
 
-    if high_risk_query and distinct_sources < 2 and _answer_has_definitive_high_risk_claim(cleaned):
+    if strict_confirmation_query and distinct_sources < 2 and _answer_has_definitive_high_risk_claim(cleaned):
         return QUERY_NO_MATCH_TEXT
 
     safe = sanitize_telegram_html(content.strip())

@@ -38,6 +38,9 @@ def normalize_space(text: str) -> str:
 
 _QUERY_GENERIC_TERMS = {
     "about",
+    "after",
+    "and",
+    "are",
     "brief",
     "briefing",
     "current",
@@ -48,7 +51,11 @@ _QUERY_GENERIC_TERMS = {
     "development",
     "developments",
     "digest",
+    "for",
+    "from",
     "give",
+    "has",
+    "have",
     "happened",
     "happening",
     "headline",
@@ -63,6 +70,7 @@ _QUERY_GENERIC_TERMS = {
     "present",
     "query",
     "recent",
+    "recently",
     "recap",
     "report",
     "reports",
@@ -72,14 +80,20 @@ _QUERY_GENERIC_TERMS = {
     "status",
     "subject",
     "summary",
+    "than",
+    "that",
+    "the",
     "tell",
     "today",
     "update",
     "updates",
+    "was",
+    "were",
     "what",
     "when",
     "where",
     "who",
+    "with",
     "why",
     "yesterday",
 }
@@ -107,6 +121,29 @@ def extract_query_keywords(query: str) -> list[str]:
         seen.add(token)
         out.append(token)
     return out
+
+
+def extract_query_numbers(query: str) -> list[str]:
+    """
+    Extract meaningful numeric claims from a query.
+
+    Examples:
+    - "217 killed and 798 injured" -> ["217", "798"]
+    - "last 24 hours" -> []
+    """
+    lowered = normalize_space(query).lower()
+    if not lowered:
+        return []
+    values: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"\b\d{2,6}\b", lowered):
+        if token in seen:
+            continue
+        if token in {"24", "48", "72"} and re.search(rf"\b{re.escape(token)}\s*(?:hours?|hrs?|h)\b", lowered):
+            continue
+        seen.add(token)
+        values.append(token)
+    return values
 
 
 def is_broad_news_query(query: str) -> bool:
@@ -869,7 +906,9 @@ async def search_recent_messages(
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
 
     broad_query = is_broad_news_query(query)
-    keyword_terms = set(extract_query_keywords(cleaned_query))
+    keyword_list = extract_query_keywords(cleaned_query)
+    keyword_terms = set(keyword_list)
+    query_numbers = set(extract_query_numbers(cleaned_query or query))
 
     stage_limit = max(10, min(60, resolved_max // max(1, min(len(monitored_chats), resolved_max)) + 8))
     if broad_query and not keyword_terms:
@@ -907,9 +946,11 @@ async def search_recent_messages(
         if not text_value:
             return
 
-        if strict_keyword_filter and keyword_terms:
+        if strict_keyword_filter and (keyword_terms or query_numbers):
             lowered_text = text_value.lower()
-            if not any(term in lowered_text for term in keyword_terms):
+            number_hit = any(number in lowered_text for number in query_numbers)
+            keyword_hit = any(term in lowered_text for term in keyword_terms)
+            if not keyword_hit and not number_hit:
                 return
 
         chat_obj = getattr(msg, "chat", None)
@@ -963,26 +1004,58 @@ async def search_recent_messages(
                     logger.debug("Query search failed for chat=%s", chat_ref, exc_info=True)
                 return
 
-    # Stage 1: server-side fuzzy search
-    search_text = None if broad_query and not keyword_terms else (cleaned_query if cleaned_query else query)
-    for chat_ref in monitored_chats:
-        await _scan_chat(
-            chat_ref,
-            search_text=search_text,
-            limit=stage_limit,
-            strict_keyword_filter=False,
-        )
+    # Stage 1: server-side fuzzy search using multiple variants. Long natural
+    # language questions often perform poorly as a single literal search string.
+    search_variants: list[str | None] = []
+    if broad_query and not keyword_terms and not query_numbers:
+        search_variants = [None]
+    else:
+        candidates: list[str] = []
+        primary = cleaned_query if cleaned_query else query
+        if primary:
+            candidates.append(primary)
+        if keyword_list:
+            candidates.append(" ".join(keyword_list[:4]))
+            for token in keyword_list[:3]:
+                if len(token) >= 4:
+                    candidates.append(token)
+        for number in list(query_numbers)[:3]:
+            candidates.append(number)
+        seen_variant: set[str] = set()
+        for value in candidates:
+            cleaned_variant = normalize_space(value)
+            if not cleaned_variant:
+                continue
+            key = cleaned_variant.lower()
+            if key in seen_variant:
+                continue
+            seen_variant.add(key)
+            search_variants.append(cleaned_variant)
+        if not search_variants:
+            search_variants = [None]
+
+    for search_text in search_variants:
+        for chat_ref in monitored_chats:
+            await _scan_chat(
+                chat_ref,
+                search_text=search_text,
+                limit=stage_limit,
+                strict_keyword_filter=False,
+            )
+            if len(collected) >= resolved_max:
+                break
         if len(collected) >= resolved_max:
             break
 
-    # Stage 2: fallback scan if no results
-    if not collected:
+    # Stage 2: fallback scan when server-side search is weak, not only fully empty.
+    fallback_trigger = max(4, min(resolved_max, 10 if (keyword_terms or query_numbers) else 8))
+    if len(collected) < fallback_trigger:
         for chat_ref in monitored_chats:
             await _scan_chat(
                 chat_ref,
                 search_text=None,
                 limit=fallback_limit,
-                strict_keyword_filter=True,
+                strict_keyword_filter=bool(keyword_terms or query_numbers),
             )
             if len(collected) >= resolved_max:
                 break
