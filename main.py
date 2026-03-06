@@ -13,6 +13,7 @@ import re
 import sqlite3
 import sys
 import time
+from types import SimpleNamespace
 import urllib.parse
 from collections import defaultdict, deque
 from datetime import datetime
@@ -208,6 +209,7 @@ album_tasks: Dict[Tuple[str, int], asyncio.Task] = {}
 digest_scheduler_task: asyncio.Task | None = None
 daily_digest_scheduler_task: asyncio.Task | None = None
 queue_clear_scheduler_task: asyncio.Task | None = None
+query_bot_poll_task: asyncio.Task | None = None
 source_title_cache: Dict[str, str] = {}
 digest_next_run_ts: float | None = None
 digest_retry_backoff_seconds: int = 0
@@ -227,6 +229,7 @@ query_bot_user_id_checked: bool = False
 instance_lock_handle = None
 web_status_server: WebStatusServer | None = None
 started_as_username: str = "unknown"
+started_as_user_id: int = 0
 startup_phase: str = "booting"
 startup_ready: bool = False
 startup_error: str = ""
@@ -4210,6 +4213,242 @@ async def _stream_query_answer(
     return answer, stats
 
 
+async def _handle_query_request(
+    *,
+    event_ref: object,
+    text: str,
+    sender_id: int,
+    chat_id: str,
+    reply_to: int | None,
+    prefer_bot_identity: bool,
+    bot_chat_id: int | None,
+) -> None:
+    now = time.time()
+    last = query_last_request_ts.get(sender_id, 0.0)
+    if now - last < 10:
+        wait_seconds = int(max(1.0, 10 - (now - last)))
+        await _safe_reply_markdown(
+            event_ref,  # type: ignore[arg-type]
+            f"Please wait {wait_seconds}s before your next query.",
+            reply_to=reply_to,
+            prefer_bot_identity=prefer_bot_identity,
+            bot_chat_id=bot_chat_id,
+        )
+        return
+    query_last_request_ts[sender_id] = now
+
+    progress = await _safe_reply_markdown(
+        event_ref,  # type: ignore[arg-type]
+        (
+            "Searching channels + trusted web... ⏳"
+            if _is_query_web_fallback_enabled()
+            else "Searching your channels... ⏳"
+        ),
+        reply_to=reply_to,
+        prefer_bot_identity=prefer_bot_identity,
+        bot_chat_id=bot_chat_id,
+    )
+    if progress is None:
+        return
+
+    try:
+        parsed_hours, cleaned_query = parse_time_filter_from_query(
+            text,
+            _query_default_hours_back(),
+        )
+        effective_query = text
+        broad_query = is_broad_news_query(text)
+        query_keywords = extract_query_keywords(cleaned_query or text)
+        high_risk_query = _is_high_risk_news_query(effective_query)
+        context_limit = _query_max_messages() * (2 if broad_query else 1)
+
+        telegram_results = await search_recent_messages(
+            _require_client(),
+            monitored_source_chat_ids,
+            cleaned_query,
+            max_messages=context_limit,
+            default_hours_back=parsed_hours,
+            logger=LOGGER,
+        )
+
+        archive_results: list[dict[str, object]] = []
+        if broad_query or len(telegram_results) < _query_web_min_telegram_results():
+            archive_results = _load_archive_query_context(
+                query_text=effective_query,
+                hours_back=parsed_hours,
+                limit=max(context_limit * 3, 80),
+                broad_query=broad_query,
+            )
+            if archive_results:
+                telegram_results = _merge_query_context(
+                    telegram_results,
+                    archive_results,
+                    limit=max(context_limit, 40),
+                )
+
+        web_results: list[dict[str, object]] = []
+        web_fallback_used = False
+        ran_web_search = False
+
+        should_run_web_search = bool(
+            _is_query_web_fallback_enabled()
+            and bool(query_keywords)
+            and (
+                high_risk_query
+                or len(telegram_results) < _query_web_min_telegram_results()
+            )
+        )
+
+        if should_run_web_search:
+            ran_web_search = True
+            await _safe_reply_markdown(
+                event_ref,  # type: ignore[arg-type]
+                (
+                    "Cross-checking channels with trusted web news... ⏳"
+                    if not high_risk_query
+                    else "High-risk query detected. Cross-checking trusted web news... ⏳"
+                ),
+                edit_message=progress,
+                prefer_bot_identity=prefer_bot_identity,
+                bot_chat_id=bot_chat_id,
+            )
+            web_results = await search_recent_news_web(
+                cleaned_query,
+                hours_back=min(parsed_hours, _query_web_max_hours_back()),
+                max_results=_query_web_max_results(),
+                allowed_domains=_query_web_allowed_domains(),
+                require_recent=_query_web_require_recent(),
+                logger=LOGGER,
+            )
+            required_sources = _query_web_require_min_sources()
+            if web_results and required_sources > 1:
+                source_hosts = {
+                    normalize_space(str(item.get("source") or "")).lower()
+                    for item in web_results
+                    if normalize_space(str(item.get("source") or ""))
+                }
+                if len(source_hosts) < required_sources:
+                    LOGGER.info(
+                        "Web fallback rejected for query due to low source diversity (%s < %s).",
+                        len(source_hosts),
+                        required_sources,
+                    )
+                    web_results = []
+            web_fallback_used = bool(web_results)
+
+        results = _merge_query_context(
+            telegram_results,
+            web_results,
+            limit=max(context_limit, _query_max_messages()),
+        )
+
+        await _safe_reply_markdown(
+            event_ref,  # type: ignore[arg-type]
+            (
+                f"Found {len(telegram_results)} evidence items"
+                + (f" + {len(web_results)} web reports" if web_results else "")
+                + " -> analyzing... ⏳"
+            ),
+            edit_message=progress,
+            prefer_bot_identity=prefer_bot_identity,
+            bot_chat_id=bot_chat_id,
+        )
+
+        history = list(_query_history_for_sender(sender_id))
+        evidence_split_section = ""
+        if not broad_query:
+            evidence_split_section = _format_evidence_split_section(
+                telegram_results,
+                web_results if ran_web_search else [],
+            )
+
+        if _is_streaming_enabled():
+            answer, stream_stats = await _stream_query_answer(
+                event_ref,  # type: ignore[arg-type]
+                progress_message=progress,
+                query_text=effective_query,
+                results=results,
+                history=history,
+                digest_mode=broad_query,
+                digest_hours_back=parsed_hours,
+                prefer_bot_identity=prefer_bot_identity,
+                bot_chat_id=bot_chat_id,
+                root_reply_to=reply_to,
+                final_suffix_html=evidence_split_section,
+            )
+        else:
+            if broad_query:
+                answer = await create_digest_summary(
+                    list(results),
+                    auth_manager=_require_auth_manager(),
+                    interval_minutes=max(1, parsed_hours * 60),
+                )
+                answer = _wrap_query_digest_answer(answer, hours_back=parsed_hours)
+            else:
+                answer = await generate_answer_from_context(
+                    query=effective_query,
+                    context_messages=results,
+                    auth_manager=_require_auth_manager(),
+                    conversation_history=history,
+                )
+            if not answer.strip():
+                answer = "No matching information found in recent updates."
+            if (
+                evidence_split_section
+                and "no relevant information found" not in strip_telegram_html(answer).lower()
+            ):
+                answer = f"{answer.strip()}<br><br>{evidence_split_section}"
+            await _safe_reply_markdown(
+                event_ref,  # type: ignore[arg-type]
+                answer,
+                edit_message=progress,
+                prefer_bot_identity=prefer_bot_identity,
+                bot_chat_id=bot_chat_id,
+            )
+            stream_stats = None
+
+        _append_query_history(sender_id, text, answer)
+        log_structured(
+            LOGGER,
+            "query_answered",
+            sender_id=sender_id,
+            chat_id=chat_id,
+            query_length=len(text),
+            hours_back=parsed_hours,
+            messages_found=len(results),
+            telegram_messages_found=len(telegram_results),
+            archive_messages_found=len(archive_results),
+            web_messages_found=len(web_results),
+            web_fallback_used=web_fallback_used,
+            web_search_ran=ran_web_search,
+            broad_query=broad_query,
+            high_risk_query=high_risk_query,
+            response_chars=len(answer),
+            stream_enabled=_is_streaming_enabled(),
+            stream_edits=(stream_stats.edit_count if stream_stats else 0),
+            stream_tokens_per_second=(
+                round(stream_stats.tokens_per_second, 3) if stream_stats else 0.0
+            ),
+        )
+    except Exception as exc:
+        LOGGER.exception("Query handling failed.")
+        await _safe_reply_markdown(
+            event_ref,  # type: ignore[arg-type]
+            "No matching information found in recent updates.",
+            edit_message=progress,
+            prefer_bot_identity=prefer_bot_identity,
+            bot_chat_id=bot_chat_id,
+        )
+        log_structured(
+            LOGGER,
+            "query_failed",
+            level=logging.ERROR,
+            sender_id=sender_id,
+            chat_id=chat_id,
+            error=str(exc),
+        )
+
+
 async def _on_query_message(event: events.NewMessage.Event) -> None:
     if not _is_query_mode_enabled():
         return
@@ -4270,248 +4509,115 @@ async def _on_query_message(event: events.NewMessage.Event) -> None:
         )
         return
 
-    # Saved Messages => self response.
-    # Own bot PM => send via bot identity.
-    query_via_bot = bool(is_own_bot_pm and not is_saved_messages)
-    query_bot_chat_id = sender_id if query_via_bot else None
-    # Always try to reply to the triggering user message. In bot-PM mode the Bot
-    # API helper already retries without reply_to_message_id if Telegram rejects
-    # the reference, so this is safe and gives proper reply threading when valid.
-    query_reply_to = int(msg.id or 0) or None
-    if query_via_bot and query_bot_chat_id:
-        bot_side_reply_to = await _resolve_query_bot_reply_target(
-            chat_id=query_bot_chat_id,
-            sender_id=sender_id,
-            text=text,
-        )
-        if bot_side_reply_to:
-            query_reply_to = bot_side_reply_to
-
-    chat_id = str(getattr(msg, "chat_id", "") or "")
-
-    now = time.time()
-    last = query_last_request_ts.get(sender_id, 0.0)
-    if now - last < 10:
-        wait_seconds = int(max(1.0, 10 - (now - last)))
-        await _safe_reply_markdown(
-            event,
-            f"Please wait {wait_seconds}s before your next query.",
-            reply_to=query_reply_to,
-            prefer_bot_identity=query_via_bot,
-            bot_chat_id=query_bot_chat_id,
+    # Bot-PM queries are handled from the actual Bot API update loop so the bot
+    # has the exact incoming message_id and can reply deterministically.
+    if is_own_bot_pm and not is_saved_messages:
+        LOGGER.debug(
+            "Query delegated to Bot API loop for bot PM chat_id=%s peer_user_id=%s",
+            getattr(msg, "chat_id", None),
+            target_user_id,
         )
         return
-    query_last_request_ts[sender_id] = now
 
-    progress = await _safe_reply_markdown(
-        event,
-        (
-            "Searching channels + trusted web... ⏳"
-            if _is_query_web_fallback_enabled()
-            else "Searching your channels... ⏳"
-        ),
-        reply_to=query_reply_to,
-        prefer_bot_identity=query_via_bot,
-        bot_chat_id=query_bot_chat_id,
+    await _handle_query_request(
+        event_ref=event,
+        text=text,
+        sender_id=sender_id,
+        chat_id=str(getattr(msg, "chat_id", "") or ""),
+        reply_to=int(msg.id or 0) or None,
+        prefer_bot_identity=False,
+        bot_chat_id=None,
     )
-    if progress is None:
+
+
+async def run_query_bot_poll_loop() -> None:
+    """
+    Poll Bot API updates for the owner's PM with their bot.
+
+    This is the reliable path for bot-PM queries because it gives the exact
+    incoming bot-side message_id, so replies can thread properly.
+    """
+    global query_bot_updates_offset
+
+    token = _bot_destination_token_from_config()
+    if not _looks_like_bot_token(token):
         return
 
-    try:
-        parsed_hours, cleaned_query = parse_time_filter_from_query(
-            text,
-            _query_default_hours_back(),
-        )
-        effective_query = text
-        broad_query = is_broad_news_query(text)
-        query_keywords = extract_query_keywords(cleaned_query or text)
-        high_risk_query = _is_high_risk_news_query(effective_query)
-        context_limit = _query_max_messages() * (2 if broad_query else 1)
+    owner_user_id = int(started_as_user_id or 0)
+    if owner_user_id <= 0:
+        return
 
-        telegram_results = await search_recent_messages(
-            _require_client(),
-            monitored_source_chat_ids,
-            cleaned_query,
-            max_messages=context_limit,
-            default_hours_back=parsed_hours,
-            logger=LOGGER,
-        )
+    if await _resolve_query_bot_user_id() is None:
+        return
 
-        archive_results: list[dict[str, object]] = []
-        if broad_query or len(telegram_results) < _query_web_min_telegram_results():
-            archive_results = _load_archive_query_context(
-                query_text=effective_query,
-                hours_back=parsed_hours,
-                limit=max(context_limit * 3, 80),
-                broad_query=broad_query,
-            )
-            if archive_results:
-                telegram_results = _merge_query_context(
-                    telegram_results,
-                    archive_results,
-                    limit=max(context_limit, 40),
+    while True:
+        try:
+            data = {
+                "timeout": "30",
+                "limit": "50",
+            }
+            if query_bot_updates_offset > 0:
+                data["offset"] = str(query_bot_updates_offset)
+
+            updates = await _query_bot_api_request("getUpdates", data=data)
+            if not isinstance(updates, list):
+                await asyncio.sleep(1.0)
+                continue
+
+            max_seen_offset = query_bot_updates_offset
+            for update in updates:
+                if not isinstance(update, dict):
+                    continue
+                update_id = int(update.get("update_id", 0) or 0)
+                if update_id > 0:
+                    max_seen_offset = max(max_seen_offset, update_id + 1)
+
+                payload = update.get("message") or update.get("edited_message")
+                if not isinstance(payload, dict):
+                    continue
+
+                chat = payload.get("chat")
+                if not isinstance(chat, dict):
+                    continue
+                if str(chat.get("type") or "") != "private":
+                    continue
+
+                chat_id = int(chat.get("id", 0) or 0)
+                sender = payload.get("from")
+                if not isinstance(sender, dict):
+                    continue
+                sender_id = int(sender.get("id", 0) or 0)
+                if sender_id != owner_user_id:
+                    continue
+                if chat_id != owner_user_id:
+                    continue
+
+                text = normalize_space(
+                    str(payload.get("text") or payload.get("caption") or "")
+                )
+                if _is_query_text_ignored(text):
+                    continue
+
+                message_id = int(payload.get("message_id", 0) or 0)
+                if message_id <= 0:
+                    continue
+
+                await _handle_query_request(
+                    event_ref=SimpleNamespace(chat_id=chat_id),
+                    text=text,
+                    sender_id=sender_id,
+                    chat_id=str(chat_id),
+                    reply_to=message_id,
+                    prefer_bot_identity=True,
+                    bot_chat_id=chat_id,
                 )
 
-        web_results: list[dict[str, object]] = []
-        web_fallback_used = False
-        ran_web_search = False
-
-        should_run_web_search = bool(
-            _is_query_web_fallback_enabled()
-            and bool(query_keywords)
-            and (
-                high_risk_query
-                or len(telegram_results) < _query_web_min_telegram_results()
-            )
-        )
-
-        if should_run_web_search:
-            ran_web_search = True
-            await _safe_reply_markdown(
-                event,
-                (
-                    "Cross-checking channels with trusted web news... ⏳"
-                    if not high_risk_query
-                    else "High-risk query detected. Cross-checking trusted web news... ⏳"
-                ),
-                edit_message=progress,
-                prefer_bot_identity=query_via_bot,
-                bot_chat_id=query_bot_chat_id,
-            )
-            web_results = await search_recent_news_web(
-                cleaned_query,
-                hours_back=min(parsed_hours, _query_web_max_hours_back()),
-                max_results=_query_web_max_results(),
-                allowed_domains=_query_web_allowed_domains(),
-                require_recent=_query_web_require_recent(),
-                logger=LOGGER,
-            )
-            required_sources = _query_web_require_min_sources()
-            if web_results and required_sources > 1:
-                source_hosts = {
-                    normalize_space(str(item.get("source") or "")).lower()
-                    for item in web_results
-                    if normalize_space(str(item.get("source") or ""))
-                }
-                if len(source_hosts) < required_sources:
-                    LOGGER.info(
-                        "Web fallback rejected for query due to low source diversity (%s < %s).",
-                        len(source_hosts),
-                        required_sources,
-                    )
-                    web_results = []
-            web_fallback_used = bool(web_results)
-
-        results = _merge_query_context(
-            telegram_results,
-            web_results,
-            limit=max(context_limit, _query_max_messages()),
-        )
-
-        await _safe_reply_markdown(
-            event,
-            (
-                f"Found {len(telegram_results)} evidence items"
-                + (f" + {len(web_results)} web reports" if web_results else "")
-                + " -> analyzing... ⏳"
-            ),
-            edit_message=progress,
-            prefer_bot_identity=query_via_bot,
-            bot_chat_id=query_bot_chat_id,
-        )
-
-        history = list(_query_history_for_sender(sender_id))
-        evidence_split_section = ""
-        if not broad_query:
-            evidence_split_section = _format_evidence_split_section(
-                telegram_results,
-                web_results if ran_web_search else [],
-            )
-        if _is_streaming_enabled():
-            answer, stream_stats = await _stream_query_answer(
-                event,
-                progress_message=progress,
-                query_text=effective_query,
-                results=results,
-                history=history,
-                digest_mode=broad_query,
-                digest_hours_back=parsed_hours,
-                prefer_bot_identity=query_via_bot,
-                bot_chat_id=query_bot_chat_id,
-                root_reply_to=query_reply_to,
-                final_suffix_html=evidence_split_section,
-            )
-        else:
-            if broad_query:
-                answer = await create_digest_summary(
-                    list(results),
-                    auth_manager=_require_auth_manager(),
-                    interval_minutes=max(1, parsed_hours * 60),
-                )
-                answer = _wrap_query_digest_answer(answer, hours_back=parsed_hours)
-            else:
-                answer = await generate_answer_from_context(
-                    query=effective_query,
-                    context_messages=results,
-                    auth_manager=_require_auth_manager(),
-                    conversation_history=history,
-                )
-            if not answer.strip():
-                answer = "No matching information found in recent updates."
-            if (
-                evidence_split_section
-                and "no relevant information found" not in strip_telegram_html(answer).lower()
-            ):
-                answer = f"{answer.strip()}<br><br>{evidence_split_section}"
-            await _safe_reply_markdown(
-                event,
-                answer,
-                edit_message=progress,
-                prefer_bot_identity=query_via_bot,
-                bot_chat_id=query_bot_chat_id,
-            )
-            stream_stats = None
-
-        _append_query_history(sender_id, text, answer)
-        log_structured(
-            LOGGER,
-            "query_answered",
-            sender_id=sender_id,
-            chat_id=chat_id,
-            query_length=len(text),
-            hours_back=parsed_hours,
-            messages_found=len(results),
-            telegram_messages_found=len(telegram_results),
-            archive_messages_found=len(archive_results),
-            web_messages_found=len(web_results),
-            web_fallback_used=web_fallback_used,
-            web_search_ran=ran_web_search,
-            broad_query=broad_query,
-            high_risk_query=high_risk_query,
-            response_chars=len(answer),
-            stream_enabled=_is_streaming_enabled(),
-            stream_edits=(stream_stats.edit_count if stream_stats else 0),
-            stream_tokens_per_second=(
-                round(stream_stats.tokens_per_second, 3) if stream_stats else 0.0
-            ),
-        )
-    except Exception as exc:
-        LOGGER.exception("Query handling failed.")
-        await _safe_reply_markdown(
-            event,
-            "No matching information found in recent updates.",
-            edit_message=progress,
-            prefer_bot_identity=query_via_bot,
-            bot_chat_id=query_bot_chat_id,
-        )
-        log_structured(
-            LOGGER,
-            "query_failed",
-            level=logging.ERROR,
-            sender_id=sender_id,
-            chat_id=chat_id,
-            error=str(exc),
-        )
+            query_bot_updates_offset = max(query_bot_updates_offset, max_seen_offset)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Bot query polling loop failed.")
+            await asyncio.sleep(2.0)
 
 
 async def _on_new_message(event: events.NewMessage.Event) -> None:
@@ -4562,6 +4668,7 @@ async def _on_new_message(event: events.NewMessage.Event) -> None:
 
 async def _shutdown_client() -> None:
     global digest_scheduler_task, daily_digest_scheduler_task, queue_clear_scheduler_task
+    global query_bot_poll_task
     global web_status_server
     configure_duplicate_runtime(None)
     breaking_delivery_refs.clear()
@@ -4581,6 +4688,11 @@ async def _shutdown_client() -> None:
         queue_clear_scheduler_task.cancel()
         await asyncio.gather(queue_clear_scheduler_task, return_exceptions=True)
     queue_clear_scheduler_task = None
+
+    if query_bot_poll_task and not query_bot_poll_task.done():
+        query_bot_poll_task.cancel()
+        await asyncio.gather(query_bot_poll_task, return_exceptions=True)
+    query_bot_poll_task = None
 
     if web_status_server is not None:
         try:
@@ -4686,8 +4798,8 @@ def _startup_health_check() -> None:
 
 async def main() -> None:
     global client, auth_manager, digest_scheduler_task
-    global daily_digest_scheduler_task, queue_clear_scheduler_task, instance_lock_handle
-    global web_status_server, started_as_username
+    global daily_digest_scheduler_task, queue_clear_scheduler_task, query_bot_poll_task
+    global instance_lock_handle, web_status_server, started_as_username, started_as_user_id
     global startup_phase, startup_ready, startup_error
 
     try:
@@ -4813,12 +4925,18 @@ async def main() -> None:
 
             me = await client.get_me()
             started_as_username = str(getattr(me, "username", "") or "unknown")
+            started_as_user_id = int(getattr(me, "id", 0) or 0)
             LOGGER.info("Userbot started as @%s", started_as_username)
             _print_cli_status(
                 "🚀",
                 f"Running as @{started_as_username} — monitoring {len(resolved_sources)} source(s)",
                 level="ok",
             )
+            if _is_query_mode_enabled() and _looks_like_bot_token(_bot_destination_token_from_config()):
+                query_bot_poll_task = asyncio.create_task(
+                    run_query_bot_poll_loop(),
+                    name="query-bot-poll",
+                )
             if _is_missing_folder_invite_link():
                 LOGGER.info("Listening to %s manually configured channels.", len(resolved_sources))
             if _is_digest_mode_enabled():
