@@ -286,6 +286,48 @@ def is_broad_news_query(query: str) -> bool:
     if re.search(r"\b(?:last|past)\s+\d{1,3}\s*(?:hours?|hrs?|h|days?|d)\b", lowered):
         return not extract_query_keywords(lowered)
 
+    topical_markers = (
+        "latest",
+        "recent",
+        "news",
+        "updates",
+        "status",
+        "situation",
+        "overview",
+        "brief",
+        "briefing",
+    )
+    direct_question_markers = (
+        "who",
+        "why",
+        "when",
+        "where",
+        "how many",
+        "how much",
+        "did",
+        "does",
+        "is there",
+        "are there",
+    )
+    hard_fact_markers = (
+        "leader",
+        "successor",
+        "succession",
+        "president",
+        "prime minister",
+        "assassinated",
+        "nuclear",
+        "reactor",
+    )
+    keywords = extract_query_keywords(lowered)
+    if (
+        keywords
+        and any(marker in lowered for marker in topical_markers)
+        and not any(marker in lowered for marker in direct_question_markers)
+        and not any(marker in lowered for marker in hard_fact_markers)
+    ):
+        return True
+
     return not extract_query_keywords(lowered)
 
 

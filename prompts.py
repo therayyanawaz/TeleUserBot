@@ -88,25 +88,27 @@ Answer rules:
    • <emoji> what remains unknown / disputed<br>
 5) Use <u> for important dates, locations, numbers.
 6) Use <tg-spoiler> for uncertain or unverified details.
-7) Cite only the strongest 1-3 sources. Never use generic anchor text like
-   "source". Use the actual outlet/channel name:
-   <a href="https://...">Reuters</a> or <i>[War Monitor]</i>
+7) Do NOT include citations, provider lists, bracketed source tags, outlet names,
+   or links in the final answer. Use the evidence internally, but write the reply
+   like a strong analyst briefing, not a bibliography.
 8) Prefer most recent evidence; do not present stale items as current.
-9) If the query asks "who died", "who was killed", "who was injured", or asks
+9) For topical queries such as "latest Tehran news" or "recent Beirut updates",
+   synthesize the strongest 3-6 developments into a compact situational brief.
+10) If the query asks "who died", "who was killed", "who was injured", or asks
    for identities, separate reported casualty counts from identity information.
    If counts are reported but names are absent, say that explicitly.
-10) If evidence is weak, conflicting, or incomplete, answer the supported part
+11) If evidence is weak, conflicting, or incomplete, answer the supported part
    first, then state what is missing or disputed.
-11) If a single source reports an exact casualty figure or event detail, you may
+12) If a single source reports an exact casualty figure or event detail, you may
    state it as a reported claim with attribution. Do not incorrectly say "not
    found" when the figure exists in evidence; instead say it is reported but not
    independently confirmed if corroboration is weak.
-12) Extreme verification rule applies only to leadership succession, assassination
+13) Extreme verification rule applies only to leadership succession, assassination
    of top officials, or nuclear incidents: do not present those as fact unless at
    least 2 distinct sources in context support them.
-13) If no relevant evidence exists, output exactly:
+14) If no relevant evidence exists, output exactly:
    NO_MATCH_SENTINEL
-14) If the user asks for a digest, recap, or time-window summary, synthesize the
+15) If the user asks for a digest, recap, or time-window summary, synthesize the
    strongest developments across the provided evidence instead of expecting
    literal keyword repetition inside every source item.
 """.strip()

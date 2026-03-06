@@ -1494,7 +1494,10 @@ def _fallback_query_answer(
     selected = _rank_query_context(query, context_messages, limit=(8 if detailed else 4))
     selected = selected[: (6 if detailed else 4)]
     lines = []
-    intro_title = "Latest updates"
+    intro_title = "Latest update"
+    normalized_query = normalize_space(query).rstrip("?")
+    if normalized_query and len(normalized_query) <= 72:
+        intro_title = normalized_query[:1].upper() + normalized_query[1:]
     if _query_is_identity_question(query):
         intro_title = "Best available answer"
     for item in selected:
@@ -1503,12 +1506,8 @@ def _fallback_query_answer(
             continue
         if len(text) > 180:
             text = f"{text[:177].rsplit(' ', 1)[0]}..."
-        source = normalize_space(str(item.get("source") or "Source"))
-        link = normalize_space(str(item.get("link") or ""))
         prefix = "🔥" if _severity_from_text_heuristic(text) == "high" else "⚠️"
-        line = f"• {prefix} {text} <i>[{source}]</i>"
-        if link.startswith("http"):
-            line += f' <a href="{link}">{source}</a>'
+        line = f"• {prefix} {text}"
         lines.append(line)
 
     if not lines:

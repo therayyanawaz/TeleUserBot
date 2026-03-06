@@ -4016,6 +4016,19 @@ def _wrap_query_digest_answer(answer: str, *, hours_back: int) -> str:
     return f"{title}<br><br>{answer.strip()}"
 
 
+def _strip_query_answer_citations(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return value
+    value = re.sub(r'\s*<a href="[^"]+">[^<]*</a>', "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s*<i>\[[^<>\]]+\]</i>", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s*\[[^\[\]<>]{2,60}\]", "", value)
+    value = re.sub(r"\bRead more\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"(?:<br>\s*){3,}", "<br><br>", value, flags=re.IGNORECASE)
+    value = re.sub(r"[ \t]{2,}", " ", value)
+    return sanitize_telegram_html(value.strip())
+
+
 def _merge_query_context(
     telegram_rows: Sequence[Dict[str, object]],
     web_rows: Sequence[Dict[str, object]],
@@ -4334,6 +4347,7 @@ async def _stream_query_answer(
         )
     if not answer.strip():
         answer = "No matching information found in recent updates."
+    answer = _strip_query_answer_citations(answer)
     if final_suffix_html.strip() and "no relevant information found" not in strip_telegram_html(answer).lower():
         answer = f"{answer.strip()}<br><br>{final_suffix_html.strip()}"
 
@@ -4501,11 +4515,6 @@ async def _handle_query_request(
 
         history = list(_query_history_for_sender(sender_id))
         evidence_split_section = ""
-        if not broad_query:
-            evidence_split_section = _format_evidence_split_section(
-                telegram_results,
-                web_results if ran_web_search else [],
-            )
 
         if _is_streaming_enabled():
             answer, stream_stats = await _stream_query_answer(
@@ -4538,6 +4547,7 @@ async def _handle_query_request(
                 )
             if not answer.strip():
                 answer = "No matching information found in recent updates."
+            answer = _strip_query_answer_citations(answer)
             if (
                 evidence_split_section
                 and "no relevant information found" not in strip_telegram_html(answer).lower()
