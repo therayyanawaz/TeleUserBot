@@ -63,6 +63,7 @@ from db import (
     mark_seen_many,
     prune_archive_older_than,
     restore_digest_batch,
+    save_to_digest_archive,
     save_to_digest_queue,
     set_last_digest_timestamp,
 )
@@ -1809,6 +1810,24 @@ def _queue_for_digest(
     )
 
 
+def _archive_for_query_search(
+    channel_id: str,
+    message_id: int,
+    raw_text: str,
+    *,
+    source_name: str | None = None,
+    message_link: str | None = None,
+) -> None:
+    save_to_digest_archive(
+        channel_id=channel_id,
+        message_id=message_id,
+        raw_text=raw_text,
+        timestamp=int(time.time()),
+        source_name=source_name,
+        message_link=message_link,
+    )
+
+
 def _severity_emoji(level: str) -> str:
     normalized = (level or "").strip().lower()
     if normalized == "high":
@@ -2792,6 +2811,13 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
                 primary_source=source,
             )
         await _register_breaking_topic_thread(topic_seed=topic_seed, sent_ref=sent_ref)
+        _archive_for_query_search(
+            channel_id,
+            msg.id,
+            text,
+            source_name=source,
+            message_link=link,
+        )
         mark_seen(channel_id, msg.id)
         log_structured(
             LOGGER,
@@ -2892,6 +2918,13 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
         reply_to = await _resolve_breaking_topic_reply(topic_seed)
         sent_ref = await _send_album(messages, payload, reply_to=reply_to)
         await _register_breaking_topic_thread(topic_seed=topic_seed, sent_ref=sent_ref)
+        _archive_for_query_search(
+            channel_id,
+            messages[0].id,
+            combined_caption,
+            source_name=source,
+            message_link=link,
+        )
         mark_seen_many(channel_id, message_ids)
         log_structured(
             LOGGER,

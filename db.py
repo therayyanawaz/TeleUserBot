@@ -277,6 +277,43 @@ def save_to_digest_queue(
         )
 
 
+def save_to_digest_archive(
+    channel_id: str,
+    message_id: int,
+    raw_text: str,
+    *,
+    timestamp: int | None = None,
+    source_name: str | None = None,
+    message_link: str | None = None,
+) -> None:
+    cleaned = (raw_text or "").strip()
+    if not cleaned:
+        return
+
+    ts = int(timestamp if timestamp is not None else time.time())
+    with _transaction() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO digest_archive (
+                channel_id,
+                message_id,
+                source_name,
+                raw_text,
+                message_link,
+                timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                channel_id,
+                int(message_id),
+                (source_name or "").strip() or None,
+                cleaned,
+                (message_link or "").strip() or None,
+                ts,
+            ),
+        )
+
+
 def claim_digest_batch(limit: int, *, batch_id: str | None = None) -> Tuple[str, List[Dict[str, object]]]:
     if limit <= 0:
         return "", []
