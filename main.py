@@ -221,6 +221,7 @@ query_conversation_history: Dict[int, Deque[Dict[str, str]]] = defaultdict(
     lambda: deque(maxlen=20)
 )
 query_bot_updates_offset: int = 0
+query_bot_poll_started_at: int = 0
 breaking_delivery_refs: Dict[str, Dict[str, object]] = {}
 breaking_topic_threads: List[Dict[str, object]] = []
 breaking_topic_lock = asyncio.Lock()
@@ -1427,10 +1428,42 @@ async def _ensure_query_bot_polling_mode() -> bool:
     )
     await _query_bot_api_request(
         "deleteWebhook",
-        data={"drop_pending_updates": "false"},
+        data={"drop_pending_updates": "true"},
     )
     await asyncio.sleep(0.5)
     return True
+
+
+async def _prime_query_bot_update_offset() -> None:
+    """
+    Drop stale pending query updates from previous runs and move polling to the tail.
+    """
+    global query_bot_updates_offset
+
+    try:
+        updates = await _query_bot_api_request(
+            "getUpdates",
+            data={
+                "timeout": "0",
+                "limit": "1",
+                "offset": "-1",
+            },
+        )
+    except Exception:
+        LOGGER.debug("Failed priming bot query update offset.", exc_info=True)
+        return
+
+    if not isinstance(updates, list):
+        return
+
+    max_seen = query_bot_updates_offset
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+        update_id = int(update.get("update_id", 0) or 0)
+        if update_id > 0:
+            max_seen = max(max_seen, update_id + 1)
+    query_bot_updates_offset = max(query_bot_updates_offset, max_seen)
 
 
 async def _resolve_query_bot_reply_target(
@@ -4578,7 +4611,7 @@ async def run_query_bot_poll_loop() -> None:
     This is the reliable path for bot-PM queries because it gives the exact
     incoming bot-side message_id, so replies can thread properly.
     """
-    global query_bot_updates_offset
+    global query_bot_updates_offset, query_bot_poll_started_at
 
     token = _bot_destination_token_from_config()
     if not _looks_like_bot_token(token):
@@ -4591,8 +4624,11 @@ async def run_query_bot_poll_loop() -> None:
     if await _resolve_query_bot_user_id() is None:
         return
 
+    query_bot_poll_started_at = int(time.time())
+
     try:
         await _ensure_query_bot_polling_mode()
+        await _prime_query_bot_update_offset()
     except Exception:
         LOGGER.exception("Failed preparing bot query polling mode.")
         await asyncio.sleep(2.0)
@@ -4621,6 +4657,14 @@ async def run_query_bot_poll_loop() -> None:
 
                 payload = update.get("message") or update.get("edited_message")
                 if not isinstance(payload, dict):
+                    continue
+
+                payload_date = int(payload.get("date", 0) or 0)
+                if (
+                    query_bot_poll_started_at > 0
+                    and payload_date > 0
+                    and payload_date < (query_bot_poll_started_at - 5)
+                ):
                     continue
 
                 chat = payload.get("chat")
