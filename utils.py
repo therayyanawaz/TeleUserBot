@@ -1176,6 +1176,50 @@ def _domain_allowed(hostname: str, allowed_domains: Sequence[str]) -> bool:
     return any(host == domain or host.endswith(f".{domain}") for domain in normalized)
 
 
+def _source_name_candidates(source_name: str) -> list[str]:
+    """
+    Convert feed source labels like "DW.com" or "Reuters" into domain-like
+    candidates so allowlist checks still work when RSS item links use wrapper
+    hosts such as news.google.com or bing.com.
+    """
+    raw = normalize_space(source_name).lower()
+    if not raw:
+        return []
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _push(value: str) -> None:
+        cleaned = normalize_space(value).lower().strip(".")
+        if not cleaned or cleaned in seen:
+            return
+        seen.add(cleaned)
+        candidates.append(cleaned)
+
+    base = re.sub(r"[^a-z0-9. -]+", "", raw)
+    _push(base)
+    compact = base.replace(" ", "")
+    _push(compact)
+    hyphenated = base.replace(" ", "-")
+    _push(hyphenated)
+
+    if "." not in compact and compact:
+        for suffix in (".com", ".org", ".net", ".co.uk"):
+            _push(f"{compact}{suffix}")
+
+    return candidates
+
+
+def _source_allowed(source_name: str, allowed_domains: Sequence[str]) -> bool:
+    normalized = [normalize_space(item).lower().lstrip(".") for item in allowed_domains if item]
+    if not normalized:
+        return True
+    for candidate in _source_name_candidates(source_name):
+        if any(candidate == domain or candidate.endswith(f".{domain}") for domain in normalized):
+            return True
+    return False
+
+
 def _parse_pub_datetime(value: str) -> datetime | None:
     raw = normalize_space(value)
     if not raw:
@@ -1281,6 +1325,8 @@ async def search_recent_news_web(
                         link = normalize_space(str(item.findtext("link") or ""))
                         description = _strip_html_tags(str(item.findtext("description") or ""))
                         pub_raw = normalize_space(str(item.findtext("pubDate") or ""))
+                        source_tag = item.find("source")
+                        source_name = normalize_space(source_tag.text if source_tag is not None else "")
 
                         if not title or not link:
                             continue
@@ -1288,7 +1334,9 @@ async def search_recent_news_web(
                             continue
 
                         host = normalize_space(str(urlparse(link).hostname or "")).lower()
-                        if not _domain_allowed(host, trusted_domains):
+                        host_allowed = _domain_allowed(host, trusted_domains)
+                        source_allowed = _source_allowed(source_name, trusted_domains)
+                        if not host_allowed and not source_allowed:
                             continue
 
                         pub_dt = _parse_pub_datetime(pub_raw)
@@ -1300,8 +1348,6 @@ async def search_recent_news_web(
                         if pub_dt is None:
                             pub_dt = now
 
-                        source_tag = item.find("source")
-                        source_name = normalize_space(source_tag.text if source_tag is not None else "")
                         if not source_name:
                             source_name = host or "web"
 
