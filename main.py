@@ -73,6 +73,8 @@ from severity_classifier import classify_message_severity
 from utils import (
     apply_premium_emoji_html,
     build_alert_header,
+    build_media_signature_digest,
+    check_and_store_media_duplicate,
     LiveTelegramStreamer,
     DuplicateRuntime,
     GlobalDuplicateResult,
@@ -1839,6 +1841,14 @@ def _message_mime_type(msg: Message) -> str:
     return ""
 
 
+def _media_dupe_history_hours() -> int:
+    try:
+        value = int(getattr(config, "DUPE_HISTORY_HOURS", 4))
+    except Exception:
+        value = 4
+    return max(1, min(value, 24))
+
+
 def _message_is_image_ocr_candidate(msg: Message) -> bool:
     if not getattr(msg, "media", None):
         return False
@@ -1855,6 +1865,147 @@ def _message_is_video_ocr_candidate(msg: Message) -> bool:
         return True
     mime_type = _message_mime_type(msg)
     return mime_type.startswith("video/")
+
+
+def _message_media_kind(msg: Message) -> str:
+    if msg.photo or _message_is_image_ocr_candidate(msg):
+        return "image"
+    if msg.video or _message_is_video_ocr_candidate(msg):
+        return "video"
+    if getattr(msg, "document", None):
+        return "document"
+    return "media"
+
+
+async def _download_media_signature_bytes(msg: Message) -> bytes:
+    for thumb in (0, 1, -1):
+        try:
+            blob = await msg.download_media(file=bytes, thumb=thumb)
+        except TypeError:
+            break
+        except Exception:
+            continue
+        if isinstance(blob, (bytes, bytearray)) and len(blob) >= 64:
+            return bytes(blob)
+
+    try:
+        size = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
+    except Exception:
+        size = 0
+    if size and size > (2 * 1024 * 1024):
+        return b""
+    try:
+        blob = await msg.download_media(file=bytes)
+    except Exception:
+        return b""
+    if isinstance(blob, (bytes, bytearray)):
+        return bytes(blob)
+    return b""
+
+
+async def _message_media_signature(msg: Message) -> tuple[str, str]:
+    if not getattr(msg, "media", None):
+        return "", ""
+
+    parts: list[str] = [_message_media_kind(msg)]
+    file_obj = getattr(msg, "file", None)
+    for attr in ("id", "size", "mime_type", "name"):
+        value = getattr(file_obj, attr, None)
+        if value:
+            parts.append(f"{attr}:{value}")
+
+    photo = getattr(msg, "photo", None)
+    if photo is not None:
+        for attr in ("id", "access_hash"):
+            value = getattr(photo, attr, None)
+            if value:
+                parts.append(f"photo_{attr}:{value}")
+
+    document = getattr(msg, "document", None)
+    if document is not None:
+        for attr in ("id", "access_hash", "mime_type", "size"):
+            value = getattr(document, attr, None)
+            if value:
+                parts.append(f"doc_{attr}:{value}")
+
+    thumb_blob = await _download_media_signature_bytes(msg)
+    if thumb_blob:
+        parts.append(f"thumb_sha1:{hashlib.sha1(thumb_blob).hexdigest()}")
+
+    return build_media_signature_digest(parts), _message_media_kind(msg)
+
+
+async def _check_single_media_duplicate(msg: Message) -> bool:
+    media_hash, media_kind = await _message_media_signature(msg)
+    if not media_hash:
+        return False
+    raw_text = normalize_space(str(getattr(msg, "message", "") or ""))
+    result = await asyncio.to_thread(
+        check_and_store_media_duplicate,
+        channel_id=str(msg.chat_id),
+        message_id=int(msg.id or 0),
+        media_hash=media_hash,
+        raw_text=raw_text,
+        media_kind=media_kind,
+        timestamp=int(time.time()),
+        history_hours=_media_dupe_history_hours(),
+    )
+    if not result.duplicate:
+        return False
+    log_structured(
+        LOGGER,
+        "media_duplicate_suppressed",
+        channel_id=str(msg.chat_id),
+        message_id=int(msg.id or 0),
+        media_kind=media_kind,
+        media_hash=media_hash,
+        score=round(float(result.match_score), 4),
+        matched_channel_id=result.matched_channel_id,
+        matched_message_id=result.matched_message_id,
+    )
+    return True
+
+
+async def _check_album_media_duplicate(messages: List[Message]) -> bool:
+    if not messages:
+        return False
+    signatures: list[str] = []
+    for msg in messages:
+        media_hash, _media_kind = await _message_media_signature(msg)
+        if media_hash:
+            signatures.append(media_hash)
+    album_hash = build_media_signature_digest(signatures)
+    if not album_hash:
+        return False
+    raw_text = normalize_space(
+        " ".join(str(getattr(msg, "message", "") or "") for msg in messages)
+    )
+    first = messages[0]
+    result = await asyncio.to_thread(
+        check_and_store_media_duplicate,
+        channel_id=str(first.chat_id),
+        message_id=int(first.id or 0),
+        media_hash=album_hash,
+        raw_text=raw_text,
+        media_kind="album",
+        timestamp=int(time.time()),
+        history_hours=_media_dupe_history_hours(),
+    )
+    if not result.duplicate:
+        return False
+    log_structured(
+        LOGGER,
+        "album_media_duplicate_suppressed",
+        channel_id=str(first.chat_id),
+        message_id=int(first.id or 0),
+        media_kind="album",
+        media_hash=album_hash,
+        score=round(float(result.match_score), 4),
+        matched_channel_id=result.matched_channel_id,
+        matched_message_id=result.matched_message_id,
+        album_size=len(messages),
+    )
+    return True
 
 
 def _normalize_media_ocr_text(text: str) -> str:
@@ -3533,6 +3684,9 @@ async def _flush_album_after_wait(key: Tuple[str, int]) -> None:
         items = album_buffers.pop(key, [])
         album_tasks.pop(key, None)
         if items:
+            if await _check_album_media_duplicate(items):
+                mark_seen_many(str(items[0].chat_id), [int(m.id or 0) for m in items])
+                return
             if _is_digest_mode_enabled():
                 await _queue_album_for_digest(items)
             else:
@@ -5046,6 +5200,11 @@ async def _on_new_message(event: events.NewMessage.Event) -> None:
     try:
         if is_seen(channel_id, msg.id):
             return
+
+        if msg.media and not msg.grouped_id:
+            if await _check_single_media_duplicate(msg):
+                mark_seen(channel_id, msg.id)
+                return
 
         if _is_dupe_detection_enabled():
             dupe_result = await is_duplicate_and_handle(event)

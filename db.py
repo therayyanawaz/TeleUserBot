@@ -153,6 +153,21 @@ def init_db() -> None:
         )
 
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recent_media_signatures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                media_hash TEXT NOT NULL,
+                normalized_text TEXT,
+                media_kind TEXT,
+                timestamp INTEGER NOT NULL,
+                UNIQUE(channel_id, message_id, media_hash)
+            )
+            """
+        )
+
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_digest_queue_pending "
             "ON digest_queue(processed, timestamp, id)"
         )
@@ -175,6 +190,14 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_recent_breaking_hash "
             "ON recent_breaking(hash)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recent_media_signatures_hash "
+            "ON recent_media_signatures(media_hash, timestamp)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recent_media_signatures_timestamp "
+            "ON recent_media_signatures(timestamp)"
         )
 
 
@@ -710,6 +733,103 @@ def load_recent_breaking(*, since_ts: int, limit: int = 10000) -> List[Dict[str,
                 "embedding_blob": bytes(row["embedding_blob"] or b""),
                 "timestamp": int(row["timestamp"]),
                 "hash": str(row["hash"] or ""),
+            }
+        )
+    return out
+
+
+def save_recent_media_signature(
+    *,
+    channel_id: str,
+    message_id: int,
+    media_hash: str,
+    normalized_text: str,
+    media_kind: str,
+    timestamp: int | None = None,
+    history_hours: int = 4,
+) -> int:
+    cleaned_hash = str(media_hash or "").strip()
+    if not cleaned_hash:
+        return 0
+
+    cleaned_text = re.sub(r"\s+", " ", (normalized_text or "").strip())
+    ts = int(timestamp if timestamp is not None else time.time())
+    hours = max(1, min(int(history_hours), 24))
+    cutoff = ts - (hours * 3600)
+
+    with _transaction() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO recent_media_signatures (
+                channel_id,
+                message_id,
+                media_hash,
+                normalized_text,
+                media_kind,
+                timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(channel_id),
+                int(message_id),
+                cleaned_hash,
+                cleaned_text,
+                str(media_kind or ""),
+                ts,
+            ),
+        )
+        pruned = conn.execute(
+            "DELETE FROM recent_media_signatures WHERE timestamp < ?",
+            (cutoff,),
+        )
+    return int(pruned.rowcount or 0)
+
+
+def purge_recent_media_signatures(*, history_hours: int = 4) -> int:
+    now = int(time.time())
+    hours = max(1, min(int(history_hours), 24))
+    cutoff = now - (hours * 3600)
+    with _transaction() as conn:
+        cur = conn.execute(
+            "DELETE FROM recent_media_signatures WHERE timestamp < ?",
+            (cutoff,),
+        )
+    return int(cur.rowcount or 0)
+
+
+def load_recent_media_signatures(
+    *,
+    media_hash: str,
+    since_ts: int,
+    limit: int = 50,
+) -> List[Dict[str, object]]:
+    cleaned_hash = str(media_hash or "").strip()
+    if not cleaned_hash:
+        return []
+    resolved_limit = max(1, min(int(limit), 1000))
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, channel_id, message_id, media_hash, normalized_text, media_kind, timestamp
+            FROM recent_media_signatures
+            WHERE media_hash = ? AND timestamp >= ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """,
+            (cleaned_hash, int(since_ts), resolved_limit),
+        ).fetchall()
+
+    out: List[Dict[str, object]] = []
+    for row in rows:
+        out.append(
+            {
+                "id": int(row["id"]),
+                "channel_id": str(row["channel_id"]),
+                "message_id": int(row["message_id"]),
+                "media_hash": str(row["media_hash"] or ""),
+                "normalized_text": str(row["normalized_text"] or ""),
+                "media_kind": str(row["media_kind"] or ""),
+                "timestamp": int(row["timestamp"]),
             }
         )
     return out

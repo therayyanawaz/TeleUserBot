@@ -23,7 +23,14 @@ from urllib.parse import quote_plus, urlparse
 import xml.etree.ElementTree as ET
 
 import httpx
-from db import load_recent_breaking, purge_recent_breaking, save_recent_breaking
+from db import (
+    load_recent_breaking,
+    load_recent_media_signatures,
+    purge_recent_breaking,
+    purge_recent_media_signatures,
+    save_recent_breaking,
+    save_recent_media_signature,
+)
 
 
 def estimate_tokens_rough(text: str) -> int:
@@ -36,6 +43,46 @@ def estimate_tokens_rough(text: str) -> int:
 
 def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def build_media_signature_digest(parts: Sequence[str]) -> str:
+    cleaned = sorted({normalize_space(part) for part in parts if normalize_space(part)})
+    if not cleaned:
+        return ""
+    payload = "\n".join(cleaned).encode("utf-8", errors="ignore")
+    return hashlib.sha1(payload).hexdigest()
+
+
+def media_duplicate_match_score(left: str, right: str) -> float:
+    left_norm, _ = build_dupe_fingerprint(left)
+    right_norm, _ = build_dupe_fingerprint(right)
+    if not left_norm or not right_norm:
+        return 1.0 if left_norm == right_norm else 0.0
+
+    left_tokens = tuple(_tokenize_for_dupe(left_norm))
+    right_tokens = tuple(_tokenize_for_dupe(right_norm))
+    tfidf = _tfidf_cosine(left_tokens, right_tokens)
+    fuzzy = 0.0
+    try:
+        from difflib import SequenceMatcher
+
+        fuzzy = SequenceMatcher(None, left_norm, right_norm).ratio()
+    except Exception:
+        fuzzy = 0.0
+    overlap = _set_jaccard(left_tokens, right_tokens)
+    left_anchors = _anchor_tokens(left_tokens)
+    right_anchors = _anchor_tokens(right_tokens)
+    anchor_overlap = _set_dice(left_anchors, right_anchors)
+    shared_tokens = set(left_tokens) & set(right_tokens)
+    strong_shared = {
+        token for token in shared_tokens if token.isdigit() or len(token) >= 5 or token in _BREAKING_HINTS
+    }
+    score = (0.35 * tfidf) + (0.20 * fuzzy) + (0.20 * overlap) + (0.25 * anchor_overlap)
+    if len(strong_shared) >= 3:
+        score = max(score, 0.34)
+    if anchor_overlap >= 0.5 and overlap >= 0.18:
+        score = max(score, 0.36)
+    return max(0.0, min(1.0, score))
 
 
 _ALERT_LABEL_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -2143,6 +2190,17 @@ class GlobalDuplicateResult:
 
 
 @dataclass
+class MediaDuplicateResult:
+    duplicate: bool
+    media_hash: str
+    media_kind: str
+    match_score: float = 0.0
+    matched_channel_id: str | None = None
+    matched_message_id: int | None = None
+    matched_timestamp: int = 0
+
+
+@dataclass
 class _HybridRecord:
     channel_id: str
     message_id: int
@@ -2601,6 +2659,78 @@ _DUPLICATE_RUNTIME: DuplicateRuntime | None = None
 def configure_duplicate_runtime(runtime: DuplicateRuntime | None) -> None:
     global _DUPLICATE_RUNTIME
     _DUPLICATE_RUNTIME = runtime
+
+
+def check_and_store_media_duplicate(
+    *,
+    channel_id: str,
+    message_id: int,
+    media_hash: str,
+    raw_text: str,
+    media_kind: str,
+    timestamp: int | None = None,
+    history_hours: int = 4,
+) -> MediaDuplicateResult:
+    cleaned_hash = normalize_space(media_hash)
+    if not cleaned_hash:
+        return MediaDuplicateResult(duplicate=False, media_hash="", media_kind=str(media_kind or ""))
+
+    now_ts = int(timestamp if timestamp is not None else time.time())
+    since_ts = now_ts - (max(1, min(int(history_hours), 24)) * 3600)
+    normalized_text, _ = build_dupe_fingerprint(raw_text)
+
+    rows = load_recent_media_signatures(
+        media_hash=cleaned_hash,
+        since_ts=since_ts,
+        limit=25,
+    )
+    best_row: dict[str, object] | None = None
+    best_score = 0.0
+
+    for row in rows:
+        if str(row.get("channel_id") or "") == str(channel_id) and int(row.get("message_id") or 0) == int(message_id):
+            continue
+        existing_text = str(row.get("normalized_text") or "")
+        if not normalized_text or not existing_text:
+            best_row = row
+            best_score = 1.0
+            break
+        score = media_duplicate_match_score(normalized_text, existing_text)
+        recent_delta = now_ts - int(row.get("timestamp") or now_ts)
+        if recent_delta <= 1800:
+            score = max(score, 0.35)
+        if score > best_score:
+            best_score = score
+            best_row = row
+
+    duplicate = best_row is not None and best_score >= 0.32
+    if not duplicate:
+        save_recent_media_signature(
+            channel_id=str(channel_id),
+            message_id=int(message_id),
+            media_hash=cleaned_hash,
+            normalized_text=normalized_text,
+            media_kind=str(media_kind or ""),
+            timestamp=now_ts,
+            history_hours=history_hours,
+        )
+        return MediaDuplicateResult(
+            duplicate=False,
+            media_hash=cleaned_hash,
+            media_kind=str(media_kind or ""),
+            match_score=float(best_score),
+        )
+
+    purge_recent_media_signatures(history_hours=history_hours)
+    return MediaDuplicateResult(
+        duplicate=True,
+        media_hash=cleaned_hash,
+        media_kind=str(media_kind or ""),
+        match_score=float(best_score),
+        matched_channel_id=str(best_row.get("channel_id") or ""),
+        matched_message_id=int(best_row.get("message_id") or 0),
+        matched_timestamp=int(best_row.get("timestamp") or 0),
+    )
 
 
 async def is_duplicate_and_handle(event: Any) -> GlobalDuplicateResult:
