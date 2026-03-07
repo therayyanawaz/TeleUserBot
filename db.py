@@ -168,6 +168,18 @@ def init_db() -> None:
         )
 
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS source_delivery_refs (
+                channel_id TEXT NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                destination_message_id INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL,
+                PRIMARY KEY (channel_id, source_message_id)
+            )
+            """
+        )
+
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_digest_queue_pending "
             "ON digest_queue(processed, timestamp, id)"
         )
@@ -198,6 +210,10 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_recent_media_signatures_timestamp "
             "ON recent_media_signatures(timestamp)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source_delivery_refs_timestamp "
+            "ON source_delivery_refs(timestamp)"
         )
 
 
@@ -833,3 +849,62 @@ def load_recent_media_signatures(
             }
         )
     return out
+
+
+def save_source_delivery_ref(
+    *,
+    channel_id: str,
+    source_message_id: int,
+    destination_message_id: int,
+    timestamp: int | None = None,
+) -> None:
+    ts = int(timestamp if timestamp is not None else time.time())
+    with _transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO source_delivery_refs (
+                channel_id,
+                source_message_id,
+                destination_message_id,
+                timestamp
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(channel_id, source_message_id) DO UPDATE SET
+                destination_message_id = excluded.destination_message_id,
+                timestamp = excluded.timestamp
+            """,
+            (
+                str(channel_id),
+                int(source_message_id),
+                int(destination_message_id),
+                ts,
+            ),
+        )
+
+
+def load_source_delivery_ref(*, channel_id: str, source_message_id: int) -> int | None:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT destination_message_id
+            FROM source_delivery_refs
+            WHERE channel_id = ? AND source_message_id = ?
+            LIMIT 1
+            """,
+            (str(channel_id), int(source_message_id)),
+        ).fetchone()
+    if row is None:
+        return None
+    value = int(row["destination_message_id"] or 0)
+    return value or None
+
+
+def purge_source_delivery_refs(*, history_hours: int = 168) -> int:
+    now = int(time.time())
+    hours = max(1, min(int(history_hours), 24 * 60))
+    cutoff = now - (hours * 3600)
+    with _transaction() as conn:
+        cur = conn.execute(
+            "DELETE FROM source_delivery_refs WHERE timestamp < ?",
+            (cutoff,),
+        )
+    return int(cur.rowcount or 0)

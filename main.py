@@ -58,12 +58,15 @@ from db import (
     get_last_digest_timestamp,
     init_db,
     is_seen,
+    load_source_delivery_ref,
     load_archive_since,
     load_queue_since,
     mark_seen,
     mark_seen_many,
     prune_archive_older_than,
+    purge_source_delivery_refs,
     restore_digest_batch,
+    save_source_delivery_ref,
     save_to_digest_archive,
     save_to_digest_queue,
     set_last_digest_timestamp,
@@ -2156,6 +2159,107 @@ def _reply_to_message_id(msg: Message) -> int:
     return value if value > 0 else 0
 
 
+def _source_reply_map_history_hours() -> int:
+    return 24 * 7
+
+
+def _message_text_content(msg: Message | None) -> str:
+    if msg is None:
+        return ""
+    return normalize_space((getattr(msg, "message", None) or "").strip())
+
+
+async def _load_reply_message(msg: Message) -> Message | None:
+    if not _reply_to_message_id(msg):
+        return None
+    try:
+        reply = await msg.get_reply_message()
+    except Exception:
+        LOGGER.debug("Failed to load replied source message.", exc_info=True)
+        return None
+    return reply if isinstance(reply, Message) else None
+
+
+def _truncate_context_line(text: str, limit: int = 240) -> str:
+    cleaned = normalize_space(text)
+    if len(cleaned) <= limit:
+        return cleaned
+    truncated = cleaned[: limit - 3].rsplit(" ", 1)[0].rstrip()
+    return f"{truncated}..."
+
+
+def _format_followup_media_caption(source_title: str, context_line: str) -> str | None:
+    cleaned = _truncate_context_line(context_line, limit=260)
+    if not cleaned:
+        return None
+    source_html = sanitize_telegram_html((source_title or "").strip() or "Source")
+    context_html = sanitize_telegram_html(cleaned)
+    return f"<b>{source_html}</b><br><br><i>Follow-up visuals:</i> {context_html}"
+
+
+async def _build_reply_context_caption(
+    source_title: str,
+    reply_message: Message | None,
+) -> tuple[str | None, str | None]:
+    reply_text = _message_text_content(reply_message)
+    if not reply_text:
+        return None, None
+
+    headline = ""
+    try:
+        headline = await summarize_breaking_headline(reply_text, _require_auth_manager())
+    except Exception:
+        LOGGER.debug("Reply-context headline generation failed.", exc_info=True)
+        headline = ""
+
+    context_line = normalize_space(headline or reply_text)
+    if not context_line:
+        return None, None
+    return _format_followup_media_caption(source_title, context_line), reply_text
+
+
+async def _resolve_source_reply_target(
+    msg: Message,
+    *,
+    fallback_topic_seed: str | None = None,
+) -> int | None:
+    reply_message = await _load_reply_message(msg)
+    if reply_message is not None:
+        mapped = load_source_delivery_ref(
+            channel_id=str(reply_message.chat_id),
+            source_message_id=int(reply_message.id or 0),
+        )
+        if mapped:
+            return mapped
+
+        reply_text = _message_text_content(reply_message)
+        if reply_text and not fallback_topic_seed:
+            fallback_topic_seed = reply_text
+
+    if fallback_topic_seed:
+        return await _resolve_breaking_topic_reply(fallback_topic_seed)
+    return None
+
+
+def _register_source_delivery_refs(
+    *,
+    channel_id: str,
+    source_message_ids: Sequence[int],
+    sent_ref: object | None,
+) -> None:
+    destination_message_id = _message_ref_id(sent_ref)
+    if not destination_message_id:
+        return
+    with contextlib.suppress(Exception):
+        purge_source_delivery_refs(history_hours=_source_reply_map_history_hours())
+    for source_message_id in {int(item) for item in source_message_ids if int(item or 0) > 0}:
+        save_source_delivery_ref(
+            channel_id=channel_id,
+            source_message_id=source_message_id,
+            destination_message_id=destination_message_id,
+        )
+
+
 def _classify_severity_with_breakdown(
     *,
     text: str,
@@ -2706,6 +2810,11 @@ def _is_session_db_locked_error(exc: BaseException) -> bool:
     return isinstance(exc, sqlite3.OperationalError) and "database is locked" in str(exc).lower()
 
 
+def _is_reply_target_missing_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "message to be replied not found" in text and "reply" in text
+
+
 async def _send_text_with_ref(text: str, reply_to: int | None = None) -> object:
     if _destination_uses_bot_api():
         payload_text = (
@@ -2724,7 +2833,12 @@ async def _send_text_with_ref(text: str, reply_to: int | None = None) -> object:
         try:
             result = await _bot_api_request("sendMessage", data=data)
             return result
-        except Exception:
+        except Exception as exc:
+            if reply_to and _is_reply_target_missing_error(exc):
+                LOGGER.debug("Reply target missing for sendMessage; retrying without reply_to.")
+                retry_data = dict(data)
+                retry_data.pop("reply_to_message_id", None)
+                return await _bot_api_request("sendMessage", data=retry_data)
             # If HTML parse fails, strip tags and retry as plain text.
             data.pop("parse_mode", None)
             fallback_text = (
@@ -2848,7 +2962,12 @@ async def _send_single_media(
         }
         try:
             return await _bot_api_request(method_map[media_type], data=data, files=files)
-        except Exception:
+        except Exception as exc:
+            if reply_to and _is_reply_target_missing_error(exc):
+                LOGGER.debug("Reply target missing for media send; retrying without reply_to.")
+                retry_data = dict(data)
+                retry_data.pop("reply_to_message_id", None)
+                return await _bot_api_request(method_map[media_type], data=retry_data, files=files)
             data.pop("parse_mode", None)
             if safe_caption:
                 fallback_caption = (
@@ -2945,7 +3064,12 @@ async def _send_album(
             data["reply_to_message_id"] = str(reply_to)
         try:
             return await _bot_api_request("sendMediaGroup", data=data, files=files)
-        except Exception:
+        except Exception as exc:
+            if reply_to and _is_reply_target_missing_error(exc):
+                LOGGER.debug("Reply target missing for media group send; retrying without reply_to.")
+                retry_data = dict(data)
+                retry_data.pop("reply_to_message_id", None)
+                return await _bot_api_request("sendMediaGroup", data=retry_data, files=files)
             if safe_caption and media_entries:
                 fallback_caption = (
                     strip_telegram_html(safe_caption)
@@ -3006,11 +3130,30 @@ async def _process_single_message(msg: Message) -> None:
         return
 
     text = (msg.message or "").strip()
-    source = await _source_title(msg)
+    source, link = await _source_info(msg)
 
     if msg.media and not text:
+        reply_message = await _load_reply_message(msg)
+        reply_to = await _resolve_source_reply_target(msg)
         media_caption = await _caption_for_media_without_text(msg)
-        await _send_single_media(msg, media_caption)
+        reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
+        if not media_caption:
+            media_caption = reply_caption
+        sent_ref = await _send_single_media(msg, media_caption, reply_to=reply_to)
+        _register_source_delivery_refs(
+            channel_id=channel_id,
+            source_message_ids=[msg.id],
+            sent_ref=sent_ref,
+        )
+        archive_text = strip_telegram_html(media_caption) if media_caption else reply_context_text
+        if archive_text:
+            _archive_for_query_search(
+                channel_id,
+                msg.id,
+                archive_text,
+                source_name=source,
+                message_link=link,
+            )
         mark_seen(channel_id, msg.id)
         return
 
@@ -3019,7 +3162,17 @@ async def _process_single_message(msg: Message) -> None:
         if summary is None:
             mark_seen(channel_id, msg.id)
             return
-        await _send_single_media(msg, _format_summary_text(source, summary))
+        reply_to = await _resolve_source_reply_target(msg)
+        sent_ref = await _send_single_media(
+            msg,
+            _format_summary_text(source, summary),
+            reply_to=reply_to,
+        )
+        _register_source_delivery_refs(
+            channel_id=channel_id,
+            source_message_ids=[msg.id],
+            sent_ref=sent_ref,
+        )
         mark_seen(channel_id, msg.id)
         return
 
@@ -3032,7 +3185,13 @@ async def _process_single_message(msg: Message) -> None:
         mark_seen(channel_id, msg.id)
         return
 
-    await _send_text(_format_summary_text(source, summary))
+    reply_to = await _resolve_source_reply_target(msg)
+    sent_ref = await _send_text_with_ref(_format_summary_text(source, summary), reply_to=reply_to)
+    _register_source_delivery_refs(
+        channel_id=channel_id,
+        source_message_ids=[msg.id],
+        sent_ref=sent_ref,
+    )
     mark_seen(channel_id, msg.id)
 
 
@@ -3047,13 +3206,32 @@ async def _process_album(messages: List[Message]) -> None:
     if all(is_seen(channel_id, m_id) for m_id in message_ids):
         return
 
-    source = await _source_title(messages[0])
+    source, link = await _source_info(messages[0])
     captions = [(m.message or "").strip() for m in messages if (m.message or "").strip()]
     combined_caption = "\n".join(captions).strip()
 
     if not combined_caption:
+        reply_message = await _load_reply_message(messages[0])
+        reply_to = await _resolve_source_reply_target(messages[0])
         media_caption = await _caption_for_album_without_text(messages)
-        await _send_album(messages, media_caption)
+        reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
+        if not media_caption:
+            media_caption = reply_caption
+        sent_ref = await _send_album(messages, media_caption, reply_to=reply_to)
+        _register_source_delivery_refs(
+            channel_id=channel_id,
+            source_message_ids=message_ids,
+            sent_ref=sent_ref,
+        )
+        archive_text = strip_telegram_html(media_caption) if media_caption else reply_context_text
+        if archive_text:
+            _archive_for_query_search(
+                channel_id,
+                messages[0].id,
+                archive_text,
+                source_name=source,
+                message_link=link,
+            )
         mark_seen_many(channel_id, message_ids)
         return
 
@@ -3062,7 +3240,17 @@ async def _process_album(messages: List[Message]) -> None:
         mark_seen_many(channel_id, message_ids)
         return
 
-    await _send_album(messages, _format_summary_text(source, summary))
+    reply_to = await _resolve_source_reply_target(messages[0])
+    sent_ref = await _send_album(
+        messages,
+        _format_summary_text(source, summary),
+        reply_to=reply_to,
+    )
+    _register_source_delivery_refs(
+        channel_id=channel_id,
+        source_message_ids=message_ids,
+        sent_ref=sent_ref,
+    )
     mark_seen_many(channel_id, message_ids)
 
 
@@ -3075,8 +3263,27 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
     source, link = await _source_info(msg)
 
     if msg.media and not text:
+        reply_message = await _load_reply_message(msg)
+        reply_to = await _resolve_source_reply_target(msg)
         media_caption = await _caption_for_media_without_text(msg)
-        await _send_single_media(msg, media_caption)
+        reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
+        if not media_caption:
+            media_caption = reply_caption
+        sent_ref = await _send_single_media(msg, media_caption, reply_to=reply_to)
+        _register_source_delivery_refs(
+            channel_id=channel_id,
+            source_message_ids=[msg.id],
+            sent_ref=sent_ref,
+        )
+        archive_text = strip_telegram_html(media_caption) if media_caption else reply_context_text
+        if archive_text:
+            _archive_for_query_search(
+                channel_id,
+                msg.id,
+                archive_text,
+                source_name=source,
+                message_link=link,
+            )
         mark_seen(channel_id, msg.id)
         return
 
@@ -3118,7 +3325,7 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
             rational_view = await summarize_vital_rational_view(text, _require_auth_manager())
         payload = _format_breaking_text(source, headline, rational_view)
         topic_seed = f"{headline}\n{text}"
-        reply_to = await _resolve_breaking_topic_reply(topic_seed)
+        reply_to = await _resolve_source_reply_target(msg, fallback_topic_seed=topic_seed)
         if msg.media:
             sent_ref = await _send_single_media(msg, payload, reply_to=reply_to)
         else:
@@ -3129,6 +3336,11 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
                 base_text=payload,
                 primary_source=source,
             )
+        _register_source_delivery_refs(
+            channel_id=channel_id,
+            source_message_ids=[msg.id],
+            sent_ref=sent_ref,
+        )
         await _register_breaking_topic_thread(topic_seed=topic_seed, sent_ref=sent_ref)
         _archive_for_query_search(
             channel_id,
@@ -3193,8 +3405,27 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
     combined_caption = "\n".join(captions).strip()
 
     if not combined_caption:
+        reply_message = await _load_reply_message(messages[0])
+        reply_to = await _resolve_source_reply_target(messages[0])
         media_caption = await _caption_for_album_without_text(messages)
-        await _send_album(messages, media_caption)
+        reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
+        if not media_caption:
+            media_caption = reply_caption
+        sent_ref = await _send_album(messages, media_caption, reply_to=reply_to)
+        _register_source_delivery_refs(
+            channel_id=channel_id,
+            source_message_ids=message_ids,
+            sent_ref=sent_ref,
+        )
+        archive_text = strip_telegram_html(media_caption) if media_caption else reply_context_text
+        if archive_text:
+            _archive_for_query_search(
+                channel_id,
+                messages[0].id,
+                archive_text,
+                source_name=source,
+                message_link=link,
+            )
         mark_seen_many(channel_id, message_ids)
         return
 
@@ -3235,8 +3466,13 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
             )
         payload = _format_breaking_text(source, headline, rational_view)
         topic_seed = f"{headline}\n{combined_caption}"
-        reply_to = await _resolve_breaking_topic_reply(topic_seed)
+        reply_to = await _resolve_source_reply_target(messages[0], fallback_topic_seed=topic_seed)
         sent_ref = await _send_album(messages, payload, reply_to=reply_to)
+        _register_source_delivery_refs(
+            channel_id=channel_id,
+            source_message_ids=message_ids,
+            sent_ref=sent_ref,
+        )
         await _register_breaking_topic_thread(topic_seed=topic_seed, sent_ref=sent_ref)
         _archive_for_query_search(
             channel_id,
