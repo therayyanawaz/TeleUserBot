@@ -76,7 +76,7 @@ Optional quality/accuracy dependencies are in `requirements.optional.txt`:
 1. Clone and enter project:
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/therayyanawaz/TeleUserBot.git
 cd TeleUserBot
 ```
 
