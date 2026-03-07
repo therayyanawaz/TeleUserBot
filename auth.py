@@ -55,6 +55,8 @@ ENV_AUTH_ENV_ONLY = "OPENAI_AUTH_ENV_ONLY"
 
 TOKEN_REFRESH_SKEW_SECONDS = 60
 CALLBACK_TIMEOUT_SECONDS = 300
+AUTH_FAILURE_COOLDOWN_SECONDS = 900
+AUTH_TERMINAL_FAILURE_COOLDOWN_SECONDS = 3600
 
 
 class OAuthError(RuntimeError):
@@ -117,6 +119,27 @@ def _normalize_unix_seconds(raw: Any) -> Optional[int]:
     if value <= 0:
         return None
     return value
+
+
+def normalize_oauth_error_message(exc: Exception) -> str:
+    text = str(exc or "").strip()
+    return text or exc.__class__.__name__
+
+
+def _is_terminal_env_auth_error(message: str) -> bool:
+    lowered = str(message or "").strip().lower()
+    if not lowered:
+        return False
+    terminal_markers = (
+        "refresh token is stale",
+        "refresh token has already been used",
+        "refresh_token_reused",
+        "authentication token has been invalidated",
+        "sign in again",
+        "update tg_userbot_auth_json",
+        "update your deployed secrets",
+    )
+    return any(marker in lowered for marker in terminal_markers)
 
 
 def _generate_code_verifier() -> str:
@@ -391,7 +414,38 @@ class AuthManager:
         self._logger = logger or logging.getLogger(__name__)
         self._lock = asyncio.Lock()
         self._runtime_token_data: Optional[Dict[str, Any]] = None
+        self._auth_failure_message: Optional[str] = None
+        self._auth_failure_until: int = 0
         ensure_runtime_dir()
+
+    def _clear_auth_failure(self) -> None:
+        self._auth_failure_message = None
+        self._auth_failure_until = 0
+
+    def _set_auth_failure(
+        self,
+        message: str,
+        *,
+        cooldown_seconds: int,
+        log_level: int = logging.ERROR,
+    ) -> None:
+        now = int(time.time())
+        active_until = now + max(30, int(cooldown_seconds))
+        if self._auth_failure_message == message and self._auth_failure_until >= now:
+            return
+        self._auth_failure_message = message
+        self._auth_failure_until = active_until
+        self._logger.log(
+            log_level,
+            "OpenAI auth unavailable until %s: %s",
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(active_until)),
+            message,
+        )
+
+    def _raise_if_auth_failed(self) -> None:
+        now = int(time.time())
+        if self._auth_failure_message and self._auth_failure_until > now:
+            raise OAuthError(self._auth_failure_message)
 
     def _is_env_only_mode(self) -> bool:
         raw = str(os.getenv(ENV_AUTH_ENV_ONLY, "true") or "").strip().lower()
@@ -407,6 +461,7 @@ class AuthManager:
         Keys: access_token, account_id
         """
         async with self._lock:
+            self._raise_if_auth_failed()
             token_data = self._load_token_data()
             if token_data is None:
                 if self._is_env_only_mode():
@@ -466,6 +521,7 @@ class AuthManager:
     async def refresh_auth_context(self) -> Dict[str, str]:
         """Force refresh using refresh_token; fallback to full OAuth if needed."""
         async with self._lock:
+            self._raise_if_auth_failed()
             token_data = self._load_token_data() or {}
             token_data = await self._refresh_or_reauth(token_data, allow_reauth=False)
             self._save_token_data(token_data)
@@ -490,6 +546,7 @@ class AuthManager:
     async def logout(self) -> Dict[str, bool]:
         async with self._lock:
             self._runtime_token_data = None
+            self._clear_auth_failure()
             removed_file = _delete_token_file(TOKEN_PATH)
             removed_env_cache = _delete_token_file(ENV_TOKEN_CACHE_PATH)
             return {
@@ -645,6 +702,7 @@ class AuthManager:
 
     def _save_token_data(self, token_data: Dict[str, Any]) -> None:
         self._runtime_token_data = dict(token_data)
+        self._clear_auth_failure()
         if self._is_env_only_mode():
             # Persist refreshed env-mode tokens to a runtime shadow cache so the
             # next restart does not replay an already-consumed refresh token.
@@ -688,13 +746,38 @@ class AuthManager:
                 if inferred:
                     refreshed["account_id"] = inferred
             return refreshed
-        except Exception:
-            if allow_reauth:
-                if self._is_env_only_mode():
-                    raise OAuthError(
-                        "OAuth refresh failed in env-only mode. "
-                        "Update TG_USERBOT_AUTH_JSON/B64 and restart."
+        except Exception as exc:
+            message = normalize_oauth_error_message(exc)
+            if self._is_env_only_mode():
+                is_terminal = _is_terminal_env_auth_error(message)
+                if allow_reauth:
+                    env_message = (
+                        message
+                        if is_terminal
+                        else (
+                            "OAuth refresh failed in env-only mode. "
+                            "Update TG_USERBOT_AUTH_JSON/B64 and restart."
+                        )
                     )
+                    self._set_auth_failure(
+                        env_message,
+                        cooldown_seconds=(
+                            AUTH_TERMINAL_FAILURE_COOLDOWN_SECONDS
+                            if is_terminal
+                            else AUTH_FAILURE_COOLDOWN_SECONDS
+                        ),
+                    )
+                    raise OAuthError(env_message) from exc
+                self._set_auth_failure(
+                    message,
+                    cooldown_seconds=(
+                        AUTH_TERMINAL_FAILURE_COOLDOWN_SECONDS
+                        if is_terminal
+                        else AUTH_FAILURE_COOLDOWN_SECONDS
+                    ),
+                )
+                raise OAuthError(message) from exc
+            if allow_reauth:
                 self._logger.exception("Refresh failed. Running full OAuth flow.")
                 return await self._run_full_oauth_flow()
             self._logger.exception("Refresh failed.")

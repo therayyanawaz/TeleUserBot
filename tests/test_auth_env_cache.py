@@ -78,6 +78,32 @@ class AuthEnvCacheTests(unittest.TestCase):
         self.assertEqual(loaded["refresh_token"], "refresh-fresh")
         self.assertEqual(loaded["access_token"], "access-fresh")
 
+    def test_stale_env_refresh_is_blocked_after_first_failure(self) -> None:
+        stale_env = {
+            "access_token": "access-old",
+            "refresh_token": "refresh-old",
+            "expires_at": 1000,
+            "account_id": "acct-1",
+        }
+        os.environ[auth.ENV_AUTH_JSON] = json.dumps(stale_env)
+
+        manager = auth.AuthManager()
+        refresh_calls = {"count": 0}
+
+        async def fake_refresh(_refresh_token: str) -> dict:
+            refresh_calls["count"] += 1
+            raise auth.OAuthError(
+                "Stored env refresh token is stale because it was already rotated."
+            )
+
+        with mock.patch.object(manager, "_refresh_with_token", side_effect=fake_refresh):
+            with self.assertRaises(auth.OAuthError):
+                auth.asyncio.run(manager.refresh_auth_context())
+            with self.assertRaises(auth.OAuthError):
+                auth.asyncio.run(manager.refresh_auth_context())
+
+        self.assertEqual(refresh_calls["count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
