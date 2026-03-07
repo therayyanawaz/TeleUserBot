@@ -46,6 +46,7 @@ JWT_CLAIM_PATH = "https://api.openai.com/auth"
 # Local runtime state storage (outside repo).
 RUNTIME_DIR = Path.home() / ".tg_userbot"
 TOKEN_PATH = RUNTIME_DIR / "auth.json"
+ENV_TOKEN_CACHE_PATH = RUNTIME_DIR / "auth.env-cache.json"
 DB_PATH = RUNTIME_DIR / "seen.db"
 ERROR_LOG_PATH = RUNTIME_DIR / "errors.log"
 ENV_AUTH_JSON = "TG_USERBOT_AUTH_JSON"
@@ -359,6 +360,30 @@ def _delete_token_file(path: Path = TOKEN_PATH) -> bool:
     return True
 
 
+def _token_recency_score(token_data: Optional[Dict[str, Any]]) -> int:
+    if not isinstance(token_data, dict):
+        return 0
+    expires_at = _normalize_unix_seconds(token_data.get("expires_at"))
+    return int(expires_at or 0)
+
+
+def _prefer_newer_token_data(
+    *candidates: Tuple[str, Optional[Dict[str, Any]]],
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    best_source = "none"
+    best_payload: Optional[Dict[str, Any]] = None
+    best_score = -1
+    for source, payload in candidates:
+        if payload is None:
+            continue
+        score = _token_recency_score(payload)
+        if score > best_score:
+            best_source = source
+            best_payload = payload
+            best_score = score
+    return best_source, best_payload
+
+
 class AuthManager:
     """Handles token load, refresh, and full OAuth PKCE login."""
 
@@ -466,13 +491,16 @@ class AuthManager:
         async with self._lock:
             self._runtime_token_data = None
             removed_file = _delete_token_file(TOKEN_PATH)
+            removed_env_cache = _delete_token_file(ENV_TOKEN_CACHE_PATH)
             return {
                 "cleared_memory": True,
                 "removed_file": removed_file,
+                "removed_env_cache": removed_env_cache,
             }
 
     def status(self) -> Dict[str, Any]:
         env_data = self._load_token_data_from_env()
+        env_cache_data = _load_token_data_from_file(ENV_TOKEN_CACHE_PATH)
         file_data = None if self._is_env_only_mode() else _load_token_data_from_file(TOKEN_PATH)
 
         source = "none"
@@ -480,12 +508,18 @@ class AuthManager:
         if isinstance(self._runtime_token_data, dict):
             source = "memory"
             token_data = dict(self._runtime_token_data)
-        elif env_data is not None:
-            source = "env"
-            token_data = env_data
+        elif self._is_env_only_mode():
+            source, selected = _prefer_newer_token_data(
+                ("env-cache", env_cache_data),
+                ("env", env_data),
+            )
+            token_data = dict(selected or {})
         elif file_data is not None:
             source = "file"
             token_data = file_data
+        elif env_data is not None:
+            source = "env"
+            token_data = env_data
 
         expires_at = _normalize_unix_seconds(token_data.get("expires_at"))
         return {
@@ -497,6 +531,8 @@ class AuthManager:
             "expires_at": expires_at,
             "token_file": str(TOKEN_PATH),
             "token_file_exists": TOKEN_PATH.exists(),
+            "env_cache_file": str(ENV_TOKEN_CACHE_PATH),
+            "env_cache_file_exists": ENV_TOKEN_CACHE_PATH.exists(),
         }
 
     def _token_data_to_context(self, token_data: Dict[str, Any]) -> Dict[str, str]:
@@ -519,6 +555,20 @@ class AuthManager:
             return dict(self._runtime_token_data)
 
         env_data = self._load_token_data_from_env()
+        if self._is_env_only_mode():
+            env_cache_data = _load_token_data_from_file(ENV_TOKEN_CACHE_PATH)
+            source, selected = _prefer_newer_token_data(
+                ("env-cache", env_cache_data),
+                ("env", env_data),
+            )
+            if selected is not None:
+                if source == "env-cache":
+                    self._logger.info("Loaded OAuth token state from %s.", ENV_TOKEN_CACHE_PATH)
+                else:
+                    self._logger.info("Loaded OAuth token state from env secret.")
+                return dict(selected)
+            return None
+
         if env_data is not None:
             self._logger.info("Loaded OAuth token state from env secret.")
             return env_data
@@ -596,8 +646,9 @@ class AuthManager:
     def _save_token_data(self, token_data: Dict[str, Any]) -> None:
         self._runtime_token_data = dict(token_data)
         if self._is_env_only_mode():
-            # Env-only mode: keep refreshed token state in memory only.
-            # This avoids writing auth.json to disk in cloud runtimes.
+            # Persist refreshed env-mode tokens to a runtime shadow cache so the
+            # next restart does not replay an already-consumed refresh token.
+            _write_token_data_to_file(token_data, ENV_TOKEN_CACHE_PATH)
             return
         _write_token_data_to_file(token_data, TOKEN_PATH)
 
@@ -739,6 +790,29 @@ class AuthManager:
             response = await http.post(TOKEN_ENDPOINT, data=payload)
 
         if response.status_code >= 400:
+            try:
+                err_payload = response.json()
+            except Exception:
+                err_payload = None
+            if isinstance(err_payload, dict):
+                err = err_payload.get("error")
+                if isinstance(err, dict):
+                    err_code = str(err.get("code") or "").strip().lower()
+                    err_message = str(err.get("message") or "").strip()
+                    if err_code == "refresh_token_reused":
+                        if self._is_env_only_mode():
+                            raise OAuthError(
+                                "Stored env refresh token is stale because it was already rotated. "
+                                "Run `python auth.py login --env-file .env` and update your deployed secrets."
+                            )
+                        raise OAuthError(
+                            "Stored refresh token is stale because it was already rotated. "
+                            "Run `python auth.py login` to sign in again."
+                        )
+                    if err_message:
+                        raise OAuthError(
+                            f"Token endpoint error {response.status_code}: {err_message}"
+                        )
             raise OAuthError(
                 f"Token endpoint error {response.status_code}: {response.text}"
             )
@@ -903,6 +977,8 @@ def _run_cli() -> int:
         print(f"has_refresh_token={status['has_refresh_token']}")
         print(f"token_file={status['token_file']}")
         print(f"token_file_exists={status['token_file_exists']}")
+        print(f"env_cache_file={status['env_cache_file']}")
+        print(f"env_cache_file_exists={status['env_cache_file_exists']}")
         if expires_at:
             print(f"expires_at={expires_at}")
         else:
@@ -918,6 +994,7 @@ def _run_cli() -> int:
             print(f"# Cleared env auth secrets in: {path}")
         print(f"# Cleared in-memory runtime state: {result['cleared_memory']}")
         print(f"# Removed local token file: {result['removed_file']}")
+        print(f"# Removed env shadow cache: {result['removed_env_cache']}")
         print("# If you stored auth in external secret managers, remove it there too.")
         return 0
 
