@@ -2204,8 +2204,43 @@ def _truncate_context_line(text: str, limit: int = 240) -> str:
     return f"{truncated}..."
 
 
+def _clean_followup_context_line(text: str) -> str:
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return ""
+
+    cleaned = re.sub(
+        r"\baccording to [^.!,;:]+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bbased on [^.!,;:]+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bcirculating on telegram\b",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\breportedly\b",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,;:-")
+    return normalize_space(cleaned)
+
+
 def _format_followup_media_caption(source_title: str, context_line: str) -> str | None:
-    cleaned = _truncate_context_line(context_line, limit=260)
+    cleaned = _clean_followup_context_line(context_line)
+    cleaned = _truncate_context_line(cleaned, limit=260)
     if not cleaned:
         return None
     source_html = sanitize_telegram_html((source_title or "").strip() or "Source")
