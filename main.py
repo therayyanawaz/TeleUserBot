@@ -1324,6 +1324,11 @@ def _destination_uses_bot_api() -> bool:
     return bool(bot_destination_token and bot_destination_chat_id)
 
 
+def _bot_api_timeout() -> httpx.Timeout:
+    # Media uploads need a much larger write timeout than text-only requests.
+    return httpx.Timeout(connect=20.0, read=90.0, write=180.0, pool=20.0)
+
+
 async def _bot_api_request(
     method: str,
     *,
@@ -1333,9 +1338,29 @@ async def _bot_api_request(
     token = _require_bot_destination_token()
     url = f"https://api.telegram.org/bot{token}/{method}"
 
-    async with httpx.AsyncClient(timeout=60) as http:
-        for _ in range(4):
-            response = await http.post(url, data=data, files=files)
+    async with httpx.AsyncClient(timeout=_bot_api_timeout()) as http:
+        for attempt in range(4):
+            try:
+                response = await http.post(url, data=data, files=files)
+            except (
+                httpx.WriteTimeout,
+                httpx.ReadTimeout,
+                httpx.ConnectTimeout,
+                httpx.RemoteProtocolError,
+                httpx.TransportError,
+            ) as exc:
+                if attempt >= 3:
+                    raise
+                wait_seconds = min(8, 2 ** attempt)
+                LOGGER.warning(
+                    "Bot API %s transport failure (%s). Retrying in %ss.",
+                    method,
+                    exc.__class__.__name__,
+                    wait_seconds,
+                )
+                await asyncio.sleep(wait_seconds)
+                continue
+
             payload = {}
             try:
                 payload = response.json()
@@ -1732,7 +1757,25 @@ def _extract_public_username(source: str) -> str | None:
     return None
 
 
+def _is_retryable_network_error(exc: BaseException) -> bool:
+    if isinstance(exc, (ConnectionResetError, TimeoutError, asyncio.TimeoutError)):
+        return True
+    if isinstance(exc, OSError):
+        text = str(exc).lower()
+        retry_markers = (
+            "connection reset by peer",
+            "broken pipe",
+            "timed out",
+            "temporary failure",
+            "network is unreachable",
+            "connection aborted",
+        )
+        return any(marker in text for marker in retry_markers)
+    return False
+
+
 async def _call_with_floodwait(func, *args, **kwargs):
+    network_attempt = 0
     while True:
         try:
             return await func(*args, **kwargs)
@@ -1740,6 +1783,19 @@ async def _call_with_floodwait(func, *args, **kwargs):
             wait_seconds = int(exc.seconds) + 1
             LOGGER.error("FloodWaitError: sleeping %s second(s).", wait_seconds)
             await asyncio.sleep(wait_seconds)
+        except Exception as exc:
+            if _is_retryable_network_error(exc) and network_attempt < 1:
+                network_attempt += 1
+                wait_seconds = 2 * network_attempt
+                LOGGER.warning(
+                    "Retryable network error in %s (%s). Retrying in %ss.",
+                    getattr(func, "__name__", repr(func)),
+                    exc.__class__.__name__,
+                    wait_seconds,
+                )
+                await asyncio.sleep(wait_seconds)
+                continue
+            raise
 
 
 async def _source_title(msg: Message) -> str:
