@@ -285,9 +285,13 @@ def _fallback_headline(text: str) -> Optional[str]:
     cleaned = normalize_space(text)
     if not cleaned:
         return None
-    first = cleaned.split(". ")[0].strip()
-    if len(first) > 120:
-        first = f"{first[:117].rsplit(' ', 1)[0]}..."
+    sentence_match = re.search(r"(.{24,700}?[.!?])(?:\s|$)", cleaned)
+    if sentence_match:
+        first = normalize_space(sentence_match.group(1))
+    else:
+        first = cleaned
+    if len(first) > 420:
+        first = f"{first[:417].rsplit(' ', 1)[0]}..."
     return first
 
 
@@ -374,7 +378,10 @@ def _breaking_headline_prompt() -> str:
     return (
         "You write emergency wire headlines.\n"
         f"Output language must be {language}. Translate if needed.\n"
-        "Return exactly one short sentence (8-18 words) with facts only.\n"
+        "Return exactly one complete sentence with facts only.\n"
+        "Target 12-28 words.\n"
+        "Never end with ellipsis.\n"
+        "Do not cut off mid-thought.\n"
         "No prefix, no markdown, no source tag, no explanation."
     )
 
@@ -1792,6 +1799,44 @@ async def classify_severity(
 
 
 def _cleanup_headline(raw: str) -> str:
+    def _looks_incomplete(value: str) -> bool:
+        trimmed = normalize_space(value)
+        if not trimmed:
+            return True
+        if trimmed.endswith(("...", "…", "(", "[", "{", ":", ";", "-", "–", "—", "/")):
+            return True
+        if trimmed.count("(") > trimmed.count(")"):
+            return True
+        tail = trimmed.split()[-1].strip(".,;:!?").lower()
+        if tail in {
+            "and",
+            "or",
+            "but",
+            "because",
+            "while",
+            "with",
+            "without",
+            "if",
+            "as",
+            "to",
+            "of",
+            "for",
+            "in",
+            "on",
+            "at",
+            "from",
+            "by",
+            "amid",
+            "over",
+            "under",
+            "into",
+            "toward",
+            "towards",
+            "linked",
+        }:
+            return True
+        return False
+
     text = normalize_space(raw)
     if not text:
         return ""
@@ -1799,8 +1844,14 @@ def _cleanup_headline(raw: str) -> str:
     text = re.sub(r"\[/?[A-Za-z0-9_ -]+\]", "", text).strip()
     if "\n" in text:
         text = text.splitlines()[0].strip()
-    if len(text) > 140:
-        text = f"{text[:137].rsplit(' ', 1)[0]}..."
+    if _looks_incomplete(text):
+        return ""
+    if len(text) > 420:
+        sentence_match = re.search(r"(.{24,700}?[.!?])(?:\s|$)", text)
+        if sentence_match:
+            text = normalize_space(sentence_match.group(1))
+        else:
+            text = f"{text[:417].rsplit(' ', 1)[0]}..."
     return text
 
 

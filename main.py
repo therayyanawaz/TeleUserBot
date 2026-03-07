@@ -2956,8 +2956,8 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
         headline = await summarize_breaking_headline(text, _require_auth_manager())
         if not headline:
             headline = normalize_space(text)
-            if len(headline) > 140:
-                headline = f"{headline[:137].rsplit(' ', 1)[0]}..."
+            if len(headline) > 420:
+                headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
         rational_view: str | None = None
         if _should_attach_vital_opinion(text):
             rational_view = await summarize_vital_rational_view(text, _require_auth_manager())
@@ -3070,8 +3070,8 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
         headline = await summarize_breaking_headline(combined_caption, _require_auth_manager())
         if not headline:
             headline = normalize_space(combined_caption)
-            if len(headline) > 140:
-                headline = f"{headline[:137].rsplit(' ', 1)[0]}..."
+            if len(headline) > 420:
+                headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
         rational_view: str | None = None
         if _should_attach_vital_opinion(combined_caption):
             rational_view = await summarize_vital_rational_view(
