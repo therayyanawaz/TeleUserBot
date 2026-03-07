@@ -1837,8 +1837,8 @@ def _media_text_ocr_video_max_bytes() -> int:
 
 
 def _media_text_ocr_langs() -> str:
-    raw = str(getattr(config, "MEDIA_TEXT_OCR_LANGS", "eng+ara+fas+urd") or "").strip()
-    return raw or "eng+ara+fas+urd"
+    raw = str(getattr(config, "MEDIA_TEXT_OCR_LANGS", "eng+ara+fas+urd+rus") or "").strip()
+    return raw or "eng+ara+fas+urd+rus"
 
 
 def _message_mime_type(msg: Message) -> str:

@@ -204,7 +204,7 @@ MEDIA_TEXT_OCR_VIDEO_ENABLED = _env_bool("MEDIA_TEXT_OCR_VIDEO_ENABLED", True)  
 MEDIA_TEXT_OCR_MIN_CHARS = _env_int("MEDIA_TEXT_OCR_MIN_CHARS", 12)  # type: int
 MEDIA_TEXT_OCR_MAX_CHARS = _env_int("MEDIA_TEXT_OCR_MAX_CHARS", 1600)  # type: int
 MEDIA_TEXT_OCR_VIDEO_MAX_MB = _env_int("MEDIA_TEXT_OCR_VIDEO_MAX_MB", 25)  # type: int
-MEDIA_TEXT_OCR_LANGS = _env_str("MEDIA_TEXT_OCR_LANGS", "eng+ara+fas+urd")  # type: str
+MEDIA_TEXT_OCR_LANGS = _env_str("MEDIA_TEXT_OCR_LANGS", "eng+ara+fas+urd+rus")  # type: str
 
 # -----------------------------------------------------------------------------
 # Breaking News Fast Path
