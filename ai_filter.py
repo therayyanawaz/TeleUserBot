@@ -377,13 +377,16 @@ def _severity_system_prompt() -> str:
 def _breaking_headline_prompt() -> str:
     language = _resolve_output_language()
     return (
-        "You write emergency wire headlines.\n"
+        "You write sharp live-news one-liners for Telegram alerts.\n"
         f"Output language must be {language}. Translate if needed.\n"
         "Return exactly one complete sentence with facts only.\n"
+        "Sound like a strong human news presenter: direct, concrete, active voice.\n"
+        "Use the most important fact first.\n"
+        "Do not use generic framing like Breaking, Update, reports say, or situation update unless uncertainty is the key fact.\n"
         "Target 12-28 words.\n"
         "Never end with ellipsis.\n"
         "Do not cut off mid-thought.\n"
-        "No prefix, no markdown, no source tag, no explanation."
+        "No prefix, no markdown, no source tag, no explanation, no hype."
     )
 
 
@@ -395,10 +398,15 @@ def _vital_rational_view_prompt() -> str:
         max_words = 20
     max_words = max(10, min(max_words, 30))
     return (
-        "You write concise, rational public-interest context for urgent news.\n"
+        "You write concise public-interest context for urgent news.\n"
         f"Output language must be {language}. Translate if needed.\n"
         f"Return exactly one sentence (max {max_words} words), neutral and evidence-aware.\n"
+        "It should sound like a calm human analyst quickly telling the reader why this matters.\n"
         "Start with: Why it matters: \n"
+        "Be specific about the consequence of this exact event.\n"
+        "Mention the affected place, asset, or system when it is clear from the source.\n"
+        "Prefer concrete consequences like retaliation risk, civilian danger, shipping disruption, air-defense pressure, diplomatic hardening, or market stress.\n"
+        "Never use generic boilerplate like 'this may affect regional stability' or 'verify updates across reliable sources'.\n"
         "Do not speculate. Do not take sides. No hashtags. No markdown."
     )
 
@@ -1065,6 +1073,12 @@ def _html_digest_cleanup(text: str, *, interval_minutes: int, max_lines: int) ->
             severity = _severity_from_text_heuristic(line)
             emoji = "🔥" if severity == "high" else ("⚠️" if severity == "medium" else "ℹ️")
             line = f"{emoji} {line}"
+        line = re.sub(
+            r"^(🔥|⚠️|ℹ️)\s+(?:breaking|alert|live update|update|situation update)\s*[:\-–—]+\s*",
+            r"\1 ",
+            line,
+            flags=re.IGNORECASE,
+        )
         if len(line) > 220:
             line = f"{line[:217].rsplit(' ', 1)[0]}..."
         line = re.sub(r"\s\[[^\]]+\](?!\()", "", line).strip()
@@ -1180,6 +1194,12 @@ def _rule_based_fallback_digest(
 
         source = _post_source(post)
         title = text.split(". ")[0].strip()
+        title = re.sub(
+            r"^(?:breaking|alert|live update|update|urgent)\s*[:\-–—]+\s*",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        )
         if len(title) > 120:
             title = f"{title[:117].rsplit(' ', 1)[0]}..."
 
@@ -1706,16 +1726,30 @@ def _fallback_query_answer(
     selected = _rank_query_context(query, context_messages, limit=(8 if detailed else 4))
     selected = selected[: (6 if detailed else 4)]
     lines = []
-    intro_title = "Latest update"
+    intro_title = "What stands out right now"
     normalized_query = normalize_space(query).rstrip("?")
-    if normalized_query and len(normalized_query) <= 72:
-        intro_title = normalized_query[:1].upper() + normalized_query[1:]
+    keywords = extract_query_keywords(query)
     if _query_is_identity_question(query):
         intro_title = "Best available answer"
+    elif _query_is_casualty_question(query):
+        intro_title = "What the evidence shows"
+    elif is_broad_news_query(query):
+        if len(keywords) == 1:
+            intro_title = f"Latest on {keywords[0].title()}"
+        elif len(keywords) >= 2:
+            intro_title = f"Latest on {keywords[0].title()} and {keywords[1].title()}"
+    elif normalized_query and len(normalized_query) <= 72:
+        intro_title = normalized_query[:1].upper() + normalized_query[1:]
     for item in selected:
         text = normalize_space(str(item.get("text") or ""))
         if not text:
             continue
+        text = re.sub(
+            r"^(?:breaking|alert|live update|update)\s*[:\-–—]+\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
         if len(text) > 180:
             text = f"{text[:177].rsplit(' ', 1)[0]}..."
         prefix = "🔥" if _severity_from_text_heuristic(text) == "high" else "⚠️"
@@ -1911,6 +1945,12 @@ def _cleanup_headline(raw: str) -> str:
     if not text:
         return ""
     text = re.sub(r"^[*`#>\-\s]+", "", text).strip()
+    text = re.sub(
+        r"^(?:breaking|alert|live update|update|urgent)\s*[:\-–—]+\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = re.sub(r"\[/?[A-Za-z0-9_ -]+\]", "", text).strip()
     if "\n" in text:
         text = text.splitlines()[0].strip()
@@ -1994,17 +2034,193 @@ def _cleanup_vital_view(raw: str) -> str:
     return text
 
 
+_VITAL_GENERIC_DETAILS = {
+    "casualty reports can rapidly escalate security and humanitarian risk",
+    "any incident near nuclear infrastructure raises regional safety concerns",
+    "military exchanges increase escalation risk and can trigger rapid retaliation",
+    "official restrictions often signal broader disruption in the coming hours",
+    "this may affect regional stability; verify updates across multiple reliable sources",
+    "this may affect regional stability",
+}
+
+_VITAL_ASSET_PATTERNS: tuple[str, ...] = (
+    "THAAD battery",
+    "THAAD radar",
+    "THAAD",
+    "radar",
+    "airspace",
+    "air defenses",
+    "air defence",
+    "naval base",
+    "air base",
+    "airbase",
+    "airport",
+    "port",
+    "embassy",
+    "reactor",
+    "nuclear plant",
+    "power plant",
+    "oil field",
+    "gas field",
+    "industrial area",
+    "industrial zone",
+    "hospital",
+    "school",
+    "camp",
+    "vessel",
+    "ship",
+    "tanker",
+)
+
+_VITAL_PRIORITY_LOCATIONS: tuple[str, ...] = (
+    "Strait of Hormuz",
+    "Gulf of Oman",
+    "Bab al-Mandeb",
+    "Red Sea",
+    "Persian Gulf",
+    "Gulf of Aden",
+)
+
+_VITAL_LOCATION_RE = re.compile(
+    r"\b(?:in|near|over|around|at|off|outside|inside|north of|south of|east of|west of)\s+"
+    r"(?:the\s+)?"
+    r"((?:(?:north|south|east|west|northern|southern|eastern|western|central)\s+)?"
+    r"[A-Z][A-Za-z0-9'/-]*(?:\s+[A-Z][A-Za-z0-9'/-]*){0,4})"
+)
+_VITAL_NAMED_ASSET_RE = re.compile(
+    r"((?:[A-Z][A-Za-z0-9'/-]*|[A-Z]{2,})(?:\s+(?:[A-Z][A-Za-z0-9'/-]*|[A-Z]{2,})){0,3}\s+"
+    r"(?:industrial area|industrial zone|naval base|air base|airbase|airport|port|embassy|"
+    r"oil field|gas field|power plant|hospital|school|camp|battery|radar))"
+)
+
+
+def _is_bad_location_candidate(value: str) -> bool:
+    lowered = normalize_space(value).lower()
+    if not lowered:
+        return True
+    actor_markers = (
+        "the idf",
+        "idf",
+        "the army",
+        "army",
+        "government",
+        "ministry",
+        "officials",
+        "police",
+        "military",
+        "spokesperson",
+    )
+    return any(marker == lowered or lowered.startswith(f"{marker} ") for marker in actor_markers)
+
+
+def _extract_vital_location(text: str) -> str:
+    clean = normalize_space(strip_telegram_html(text))
+    if not clean:
+        return ""
+    lowered = clean.lower()
+    for location in _VITAL_PRIORITY_LOCATIONS:
+        if location.lower() in lowered:
+            return location
+    location_match = _VITAL_LOCATION_RE.search(clean)
+    if location_match:
+        return normalize_space(location_match.group(1))
+
+    lead_match = re.match(r"([A-Z][A-Za-z0-9'/-]*(?:\s+[A-Z][A-Za-z0-9'/-]*){0,3})", clean)
+    if lead_match:
+        candidate = normalize_space(lead_match.group(1))
+        if not _is_bad_location_candidate(candidate):
+            return candidate
+    return ""
+
+
+def _extract_vital_focus(text: str) -> str:
+    clean = normalize_space(strip_telegram_html(text))
+    if not clean:
+        return ""
+
+    named_asset = _VITAL_NAMED_ASSET_RE.search(clean)
+    if named_asset:
+        return normalize_space(named_asset.group(1))
+
+    for pattern in _VITAL_ASSET_PATTERNS:
+        match = re.search(rf"\b{re.escape(pattern)}\b", clean, flags=re.IGNORECASE)
+        if match:
+            return clean[match.start() : match.end()]
+
+    return _extract_vital_location(clean)
+
+
+def _vital_view_is_too_generic(text: str) -> bool:
+    lowered = normalize_space(strip_telegram_html(text)).lower()
+    if not lowered:
+        return True
+    detail = lowered
+    if detail.startswith("why it matters:"):
+        detail = normalize_space(detail.split(":", 1)[1])
+    if detail in _VITAL_GENERIC_DETAILS:
+        return True
+    if "verify updates across multiple reliable sources" in detail:
+        return True
+    if "regional stability" in detail and len(detail.split()) <= 14:
+        return True
+    return False
+
+
 def _fallback_vital_view(text: str) -> str:
-    lowered = text.lower()
+    clean = normalize_space(strip_telegram_html(text))
+    lowered = clean.lower()
+    focus = _extract_vital_focus(clean)
+    location = _extract_vital_location(clean)
+
+    def _with_focus(template: str, generic: str, *, prefer_location: bool = False) -> str:
+        chosen = focus
+        if prefer_location and location and not _is_bad_location_candidate(location):
+            chosen = location
+        if chosen:
+            return template.format(focus=chosen)
+        return generic
+
     if any(k in lowered for k in ("killed", "dead", "casualt", "injur")):
-        return "Why it matters: Casualty reports can rapidly escalate security and humanitarian risk."
+        return _with_focus(
+            "Why it matters: Rising casualties around {focus} will intensify pressure and keep escalation risk high.",
+            "Why it matters: Rising casualties will intensify pressure and keep escalation risk high.",
+        )
     if any(k in lowered for k in ("nuclear", "reactor", "power plant")):
-        return "Why it matters: Any incident near nuclear infrastructure raises regional safety concerns."
-    if any(k in lowered for k in ("missile", "drone", "airstrike", "strike", "explosion")):
-        return "Why it matters: Military exchanges increase escalation risk and can trigger rapid retaliation."
-    if any(k in lowered for k in ("evacu", "airspace", "closed", "emergency")):
-        return "Why it matters: Official restrictions often signal broader disruption in the coming hours."
-    return "Why it matters: This may affect regional stability; verify updates across multiple reliable sources."
+        return _with_focus(
+            "Why it matters: Trouble near {focus} would draw urgent scrutiny and raise the stakes fast.",
+            "Why it matters: Trouble near nuclear infrastructure would draw urgent scrutiny and raise the stakes fast.",
+        )
+    if any(k in lowered for k in ("evacu", "airspace", "closed", "emergency", "warned civilians", "leave immediately", "leave now")):
+        return _with_focus(
+            "Why it matters: Restrictions around {focus} usually mean officials expect more disruption or follow-on strikes.",
+            "Why it matters: These restrictions usually mean officials expect more disruption or follow-on strikes.",
+            prefer_location=True,
+        )
+    if any(k in lowered for k in ("ship", "vessel", "tanker", "shipping", "port", "hormuz", "oil field", "gas field")):
+        return _with_focus(
+            "Why it matters: Disruption around {focus} can hit shipping lanes, energy flows, and insurance costs.",
+            "Why it matters: Disruption here can hit shipping lanes, energy flows, and insurance costs.",
+            prefer_location=True,
+        )
+    if any(k in lowered for k in ("radar", "thaad", "air defense", "air defence", "intercept", "base", "battery")):
+        return _with_focus(
+            "Why it matters: Pressure on {focus} suggests the defense picture there is still shifting.",
+            "Why it matters: Pressure on local defenses suggests the military picture is still shifting.",
+        )
+    if any(k in lowered for k in ("missile", "drone", "airstrike", "strike", "explosion", "blast", "shelling")):
+        return _with_focus(
+            "Why it matters: A hit around {focus} raises the chance of fast retaliation and a wider fight.",
+            "Why it matters: This raises the chance of fast retaliation and a wider fight.",
+        )
+    if any(k in lowered for k in ("said", "says", "announced", "declared", "statement", "warned")):
+        return _with_focus(
+            "Why it matters: Public signaling around {focus} can harden positions and shape the next move.",
+            "Why it matters: Public signaling like this can harden positions and shape the next move.",
+        )
+    return _with_focus(
+        "Why it matters: This points to a live security shift around {focus} worth watching for follow-on moves.",
+        "Why it matters: This points to a live security shift worth watching for follow-on moves.",
+    )
 
 
 async def summarize_breaking_headline(
@@ -2106,7 +2322,7 @@ async def summarize_vital_rational_view(
         return fallback
 
     view = _cleanup_vital_view(raw)
-    if view:
+    if view and not _vital_view_is_too_generic(view):
         _vital_view_cache_set(key, view)
         return view
 
