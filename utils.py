@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter, deque
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -614,7 +615,12 @@ def is_broad_news_query(query: str) -> bool:
     return not extract_query_keywords(lowered)
 
 
-def extract_ocr_text_from_image_bytes(blob: bytes, *, max_chars: int = 1600) -> str:
+def extract_ocr_text_from_image_bytes(
+    blob: bytes,
+    *,
+    max_chars: int = 1600,
+    languages: str = "eng",
+) -> str:
     """
     Best-effort OCR extraction from image bytes.
     Returns empty string if OCR dependencies/runtime are unavailable.
@@ -623,18 +629,62 @@ def extract_ocr_text_from_image_bytes(blob: bytes, *, max_chars: int = 1600) -> 
         return ""
     try:
         from io import BytesIO
-        from PIL import Image  # type: ignore
+        from PIL import Image, ImageFilter, ImageOps  # type: ignore
         import pytesseract  # type: ignore
     except Exception:
         return ""
 
     try:
         with Image.open(BytesIO(blob)) as img:
+            base = ImageOps.exif_transpose(img)
+            variants = []
             try:
-                img = img.convert("L")
+                grayscale = base.convert("L")
             except Exception:
-                pass
-            raw = pytesseract.image_to_string(img)
+                grayscale = base
+
+            variants.append(grayscale)
+            with contextlib.suppress(Exception):
+                variants.append(ImageOps.autocontrast(grayscale))
+            with contextlib.suppress(Exception):
+                variants.append(
+                    ImageOps.autocontrast(grayscale).point(
+                        lambda px: 255 if px > 150 else 0,
+                        mode="1",
+                    )
+                )
+            with contextlib.suppress(Exception):
+                variants.append(ImageOps.grayscale(base.filter(ImageFilter.SHARPEN)))
+
+            raw = ""
+            best_text = ""
+            best_score = 0
+            lang_value = normalize_space(languages).replace(" ", "") or "eng"
+            tesseract_configs = (
+                "--psm 6",
+                "--psm 11",
+                "--psm 12",
+            )
+
+            for variant in variants:
+                for tesseract_config in tesseract_configs:
+                    try:
+                        candidate_raw = pytesseract.image_to_string(
+                            variant,
+                            lang=lang_value,
+                            config=tesseract_config,
+                        )
+                    except Exception:
+                        continue
+                    candidate = normalize_space(str(candidate_raw or ""))
+                    if not candidate:
+                        continue
+                    score = len(re.findall(r"[\w\u0600-\u06FF]", candidate))
+                    if score > best_score:
+                        best_score = score
+                        best_text = candidate
+
+            raw = best_text
     except Exception:
         return ""
 

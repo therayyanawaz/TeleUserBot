@@ -1835,6 +1835,11 @@ def _media_text_ocr_video_max_bytes() -> int:
     return value_mb * 1024 * 1024
 
 
+def _media_text_ocr_langs() -> str:
+    raw = str(getattr(config, "MEDIA_TEXT_OCR_LANGS", "eng+ara+fas+urd") or "").strip()
+    return raw or "eng+ara+fas+urd"
+
+
 def _message_mime_type(msg: Message) -> str:
     value = getattr(getattr(msg, "file", None), "mime_type", None)
     if isinstance(value, str) and value.strip():
@@ -2055,6 +2060,7 @@ async def _extract_media_ocr_translation(msg: Message) -> str | None:
             extract_ocr_text_from_image_bytes,
             blob,
             max_chars=_media_text_ocr_max_chars(),
+            languages=_media_text_ocr_langs(),
         )
     elif _message_is_video_ocr_candidate(msg):
         if not _media_text_ocr_video_enabled():
@@ -2072,6 +2078,7 @@ async def _extract_media_ocr_translation(msg: Message) -> str | None:
             extract_ocr_text_from_image_bytes,
             frame_blob,
             max_chars=_media_text_ocr_max_chars(),
+            languages=_media_text_ocr_langs(),
         )
     else:
         return None

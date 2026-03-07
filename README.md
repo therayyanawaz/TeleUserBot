@@ -235,6 +235,13 @@ MEDIA_TEXT_OCR_VIDEO_ENABLED=true
 MEDIA_TEXT_OCR_MIN_CHARS=12
 MEDIA_TEXT_OCR_MAX_CHARS=1600
 MEDIA_TEXT_OCR_VIDEO_MAX_MB=25
+MEDIA_TEXT_OCR_LANGS=eng+ara+fas+urd
+```
+
+If you want Arabic/Persian OCR to actually work, install the language packs too:
+
+```bash
+sudo apt-get install -y tesseract-ocr-ara tesseract-ocr-fas tesseract-ocr-urd
 ```
 
 ## Recommended Digest Setup
