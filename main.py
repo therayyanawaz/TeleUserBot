@@ -3936,6 +3936,7 @@ async def _flush_album_after_wait(key: Tuple[str, int]) -> None:
         items = album_buffers.pop(key, [])
         album_tasks.pop(key, None)
         if items:
+            items = await _refresh_album_messages(items)
             if await _check_album_media_duplicate(items):
                 mark_seen_many(str(items[0].chat_id), [int(m.id or 0) for m in items])
                 return
@@ -3972,6 +3973,48 @@ async def _resolve_entity_id(chat_obj) -> int | None:
         return utils.get_peer_id(entity)
     except Exception:
         return None
+
+
+async def _refresh_album_messages(messages: List[Message]) -> List[Message]:
+    """
+    Rehydrate buffered album fragments from Telegram before processing.
+
+    NewMessage album fragments can arrive without the final caption-bearing state.
+    Refetching by IDs gives the authoritative server copy and prevents silent
+    caption loss on grouped media.
+    """
+    if not messages:
+        return messages
+
+    ordered = sorted(messages, key=lambda m: int(m.id or 0))
+    chat_ref = ordered[0].chat_id
+    ids = [int(m.id or 0) for m in ordered if int(m.id or 0) > 0]
+    if not ids:
+        return ordered
+
+    tg = _require_client()
+    try:
+        refreshed = await _call_with_floodwait(tg.get_messages, chat_ref, ids=ids)
+    except Exception:
+        LOGGER.debug("Failed to refresh album messages; using buffered fragments.", exc_info=True)
+        return ordered
+
+    refreshed_list: List[Message]
+    if isinstance(refreshed, Message):
+        refreshed_list = [refreshed]
+    elif isinstance(refreshed, list):
+        refreshed_list = [item for item in refreshed if isinstance(item, Message)]
+    else:
+        refreshed_list = []
+
+    if not refreshed_list:
+        return ordered
+
+    refreshed_by_id = {int(item.id or 0): item for item in refreshed_list if int(item.id or 0) > 0}
+    resolved: List[Message] = []
+    for original in ordered:
+        resolved.append(refreshed_by_id.get(int(original.id or 0), original))
+    return sorted(resolved, key=lambda m: int(m.id or 0))
 
 
 async def _connect_client_with_lock_guard(
