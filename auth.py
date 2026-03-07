@@ -280,6 +280,42 @@ def write_auth_payload_to_env_file(payload: Dict[str, str], env_path: Path) -> P
     return env_path
 
 
+def clear_auth_payload_from_env_file(env_path: Path) -> Path:
+    """Clear env-only OAuth secrets from a local .env file."""
+    env_path = env_path.expanduser().resolve()
+    if not env_path.exists():
+        return env_path
+
+    original_text = env_path.read_text(encoding="utf-8")
+    original_lines = original_text.splitlines()
+    has_trailing_newline = original_text.endswith("\n")
+
+    updates = {
+        ENV_AUTH_JSON: "",
+        ENV_AUTH_JSON_B64: "",
+    }
+
+    updated_lines = []
+    seen_keys = set()
+    for line in original_lines:
+        key = _extract_env_key(line)
+        if key in updates:
+            updated_lines.append(_render_env_line(key, updates[key]))
+            seen_keys.add(key)
+            continue
+        updated_lines.append(line)
+
+    for key, value in updates.items():
+        if key not in seen_keys:
+            updated_lines.append(_render_env_line(key, value))
+
+    out_text = "\n".join(updated_lines)
+    if has_trailing_newline or out_text:
+        out_text += "\n"
+    env_path.write_text(out_text, encoding="utf-8")
+    return env_path
+
+
 def ensure_runtime_dir() -> Path:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -287,6 +323,40 @@ def ensure_runtime_dir() -> Path:
     except OSError:
         pass
     return RUNTIME_DIR
+
+
+def _load_token_data_from_file(path: Path = TOKEN_PATH) -> Optional[Dict[str, Any]]:
+    token_path = path.expanduser().resolve()
+    if not token_path.exists():
+        return None
+    try:
+        payload = json.loads(token_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    manager = AuthManager()
+    return manager._normalize_loaded_token_data(payload)
+
+
+def _write_token_data_to_file(token_data: Dict[str, Any], path: Path = TOKEN_PATH) -> Path:
+    token_path = path.expanduser().resolve()
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(token_data, indent=2, ensure_ascii=False)
+    token_path.write_text(serialized + "\n", encoding="utf-8")
+    try:
+        os.chmod(token_path, 0o600)
+    except OSError:
+        pass
+    return token_path
+
+
+def _delete_token_file(path: Path = TOKEN_PATH) -> bool:
+    token_path = path.expanduser().resolve()
+    if not token_path.exists():
+        return False
+    token_path.unlink()
+    return True
 
 
 class AuthManager:
@@ -392,6 +462,43 @@ class AuthManager:
             self._save_token_data(token_data)
             return self._token_data_to_context(token_data)
 
+    async def logout(self) -> Dict[str, bool]:
+        async with self._lock:
+            self._runtime_token_data = None
+            removed_file = _delete_token_file(TOKEN_PATH)
+            return {
+                "cleared_memory": True,
+                "removed_file": removed_file,
+            }
+
+    def status(self) -> Dict[str, Any]:
+        env_data = self._load_token_data_from_env()
+        file_data = None if self._is_env_only_mode() else _load_token_data_from_file(TOKEN_PATH)
+
+        source = "none"
+        token_data: Dict[str, Any] = {}
+        if isinstance(self._runtime_token_data, dict):
+            source = "memory"
+            token_data = dict(self._runtime_token_data)
+        elif env_data is not None:
+            source = "env"
+            token_data = env_data
+        elif file_data is not None:
+            source = "file"
+            token_data = file_data
+
+        expires_at = _normalize_unix_seconds(token_data.get("expires_at"))
+        return {
+            "mode": "env-only" if self._is_env_only_mode() else "local-file",
+            "source": source,
+            "account_id": str(token_data.get("account_id") or ""),
+            "has_access_token": bool(str(token_data.get("access_token") or "").strip()),
+            "has_refresh_token": bool(str(token_data.get("refresh_token") or "").strip()),
+            "expires_at": expires_at,
+            "token_file": str(TOKEN_PATH),
+            "token_file_exists": TOKEN_PATH.exists(),
+        }
+
     def _token_data_to_context(self, token_data: Dict[str, Any]) -> Dict[str, str]:
         access_token = str(token_data.get("access_token") or "").strip()
         account_id = str(token_data.get("account_id") or "").strip()
@@ -415,6 +522,11 @@ class AuthManager:
         if env_data is not None:
             self._logger.info("Loaded OAuth token state from env secret.")
             return env_data
+        if not self._is_env_only_mode():
+            file_data = _load_token_data_from_file(TOKEN_PATH)
+            if file_data is not None:
+                self._logger.info("Loaded OAuth token state from %s.", TOKEN_PATH)
+                return file_data
         return None
 
     def _load_token_data_from_env(self) -> Optional[Dict[str, Any]]:
@@ -482,9 +594,12 @@ class AuthManager:
         return data
 
     def _save_token_data(self, token_data: Dict[str, Any]) -> None:
-        # Env-only mode: keep refreshed token state in memory only.
-        # This avoids writing auth.json to disk in cloud runtimes.
         self._runtime_token_data = dict(token_data)
+        if self._is_env_only_mode():
+            # Env-only mode: keep refreshed token state in memory only.
+            # This avoids writing auth.json to disk in cloud runtimes.
+            return
+        _write_token_data_to_file(token_data, TOKEN_PATH)
 
     def _is_expiring(self, token_data: Dict[str, Any]) -> bool:
         expires_at = _normalize_unix_seconds(token_data.get("expires_at"))
@@ -678,6 +793,24 @@ async def bootstrap_env_oauth_payload(
             os.environ[ENV_AUTH_ENV_ONLY] = prev
 
 
+async def login_local_oauth(
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, Any]:
+    """Run browser OAuth and persist token state to ~/.tg_userbot/auth.json."""
+    prev = os.getenv(ENV_AUTH_ENV_ONLY)
+    os.environ[ENV_AUTH_ENV_ONLY] = "false"
+    try:
+        manager = AuthManager(logger=logger)
+        token_data = await manager._run_full_oauth_flow()
+        manager._save_token_data(token_data)
+        return token_data
+    finally:
+        if prev is None:
+            os.environ.pop(ENV_AUTH_ENV_ONLY, None)
+        else:
+            os.environ[ENV_AUTH_ENV_ONLY] = prev
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="OpenAI OAuth helpers for TeleUserBot",
@@ -713,13 +846,43 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print full token secrets to stdout (sensitive).",
     )
+
+    login = sub.add_parser(
+        "login",
+        help="Login to OpenAI OAuth either locally (~/.tg_userbot/auth.json) or by updating a .env file.",
+    )
+    login.add_argument(
+        "--env-file",
+        default="",
+        help="If set, run env bootstrap and write/update this .env file instead of local auth.json.",
+    )
+    login.add_argument(
+        "--print-secrets",
+        action="store_true",
+        help="When using --env-file, also print the raw env secrets to stdout (sensitive).",
+    )
+
+    logout = sub.add_parser(
+        "logout",
+        help="Clear saved OpenAI OAuth state.",
+    )
+    logout.add_argument(
+        "--env-file",
+        default="",
+        help="Optional .env file to clear TG_USERBOT_AUTH_JSON / TG_USERBOT_AUTH_JSON_B64 from.",
+    )
+
+    sub.add_parser(
+        "status",
+        help="Show which OpenAI OAuth token source is active and whether it is usable.",
+    )
     return parser
 
 
 def _run_cli() -> int:
     parser = _build_arg_parser()
     args = parser.parse_args()
-    if args.command not in {"bootstrap-env", "setup-env"}:
+    if args.command not in {"bootstrap-env", "setup-env", "login", "logout", "status"}:
         parser.print_help()
         return 0
 
@@ -728,6 +891,68 @@ def _run_cli() -> int:
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
     logger = logging.getLogger("auth-bootstrap")
+
+    if args.command == "status":
+        manager = AuthManager(logger=logger)
+        status = manager.status()
+        expires_at = status.get("expires_at")
+        print(f"mode={status['mode']}")
+        print(f"source={status['source']}")
+        print(f"account_id={status['account_id'] or 'unknown'}")
+        print(f"has_access_token={status['has_access_token']}")
+        print(f"has_refresh_token={status['has_refresh_token']}")
+        print(f"token_file={status['token_file']}")
+        print(f"token_file_exists={status['token_file_exists']}")
+        if expires_at:
+            print(f"expires_at={expires_at}")
+        else:
+            print("expires_at=unknown")
+        return 0
+
+    if args.command == "logout":
+        manager = AuthManager(logger=logger)
+        result = asyncio.run(manager.logout())
+        env_file = str(getattr(args, "env_file", "") or "").strip()
+        if env_file:
+            path = clear_auth_payload_from_env_file(Path(env_file))
+            print(f"# Cleared env auth secrets in: {path}")
+        print(f"# Cleared in-memory runtime state: {result['cleared_memory']}")
+        print(f"# Removed local token file: {result['removed_file']}")
+        print("# If you stored auth in external secret managers, remove it there too.")
+        return 0
+
+    if args.command == "login":
+        env_file = str(getattr(args, "env_file", "") or "").strip()
+        if env_file:
+            try:
+                payload = asyncio.run(bootstrap_env_oauth_payload(logger=logger))
+            except Exception as exc:
+                print(f"Login failed: {exc}")
+                return 1
+            snippet = _env_snippet_from_payload(payload)
+            env_path = write_auth_payload_to_env_file(payload, Path(env_file))
+            print(f"# Updated env file: {env_path}")
+            print(f"# {ENV_AUTH_ENV_ONLY}=true")
+            print(f"# {ENV_AUTH_JSON}=\"\"")
+            print(f"# {ENV_AUTH_JSON_B64}=SET (len={len(payload['b64'])})")
+            print(
+                f"# Token account_id={payload['account_id']} expires_at={payload['expires_at']}"
+            )
+            if bool(getattr(args, "print_secrets", False)):
+                print("\n# Sensitive values (requested via --print-secrets):\n")
+                print(snippet)
+            return 0
+
+        try:
+            token_data = asyncio.run(login_local_oauth(logger=logger))
+        except Exception as exc:
+            print(f"Login failed: {exc}")
+            return 1
+        expires_at = int(_normalize_unix_seconds(token_data.get("expires_at")) or 0)
+        print(f"# Saved local OAuth token: {TOKEN_PATH}")
+        print(f"# account_id={token_data.get('account_id') or ''} expires_at={expires_at}")
+        print(f"# Set {ENV_AUTH_ENV_ONLY}=false when running main.py to use local auth.json.")
+        return 0
 
     try:
         payload = asyncio.run(bootstrap_env_oauth_payload(logger=logger))

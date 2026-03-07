@@ -186,6 +186,38 @@ OPENAI_AUTH_ENV_ONLY=false
 
 First run opens browser, completes PKCE login, stores token in runtime dir.
 
+### Auth lifecycle commands
+
+Local login to `~/.tg_userbot/auth.json`:
+
+```bash
+python auth.py login
+```
+
+Env-mode login and `.env` update:
+
+```bash
+python auth.py login --env-file .env
+```
+
+Show current auth source/status:
+
+```bash
+python auth.py status
+```
+
+Logout local auth:
+
+```bash
+python auth.py logout
+```
+
+Logout and clear `.env` secrets too:
+
+```bash
+python auth.py logout --env-file .env
+```
+
 ## Media OCR Translation
 
 Media OCR is intentionally narrow:
