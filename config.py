@@ -188,7 +188,7 @@ IMMEDIATE_HIGH = _env_bool("IMMEDIATE_HIGH", True)  # type: bool
 DIGEST_IMPORTANCE_SCORING = _env_bool("DIGEST_IMPORTANCE_SCORING", True)  # type: bool
 
 # Allow AI to include HTML read-more links when message links are available.
-DIGEST_INCLUDE_READ_MORE_LINKS = _env_bool("DIGEST_INCLUDE_READ_MORE_LINKS", True)  # type: bool
+DIGEST_INCLUDE_READ_MORE_LINKS = _env_bool("DIGEST_INCLUDE_READ_MORE_LINKS", False)  # type: bool
 
 # Include source/channel tags in outbound messages.
 INCLUDE_SOURCE_TAGS = _env_bool("INCLUDE_SOURCE_TAGS", False)  # type: bool

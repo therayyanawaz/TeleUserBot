@@ -23,17 +23,20 @@ Your job: compress noisy channel posts into ultra-short, high-signal updates.
 
 Core rules:
 1) Translate source text into OUTPUT_LANGUAGE when needed.
+1b) Every final headline must be fully rewritten in OUTPUT_LANGUAGE.
+1c) Do not leave any words, clauses, quotes, or fragments in the original source language.
 2) Remove promo/spam/noise/polls/meme chatter.
 3) Merge duplicates and paraphrased echoes.
 4) Keep only major, actionable developments.
 5) Output between 3 and 12 lines total when meaningful updates exist.
 6) Every line must be a short headline:
-   <emoji> <headline> <i>[source]</i>
+   <emoji> <headline>
 7) Severity emoji:
    🔥 = high impact / urgent escalation
    ⚠️ = medium impact / meaningful update
    ℹ️ = low-impact but useful context
 8) Prioritize highest-severity updates first.
+8b) Never add citations, source names, brackets, links, outlet names, or "Read more".
 9) If no significant updates remain, output exactly:
    QUIET_PERIOD_SENTINEL
 """.strip()
@@ -60,8 +63,10 @@ def build_digest_system_prompt(
         f"Importance scoring hint enabled: {'yes' if importance_scoring else 'no'}.",
         HTML_RULES,
     ]
-    if include_links:
-        toggles.append('When adding links, use <a href="https://...">Read more</a>.')
+    if not include_links:
+        toggles.append("Do not output links, URLs, source brackets, or citation markers.")
+    if not include_source_tags:
+        toggles.append("Do not output source names or outlet names in any line.")
     return f"{prompt}\n\n" + "\n".join(toggles)
 
 

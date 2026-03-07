@@ -32,6 +32,7 @@ from utils import (
     is_broad_news_query,
     normalize_space,
     sanitize_telegram_html,
+    strip_telegram_html,
 )
 
 
@@ -940,21 +941,7 @@ def _json_digest_to_html(payload: Dict[str, Any], *, interval_minutes: int, max_
         if len(headline) > 140:
             headline = f"{headline[:137].rsplit(' ', 1)[0]}..."
 
-        source_tag = ""
-        if _include_source_tags():
-            source_tag_value = normalize_space(str(item.get("source_tag") or ""))
-            if not source_tag_value:
-                sources = item.get("sources")
-                if isinstance(sources, list) and sources:
-                    source_tag_value = normalize_space(str(sources[0]))
-            source_tag = f" <i>[{source_tag_value}]</i>" if source_tag_value else ""
-
-        read_more = normalize_space(str(item.get("read_more") or ""))
-        read_more_part = ""
-        if read_more.startswith("http") and bool(getattr(config, "DIGEST_INCLUDE_READ_MORE_LINKS", True)):
-            read_more_part = f' <a href="{read_more}">Read more</a>'
-
-        line = f"{emoji} {headline}{source_tag}{read_more_part}".strip()
+        line = f"{emoji} {headline}".strip()
         lines.append(line)
 
         if len(lines) >= max_lines:
@@ -966,8 +953,94 @@ def _json_digest_to_html(payload: Dict[str, Any], *, interval_minutes: int, max_
     return sanitize_telegram_html("<br>".join(lines[:max_lines]))
 
 
+def _strip_digest_citations(text: str) -> str:
+    cleaned = str(text or "")
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r'<a\s+href="[^"]*">\s*Read more\s*</a>', "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'<a\s+href="[^"]*">.*?</a>', "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bRead more\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"https?://\S+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*\[[^\]]+\]", "", cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\s+\n", "\n", cleaned)
+    cleaned = re.sub(r"(?:<br>\s*){3,}", "<br><br>", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def _digest_needs_english_rewrite(text: str, output_language: str) -> bool:
+    if normalize_space(output_language).lower() != "english":
+        return False
+    plain = strip_telegram_html(text)
+    if not plain:
+        return False
+
+    non_ascii_letters = sum(1 for ch in plain if ch.isalpha() and ord(ch) > 127)
+    arabic_script = bool(re.search(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", plain))
+    cyrillic_script = bool(re.search(r"[\u0400-\u04FF]", plain))
+    return arabic_script or cyrillic_script or non_ascii_letters >= 4
+
+
+def _digest_english_rewrite_prompt() -> str:
+    return (
+        "Rewrite this Telegram HTML digest into clean English only.\n"
+        "Rules:\n"
+        "- Keep the same headline-only digest structure\n"
+        "- Preserve severity emojis and line breaks\n"
+        "- Translate every non-English word or phrase into English\n"
+        "- Remove citations, source names, bracket tags, outlet names, links, and any 'Read more' text\n"
+        "- Do not add new facts\n"
+        "- Output Telegram HTML only"
+    )
+
+
+async def _normalize_digest_output(
+    text: str,
+    auth_manager: AuthManager,
+    *,
+    interval_minutes: int,
+    max_lines: int,
+) -> str:
+    cleaned = _html_digest_cleanup(
+        _strip_digest_citations(text),
+        interval_minutes=interval_minutes,
+        max_lines=max_lines,
+    )
+    if not _digest_needs_english_rewrite(cleaned, _resolve_output_language()):
+        return cleaned
+
+    try:
+        auth_context = await auth_manager.get_auth_context()
+        rewritten = await _call_codex(
+            cleaned,
+            auth_context,
+            instructions=_digest_english_rewrite_prompt(),
+            verbosity="low",
+        )
+    except _CodexAuthError:
+        try:
+            auth_context = await auth_manager.refresh_auth_context()
+            rewritten = await _call_codex(
+                cleaned,
+                auth_context,
+                instructions=_digest_english_rewrite_prompt(),
+                verbosity="low",
+            )
+        except Exception:
+            return cleaned
+    except Exception:
+        return cleaned
+
+    normalized = _html_digest_cleanup(
+        _strip_digest_citations(rewritten),
+        interval_minutes=interval_minutes,
+        max_lines=max_lines,
+    )
+    return normalized or cleaned
+
+
 def _html_digest_cleanup(text: str, *, interval_minutes: int, max_lines: int) -> str:
-    cleaned = (text or "").strip()
+    cleaned = _strip_digest_citations((text or "").strip())
     if not cleaned:
         return quiet_period_message(interval_minutes)
 
@@ -981,7 +1054,6 @@ def _html_digest_cleanup(text: str, *, interval_minutes: int, max_lines: int) ->
     text_lines = re.sub(r"<br\s*/?>", "\n", cleaned, flags=re.IGNORECASE)
     lines_raw = [line.rstrip() for line in text_lines.splitlines() if line.strip()]
     lines: List[str] = []
-    include_sources = _include_source_tags()
     for raw in lines_raw:
         line = re.sub(r"</?[^>]+>", "", raw).strip()
         line = re.sub(r"^[-*•]\s*", "", line)
@@ -995,9 +1067,7 @@ def _html_digest_cleanup(text: str, *, interval_minutes: int, max_lines: int) ->
             line = f"{emoji} {line}"
         if len(line) > 220:
             line = f"{line[:217].rsplit(' ', 1)[0]}..."
-        if not include_sources:
-            # Remove bracketed source tags.
-            line = re.sub(r"\s\[[^\]]+\](?!\()", "", line).strip()
+        line = re.sub(r"\s\[[^\]]+\](?!\()", "", line).strip()
         lines.append(line)
     if not lines:
         return quiet_period_message(interval_minutes)
@@ -1095,8 +1165,8 @@ def _rule_based_fallback_digest(
 ) -> str:
     top: List[str] = []
     seen = set()
-    include_links = bool(getattr(config, "DIGEST_INCLUDE_READ_MORE_LINKS", True))
-    include_sources = _include_source_tags()
+    include_links = False
+    include_sources = False
 
     for post in posts:
         text = _post_text(post)
@@ -1137,7 +1207,7 @@ def _tiny_local_digest(posts: Sequence[Dict[str, object]], *, max_items: int = 6
     This is intentionally tiny/fast and purely deterministic.
     """
     lines: List[str] = []
-    include_sources = _include_source_tags()
+    include_sources = False
     for post in posts:
         text = _post_text(post)
         if not text:
@@ -2137,7 +2207,7 @@ async def create_digest_summary(
     if on_token is not None:
         prefer_json = False
     importance_scoring = bool(getattr(config, "DIGEST_IMPORTANCE_SCORING", True))
-    include_links = bool(getattr(config, "DIGEST_INCLUDE_READ_MORE_LINKS", True))
+    include_links = False
     output_language = _resolve_output_language()
 
     user_payload = (
@@ -2159,7 +2229,7 @@ async def create_digest_summary(
         importance_scoring=importance_scoring,
         include_links=include_links,
         output_language=output_language,
-        include_source_tags=_include_source_tags(),
+        include_source_tags=False,
     )
 
     try:
@@ -2202,8 +2272,13 @@ async def create_digest_summary(
     if prefer_json:
         parsed = _try_parse_digest_json(content)
         if parsed is not None:
-            return _json_digest_to_html(
-                parsed,
+            return await _normalize_digest_output(
+                _json_digest_to_html(
+                    parsed,
+                    interval_minutes=interval_minutes,
+                    max_lines=max_lines,
+                ),
+                manager,
                 interval_minutes=interval_minutes,
                 max_lines=max_lines,
             )
@@ -2214,7 +2289,7 @@ async def create_digest_summary(
             importance_scoring=importance_scoring,
             include_links=include_links,
             output_language=output_language,
-            include_source_tags=_include_source_tags(),
+            include_source_tags=False,
         )
         try:
             content = await _call_codex(
@@ -2226,8 +2301,9 @@ async def create_digest_summary(
         except Exception:
             return local_fallback_digest(posts, interval_minutes=interval_minutes)
 
-    return _html_digest_cleanup(
+    return await _normalize_digest_output(
         content,
+        manager,
         interval_minutes=interval_minutes,
         max_lines=max_lines,
     )
