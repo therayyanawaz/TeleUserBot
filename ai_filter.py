@@ -18,6 +18,7 @@ import httpx
 import config
 from auth import AuthManager
 from prompts import (
+    HUMAN_NEWSROOM_VOICE,
     QUERY_NO_MATCH_TEXT,
     build_digest_input_block,
     build_digest_system_prompt,
@@ -352,12 +353,15 @@ def _streaming_enabled() -> bool:
 def _summary_system_prompt() -> str:
     language = _resolve_output_language()
     return (
-        "You are a strict news filter.\n"
+        "You are a strict news filter working like a human newsroom editor.\n"
         f"Always write output in {language}.\n"
         f"If the input is in another language, translate it into {language} while summarizing.\n"
+        f"{HUMAN_NEWSROOM_VOICE}\n"
         "Output must be Telegram HTML only.\n"
         "Allowed tags: <b>, <i>, <u>, <s>, <tg-spoiler>, <code>, <pre>, <blockquote>, <a href>, <br>.\n"
         "If this message is real news or useful info, return a 2-3 line HTML summary.\n"
+        "Do not sound robotic, padded, or generic.\n"
+        "Lead with the clearest fact and keep the wording crisp.\n"
         "If it is spam, ads, promotional, or noise, reply only: SKIP"
     )
 
@@ -380,9 +384,12 @@ def _breaking_headline_prompt() -> str:
         "You write sharp live-news one-liners for Telegram alerts.\n"
         f"Output language must be {language}. Translate if needed.\n"
         "Return exactly one complete sentence with facts only.\n"
-        "Sound like a strong human news presenter: direct, concrete, active voice.\n"
+        "Sound like a strong human live-news presenter: direct, concrete, active voice.\n"
+        "Use natural spoken cadence without sounding casual or sloppy.\n"
         "Use the most important fact first.\n"
         "Do not use generic framing like Breaking, Update, reports say, or situation update unless uncertainty is the key fact.\n"
+        "Weak: Situation update after overnight military activity.\n"
+        "Strong: Air defenses lit up over Amman after overnight interceptions.\n"
         "Target 12-28 words.\n"
         "Never end with ellipsis.\n"
         "Do not cut off mid-thought.\n"
@@ -403,9 +410,11 @@ def _vital_rational_view_prompt() -> str:
         f"Return exactly one sentence (max {max_words} words), neutral and evidence-aware.\n"
         "It should sound like a calm human analyst quickly telling the reader why this matters.\n"
         "Start with: Why it matters: \n"
-        "Be specific about the consequence of this exact event.\n"
+        "State the specific consequence of this exact event.\n"
         "Mention the affected place, asset, or system when it is clear from the source.\n"
         "Prefer concrete consequences like retaliation risk, civilian danger, shipping disruption, air-defense pressure, diplomatic hardening, or market stress.\n"
+        "Weak: Why it matters: This may affect regional stability.\n"
+        "Strong: Why it matters: Pressure on Strait of Hormuz traffic can jolt shipping costs within hours.\n"
         "Never use generic boilerplate like 'this may affect regional stability' or 'verify updates across reliable sources'.\n"
         "Do not speculate. Do not take sides. No hashtags. No markdown."
     )
@@ -995,6 +1004,8 @@ def _digest_english_rewrite_prompt() -> str:
         "Rules:\n"
         "- Keep the same headline-only digest structure\n"
         "- Preserve severity emojis and line breaks\n"
+        "- Make the English sound human, readable, and alive\n"
+        "- Avoid repetitive sentence shapes and stiff wording\n"
         "- Translate every non-English word or phrase into English\n"
         "- Remove citations, source names, bracket tags, outlet names, links, and any 'Read more' text\n"
         "- Do not add new facts\n"

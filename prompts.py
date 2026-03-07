@@ -17,6 +17,19 @@ Never output Markdown. Never output unsupported tags. Keep tags valid and closed
 """.strip()
 
 
+HUMAN_NEWSROOM_VOICE = """
+Voice rules:
+- Sound human, readable, and alive.
+- Write like a switched-on newsroom editor, not a template or bot.
+- Use natural spoken cadence while staying factual and controlled.
+- Prefer strong verbs, concrete nouns, and clean sentence rhythm.
+- Avoid repetitive sentence shapes.
+- Avoid stiff analyst jargon, robotic filler, and template phrasing.
+- Talk like a person helping a smart reader catch up fast.
+- Never over-dramatize, moralize, role-play, or speculate beyond the evidence.
+""".strip()
+
+
 DIGEST_PROMPT_CORE = """
 You are an elite real-time news editor for Telegram digests.
 Your job: compress noisy channel posts into ultra-short, high-signal updates.
@@ -43,6 +56,12 @@ Core rules:
 8b) Never add citations, source names, brackets, links, outlet names, or "Read more".
 9) If no significant updates remain, output exactly:
    QUIET_PERIOD_SENTINEL
+
+Style examples:
+- Weak: ⚠️ Situation update in Beirut after overnight activity
+- Strong: ⚠️ Beirut woke to more strikes after another tense night in Dahieh
+- Weak: ℹ️ Reports say officials made a statement
+- Strong: ℹ️ Tehran signaled no pullback after the latest warning
 """.strip()
 
 
@@ -65,6 +84,7 @@ def build_digest_system_prompt(
         f"Include source tags: {'yes' if include_source_tags else 'no'} (if no, omit source brackets).",
         f"Include links when reliable and available: {'yes' if include_links else 'no'}.",
         f"Importance scoring hint enabled: {'yes' if importance_scoring else 'no'}.",
+        HUMAN_NEWSROOM_VOICE,
         HTML_RULES,
     ]
     if not include_links:
@@ -128,6 +148,12 @@ Answer rules:
    clearly instead of blending them into a false single narrative.
 18) Prefer natural, confident phrasing over stiff analyst jargon.
 19) Avoid robotic filler such as "based on the provided evidence" unless the uncertainty itself must be made explicit.
+
+Tone examples:
+- Weak: Based on the provided evidence, there appears to be heightened tension in Tehran.
+- Strong: Right now, Tehran looks tense, but the evidence does not show a citywide lockdown.
+- Weak: No matching information was identified for the casualty question.
+- Strong: The count is being reported, but the names of the dead are still not clearly confirmed.
 """.strip()
 
 
@@ -141,6 +167,7 @@ def build_query_system_prompt(*, output_language: str, detailed: bool) -> str:
     return (
         f"{base}\n\n"
         f"Output language must be {output_language}. Translate source text when needed.\n"
+        f"{HUMAN_NEWSROOM_VOICE}\n"
         f"{HTML_RULES}\n"
         f"{mode_line}"
     )
