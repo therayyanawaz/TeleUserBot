@@ -78,6 +78,7 @@ from utils import (
     build_alert_header,
     build_media_signature_digest,
     check_and_store_media_duplicate,
+    compute_visual_media_hash,
     LiveTelegramStreamer,
     DuplicateRuntime,
     GlobalDuplicateResult,
@@ -1910,7 +1911,23 @@ async def _message_media_signature(msg: Message) -> tuple[str, str]:
     if not getattr(msg, "media", None):
         return "", ""
 
-    parts: list[str] = [_message_media_kind(msg)]
+    media_kind = _message_media_kind(msg)
+    parts: list[str] = [media_kind]
+    media_blob = await _download_media_signature_bytes(msg)
+
+    visual_blob = b""
+    if media_kind == "image":
+        visual_blob = media_blob
+    elif media_kind == "video" and media_blob:
+        with contextlib.suppress(Exception):
+            visual_blob = await asyncio.to_thread(extract_first_video_frame_bytes, media_blob)
+
+    visual_hash = ""
+    if visual_blob:
+        visual_hash = await asyncio.to_thread(compute_visual_media_hash, visual_blob)
+    if visual_hash:
+        return f"visual:{media_kind}:{visual_hash}", media_kind
+
     file_obj = getattr(msg, "file", None)
     for attr in ("id", "size", "mime_type", "name"):
         value = getattr(file_obj, attr, None)
@@ -1931,11 +1948,10 @@ async def _message_media_signature(msg: Message) -> tuple[str, str]:
             if value:
                 parts.append(f"doc_{attr}:{value}")
 
-    thumb_blob = await _download_media_signature_bytes(msg)
-    if thumb_blob:
-        parts.append(f"thumb_sha1:{hashlib.sha1(thumb_blob).hexdigest()}")
+    if media_blob:
+        parts.append(f"thumb_sha1:{hashlib.sha1(media_blob).hexdigest()}")
 
-    return build_media_signature_digest(parts), _message_media_kind(msg)
+    return build_media_signature_digest(parts), media_kind
 
 
 async def _check_single_media_duplicate(msg: Message) -> bool:
