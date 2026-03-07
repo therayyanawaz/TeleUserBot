@@ -27,6 +27,7 @@ from telethon.errors import (
     ChatForwardsRestrictedError,
     FloodWaitError,
     MessageNotModifiedError,
+    PhoneNumberInvalidError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
     SessionPasswordNeededError,
@@ -4104,8 +4105,17 @@ async def _interactive_user_login(tg: TelegramClient) -> None:
                 )
             return
 
-        phone = _prompt_phone_number()
-        sent = await _call_with_floodwait(tg.send_code_request, phone)
+        while True:
+            phone = _prompt_phone_number()
+            try:
+                sent = await _call_with_floodwait(tg.send_code_request, phone)
+                break
+            except PhoneNumberInvalidError:
+                print(
+                    "Telegram rejected that phone number. "
+                    "Use full E.164 format with country code, e.g. +15551234567."
+                )
+                continue
         while True:
             code = _prompt_non_empty("Telegram login code: ")
             try:
