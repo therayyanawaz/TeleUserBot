@@ -38,6 +38,170 @@ def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+_ALERT_LABEL_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "🕯️ Casualty Alert",
+        (
+            "killed",
+            "dead",
+            "deaths",
+            "casualties",
+            "casualty",
+            "injured",
+            "wounded",
+            "fatalities",
+            "fatality",
+            "massacre",
+            "body count",
+        ),
+    ),
+    (
+        "🛡️ Interception Alert",
+        (
+            "intercepted",
+            "interception",
+            "interceptions",
+            "shot down",
+            "air defense",
+            "air-defence",
+            "air defence",
+            "iron dome",
+            "defenses activated",
+            "defence activated",
+        ),
+    ),
+    (
+        "⚠️ Civil Warning",
+        (
+            "evacuate",
+            "evacuation",
+            "warning",
+            "warnings",
+            "shelter",
+            "shelters",
+            "airspace closed",
+            "closure",
+            "curfew",
+            "stay indoors",
+            "sirens",
+        ),
+    ),
+    (
+        "🚨 Strike Alert",
+        (
+            "airstrike",
+            "air strike",
+            "strike",
+            "strikes",
+            "missile",
+            "missiles",
+            "rocket",
+            "rockets",
+            "drone strike",
+            "bombing",
+            "blast",
+            "blasts",
+            "explosion",
+            "explosions",
+            "shelling",
+            "raid",
+            "raids",
+        ),
+    ),
+    (
+        "📣 Major Statement",
+        (
+            "said",
+            "says",
+            "announced",
+            "declared",
+            "statement",
+            "spokesperson",
+            "spokesman",
+            "spokeswoman",
+            "official says",
+            "minister says",
+            "president says",
+            "trump says",
+        ),
+    ),
+    (
+        "🚢 Maritime Watch",
+        (
+            "vessel",
+            "ship",
+            "shipping",
+            "cargo ship",
+            "tanker",
+            "strait of hormuz",
+            "naval",
+            "port",
+            "crew rescued",
+        ),
+    ),
+    (
+        "🏛️ Leadership Alert",
+        (
+            "leader",
+            "supreme leader",
+            "president",
+            "prime minister",
+            "commander",
+            "succession",
+            "cabinet",
+            "government reshuffle",
+            "assassinated",
+            "resigned",
+        ),
+    ),
+    (
+        "⚡ Disruption Alert",
+        (
+            "outage",
+            "blackout",
+            "cyber",
+            "internet down",
+            "power cut",
+            "power outage",
+            "communications down",
+            "disruption",
+        ),
+    ),
+)
+
+
+def choose_alert_label(text: str, *, severity: str = "high") -> str:
+    """
+    Pick a more specific, human-readable alert label than generic "BREAKING".
+    """
+    lowered = normalize_space(text).lower()
+    if lowered:
+        for label, markers in _ALERT_LABEL_RULES:
+            if any(marker in lowered for marker in markers):
+                return label
+
+    normalized_severity = normalize_space(severity).lower()
+    if normalized_severity == "high":
+        return "🔥 Flash Update"
+    if normalized_severity == "medium":
+        return "⚠️ Live Update"
+    return "ℹ️ Situation Update"
+
+
+def build_alert_header(
+    text: str,
+    *,
+    severity: str,
+    source_title: str,
+    include_source: bool,
+) -> str:
+    label = choose_alert_label(text, severity=severity)
+    if include_source:
+        safe_source = sanitize_telegram_html(source_title)
+        return f"<b>{label} • {safe_source}</b>"
+    return f"<b>{label}</b>"
+
+
 @dataclass(frozen=True)
 class QueryPlan:
     original_query: str

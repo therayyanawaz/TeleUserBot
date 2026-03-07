@@ -72,6 +72,7 @@ from prompts import quiet_period_message
 from severity_classifier import classify_message_severity
 from utils import (
     apply_premium_emoji_html,
+    build_alert_header,
     LiveTelegramStreamer,
     DuplicateRuntime,
     GlobalDuplicateResult,
@@ -2096,7 +2097,6 @@ def _format_breaking_text(source_title: str, headline: str, rational_view: str |
 
     clean_headline = normalize_space(headline)
     safe_headline = sanitize_telegram_html(clean_headline)
-    safe_source = sanitize_telegram_html(source_title)
     def _normalize_structured_block(value: str) -> str:
         text = str(value or "").strip()
         if not text:
@@ -2132,9 +2132,13 @@ def _format_breaking_text(source_title: str, headline: str, rational_view: str |
             cleaned_rational = _clean_rational_view(rational_view)
             if cleaned_rational:
                 rational_part = f"<br><br><i>{sanitize_telegram_html(cleaned_rational)}</i>"
-    if _include_source_tags():
-        return f"<b>🔥 BREAKING • {safe_source}</b><br><br>{safe_headline}{rational_part}"
-    return f"<b>🔥 BREAKING</b><br><br>{safe_headline}{rational_part}"
+    header = build_alert_header(
+        clean_headline,
+        severity="high",
+        source_title=source_title,
+        include_source=_include_source_tags(),
+    )
+    return f"{header}<br><br>{safe_headline}{rational_part}"
 
 
 def _cleanup_breaking_refs(now_ts: int | None = None) -> None:
