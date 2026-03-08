@@ -3645,9 +3645,37 @@ def _format_digest_message(
     *,
     title: str = "Digest",
 ) -> str:
+    def _count_digest_headlines(body: str) -> int:
+        plain = normalize_space(strip_telegram_html(body))
+        if not plain:
+            return 0
+        lowered = plain.lower()
+        if "no major developments" in lowered or "quiet period" in lowered:
+            return 0
+
+        count = 0
+        for raw_line in body.replace("<br><br>", "\n").replace("<br>", "\n").splitlines():
+            line = normalize_space(strip_telegram_html(raw_line))
+            if not line:
+                continue
+            if re.match(r"^[•-]s+", line):
+                count += 1
+                continue
+            if re.match(r"^[\U0001F300-\U0001FAFF\u2600-\u27BF]", line):
+                count += 1
+                continue
+        return count
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     label = sanitize_telegram_html(title.strip() or "Digest")
-    header = f"<b>📰 {label} • {timestamp} • {total_updates} updates</b>"
+    headline_count = _count_digest_headlines(digest_body)
+    if headline_count > 0:
+        header = (
+            f"<b>📰 {label} • {timestamp} • "
+            f"{headline_count} headlines from {total_updates} updates</b>"
+        )
+    else:
+        header = f"<b>📰 {label} • {timestamp} • {total_updates} updates reviewed</b>"
     _ = sources
     return sanitize_telegram_html(f"{header}<br><br>{digest_body.strip()}")
 
