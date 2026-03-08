@@ -235,6 +235,8 @@ HUMANIZED_VITAL_OPINION_MAX_WORDS = _env_int("HUMANIZED_VITAL_OPINION_MAX_WORDS"
 # -----------------------------------------------------------------------------
 DIGEST_SEND_DELAY_SECONDS = _env_float("DIGEST_SEND_DELAY_SECONDS", 0.8)  # type: float
 DIGEST_SEND_CHUNK_SIZE = _env_int("DIGEST_SEND_CHUNK_SIZE", 3600)  # type: int
+DIGEST_PIN_HOURLY = _env_bool("DIGEST_PIN_HOURLY", False)  # type: bool
+DIGEST_PIN_DAILY = _env_bool("DIGEST_PIN_DAILY", False)  # type: bool
 DIGEST_RETRY_BASE_SECONDS = _env_int("DIGEST_RETRY_BASE_SECONDS", 30)  # type: int
 DIGEST_RETRY_MAX_SECONDS = _env_int("DIGEST_RETRY_MAX_SECONDS", 900)  # type: int
 DIGEST_429_THRESHOLD_PER_HOUR = _env_int("DIGEST_429_THRESHOLD_PER_HOUR", 3)  # type: int

@@ -57,6 +57,7 @@ from db import (
     count_inflight,
     count_pending,
     get_last_digest_timestamp,
+    get_meta,
     init_db,
     is_seen,
     load_source_delivery_ref,
@@ -71,6 +72,7 @@ from db import (
     save_to_digest_archive,
     save_to_digest_queue,
     set_last_digest_timestamp,
+    set_meta,
 )
 from prompts import quiet_period_message
 from severity_classifier import classify_message_severity
@@ -3722,13 +3724,94 @@ async def _run_post_processors(text: str, context: Dict[str, object]) -> str:
     return current
 
 
-async def _send_digest_message(text: str) -> None:
+def _digest_pin_hourly_enabled() -> bool:
+    return _bool_flag(getattr(config, "DIGEST_PIN_HOURLY", False), False)
+
+
+def _digest_pin_daily_enabled() -> bool:
+    return _bool_flag(getattr(config, "DIGEST_PIN_DAILY", False), False)
+
+
+def _digest_pin_meta_key(kind: str) -> str:
+    normalized = (kind or "").strip().lower()
+    return f"digest_pin::{normalized}::message_id"
+
+
+async def _unpin_digest_message_id(message_id: int) -> None:
+    if message_id <= 0:
+        return
+    if _destination_uses_bot_api():
+        await _bot_api_request(
+            "unpinChatMessage",
+            data={
+                "chat_id": _require_bot_destination_chat_id(),
+                "message_id": str(message_id),
+            },
+        )
+        return
+
+    tg = _require_client()
+    await _call_with_floodwait(
+        tg.unpin_message,
+        _require_destination_peer(),
+        message=message_id,
+    )
+
+
+async def _pin_digest_message_ref(ref: object | None, *, kind: str) -> None:
+    enabled = _digest_pin_hourly_enabled() if kind == "hourly" else _digest_pin_daily_enabled()
+    if not enabled:
+        return
+
+    message_id = _message_ref_id(ref) or 0
+    if message_id <= 0:
+        return
+
+    meta_key = _digest_pin_meta_key(kind)
+    previous_raw = get_meta(meta_key) or ""
+    try:
+        previous_id = int(previous_raw) if previous_raw else 0
+    except Exception:
+        previous_id = 0
+
+    try:
+        if previous_id > 0 and previous_id != message_id:
+            with contextlib.suppress(Exception):
+                await _unpin_digest_message_id(previous_id)
+
+        if _destination_uses_bot_api():
+            await _bot_api_request(
+                "pinChatMessage",
+                data={
+                    "chat_id": _require_bot_destination_chat_id(),
+                    "message_id": str(message_id),
+                    "disable_notification": "true",
+                },
+            )
+        else:
+            tg = _require_client()
+            await _call_with_floodwait(
+                tg.pin_message,
+                _require_destination_peer(),
+                message=message_id,
+                notify=False,
+            )
+        set_meta(meta_key, str(message_id))
+    except Exception:
+        LOGGER.exception("Failed rotating %s digest pin.", kind)
+
+
+async def _send_digest_message(text: str) -> object | None:
     chunks = split_html_chunks(text, max_chars=_digest_send_chunk_size())
     delay = _digest_send_delay_seconds()
+    first_ref = None
     for idx, chunk in enumerate(chunks):
-        await _send_text(chunk)
+        ref = await _send_text_with_ref(chunk)
+        if first_ref is None:
+            first_ref = ref
         if idx < len(chunks) - 1 and delay > 0:
             await asyncio.sleep(delay)
+    return first_ref
 
 
 async def _flush_digest_queue_once() -> None:
@@ -3813,10 +3896,14 @@ async def _flush_digest_queue_once() -> None:
                 sources=source_names,
                 title=f"Hourly Digest (last {max(1, _digest_interval_seconds() // 60)}m)",
             )
+            sent_ref = None
             if _is_streaming_enabled():
                 stream_stats = await streamer.finalize(digest_message)
+                sent_ref = getattr(streamer, "_primary_ref", None)
             else:
-                await _send_digest_message(digest_message)
+                sent_ref = await _send_digest_message(digest_message)
+
+            await _pin_digest_message_ref(sent_ref, kind="hourly")
 
             acked = ack_digest_batch(batch_id)
             set_last_digest_timestamp(int(time.time()))
@@ -3935,10 +4022,14 @@ async def _send_daily_archive_digest_once() -> None:
                 sources=source_names,
                 title=f"24h Digest (last {window_hours}h)",
             )
+            sent_ref = None
             if _is_streaming_enabled():
                 stream_stats = await streamer.finalize(digest_message)
+                sent_ref = getattr(streamer, "_primary_ref", None)
             else:
-                await _send_digest_message(digest_message)
+                sent_ref = await _send_digest_message(digest_message)
+
+            await _pin_digest_message_ref(sent_ref, kind="daily")
 
             set_last_digest_timestamp(int(time.time()))
             log_structured(
@@ -5770,6 +5861,8 @@ def _startup_health_check() -> None:
         digest_queue_clear_enabled=bool(queue_clear_interval_seconds > 0),
         digest_queue_clear_inflight=_digest_queue_clear_include_inflight(),
         digest_queue_clear_scope=queue_clear_scope,
+        digest_pin_hourly=_digest_pin_hourly_enabled(),
+        digest_pin_daily=_digest_pin_daily_enabled(),
         web_server_enabled=_is_web_server_enabled(),
         web_server_host=_web_server_host(),
         web_server_port=_web_server_port(),
@@ -5780,7 +5873,7 @@ def _startup_health_check() -> None:
         quota_health=get_quota_health(),
     )
     LOGGER.info(
-        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s query_web=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%s scope=%s web=%s@%s:%s",
+        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s query_web=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%s scope=%s pin_hourly=%s pin_daily=%s web=%s@%s:%s",
         mode,
         pending,
         inflight,
@@ -5799,6 +5892,8 @@ def _startup_health_check() -> None:
         ",".join(f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()) or "off",
         queue_clear_display,
         queue_clear_scope,
+        _digest_pin_hourly_enabled(),
+        _digest_pin_daily_enabled(),
         _is_web_server_enabled(),
         _web_server_host(),
         _web_server_port(),

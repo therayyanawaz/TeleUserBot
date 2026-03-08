@@ -248,6 +248,8 @@ sudo apt-get install -y tesseract-ocr-ara tesseract-ocr-fas tesseract-ocr-urd te
 
 ```env
 DIGEST_MODE=true
+DIGEST_PIN_HOURLY=false
+DIGEST_PIN_DAILY=false
 DIGEST_INTERVAL_MINUTES=60
 DIGEST_DAILY_TIMES=["00:00"]
 DIGEST_DAILY_WINDOW_HOURS=24
