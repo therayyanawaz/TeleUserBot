@@ -3658,7 +3658,7 @@ def _format_digest_message(
             line = normalize_space(strip_telegram_html(raw_line))
             if not line:
                 continue
-            if re.match(r"^[•-]s+", line):
+            if re.match(r"^[•-]\s+", line):
                 count += 1
                 continue
             if re.match(r"^[\U0001F300-\U0001FAFF\u2600-\u27BF]", line):
