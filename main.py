@@ -2309,9 +2309,8 @@ def _format_followup_media_caption(source_title: str, context_line: str) -> str 
     cleaned = _truncate_context_line(cleaned, limit=260)
     if not cleaned:
         return None
-    source_html = sanitize_telegram_html((source_title or "").strip() or "Source")
     context_html = sanitize_telegram_html(cleaned)
-    return f"<b>{source_html}</b><br><br><i>Follow-up visuals:</i> {context_html}"
+    return f"<i>Follow-up visuals:</i> {context_html}"
 
 
 async def _build_reply_context_caption(
