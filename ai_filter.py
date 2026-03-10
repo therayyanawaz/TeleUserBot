@@ -403,19 +403,21 @@ def _vital_rational_view_prompt() -> str:
         max_words = int(getattr(config, "HUMANIZED_VITAL_OPINION_MAX_WORDS", 20))
     except Exception:
         max_words = 20
-    max_words = max(10, min(max_words, 30))
+    max_words = max(10, min(max_words, 32))
     return (
-        "You write concise public-interest context for urgent news.\n"
+        "You write one-line connective context for urgent Telegram alerts.\n"
         f"Output language must be {language}. Translate if needed.\n"
-        f"Return exactly one sentence (max {max_words} words), neutral and evidence-aware.\n"
-        "It should sound like a calm human analyst quickly telling the reader why this matters.\n"
+        f"Return exactly one sentence (max {max_words} words), neutral and precise.\n"
         "Start with: Why it matters: \n"
-        "State the specific consequence of this exact event.\n"
-        "Mention the affected place, asset, or system when it is clear from the source.\n"
-        "Prefer concrete consequences like retaliation risk, civilian danger, shipping disruption, air-defense pressure, diplomatic hardening, or market stress.\n"
-        "Weak: Why it matters: This may affect regional stability.\n"
-        "Strong: Why it matters: Pressure on Strait of Hormuz traffic can jolt shipping costs within hours.\n"
-        "Never use generic boilerplate like 'this may affect regional stability' or 'verify updates across reliable sources'.\n"
+        "Do not explain generic consequences or obvious common sense.\n"
+        "Your only job is to connect the current update to the recent story arc when that connection is real.\n"
+        "Use the provided recent related updates as your bridge material.\n"
+        "Answer the reader's implicit question: what changed now compared with what was already happening?\n"
+        "Good pattern: Why it matters: This comes hours after earlier strikes near Tehran, so the pressure now appears to be reaching deeper into the capital.\n"
+        "Good pattern: Why it matters: Earlier Gulf alerts centered on Bahrain, and this pushes the same tension into Abu Dhabi.\n"
+        "Bad: Why it matters: This raises regional stability concerns.\n"
+        "Bad: Why it matters: Civilian danger is increasing.\n"
+        "If there is no non-obvious bridge to the recent updates, reply exactly: SKIP\n"
         "Do not speculate. Do not take sides. No hashtags. No markdown."
     )
 
@@ -1998,6 +2000,8 @@ def _cleanup_vital_view(raw: str) -> str:
             "by",
             "amid",
             "pending",
+            "after",
+            "before",
         }
         text_value = normalize_space(value)
         if not text_value:
@@ -2020,17 +2024,21 @@ def _cleanup_vital_view(raw: str) -> str:
     text = normalize_space(raw)
     if not text:
         return ""
+    if text.strip().upper() == "SKIP":
+        return ""
     text = re.sub(r"^[*`#>\-\s]+", "", text).strip()
     text = re.sub(r"</?[^>]+>", "", text).strip()
     if "\n" in text:
         text = text.splitlines()[0].strip()
+    if not text:
+        return ""
     if not text.lower().startswith("why it matters:"):
         text = f"Why it matters: {text}"
     try:
         max_words = int(getattr(config, "HUMANIZED_VITAL_OPINION_MAX_WORDS", 20))
     except Exception:
         max_words = 20
-    max_words = max(10, min(max_words, 30))
+    max_words = max(10, min(max_words, 32))
     words = text.split()
     if len(words) > max_words:
         text = " ".join(words[:max_words])
@@ -2038,20 +2046,18 @@ def _cleanup_vital_view(raw: str) -> str:
     if text.lower().startswith("why it matters:"):
         detail = normalize_space(text.split(":", 1)[1] if ":" in text else "")
         if not detail:
-            return _finalize_sentence(_fallback_vital_view(raw))
-    text = _finalize_sentence(text)
-    if not text:
-        return _finalize_sentence(_fallback_vital_view(raw))
-    return text
+            return ""
+    return _finalize_sentence(text)
 
 
 _VITAL_GENERIC_DETAILS = {
-    "casualty reports can rapidly escalate security and humanitarian risk",
-    "any incident near nuclear infrastructure raises regional safety concerns",
-    "military exchanges increase escalation risk and can trigger rapid retaliation",
-    "official restrictions often signal broader disruption in the coming hours",
     "this may affect regional stability; verify updates across multiple reliable sources",
     "this may affect regional stability",
+    "civilian danger is increasing",
+    "this keeps escalation risk high",
+    "this raises immediate civilian-safety risks",
+    "this can strain critical infrastructure",
+    "the same story is still unfolding",
 }
 
 _VITAL_ASSET_PATTERNS: tuple[str, ...] = (
@@ -2168,70 +2174,97 @@ def _vital_view_is_too_generic(text: str) -> bool:
     detail = lowered
     if detail.startswith("why it matters:"):
         detail = normalize_space(detail.split(":", 1)[1])
+    if not detail:
+        return True
     if detail in _VITAL_GENERIC_DETAILS:
         return True
-    if "verify updates across multiple reliable sources" in detail:
-        return True
-    if "regional stability" in detail and len(detail.split()) <= 14:
-        return True
-    return False
-
-
-def _fallback_vital_view(text: str) -> str:
-    clean = normalize_space(strip_telegram_html(text))
-    lowered = clean.lower()
-    focus = _extract_vital_focus(clean)
-    location = _extract_vital_location(clean)
-
-    def _with_focus(template: str, generic: str, *, prefer_location: bool = False) -> str:
-        chosen = focus
-        if prefer_location and location and not _is_bad_location_candidate(location):
-            chosen = location
-        if chosen:
-            return template.format(focus=chosen)
-        return generic
-
-    if any(k in lowered for k in ("killed", "dead", "casualt", "injur")):
-        return _with_focus(
-            "Why it matters: Rising casualties around {focus} will intensify pressure and keep escalation risk high.",
-            "Why it matters: Rising casualties will intensify pressure and keep escalation risk high.",
-        )
-    if any(k in lowered for k in ("nuclear", "reactor", "power plant")):
-        return _with_focus(
-            "Why it matters: Trouble near {focus} would draw urgent scrutiny and raise the stakes fast.",
-            "Why it matters: Trouble near nuclear infrastructure would draw urgent scrutiny and raise the stakes fast.",
-        )
-    if any(k in lowered for k in ("evacu", "airspace", "closed", "emergency", "warned civilians", "leave immediately", "leave now")):
-        return _with_focus(
-            "Why it matters: Restrictions around {focus} usually mean officials expect more disruption or follow-on strikes.",
-            "Why it matters: These restrictions usually mean officials expect more disruption or follow-on strikes.",
-            prefer_location=True,
-        )
-    if any(k in lowered for k in ("ship", "vessel", "tanker", "shipping", "port", "hormuz", "oil field", "gas field")):
-        return _with_focus(
-            "Why it matters: Disruption around {focus} can hit shipping lanes, energy flows, and insurance costs.",
-            "Why it matters: Disruption here can hit shipping lanes, energy flows, and insurance costs.",
-            prefer_location=True,
-        )
-    if any(k in lowered for k in ("radar", "thaad", "air defense", "air defence", "intercept", "base", "battery")):
-        return _with_focus(
-            "Why it matters: Pressure on {focus} suggests the defense picture there is still shifting.",
-            "Why it matters: Pressure on local defenses suggests the military picture is still shifting.",
-        )
-    if any(k in lowered for k in ("missile", "drone", "airstrike", "strike", "explosion", "blast", "shelling")):
-        return _with_focus(
-            "Why it matters: A hit around {focus} raises the chance of fast retaliation and a wider fight.",
-            "Why it matters: This raises the chance of fast retaliation and a wider fight.",
-        )
-    if any(k in lowered for k in ("said", "says", "announced", "declared", "statement", "warned")):
-        return _with_focus(
-            "Why it matters: Public signaling around {focus} can harden positions and shape the next move.",
-            "Why it matters: Public signaling like this can harden positions and shape the next move.",
-        )
-    return _with_focus(
-        "Why it matters: This points to a live security shift around {focus} worth watching for follow-on moves.",
-        "Why it matters: This points to a live security shift worth watching for follow-on moves.",
+    banned_fragments = (
+        "verify updates across multiple reliable sources",
+        "regional stability",
+        "civilian-safety risks",
+        "civilian danger",
+        "critical infrastructure",
+        "the same story is still unfolding",
+        "worth watching",
+        "raises escalation risk",
     )
+    return any(fragment in detail for fragment in banned_fragments)
+
+
+def _recent_context_bridge_input(current_text: str, recent_context: Sequence[str] | None) -> str:
+    current = normalize_space(strip_telegram_html(current_text))
+    lines = [f"Current update: {current}"]
+    cleaned_context: list[str] = []
+    for item in recent_context or ():
+        value = normalize_space(strip_telegram_html(str(item)))
+        if not value:
+            continue
+        cleaned_context.append(value)
+    if cleaned_context:
+        lines.append("Recent related updates:")
+        lines.extend(f"- {item}" for item in cleaned_context[:3])
+    return "\n".join(lines)
+
+
+def _fallback_story_bridge(current_text: str, recent_context: Sequence[str] | None) -> str | None:
+    def _usable_location(value: str) -> str:
+        candidate = normalize_space(value)
+        if len(candidate) < 3:
+            return ""
+        if candidate.lower() in {"a", "an", "the"}:
+            return ""
+        if _is_bad_location_candidate(candidate):
+            return ""
+        return candidate
+
+    def _usable_focus(value: str) -> str:
+        candidate = normalize_space(value)
+        if len(candidate) < 3:
+            return ""
+        if candidate.lower() in {"a", "an", "the"}:
+            return ""
+        return candidate
+
+    items = [normalize_space(strip_telegram_html(str(item))) for item in (recent_context or ())]
+    items = [item for item in items if item]
+    if not items:
+        return None
+
+    current_clean = normalize_space(strip_telegram_html(current_text))
+    current_focus = _usable_focus(_extract_vital_focus(current_clean))
+    current_location = _usable_location(_extract_vital_location(current_clean))
+    anchor = items[0]
+    anchor_focus = _usable_focus(_extract_vital_focus(anchor))
+    anchor_location = _usable_location(_extract_vital_location(anchor))
+
+    if current_location and anchor_location and current_location.lower() != anchor_location.lower():
+        return (
+            f"Why it matters: Earlier pressure centered on {anchor_location}, and this now appears to have reached {current_location}."
+        )
+    if current_location and anchor_location and current_location.lower() == anchor_location.lower():
+        return (
+            f"Why it matters: This lands after earlier pressure around {current_location}, so the same thread still appears active there."
+        )
+    if anchor_location:
+        return (
+            f"Why it matters: This comes after earlier pressure around {anchor_location}, so the same thread still appears active there."
+        )
+    if current_focus and anchor_focus and current_focus.lower() != anchor_focus.lower():
+        return (
+            f"Why it matters: Earlier alerts focused on {anchor_focus}, and this latest move now pulls {current_focus} into the same thread."
+        )
+    anchor_text = anchor
+    if anchor_text.startswith("-"):
+        anchor_text = anchor_text[1:].strip()
+    age_split = anchor_text.split(":", 1)
+    bridge_anchor = age_split[1].strip() if len(age_split) == 2 and age_split[0] else anchor_text
+    bridge_anchor = re.sub(r"^[A-Z][a-z]+\s+after\s+", "", bridge_anchor)
+    bridge_anchor = normalize_space(bridge_anchor)
+    if not bridge_anchor:
+        return None
+    if len(bridge_anchor) > 110:
+        bridge_anchor = bridge_anchor[:107].rsplit(" ", 1)[0] + "..."
+    return f"Why it matters: This follows {bridge_anchor}, so this no longer looks like a one-off update."
 
 
 async def summarize_breaking_headline(
@@ -2292,18 +2325,29 @@ async def summarize_breaking_headline(
 async def summarize_vital_rational_view(
     text: str,
     auth_manager: AuthManager,
+    *,
+    recent_context: Sequence[str] | None = None,
 ) -> Optional[str]:
     cleaned = text.strip()
     if not cleaned:
         return None
 
-    key = _cache_key(f"vital_view::{cleaned}")
+    cleaned_context = [
+        normalize_space(strip_telegram_html(str(item)))
+        for item in (recent_context or ())
+        if normalize_space(strip_telegram_html(str(item)))
+    ]
+    if not cleaned_context:
+        return None
+
+    context_key = "||".join(cleaned_context[:3])
+    key = _cache_key(f"vital_view::{cleaned}::{context_key}")
     cached = _vital_view_cache_get(key)
     if cached is not None or key in _VITAL_VIEW_CACHE:
         return cached
 
-    compact = cleaned if len(cleaned) <= 2200 else f"{cleaned[:2197].rsplit(' ', 1)[0]}..."
-    fallback = _cleanup_vital_view(_fallback_vital_view(cleaned))
+    compact = _recent_context_bridge_input(cleaned, cleaned_context)
+    fallback = _cleanup_vital_view(_fallback_story_bridge(cleaned, cleaned_context))
 
     try:
         auth_context = await auth_manager.get_auth_context()

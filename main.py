@@ -2622,6 +2622,68 @@ def _breaking_topic_fuzzy_similarity(left_norm: str, right_norm: str) -> float:
     return float(SequenceMatcher(None, left_norm, right_norm).ratio())
 
 
+def _format_story_bridge_age(age_seconds: int) -> str:
+    seconds = max(0, int(age_seconds))
+    if seconds < 120:
+        return "moments ago"
+    if seconds < 3600:
+        minutes = max(1, seconds // 60)
+        return f"{minutes}m ago"
+    hours = max(1, seconds // 3600)
+    return f"{hours}h ago"
+
+
+def _compact_story_bridge_text(text: str, *, max_words: int = 18) -> str:
+    clean = normalize_space(strip_telegram_html(text))
+    if not clean:
+        return ""
+    clean = re.sub(r"\s+", " ", clean).strip()
+    sentence_match = re.search(r"(.{18,260}?[.!?])(?:\s|$)", clean)
+    if sentence_match:
+        clean = normalize_space(sentence_match.group(1))
+    words = clean.split()
+    if len(words) > max_words:
+        clean = " ".join(words[:max_words]).rstrip(".,;:!?") + "..."
+    return clean
+
+
+def _recent_story_bridge_context(text: str, *, hours: int = 6, limit: int = 3) -> List[str]:
+    now = int(time.time())
+    since_ts = max(0, now - max(1, hours) * 3600)
+    rows = load_archive_since(since_ts, 160)
+    current_tokens = _breaking_topic_tokens(text)
+    current_norm = _breaking_topic_normalized(text)
+    if not current_tokens or not current_norm:
+        return []
+
+    ranked: list[tuple[float, int, str]] = []
+    seen_norms: set[str] = set()
+    for row in rows:
+        raw_text = str(row.get("raw_text") or "").strip()
+        if not raw_text:
+            continue
+        candidate_norm = _breaking_topic_normalized(raw_text)
+        if not candidate_norm or candidate_norm == current_norm or candidate_norm in seen_norms:
+            continue
+        candidate_tokens = _breaking_topic_tokens(raw_text)
+        overlap, ratio = _breaking_topic_similarity(current_tokens, candidate_tokens)
+        fuzzy = _breaking_topic_fuzzy_similarity(current_norm, candidate_norm)
+        if overlap < 2 and ratio < 0.34 and fuzzy < 0.55:
+            continue
+        ts = int(row.get("timestamp") or 0)
+        age = max(0, now - ts)
+        recency_bonus = max(0.0, 1.0 - min(age, hours * 3600) / float(hours * 3600 or 1)) * 0.2
+        score = overlap * 0.18 + ratio * 0.42 + fuzzy * 0.25 + recency_bonus
+        compact = _compact_story_bridge_text(raw_text)
+        if not compact:
+            continue
+        ranked.append((score, ts, f"{_format_story_bridge_age(age)}: {compact}"))
+        seen_norms.add(candidate_norm)
+
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item[2] for item in ranked[: max(1, limit)]]
+
+
 def _cleanup_breaking_topic_threads_locked(now_ts: int | None = None) -> None:
     now = int(now_ts if now_ts is not None else time.time())
     cutoff = now - _breaking_topic_window_seconds()
@@ -3439,7 +3501,12 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
                 headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
         rational_view: str | None = None
         if _should_attach_vital_opinion(text):
-            rational_view = await summarize_vital_rational_view(text, _require_auth_manager())
+            recent_context = _recent_story_bridge_context(text)
+            rational_view = await summarize_vital_rational_view(
+                text,
+                _require_auth_manager(),
+                recent_context=recent_context,
+            )
         payload = _format_breaking_text(source, headline, rational_view)
         topic_seed = f"{headline}\n{text}"
         reply_to = await _resolve_source_reply_target(msg, fallback_topic_seed=topic_seed)
@@ -3577,9 +3644,11 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
                 headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
         rational_view: str | None = None
         if _should_attach_vital_opinion(combined_caption):
+            recent_context = _recent_story_bridge_context(combined_caption)
             rational_view = await summarize_vital_rational_view(
                 combined_caption,
                 _require_auth_manager(),
+                recent_context=recent_context,
             )
         payload = _format_breaking_text(source, headline, rational_view)
         topic_seed = f"{headline}\n{combined_caption}"
