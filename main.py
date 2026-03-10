@@ -2103,6 +2103,16 @@ def _normalize_media_ocr_text(text: str) -> str:
     return cleaned
 
 
+def _format_ocr_translation_caption(translated_text: str) -> str | None:
+    cleaned = normalize_space(strip_telegram_html(translated_text))
+    if not cleaned:
+        return None
+    capped = _truncate_context_line(cleaned, limit=min(_media_text_ocr_max_chars(), 700))
+    if not capped:
+        return None
+    return f"<i>Translate:</i> {sanitize_telegram_html(capped)}"
+
+
 async def _extract_media_ocr_translation(msg: Message) -> str | None:
     if not _media_text_ocr_enabled():
         return None
@@ -2149,7 +2159,7 @@ async def _extract_media_ocr_translation(msg: Message) -> str | None:
     translated = await translate_ocr_text_to_english(normalized, _require_auth_manager())
     if not translated:
         return None
-    return sanitize_telegram_html(translated)
+    return _format_ocr_translation_caption(translated)
 
 
 async def _caption_for_media_without_text(msg: Message) -> str | None:
