@@ -71,6 +71,33 @@ def _to_archive_rows_dict(rows: Iterable[sqlite3.Row]) -> List[Dict[str, object]
     return result
 
 
+def _to_inbound_job_rows(rows: Iterable[sqlite3.Row]) -> List[Dict[str, object]]:
+    result: List[Dict[str, object]] = []
+    for row in rows:
+        result.append(
+            {
+                "id": int(row["id"]),
+                "job_key": str(row["job_key"]),
+                "priority": int(row["priority"]),
+                "stage": str(row["stage"]),
+                "status": str(row["status"]),
+                "run_after_ts": int(row["run_after_ts"]),
+                "channel_id": str(row["channel_id"]),
+                "message_id": int(row["message_id"]),
+                "payload_json": str(row["payload_json"] or "{}"),
+                "retry_count": int(row["retry_count"]),
+                "max_retries": int(row["max_retries"]),
+                "last_error": str(row["last_error"] or ""),
+                "last_error_at": int(row["last_error_at"] or 0),
+                "claimed_by": str(row["claimed_by"] or ""),
+                "claimed_at": int(row["claimed_at"] or 0),
+                "created_at": int(row["created_at"]),
+                "updated_at": int(row["updated_at"]),
+            }
+        )
+    return result
+
+
 def init_db() -> None:
     ensure_runtime_dir()
     with _transaction() as conn:
@@ -180,6 +207,43 @@ def init_db() -> None:
         )
 
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inbound_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_key TEXT NOT NULL UNIQUE,
+                priority INTEGER NOT NULL DEFAULT 50,
+                stage TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                run_after_ts INTEGER NOT NULL,
+                channel_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 4,
+                last_error TEXT,
+                last_error_at INTEGER,
+                claimed_by TEXT,
+                claimed_at INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_decision_cache (
+                cache_key TEXT PRIMARY KEY,
+                normalized_hash TEXT NOT NULL,
+                prompt_version TEXT NOT NULL,
+                model TEXT NOT NULL,
+                decision_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            )
+            """
+        )
+
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_digest_queue_pending "
             "ON digest_queue(processed, timestamp, id)"
         )
@@ -215,6 +279,452 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_source_delivery_refs_timestamp "
             "ON source_delivery_refs(timestamp)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbound_jobs_stage_status "
+            "ON inbound_jobs(stage, status, run_after_ts, priority, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbound_jobs_channel_message "
+            "ON inbound_jobs(channel_id, message_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbound_jobs_status_updated "
+            "ON inbound_jobs(status, updated_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_decision_cache_created_at "
+            "ON ai_decision_cache(created_at)"
+        )
+
+
+def enqueue_inbound_job(
+    *,
+    job_key: str,
+    stage: str,
+    channel_id: str,
+    message_id: int,
+    payload_json: str,
+    priority: int = 50,
+    run_after_ts: int | None = None,
+    max_retries: int = 4,
+) -> bool:
+    cleaned_job_key = str(job_key or "").strip()
+    cleaned_stage = str(stage or "").strip()
+    if not cleaned_job_key or not cleaned_stage:
+        return False
+
+    now_ts = int(time.time())
+    scheduled_ts = int(run_after_ts if run_after_ts is not None else now_ts)
+    with _transaction() as conn:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO inbound_jobs (
+                job_key,
+                priority,
+                stage,
+                status,
+                run_after_ts,
+                channel_id,
+                message_id,
+                payload_json,
+                retry_count,
+                max_retries,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, 0, ?, ?, ?)
+            """,
+            (
+                cleaned_job_key,
+                int(priority),
+                cleaned_stage,
+                scheduled_ts,
+                str(channel_id),
+                int(message_id),
+                str(payload_json or "{}"),
+                max(1, int(max_retries)),
+                now_ts,
+                now_ts,
+            ),
+        )
+        return int(cur.rowcount or 0) > 0
+
+
+def claim_inbound_jobs(stage: str, limit: int, *, worker_id: str) -> List[Dict[str, object]]:
+    cleaned_stage = str(stage or "").strip()
+    cleaned_worker_id = str(worker_id or "").strip() or "worker"
+    resolved_limit = max(1, int(limit))
+    now_ts = int(time.time())
+
+    with _transaction() as conn:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM inbound_jobs
+            WHERE stage = ?
+              AND status = 'pending'
+              AND run_after_ts <= ?
+            ORDER BY priority DESC, run_after_ts ASC, created_at ASC, id ASC
+            LIMIT ?
+            """,
+            (cleaned_stage, now_ts, resolved_limit),
+        ).fetchall()
+        if not rows:
+            return []
+
+        ids = [int(row["id"]) for row in rows]
+        conn.executemany(
+            """
+            UPDATE inbound_jobs
+            SET status = 'in_progress',
+                claimed_by = ?,
+                claimed_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            [(cleaned_worker_id, now_ts, now_ts, job_id) for job_id in ids],
+        )
+
+        placeholders = ",".join("?" for _ in ids)
+        claimed = conn.execute(
+            f"""
+            SELECT id, job_key, priority, stage, status, run_after_ts, channel_id, message_id,
+                   payload_json, retry_count, max_retries, last_error, last_error_at,
+                   claimed_by, claimed_at, created_at, updated_at
+            FROM inbound_jobs
+            WHERE id IN ({placeholders})
+            ORDER BY priority DESC, run_after_ts ASC, created_at ASC, id ASC
+            """,
+            ids,
+        ).fetchall()
+
+    return _to_inbound_job_rows(claimed)
+
+
+def advance_inbound_job(
+    job_id: int,
+    *,
+    next_stage: str,
+    payload_json: str,
+    priority: int | None = None,
+    run_after_ts: int | None = None,
+) -> None:
+    now_ts = int(time.time())
+    next_ts = int(run_after_ts if run_after_ts is not None else now_ts)
+    with _transaction() as conn:
+        if priority is None:
+            conn.execute(
+                """
+                UPDATE inbound_jobs
+                SET stage = ?,
+                    status = 'pending',
+                    run_after_ts = ?,
+                    payload_json = ?,
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (str(next_stage), next_ts, str(payload_json or "{}"), now_ts, int(job_id)),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE inbound_jobs
+                SET stage = ?,
+                    status = 'pending',
+                    priority = ?,
+                    run_after_ts = ?,
+                    payload_json = ?,
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(next_stage),
+                    int(priority),
+                    next_ts,
+                    str(payload_json or "{}"),
+                    now_ts,
+                    int(job_id),
+                ),
+            )
+
+
+def complete_inbound_job(job_id: int, *, payload_json: str | None = None) -> None:
+    now_ts = int(time.time())
+    with _transaction() as conn:
+        if payload_json is None:
+            conn.execute(
+                """
+                UPDATE inbound_jobs
+                SET status = 'done',
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now_ts, int(job_id)),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE inbound_jobs
+                SET status = 'done',
+                    payload_json = ?,
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (str(payload_json or "{}"), now_ts, int(job_id)),
+            )
+
+
+def retry_or_dead_letter_inbound_job(
+    job_id: int,
+    *,
+    error_text: str,
+    retry_delay_seconds: int,
+) -> bool:
+    now_ts = int(time.time())
+    with _transaction() as conn:
+        row = conn.execute(
+            """
+            SELECT retry_count, max_retries
+            FROM inbound_jobs
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (int(job_id),),
+        ).fetchone()
+        if row is None:
+            return False
+
+        retry_count = int(row["retry_count"] or 0) + 1
+        max_retries = max(1, int(row["max_retries"] or 1))
+        if retry_count >= max_retries:
+            conn.execute(
+                """
+                UPDATE inbound_jobs
+                SET status = 'dead',
+                    retry_count = ?,
+                    last_error = ?,
+                    last_error_at = ?,
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (retry_count, str(error_text or ""), now_ts, now_ts, int(job_id)),
+            )
+            return False
+
+        conn.execute(
+            """
+            UPDATE inbound_jobs
+            SET status = 'pending',
+                retry_count = ?,
+                last_error = ?,
+                last_error_at = ?,
+                run_after_ts = ?,
+                claimed_by = NULL,
+                claimed_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                retry_count,
+                str(error_text or ""),
+                now_ts,
+                now_ts + max(1, int(retry_delay_seconds)),
+                now_ts,
+                int(job_id),
+            ),
+        )
+        return True
+
+
+def reset_in_progress_inbound_jobs(*, older_than_seconds: int = 0) -> int:
+    now_ts = int(time.time())
+    threshold = now_ts - max(0, int(older_than_seconds))
+    with _transaction() as conn:
+        cur = conn.execute(
+            """
+            UPDATE inbound_jobs
+            SET status = 'pending',
+                claimed_by = NULL,
+                claimed_at = NULL,
+                updated_at = ?
+            WHERE status = 'in_progress'
+              AND COALESCE(claimed_at, 0) <= ?
+            """,
+            (now_ts, threshold),
+        )
+        return int(cur.rowcount or 0)
+
+
+def count_inbound_jobs(*, stage: str | None = None, status: str | None = None) -> int:
+    clauses: List[str] = []
+    params: List[object] = []
+    if stage:
+        clauses.append("stage = ?")
+        params.append(str(stage))
+    if status:
+        clauses.append("status = ?")
+        params.append(str(status))
+
+    query = "SELECT COUNT(*) FROM inbound_jobs"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+
+    with _connect() as conn:
+        row = conn.execute(query, tuple(params)).fetchone()
+    return int(row[0] if row else 0)
+
+
+def load_inbound_job_counts() -> Dict[str, Dict[str, int]]:
+    out: Dict[str, Dict[str, int]] = {}
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT stage, status, COUNT(*) AS row_count
+            FROM inbound_jobs
+            GROUP BY stage, status
+            """
+        ).fetchall()
+    for row in rows:
+        stage = str(row["stage"] or "")
+        status = str(row["status"] or "")
+        if not stage or not status:
+            continue
+        bucket = out.setdefault(stage, {})
+        bucket[status] = int(row["row_count"] or 0)
+    return out
+
+
+def oldest_pending_inbound_job_age_seconds() -> int | None:
+    now_ts = int(time.time())
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT MIN(created_at) AS min_created_at
+            FROM inbound_jobs
+            WHERE status = 'pending'
+            """
+        ).fetchone()
+    if row is None or row["min_created_at"] is None:
+        return None
+    created_at = int(row["min_created_at"] or 0)
+    if created_at <= 0:
+        return None
+    return max(0, now_ts - created_at)
+
+
+def load_recent_inbound_job_failures(limit: int = 10) -> List[Dict[str, object]]:
+    resolved_limit = max(1, int(limit))
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, job_key, stage, status, retry_count, max_retries, last_error, last_error_at
+            FROM inbound_jobs
+            WHERE last_error_at IS NOT NULL
+            ORDER BY last_error_at DESC, id DESC
+            LIMIT ?
+            """,
+            (resolved_limit,),
+        ).fetchall()
+    result: List[Dict[str, object]] = []
+    for row in rows:
+        result.append(
+            {
+                "id": int(row["id"]),
+                "job_key": str(row["job_key"]),
+                "stage": str(row["stage"] or ""),
+                "status": str(row["status"] or ""),
+                "retry_count": int(row["retry_count"] or 0),
+                "max_retries": int(row["max_retries"] or 0),
+                "last_error": str(row["last_error"] or ""),
+                "last_error_at": int(row["last_error_at"] or 0),
+            }
+        )
+    return result
+
+
+def ai_decision_cache_get(
+    *,
+    normalized_hash: str,
+    prompt_version: str,
+    model: str,
+    max_age_hours: int,
+) -> str | None:
+    cache_key = f"{normalized_hash}::{prompt_version}::{model}"
+    cutoff_ts = int(time.time()) - (max(1, int(max_age_hours)) * 3600)
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT decision_json
+            FROM ai_decision_cache
+            WHERE cache_key = ?
+              AND created_at >= ?
+            LIMIT 1
+            """,
+            (cache_key, cutoff_ts),
+        ).fetchone()
+    if row is None:
+        return None
+    return str(row["decision_json"] or "")
+
+
+def ai_decision_cache_set(
+    *,
+    normalized_hash: str,
+    prompt_version: str,
+    model: str,
+    decision_json: str,
+) -> None:
+    cache_key = f"{normalized_hash}::{prompt_version}::{model}"
+    now_ts = int(time.time())
+    with _transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO ai_decision_cache (
+                cache_key,
+                normalized_hash,
+                prompt_version,
+                model,
+                decision_json,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                decision_json = excluded.decision_json,
+                created_at = excluded.created_at
+            """,
+            (
+                cache_key,
+                str(normalized_hash or ""),
+                str(prompt_version or ""),
+                str(model or ""),
+                str(decision_json or "{}"),
+                now_ts,
+            ),
+        )
+
+
+def purge_ai_decision_cache(*, older_than_ts: int) -> int:
+    cutoff_ts = int(max(0, older_than_ts))
+    with _transaction() as conn:
+        cur = conn.execute(
+            "DELETE FROM ai_decision_cache WHERE created_at < ?",
+            (cutoff_ts,),
+        )
+        return int(cur.rowcount or 0)
+
+
+def count_ai_decision_cache_entries() -> int:
+    with _connect() as conn:
+        row = conn.execute("SELECT COUNT(*) FROM ai_decision_cache").fetchone()
+    return int(row[0] if row else 0)
 
 
 def is_seen(channel_id: str, message_id: int) -> bool:

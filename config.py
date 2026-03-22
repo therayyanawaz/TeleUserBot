@@ -240,6 +240,19 @@ DIGEST_PIN_DAILY = _env_bool("DIGEST_PIN_DAILY", False)  # type: bool
 DIGEST_RETRY_BASE_SECONDS = _env_int("DIGEST_RETRY_BASE_SECONDS", 30)  # type: int
 DIGEST_RETRY_MAX_SECONDS = _env_int("DIGEST_RETRY_MAX_SECONDS", 900)  # type: int
 DIGEST_429_THRESHOLD_PER_HOUR = _env_int("DIGEST_429_THRESHOLD_PER_HOUR", 3)  # type: int
+BREAKING_SLA_SECONDS = _env_int("BREAKING_SLA_SECONDS", 15)  # type: int
+
+# -----------------------------------------------------------------------------
+# Intake Pipeline
+# -----------------------------------------------------------------------------
+PIPELINE_TRIAGE_WORKERS = _env_int("PIPELINE_TRIAGE_WORKERS", 4)  # type: int
+PIPELINE_AI_WORKERS = _env_int("PIPELINE_AI_WORKERS", 2)  # type: int
+PIPELINE_DELIVERY_WORKERS = _env_int("PIPELINE_DELIVERY_WORKERS", 2)  # type: int
+PIPELINE_OCR_WORKERS = _env_int("PIPELINE_OCR_WORKERS", 1)  # type: int
+PIPELINE_QUERY_WEB_WORKERS = _env_int("PIPELINE_QUERY_WEB_WORKERS", 1)  # type: int
+PIPELINE_JOB_MAX_RETRIES = _env_int("PIPELINE_JOB_MAX_RETRIES", 4)  # type: int
+PIPELINE_RETRY_BASE_SECONDS = _env_int("PIPELINE_RETRY_BASE_SECONDS", 2)  # type: int
+AI_DECISION_CACHE_HOURS = _env_int("AI_DECISION_CACHE_HOURS", 72)  # type: int
 
 # -----------------------------------------------------------------------------
 # Commands / Extensibility

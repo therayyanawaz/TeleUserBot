@@ -42,7 +42,9 @@ from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInv
 import config
 from ai_filter import (
     create_digest_summary,
+    decide_filter_action,
     generate_answer_from_context,
+    get_filter_decision_cache_stats,
     get_quota_health,
     summarize_breaking_headline,
     summarize_vital_rational_view,
@@ -52,21 +54,32 @@ from ai_filter import (
 from auth import AuthManager, ERROR_LOG_PATH, ensure_runtime_dir
 from db import (
     ack_digest_batch,
+    advance_inbound_job,
+    claim_inbound_jobs,
     claim_digest_batch,
     clear_digest_queue_scoped,
+    complete_inbound_job,
+    count_ai_decision_cache_entries,
     count_inflight,
     count_pending,
+    enqueue_inbound_job,
     get_last_digest_timestamp,
     get_meta,
     init_db,
     is_seen,
+    load_inbound_job_counts,
+    load_recent_inbound_job_failures,
     load_source_delivery_ref,
     load_archive_since,
     load_queue_since,
     mark_seen,
     mark_seen_many,
+    oldest_pending_inbound_job_age_seconds,
     prune_archive_older_than,
+    purge_ai_decision_cache,
     purge_source_delivery_refs,
+    reset_in_progress_inbound_jobs,
+    retry_or_dead_letter_inbound_job,
     restore_digest_batch,
     save_source_delivery_ref,
     save_to_digest_archive,
@@ -113,6 +126,7 @@ from utils import (
     strip_telegram_html,
 )
 from web_server import WebStatusServer
+from shared_http import close_shared_http_clients, get_bot_http_client
 
 try:
     import fcntl
@@ -252,6 +266,17 @@ started_as_user_id: int = 0
 startup_phase: str = "booting"
 startup_ready: bool = False
 startup_error: str = ""
+pipeline_worker_tasks: List[asyncio.Task] = []
+pipeline_sentence_transformer_warm_task: asyncio.Task | None = None
+pipeline_query_web_semaphore: asyncio.Semaphore | None = None
+pipeline_stage_latency_seconds: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=200))
+pipeline_stage_runs: Dict[str, int] = defaultdict(int)
+
+INBOUND_STAGE_TRIAGE = "triage"
+INBOUND_STAGE_OCR = "ocr"
+INBOUND_STAGE_AI_DECISION = "ai_decision"
+INBOUND_STAGE_DELIVERY = "delivery_or_queue"
+INBOUND_STAGE_ARCHIVE = "archive"
 
 ALBUM_WAIT_SECONDS = 1.5
 ENV_PATH = Path(__file__).with_name(".env")
@@ -765,8 +790,8 @@ async def _resolve_query_bot_user_id() -> int | None:
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=15) as http:
-            response = await http.get(f"https://api.telegram.org/bot{token}/getMe")
+        http = await get_bot_http_client(httpx.Timeout(15.0))
+        response = await http.get(f"https://api.telegram.org/bot{token}/getMe")
         if response.status_code != 200:
             query_allowed_bot_user_id = None
             return None
@@ -1340,54 +1365,54 @@ async def _bot_api_request(
     token = _require_bot_destination_token()
     url = f"https://api.telegram.org/bot{token}/{method}"
 
-    async with httpx.AsyncClient(timeout=_bot_api_timeout()) as http:
-        for attempt in range(4):
-            try:
-                response = await http.post(url, data=data, files=files)
-            except (
-                httpx.WriteTimeout,
-                httpx.ReadTimeout,
-                httpx.ConnectTimeout,
-                httpx.RemoteProtocolError,
-                httpx.TransportError,
-            ) as exc:
-                if attempt >= 3:
-                    raise
-                wait_seconds = min(8, 2 ** attempt)
-                LOGGER.warning(
-                    "Bot API %s transport failure (%s). Retrying in %ss.",
-                    method,
-                    exc.__class__.__name__,
-                    wait_seconds,
-                )
-                await asyncio.sleep(wait_seconds)
-                continue
+    http = await get_bot_http_client(_bot_api_timeout())
+    for attempt in range(4):
+        try:
+            response = await http.post(url, data=data, files=files)
+        except (
+            httpx.WriteTimeout,
+            httpx.ReadTimeout,
+            httpx.ConnectTimeout,
+            httpx.RemoteProtocolError,
+            httpx.TransportError,
+        ) as exc:
+            if attempt >= 3:
+                raise
+            wait_seconds = min(8, 2 ** attempt)
+            LOGGER.warning(
+                "Bot API %s transport failure (%s). Retrying in %ss.",
+                method,
+                exc.__class__.__name__,
+                wait_seconds,
+            )
+            await asyncio.sleep(wait_seconds)
+            continue
 
+        payload = {}
+        try:
+            payload = response.json()
+        except Exception:
             payload = {}
-            try:
-                payload = response.json()
-            except Exception:
-                payload = {}
 
-            if response.status_code == 429 or (
-                isinstance(payload, dict) and payload.get("error_code") == 429
-            ):
-                retry_after = int(
-                    (payload.get("parameters") or {}).get("retry_after", 2)  # type: ignore[union-attr]
-                )
-                await asyncio.sleep(retry_after + 1)
-                continue
+        if response.status_code == 429 or (
+            isinstance(payload, dict) and payload.get("error_code") == 429
+        ):
+            retry_after = int(
+                (payload.get("parameters") or {}).get("retry_after", 2)  # type: ignore[union-attr]
+            )
+            await asyncio.sleep(retry_after + 1)
+            continue
 
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Bot API {method} failed: HTTP {response.status_code} {response.text}"
-                )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Bot API {method} failed: HTTP {response.status_code} {response.text}"
+            )
 
-            if not isinstance(payload, dict):
-                raise RuntimeError(f"Bot API {method} returned invalid response payload.")
-            if not payload.get("ok"):
-                raise RuntimeError(f"Bot API {method} error: {payload}")
-            return payload.get("result")
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Bot API {method} returned invalid response payload.")
+        if not payload.get("ok"):
+            raise RuntimeError(f"Bot API {method} error: {payload}")
+        return payload.get("result")
 
     raise RuntimeError(f"Bot API {method} failed after retries.")
 
@@ -1406,34 +1431,34 @@ async def _query_bot_api_request(
         raise RuntimeError("BOT_DESTINATION_TOKEN is missing/invalid for bot query replies.")
 
     url = f"https://api.telegram.org/bot{token}/{method}"
-    async with httpx.AsyncClient(timeout=60) as http:
-        for _ in range(4):
-            response = await http.post(url, data=data)
+    http = await get_bot_http_client(httpx.Timeout(60.0))
+    for _ in range(4):
+        response = await http.post(url, data=data)
+        payload = {}
+        try:
+            payload = response.json()
+        except Exception:
             payload = {}
-            try:
-                payload = response.json()
-            except Exception:
-                payload = {}
 
-            if response.status_code == 429 or (
-                isinstance(payload, dict) and payload.get("error_code") == 429
-            ):
-                retry_after = int(
-                    (payload.get("parameters") or {}).get("retry_after", 2)  # type: ignore[union-attr]
-                )
-                await asyncio.sleep(retry_after + 1)
-                continue
+        if response.status_code == 429 or (
+            isinstance(payload, dict) and payload.get("error_code") == 429
+        ):
+            retry_after = int(
+                (payload.get("parameters") or {}).get("retry_after", 2)  # type: ignore[union-attr]
+            )
+            await asyncio.sleep(retry_after + 1)
+            continue
 
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Bot API {method} failed: HTTP {response.status_code} {response.text}"
-                )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Bot API {method} failed: HTTP {response.status_code} {response.text}"
+            )
 
-            if not isinstance(payload, dict):
-                raise RuntimeError(f"Bot API {method} returned invalid response payload.")
-            if not payload.get("ok"):
-                raise RuntimeError(f"Bot API {method} error: {payload}")
-            return payload.get("result")
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Bot API {method} returned invalid response payload.")
+        if not payload.get("ok"):
+            raise RuntimeError(f"Bot API {method} error: {payload}")
+        return payload.get("result")
 
     raise RuntimeError(f"Bot API {method} failed after retries.")
 
@@ -1671,10 +1696,17 @@ def _filename_for_bot_media(msg: Message, index: int) -> str:
 
 def _format_summary_text(source_title: str, summary: str) -> str:
     safe_source = sanitize_telegram_html(source_title)
-    safe_summary = sanitize_telegram_html(summary)
+    safe_summary = str(summary or "").strip()
     if _include_source_tags():
         return f"<b>📰 {safe_source}</b><br><br>{safe_summary}"
     return f"<b>📰 Update</b><br><br>{safe_summary}"
+
+
+def _plain_text_from_html_fragment(text: str) -> str:
+    if not text:
+        return ""
+    normalized = re.sub(r"(?i)<br\s*/?>", "\n", str(text))
+    return normalize_space(strip_telegram_html(normalized))
 
 
 def _format_source_label(source_title: str) -> str:
@@ -2886,6 +2918,7 @@ async def _init_dupe_detector() -> None:
         await asyncio.to_thread(
             detector.warm_start_from_db,
             warm_hours=min(2, _dupe_history_hours()),
+            ensure_backends=not _dupe_use_sentence_transformers(),
         )
         await asyncio.to_thread(detector.purge_old_records)
 
@@ -2915,6 +2948,26 @@ async def _init_dupe_detector() -> None:
         dupe_detector = None
         configure_duplicate_runtime(None)
         LOGGER.exception("Failed to initialize near-duplicate detector. Disabling dedupe.")
+
+
+async def _maybe_start_duplicate_backend_warmup() -> None:
+    global pipeline_sentence_transformer_warm_task
+    if pipeline_sentence_transformer_warm_task and not pipeline_sentence_transformer_warm_task.done():
+        return
+    if dupe_detector is None or not _dupe_use_sentence_transformers():
+        return
+
+    async def _warm_duplicate_backend() -> None:
+        try:
+            await asyncio.to_thread(dupe_detector.warm_backends)
+            LOGGER.info("Sentence-transformer duplicate backend warmed in background.")
+        except Exception:
+            LOGGER.exception("Background sentence-transformer warmup failed.")
+
+    pipeline_sentence_transformer_warm_task = asyncio.create_task(
+        _warm_duplicate_backend(),
+        name="dupe-backend-warmup",
+    )
 
 
 async def _send_text(text: str) -> None:
@@ -3718,6 +3771,614 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
     )
 
 
+def _pipeline_worker_targets() -> Dict[str, int]:
+    return {
+        INBOUND_STAGE_TRIAGE: max(1, int(getattr(config, "PIPELINE_TRIAGE_WORKERS", 4) or 4)),
+        INBOUND_STAGE_AI_DECISION: max(1, int(getattr(config, "PIPELINE_AI_WORKERS", 2) or 2)),
+        INBOUND_STAGE_DELIVERY: max(1, int(getattr(config, "PIPELINE_DELIVERY_WORKERS", 2) or 2)),
+        INBOUND_STAGE_OCR: max(1, int(getattr(config, "PIPELINE_OCR_WORKERS", 1) or 1)),
+        "query_web": max(1, int(getattr(config, "PIPELINE_QUERY_WEB_WORKERS", 1) or 1)),
+    }
+
+
+def _pipeline_job_max_retries() -> int:
+    return max(1, int(getattr(config, "PIPELINE_JOB_MAX_RETRIES", 4) or 4))
+
+
+def _pipeline_retry_delay_seconds(retry_count: int) -> int:
+    base = max(1, int(getattr(config, "PIPELINE_RETRY_BASE_SECONDS", 2) or 2))
+    exponent = max(0, int(retry_count))
+    return min(300, base * (2 ** exponent))
+
+
+def _record_pipeline_stage_latency(stage: str, elapsed_seconds: float) -> None:
+    pipeline_stage_runs[stage] += 1
+    pipeline_stage_latency_seconds[stage].append(max(0.0, float(elapsed_seconds)))
+
+
+def _pipeline_stage_latency_snapshot() -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for stage in (
+        INBOUND_STAGE_TRIAGE,
+        INBOUND_STAGE_OCR,
+        INBOUND_STAGE_AI_DECISION,
+        INBOUND_STAGE_DELIVERY,
+        INBOUND_STAGE_ARCHIVE,
+    ):
+        values = list(pipeline_stage_latency_seconds.get(stage, ()))
+        if not values:
+            out[stage] = {
+                "count": float(pipeline_stage_runs.get(stage, 0)),
+                "avg_ms": 0.0,
+                "p95_ms": 0.0,
+            }
+            continue
+        ordered = sorted(values)
+        p95_index = max(0, min(len(ordered) - 1, int(math.ceil(len(ordered) * 0.95)) - 1))
+        out[stage] = {
+            "count": float(pipeline_stage_runs.get(stage, 0)),
+            "avg_ms": round((sum(values) / len(values)) * 1000.0, 2),
+            "p95_ms": round(ordered[p95_index] * 1000.0, 2),
+        }
+    return out
+
+
+def _pipeline_payload_json(payload: Dict[str, object]) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _pipeline_job_message_ids(payload: Dict[str, object]) -> List[int]:
+    raw_ids = payload.get("message_ids")
+    if not isinstance(raw_ids, list):
+        return []
+    return [int(item) for item in raw_ids if int(item or 0) > 0]
+
+
+def _pipeline_job_primary_message_id(payload: Dict[str, object]) -> int:
+    message_ids = _pipeline_job_message_ids(payload)
+    if message_ids:
+        return int(message_ids[0])
+    return int(payload.get("primary_message_id") or 0)
+
+
+def _pipeline_job_key(*, channel_id: str, message_ids: Sequence[int], grouped_id: int = 0) -> str:
+    cleaned_ids = [int(item) for item in message_ids if int(item or 0) > 0]
+    if grouped_id > 0:
+        return f"album:{channel_id}:{grouped_id}"
+    if len(cleaned_ids) <= 1:
+        return f"single:{channel_id}:{cleaned_ids[0] if cleaned_ids else 0}"
+    return f"multi:{channel_id}:{cleaned_ids[0]}:{cleaned_ids[-1]}"
+
+
+def _pipeline_priority_for_severity(severity: str | None) -> int:
+    normalized = (severity or "").strip().lower()
+    if normalized == "high":
+        return 90
+    if normalized == "medium":
+        return 60
+    return 50
+
+
+def _build_inbound_payload(
+    messages: Sequence[Message],
+    *,
+    kind: str,
+    grouped_id: int = 0,
+) -> Dict[str, object]:
+    ordered = sorted(messages, key=lambda item: int(item.id or 0))
+    primary = ordered[0]
+    message_ids = [int(item.id or 0) for item in ordered if int(item.id or 0) > 0]
+    return {
+        "kind": kind,
+        "channel_id": str(primary.chat_id),
+        "primary_message_id": int(primary.id or 0),
+        "message_ids": message_ids,
+        "grouped_id": int(grouped_id or 0),
+        "queued_at": int(time.time()),
+    }
+
+
+def _mark_payload_seen(payload: Dict[str, object]) -> None:
+    channel_id = str(payload.get("channel_id") or "")
+    message_ids = _pipeline_job_message_ids(payload)
+    if not channel_id or not message_ids:
+        return
+    if len(message_ids) == 1:
+        mark_seen(channel_id, message_ids[0])
+    else:
+        mark_seen_many(channel_id, message_ids)
+
+
+async def _enqueue_inbound_messages(
+    messages: Sequence[Message],
+    *,
+    kind: str,
+    grouped_id: int = 0,
+) -> bool:
+    if not messages:
+        return False
+    payload = _build_inbound_payload(messages, kind=kind, grouped_id=grouped_id)
+    message_ids = _pipeline_job_message_ids(payload)
+    inserted = enqueue_inbound_job(
+        job_key=_pipeline_job_key(
+            channel_id=str(payload.get("channel_id") or ""),
+            message_ids=message_ids,
+            grouped_id=int(payload.get("grouped_id") or 0),
+        ),
+        stage=INBOUND_STAGE_TRIAGE,
+        channel_id=str(payload.get("channel_id") or ""),
+        message_id=_pipeline_job_primary_message_id(payload),
+        payload_json=_pipeline_payload_json(payload),
+        priority=50,
+        max_retries=_pipeline_job_max_retries(),
+    )
+    if inserted:
+        log_structured(
+            LOGGER,
+            "inbound_job_enqueued",
+            stage=INBOUND_STAGE_TRIAGE,
+            channel_id=str(payload.get("channel_id") or ""),
+            message_id=_pipeline_job_primary_message_id(payload),
+            kind=kind,
+            grouped_id=int(payload.get("grouped_id") or 0),
+            item_count=len(message_ids),
+        )
+    return inserted
+
+
+def _load_inbound_payload(job: Dict[str, object]) -> Dict[str, object]:
+    raw = str(job.get("payload_json") or "{}")
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+async def _fetch_messages_for_payload(payload: Dict[str, object]) -> List[Message]:
+    channel_id = str(payload.get("channel_id") or "").strip()
+    message_ids = _pipeline_job_message_ids(payload)
+    if not channel_id or not message_ids:
+        return []
+
+    chat_ref: object = channel_id
+    if channel_id.lstrip("-").isdigit():
+        with contextlib.suppress(Exception):
+            chat_ref = int(channel_id)
+
+    tg = _require_client()
+    try:
+        fetched = await _call_with_floodwait(tg.get_messages, chat_ref, ids=message_ids)
+    except Exception:
+        LOGGER.debug("Failed to rehydrate inbound job messages.", exc_info=True)
+        return []
+
+    if isinstance(fetched, Message):
+        fetched_items = [fetched]
+    elif isinstance(fetched, list):
+        fetched_items = [item for item in fetched if isinstance(item, Message)]
+    else:
+        fetched_items = []
+
+    if not fetched_items:
+        return []
+
+    by_id = {int(item.id or 0): item for item in fetched_items if int(item.id or 0) > 0}
+    resolved = [by_id[item_id] for item_id in message_ids if item_id in by_id]
+    return sorted(resolved, key=lambda item: int(item.id or 0))
+
+
+async def _advance_job_to_archive(job: Dict[str, object], payload: Dict[str, object]) -> None:
+    advance_inbound_job(
+        int(job["id"]),
+        next_stage=INBOUND_STAGE_ARCHIVE,
+        payload_json=_pipeline_payload_json(payload),
+        priority=50,
+    )
+
+
+async def _handle_triage_inbound_job(job: Dict[str, object]) -> None:
+    payload = _load_inbound_payload(job)
+    messages = await _fetch_messages_for_payload(payload)
+    if not messages:
+        payload["final_action"] = "skip"
+        payload["skip_reason"] = "message_missing"
+        await _advance_job_to_archive(job, payload)
+        return
+
+    primary = messages[0]
+    source, link = await _source_info(primary)
+    combined_text = normalize_space(
+        "\n".join((item.message or "").strip() for item in messages if (item.message or "").strip())
+    )
+    has_media = any(bool(item.media) for item in messages)
+    message_ids = [int(item.id or 0) for item in messages if int(item.id or 0) > 0]
+
+    severity = "medium"
+    severity_score = 0.0
+    severity_breakdown: dict = {}
+    if combined_text:
+        if _is_severity_routing_enabled():
+            severity, severity_score, severity_breakdown = _classify_severity_with_breakdown(
+                text=combined_text,
+                source=source,
+                channel_id=str(primary.chat_id),
+                message_id=int(primary.id or 0),
+                has_media=has_media,
+                has_link=bool(link),
+                reply_to=_reply_to_message_id(primary),
+                album_size=len(messages),
+            )
+        elif _contains_breaking_keyword(combined_text):
+            severity = "high"
+
+        if severity != "high" and _contains_breaking_keyword(combined_text):
+            severity = "high"
+            severity_score = max(float(severity_score), 0.82)
+            severity_breakdown = dict(severity_breakdown or {})
+            severity_breakdown["keyword_override"] = True
+
+    payload.update(
+        {
+            "channel_id": str(primary.chat_id),
+            "primary_message_id": int(primary.id or 0),
+            "message_ids": message_ids,
+            "source": source,
+            "message_link": link or "",
+            "combined_text": combined_text,
+            "candidate_text": combined_text,
+            "archive_text": combined_text,
+            "has_text": bool(combined_text),
+            "has_media": has_media,
+            "severity": severity,
+            "severity_score": float(severity_score),
+            "severity_breakdown": severity_breakdown,
+        }
+    )
+
+    if not combined_text and not has_media:
+        payload["final_action"] = "skip"
+        payload["skip_reason"] = "empty_message"
+        await _advance_job_to_archive(job, payload)
+        return
+
+    next_stage = INBOUND_STAGE_AI_DECISION if combined_text else INBOUND_STAGE_DELIVERY
+    if not combined_text and has_media and _media_text_ocr_enabled():
+        next_stage = INBOUND_STAGE_OCR
+
+    advance_inbound_job(
+        int(job["id"]),
+        next_stage=next_stage,
+        payload_json=_pipeline_payload_json(payload),
+        priority=_pipeline_priority_for_severity(severity),
+    )
+
+
+async def _handle_ocr_inbound_job(job: Dict[str, object]) -> None:
+    payload = _load_inbound_payload(job)
+    messages = await _fetch_messages_for_payload(payload)
+    if not messages:
+        payload["final_action"] = "skip"
+        payload["skip_reason"] = "message_missing"
+        await _advance_job_to_archive(job, payload)
+        return
+
+    caption_html = ""
+    if str(payload.get("kind") or "single") == "album":
+        caption_html = str(await _caption_for_album_without_text(messages) or "")
+    else:
+        caption_html = str(await _caption_for_media_without_text(messages[0]) or "")
+
+    plain_text = _plain_text_from_html_fragment(caption_html)
+    payload["ocr_caption_html"] = caption_html
+    payload["ocr_plain_text"] = plain_text
+    if plain_text and not str(payload.get("candidate_text") or "").strip():
+        payload["candidate_text"] = plain_text
+        payload["archive_text"] = plain_text
+
+    next_stage = INBOUND_STAGE_AI_DECISION if str(payload.get("candidate_text") or "").strip() else INBOUND_STAGE_DELIVERY
+    advance_inbound_job(
+        int(job["id"]),
+        next_stage=next_stage,
+        payload_json=_pipeline_payload_json(payload),
+        priority=_pipeline_priority_for_severity(str(payload.get("severity") or "medium")),
+    )
+
+
+async def _handle_ai_inbound_job(job: Dict[str, object]) -> None:
+    payload = _load_inbound_payload(job)
+    candidate_text = normalize_space(str(payload.get("candidate_text") or payload.get("combined_text") or ""))
+    if not candidate_text:
+        advance_inbound_job(
+            int(job["id"]),
+            next_stage=INBOUND_STAGE_DELIVERY,
+            payload_json=_pipeline_payload_json(payload),
+            priority=_pipeline_priority_for_severity(str(payload.get("severity") or "medium")),
+        )
+        return
+
+    decision = await decide_filter_action(candidate_text, _require_auth_manager())
+    payload["filter_decision"] = {
+        "action": decision.action,
+        "severity": decision.severity,
+        "summary_html": decision.summary_html,
+        "headline_html": decision.headline_html,
+        "story_bridge_html": decision.story_bridge_html,
+        "confidence": decision.confidence,
+        "reason_code": decision.reason_code,
+        "topic_key": decision.topic_key,
+        "needs_ocr_translation": decision.needs_ocr_translation,
+        "cached": decision.cached,
+    }
+    advance_inbound_job(
+        int(job["id"]),
+        next_stage=INBOUND_STAGE_DELIVERY,
+        payload_json=_pipeline_payload_json(payload),
+        priority=_pipeline_priority_for_severity(str(payload.get("severity") or "medium")),
+    )
+
+
+async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
+    payload = _load_inbound_payload(job)
+    messages = await _fetch_messages_for_payload(payload)
+    if not messages:
+        payload["final_action"] = "skip"
+        payload["skip_reason"] = "message_missing"
+        await _advance_job_to_archive(job, payload)
+        return
+
+    primary = messages[0]
+    kind = str(payload.get("kind") or "single")
+    channel_id = str(payload.get("channel_id") or primary.chat_id)
+    message_ids = [int(item.id or 0) for item in messages if int(item.id or 0) > 0]
+    source = str(payload.get("source") or "")
+    link = normalize_space(str(payload.get("message_link") or ""))
+    has_media = bool(payload.get("has_media"))
+    severity = str(payload.get("severity") or "medium")
+    candidate_text = normalize_space(str(payload.get("candidate_text") or payload.get("combined_text") or ""))
+    decision = payload.get("filter_decision")
+    if not isinstance(decision, dict):
+        decision = {}
+    action = normalize_space(str(decision.get("action") or ("deliver" if candidate_text else ""))).lower()
+
+    if action == "skip":
+        payload["final_action"] = "skip"
+        payload["skip_reason"] = str(decision.get("reason_code") or "ai_skip")
+        await _advance_job_to_archive(job, payload)
+        return
+
+    if not candidate_text and has_media:
+        reply_message = await _load_reply_message(primary)
+        reply_to = await _resolve_source_reply_target(primary)
+        media_caption = str(payload.get("ocr_caption_html") or "")
+        reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
+        if not media_caption:
+            media_caption = reply_caption or ""
+
+        if kind == "album":
+            sent_ref = await _send_album(messages, media_caption or None, reply_to=reply_to)
+        else:
+            sent_ref = await _send_single_media(primary, media_caption or None, reply_to=reply_to)
+        _register_source_delivery_refs(
+            channel_id=channel_id,
+            source_message_ids=message_ids,
+            sent_ref=sent_ref,
+        )
+        payload["delivery_message_id"] = int(_message_ref_id(sent_ref) or 0)
+        payload["archive_text"] = (
+            _plain_text_from_html_fragment(media_caption)
+            or normalize_space(reply_context_text or "")
+            or normalize_space(str(payload.get("archive_text") or ""))
+        )
+        payload["final_action"] = "media_passthrough"
+        await _advance_job_to_archive(job, payload)
+        return
+
+    if severity == "high" and _is_immediate_high_enabled() and candidate_text:
+        headline = _plain_text_from_html_fragment(str(decision.get("headline_html") or "")) or candidate_text
+        if len(headline) > 420:
+            headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
+        story_bridge = _plain_text_from_html_fragment(str(decision.get("story_bridge_html") or ""))
+        payload_text = _format_breaking_text(source, headline, story_bridge or None)
+        topic_seed = f"{headline}\n{candidate_text}"
+        reply_to = await _resolve_source_reply_target(primary, fallback_topic_seed=topic_seed)
+
+        if has_media:
+            if kind == "album":
+                sent_ref = await _send_album(messages, payload_text, reply_to=reply_to)
+            else:
+                sent_ref = await _send_single_media(primary, payload_text, reply_to=reply_to)
+        else:
+            sent_ref = await _send_text_with_ref(payload_text, reply_to=reply_to)
+            _normalized, text_hash = build_dupe_fingerprint(candidate_text)
+            _register_breaking_delivery(
+                text_hash=text_hash,
+                ref=sent_ref,
+                base_text=payload_text,
+                primary_source=source,
+            )
+
+        _register_source_delivery_refs(
+            channel_id=channel_id,
+            source_message_ids=message_ids,
+            sent_ref=sent_ref,
+        )
+        await _register_breaking_topic_thread(topic_seed=topic_seed, sent_ref=sent_ref)
+        payload["delivery_message_id"] = int(_message_ref_id(sent_ref) or 0)
+        payload["archive_text"] = candidate_text
+        payload["final_action"] = "breaking_delivery"
+        log_structured(
+            LOGGER,
+            "breaking_pipeline_sent",
+            channel_id=channel_id,
+            message_id=int(primary.id or 0),
+            source=source,
+            severity=severity,
+            severity_score=float(payload.get("severity_score") or 0.0),
+            reply_to=reply_to or 0,
+            kind=kind,
+        )
+        await _advance_job_to_archive(job, payload)
+        return
+
+    if (_is_digest_mode_enabled() or action == "digest") and candidate_text:
+        _queue_for_digest(
+            channel_id,
+            int(primary.id or 0),
+            candidate_text,
+            source_name=source,
+            message_link=link or None,
+        )
+        payload["final_action"] = "digest_queued"
+        payload["archive_text"] = candidate_text
+        log_structured(
+            LOGGER,
+            "digest_pipeline_queued",
+            channel_id=channel_id,
+            message_id=int(primary.id or 0),
+            severity=severity,
+            source=source,
+            kind=kind,
+            pending=count_pending(),
+        )
+        await _advance_job_to_archive(job, payload)
+        return
+
+    summary_html = str(decision.get("summary_html") or "").strip()
+    if not summary_html:
+        summary_html = sanitize_telegram_html(_truncate_context_line(candidate_text, limit=700))
+    reply_to = await _resolve_source_reply_target(primary)
+    formatted_summary = _format_summary_text(source, summary_html)
+    if has_media:
+        if kind == "album":
+            sent_ref = await _send_album(messages, formatted_summary, reply_to=reply_to)
+        else:
+            sent_ref = await _send_single_media(primary, formatted_summary, reply_to=reply_to)
+    else:
+        sent_ref = await _send_text_with_ref(formatted_summary, reply_to=reply_to)
+
+    _register_source_delivery_refs(
+        channel_id=channel_id,
+        source_message_ids=message_ids,
+        sent_ref=sent_ref,
+    )
+    payload["delivery_message_id"] = int(_message_ref_id(sent_ref) or 0)
+    payload["archive_text"] = candidate_text
+    payload["final_action"] = "delivered"
+    await _advance_job_to_archive(job, payload)
+
+
+async def _handle_archive_inbound_job(job: Dict[str, object]) -> None:
+    payload = _load_inbound_payload(job)
+    final_action = str(payload.get("final_action") or "").strip().lower()
+    archive_text = normalize_space(str(payload.get("archive_text") or ""))
+    channel_id = str(payload.get("channel_id") or "")
+    primary_message_id = _pipeline_job_primary_message_id(payload)
+    source_name = normalize_space(str(payload.get("source") or ""))
+    message_link = normalize_space(str(payload.get("message_link") or ""))
+
+    if final_action in {"digest_queued", "breaking_delivery", "delivered", "media_passthrough"} and archive_text:
+        _archive_for_query_search(
+            channel_id,
+            primary_message_id,
+            archive_text,
+            source_name=source_name or None,
+            message_link=message_link or None,
+        )
+
+    _mark_payload_seen(payload)
+    complete_inbound_job(int(job["id"]), payload_json=_pipeline_payload_json(payload))
+
+
+async def _handle_inbound_job(stage: str, job: Dict[str, object]) -> None:
+    if stage == INBOUND_STAGE_TRIAGE:
+        await _handle_triage_inbound_job(job)
+        return
+    if stage == INBOUND_STAGE_OCR:
+        await _handle_ocr_inbound_job(job)
+        return
+    if stage == INBOUND_STAGE_AI_DECISION:
+        await _handle_ai_inbound_job(job)
+        return
+    if stage == INBOUND_STAGE_DELIVERY:
+        await _handle_delivery_inbound_job(job)
+        return
+    if stage == INBOUND_STAGE_ARCHIVE:
+        await _handle_archive_inbound_job(job)
+        return
+    raise RuntimeError(f"Unsupported inbound job stage: {stage}")
+
+
+async def _run_inbound_stage_worker(stage: str, worker_index: int) -> None:
+    worker_id = f"{stage}-{worker_index}-{uuid.uuid4().hex[:8]}"
+    while True:
+        jobs = claim_inbound_jobs(stage, 1, worker_id=worker_id)
+        if not jobs:
+            await asyncio.sleep(0.25)
+            continue
+
+        job = jobs[0]
+        started = time.perf_counter()
+        try:
+            await _handle_inbound_job(stage, job)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOGGER.exception(
+                "Inbound pipeline stage failed stage=%s job_id=%s job_key=%s",
+                stage,
+                job.get("id"),
+                job.get("job_key"),
+            )
+            retry_or_dead_letter_inbound_job(
+                int(job["id"]),
+                error_text=str(exc)[:1000],
+                retry_delay_seconds=_pipeline_retry_delay_seconds(int(job.get("retry_count") or 0)),
+            )
+        finally:
+            _record_pipeline_stage_latency(stage, time.perf_counter() - started)
+
+
+async def _start_pipeline_workers() -> None:
+    global pipeline_query_web_semaphore
+    if pipeline_worker_tasks:
+        return
+
+    targets = _pipeline_worker_targets()
+    pipeline_query_web_semaphore = asyncio.Semaphore(max(1, int(targets.get("query_web", 1) or 1)))
+    reset_in_progress_inbound_jobs(older_than_seconds=0)
+    purge_ai_decision_cache(
+        older_than_ts=int(time.time()) - (max(1, int(getattr(config, "AI_DECISION_CACHE_HOURS", 72) or 72)) * 3600)
+    )
+
+    for stage in (
+        INBOUND_STAGE_TRIAGE,
+        INBOUND_STAGE_OCR,
+        INBOUND_STAGE_AI_DECISION,
+        INBOUND_STAGE_DELIVERY,
+        INBOUND_STAGE_ARCHIVE,
+    ):
+        for index in range(max(1, int(targets.get(stage, 1) or 1))):
+            pipeline_worker_tasks.append(
+                asyncio.create_task(
+                    _run_inbound_stage_worker(stage, index + 1),
+                    name=f"inbound-{stage}-{index + 1}",
+                )
+            )
+
+
+async def _stop_pipeline_workers() -> None:
+    global pipeline_query_web_semaphore
+    pending = [task for task in pipeline_worker_tasks if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    pipeline_worker_tasks.clear()
+    pipeline_query_web_semaphore = None
+    reset_in_progress_inbound_jobs(older_than_seconds=0)
+
+
 def _format_digest_message(
     digest_body: str,
     total_updates: int,
@@ -4236,10 +4897,17 @@ async def _flush_album_after_wait(key: Tuple[str, int]) -> None:
             if await _check_album_media_duplicate(items):
                 mark_seen_many(str(items[0].chat_id), [int(m.id or 0) for m in items])
                 return
-            if _is_digest_mode_enabled():
-                await _queue_album_for_digest(items)
-            else:
-                await _process_album(items)
+            inserted = await _enqueue_inbound_messages(
+                items,
+                kind="album",
+                grouped_id=int(key[1] or 0),
+            )
+            if not inserted:
+                LOGGER.debug(
+                    "Skipped duplicate inbound album enqueue channel_id=%s grouped_id=%s",
+                    key[0],
+                    key[1],
+                )
     except asyncio.CancelledError:
         return
     except Exception:
@@ -4776,6 +5444,26 @@ def _web_status_payload() -> Dict[str, object]:
         inflight = count_inflight()
     except Exception:
         inflight = 0
+    try:
+        inbound_counts = load_inbound_job_counts()
+    except Exception:
+        inbound_counts = {}
+    try:
+        inbound_oldest = oldest_pending_inbound_job_age_seconds()
+    except Exception:
+        inbound_oldest = None
+    try:
+        ai_cache_stats = get_filter_decision_cache_stats()
+    except Exception:
+        ai_cache_stats = {"hits": 0.0, "misses": 0.0, "hit_rate": 0.0}
+    try:
+        ai_cache_entries = count_ai_decision_cache_entries()
+    except Exception:
+        ai_cache_entries = 0
+    try:
+        recent_failures = load_recent_inbound_job_failures(limit=5)
+    except Exception:
+        recent_failures = []
     return {
         "ok": not bool(startup_error),
         "ready": bool(startup_ready),
@@ -4794,6 +5482,18 @@ def _web_status_payload() -> Dict[str, object]:
         "severity_routing": _is_severity_routing_enabled(),
         "query_mode": _is_query_mode_enabled(),
         "html_formatting": _is_html_formatting_enabled(),
+        "breaking_sla_seconds": int(getattr(config, "BREAKING_SLA_SECONDS", 15) or 15),
+        "pipeline_workers": _pipeline_worker_targets(),
+        "pipeline_queue_depth": inbound_counts,
+        "pipeline_oldest_pending_seconds": inbound_oldest,
+        "pipeline_stage_latencies_ms": _pipeline_stage_latency_snapshot(),
+        "pipeline_recent_failures": recent_failures,
+        "ai_decision_cache": {
+            "entries": ai_cache_entries,
+            "hits": ai_cache_stats.get("hits", 0.0),
+            "misses": ai_cache_stats.get("misses", 0.0),
+            "hit_rate": ai_cache_stats.get("hit_rate", 0.0),
+        },
     }
 
 
@@ -5313,6 +6013,12 @@ async def _stream_query_answer(
     stats = await streamer.finalize(answer)
     return answer, stats
 
+async def _search_recent_news_web_bounded(*args, **kwargs) -> list[dict[str, object]]:
+    if pipeline_query_web_semaphore is None:
+        return await search_recent_news_web(*args, **kwargs)
+    async with pipeline_query_web_semaphore:
+        return await search_recent_news_web(*args, **kwargs)
+
 
 async def _handle_query_request(
     *,
@@ -5386,7 +6092,7 @@ async def _handle_query_request(
         web_task: asyncio.Task[list[dict[str, object]]] | None = None
         if preload_web_search:
             web_task = asyncio.create_task(
-                search_recent_news_web(
+                _search_recent_news_web_bounded(
                     cleaned_query,
                     hours_back=min(parsed_hours, _query_web_max_hours_back()),
                     max_results=_query_web_max_results(),
@@ -5457,7 +6163,7 @@ async def _handle_query_request(
                 prefer_bot_identity=prefer_bot_identity,
                 bot_chat_id=bot_chat_id,
             )
-            web_results = await search_recent_news_web(
+            web_results = await _search_recent_news_web_bounded(
                 cleaned_query,
                 hours_back=min(parsed_hours, _query_web_max_hours_back()),
                 max_results=_query_web_max_results(),
@@ -5832,10 +6538,13 @@ async def _on_new_message(event: events.NewMessage.Event) -> None:
             album_tasks[key] = asyncio.create_task(_flush_album_after_wait(key))
             return
 
-        if _is_digest_mode_enabled():
-            await _queue_single_message_for_digest(msg)
-        else:
-            await _process_single_message(msg)
+        inserted = await _enqueue_inbound_messages([msg], kind="single")
+        if not inserted:
+            LOGGER.debug(
+                "Skipped duplicate inbound enqueue channel_id=%s message_id=%s",
+                channel_id,
+                msg.id,
+            )
     except Exception:
         LOGGER.exception(
             "Failed processing message channel_id=%s message_id=%s",
@@ -5847,10 +6556,17 @@ async def _on_new_message(event: events.NewMessage.Event) -> None:
 async def _shutdown_client() -> None:
     global digest_scheduler_task, daily_digest_scheduler_task, queue_clear_scheduler_task
     global query_bot_poll_task
-    global web_status_server
+    global web_status_server, pipeline_sentence_transformer_warm_task
     configure_duplicate_runtime(None)
     breaking_delivery_refs.clear()
     breaking_topic_threads.clear()
+
+    await _stop_pipeline_workers()
+
+    if pipeline_sentence_transformer_warm_task and not pipeline_sentence_transformer_warm_task.done():
+        pipeline_sentence_transformer_warm_task.cancel()
+        await asyncio.gather(pipeline_sentence_transformer_warm_task, return_exceptions=True)
+    pipeline_sentence_transformer_warm_task = None
 
     if digest_scheduler_task and not digest_scheduler_task.done():
         digest_scheduler_task.cancel()
@@ -5881,6 +6597,7 @@ async def _shutdown_client() -> None:
 
     tg = client
     if tg is None:
+        await close_shared_http_clients()
         return
 
     pending = [task for task in album_tasks.values() if not task.done()]
@@ -5901,6 +6618,8 @@ async def _shutdown_client() -> None:
             )
             return
         LOGGER.exception("Failed during client shutdown.")
+    finally:
+        await close_shared_http_clients()
 
 
 def _startup_health_check() -> None:
@@ -6092,6 +6811,10 @@ async def main() -> None:
                 resolved_sources = await setup_sources()
             _print_cli_status("✓", f"Sources ready ({len(resolved_sources)} total)", level="ok")
 
+            startup_phase = "pipeline"
+            await _start_pipeline_workers()
+            _print_cli_status("âœ“", "Inbound pipeline workers started", level="ok")
+
             startup_phase = "handlers"
             client.add_event_handler(_on_new_message, events.NewMessage(chats=resolved_sources))
             status_pattern = rf"^{re.escape(_digest_status_command())}(?:\\s+.*)?$"
@@ -6152,6 +6875,7 @@ async def main() -> None:
             startup_phase = "running"
             startup_ready = True
             startup_error = ""
+            await _maybe_start_duplicate_backend_warmup()
             try:
                 await client.run_until_disconnected()
             except (asyncio.CancelledError, KeyboardInterrupt):

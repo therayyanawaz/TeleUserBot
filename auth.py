@@ -21,6 +21,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
+from shared_http import get_auth_http_client
+
 
 # Public OAuth client constants (same family as Codex CLI OAuth flow).
 OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -869,8 +871,8 @@ class AuthManager:
         return await self._post_token_payload(payload)
 
     async def _post_token_payload(self, payload: Dict[str, str]) -> Dict[str, Any]:
-        async with httpx.AsyncClient(timeout=30) as http:
-            response = await http.post(TOKEN_ENDPOINT, data=payload)
+        http = await get_auth_http_client()
+        response = await http.post(TOKEN_ENDPOINT, data=payload)
 
         if response.status_code >= 400:
             try:

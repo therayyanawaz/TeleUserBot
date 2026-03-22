@@ -24,7 +24,6 @@ from typing import Any, Awaitable, Callable, Iterable, List, Sequence, Tuple
 from urllib.parse import quote_plus, urlparse
 import xml.etree.ElementTree as ET
 
-import httpx
 from db import (
     load_recent_breaking,
     load_recent_media_signatures,
@@ -33,6 +32,7 @@ from db import (
     save_recent_breaking,
     save_recent_media_signature,
 )
+from shared_http import get_web_http_client
 
 
 def estimate_tokens_rough(text: str) -> int:
@@ -1719,7 +1719,10 @@ async def search_recent_news_web(
     )
 
     try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as http:
+        http = await get_web_http_client()
+        original_headers = dict(http.headers)
+        http.headers.update(headers)
+        try:
             for variant in search_variants[:6]:
                 search_query = f"{variant} when:{resolved_hours}h"
                 for provider_name, build_url in providers:
@@ -1808,6 +1811,9 @@ async def search_recent_news_web(
                         break
                 if len(rows) >= resolved_max:
                     break
+        finally:
+            http.headers.clear()
+            http.headers.update(original_headers)
     except Exception:
         if logger:
             logger.debug("Web fallback search failed.", exc_info=True)
@@ -2533,7 +2539,10 @@ class HybridDuplicateEngine:
             order_sim,
         )
 
-    def warm_start_from_db(self, *, warm_hours: int = 2) -> None:
+    def warm_backends(self) -> None:
+        self._ensure_backends()
+
+    def warm_start_from_db(self, *, warm_hours: int = 2, ensure_backends: bool = True) -> None:
         now_ts = int(time.time())
         hours = max(1, min(int(warm_hours), self.history_hours))
         rows = load_recent_breaking(
@@ -2543,7 +2552,8 @@ class HybridDuplicateEngine:
         rows = list(reversed(rows))
 
         with self._lock:
-            self._ensure_backends()
+            if ensure_backends:
+                self._ensure_backends()
             for row in rows:
                 normalized_text = normalize_space(str(row.get("normalized_text") or ""))
                 if len(normalized_text) < 12:

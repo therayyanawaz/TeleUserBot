@@ -17,6 +17,7 @@ import httpx
 
 import config
 from auth import AuthManager
+from db import ai_decision_cache_get, ai_decision_cache_set
 from prompts import (
     HUMAN_NEWSROOM_VOICE,
     QUERY_NO_MATCH_TEXT,
@@ -25,6 +26,7 @@ from prompts import (
     build_query_system_prompt,
     quiet_period_message,
 )
+from shared_http import get_codex_http_client
 from utils import estimate_tokens_rough as _estimate_tokens_rough
 from utils import (
     expand_query_terms,
@@ -43,6 +45,7 @@ DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 DEFAULT_CODEX_ORIGINATOR = "pi"
 DEFAULT_DIGEST_MAX_POSTS = 80
 DEFAULT_DIGEST_MAX_TOKENS = 18000
+FILTER_DECISION_PROMPT_VERSION = "v1"
 
 LOGGER = logging.getLogger("tg_news_userbot.ai_filter")
 _SUMMARY_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -51,6 +54,8 @@ _HEADLINE_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
 _VITAL_VIEW_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
 _OCR_TRANSLATION_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
 _QUOTA_WARNING_LOGGED = False
+_FILTER_DECISION_CACHE_HITS = 0
+_FILTER_DECISION_CACHE_MISSES = 0
 
 # Quota health tracking: capture recent 429/rate-limit events.
 _QUOTA_429_EVENTS: deque[int] = deque(maxlen=512)
@@ -66,6 +71,20 @@ class _CodexRateLimitError(RuntimeError):
 
 class _CodexApiError(RuntimeError):
     """Raised for non-auth Codex backend errors."""
+
+
+@dataclass
+class FilterDecision:
+    action: Literal["skip", "deliver", "digest"]
+    severity: Literal["high", "medium", "low"]
+    summary_html: str
+    headline_html: str
+    story_bridge_html: str
+    confidence: float
+    reason_code: str
+    topic_key: str
+    needs_ocr_translation: bool
+    cached: bool = False
 
 
 def estimate_tokens_rough(text: str) -> int:
@@ -108,6 +127,16 @@ def get_quota_health() -> Dict[str, Any]:
         "recent_429_count": count_429_1h,
         "interval_multiplier": interval_multiplier,
         "batch_scale": batch_scale,
+    }
+
+
+def get_filter_decision_cache_stats() -> Dict[str, float]:
+    total = _FILTER_DECISION_CACHE_HITS + _FILTER_DECISION_CACHE_MISSES
+    hit_rate = (float(_FILTER_DECISION_CACHE_HITS) / float(total)) if total > 0 else 0.0
+    return {
+        "hits": float(_FILTER_DECISION_CACHE_HITS),
+        "misses": float(_FILTER_DECISION_CACHE_MISSES),
+        "hit_rate": hit_rate,
     }
 
 
@@ -366,6 +395,30 @@ def _summary_system_prompt() -> str:
     )
 
 
+def _filter_decision_system_prompt() -> str:
+    language = _resolve_output_language()
+    return (
+        "You are a strict newsroom intake classifier for Telegram news monitoring.\n"
+        f"Always write HTML fields in {language}. Translate if needed.\n"
+        f"{HUMAN_NEWSROOM_VOICE}\n"
+        "Return ONLY one JSON object with these keys:\n"
+        "action, severity, summary_html, headline_html, story_bridge_html, confidence, reason_code, topic_key, needs_ocr_translation\n"
+        "action must be one of: skip, deliver, digest\n"
+        "severity must be one of: high, medium, low\n"
+        "summary_html must be Telegram-safe HTML using only <b>, <i>, <u>, <s>, <tg-spoiler>, <code>, <pre>, <blockquote>, <a href>, <br>\n"
+        "headline_html must be a concise one-line Telegram-safe HTML headline or empty string\n"
+        "story_bridge_html must be a concise Telegram-safe HTML contextual bridge or empty string\n"
+        "confidence must be a number from 0 to 1\n"
+        "reason_code must be a short snake_case code\n"
+        "topic_key must be a short normalized topic label\n"
+        "needs_ocr_translation must be true or false\n"
+        "Use skip for spam, ads, promos, noise, or clearly irrelevant updates.\n"
+        "Use deliver for urgent/breaking items that should be sent immediately.\n"
+        "Use digest for meaningful non-breaking items worth keeping.\n"
+        "Do not include markdown fences, comments, or extra text."
+    )
+
+
 def _severity_system_prompt() -> str:
     return (
         "Classify urgency for an incoming news post.\n"
@@ -575,7 +628,6 @@ class _StreamingCodexResponse:
         self._verbosity = verbosity
         self._image_data_urls = list(image_data_urls or [])
 
-        self._client: httpx.AsyncClient | None = None
         self._stream_ctx = None
         self._response: httpx.Response | None = None
 
@@ -603,9 +655,8 @@ class _StreamingCodexResponse:
             image_data_urls=self._image_data_urls,
         )
 
-        timeout = httpx.Timeout(90.0, connect=20.0)
-        self._client = httpx.AsyncClient(timeout=timeout)
-        self._stream_ctx = self._client.stream(
+        client = await get_codex_http_client()
+        self._stream_ctx = client.stream(
             "POST",
             _resolve_codex_url(),
             headers=headers,
@@ -631,9 +682,6 @@ class _StreamingCodexResponse:
         if self._stream_ctx is not None:
             await self._stream_ctx.__aexit__(exc_type, exc, tb)
             self._stream_ctx = None
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
         self._response = None
 
     async def __aiter__(self) -> AsyncIterator[str]:
@@ -746,9 +794,8 @@ async def _call_codex_non_stream(
         stream=False,
         image_data_urls=image_data_urls,
     )
-    timeout = httpx.Timeout(90.0, connect=20.0)
-    async with httpx.AsyncClient(timeout=timeout) as http:
-        response = await http.post(_resolve_codex_url(), headers=headers, json=payload)
+    http = await get_codex_http_client()
+    response = await http.post(_resolve_codex_url(), headers=headers, json=payload)
     if response.status_code >= 400:
         _raise_codex_http_error(response)
     try:
@@ -883,6 +930,118 @@ def _try_parse_digest_json(text: str) -> Dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     return payload
+
+
+def _resolve_ai_decision_cache_hours() -> int:
+    raw = getattr(config, "AI_DECISION_CACHE_HOURS", 72)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 72
+    return max(1, min(value, 24 * 30))
+
+
+def _sanitize_reason_code(value: Any) -> str:
+    cleaned = normalize_space(str(value or "")).lower()
+    cleaned = re.sub(r"[^a-z0-9_]+", "_", cleaned)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned[:48] or "unclassified"
+
+
+def _sanitize_topic_key(value: Any, fallback_text: str) -> str:
+    cleaned = normalize_space(str(value or "")).lower()
+    cleaned = re.sub(r"[^a-z0-9\s/_-]+", "", cleaned)
+    cleaned = re.sub(r"\s+", "_", cleaned).strip(" _-")
+    if cleaned:
+        return cleaned[:80]
+    tokens = re.findall(r"[a-z0-9]{3,}", normalize_space(fallback_text).lower())
+    return "_".join(tokens[:6])[:80] or "general_update"
+
+
+def _fallback_filter_decision(text: str) -> FilterDecision:
+    cleaned = normalize_space(text)
+    if not cleaned or _likely_noise(cleaned):
+        return FilterDecision(
+            action="skip",
+            severity="low",
+            summary_html="",
+            headline_html="",
+            story_bridge_html="",
+            confidence=0.2,
+            reason_code="likely_noise",
+            topic_key=_sanitize_topic_key("", cleaned),
+            needs_ocr_translation=False,
+        )
+
+    summary = _fallback_summary(cleaned) or ""
+    severity = _severity_from_text_heuristic(cleaned)
+    action: Literal["skip", "deliver", "digest"] = "deliver" if severity == "high" else "digest"
+    headline = _fallback_headline(cleaned) or ""
+    return FilterDecision(
+        action=action,
+        severity=severity,
+        summary_html=summary,
+        headline_html=headline,
+        story_bridge_html="",
+        confidence=0.55 if summary else 0.35,
+        reason_code="local_fallback",
+        topic_key=_sanitize_topic_key("", cleaned),
+        needs_ocr_translation=False,
+    )
+
+
+def _normalize_filter_action(value: Any, severity: str) -> Literal["skip", "deliver", "digest"]:
+    cleaned = normalize_space(str(value or "")).lower()
+    if cleaned in {"skip", "drop", "ignore"}:
+        return "skip"
+    if cleaned in {"deliver", "send", "breaking", "immediate"}:
+        return "deliver"
+    if cleaned in {"digest", "queue", "keep"}:
+        return "digest"
+    return "deliver" if severity == "high" else "digest"
+
+
+def _validate_filter_decision(payload: Dict[str, Any], raw_text: str) -> FilterDecision:
+    fallback = _fallback_filter_decision(raw_text)
+
+    severity = _normalize_severity_label(str(payload.get("severity") or "")) or fallback.severity
+    action = _normalize_filter_action(payload.get("action"), severity)
+    confidence_raw = payload.get("confidence", fallback.confidence)
+    try:
+        confidence = float(confidence_raw)
+    except Exception:
+        confidence = fallback.confidence
+    confidence = max(0.0, min(confidence, 1.0))
+
+    summary_html = sanitize_telegram_html(str(payload.get("summary_html") or "")).strip()
+    headline_html = sanitize_telegram_html(str(payload.get("headline_html") or "")).strip()
+    story_bridge_html = sanitize_telegram_html(str(payload.get("story_bridge_html") or "")).strip()
+
+    if action != "skip" and not summary_html:
+        summary_html = fallback.summary_html
+    if not headline_html and severity == "high":
+        headline_html = fallback.headline_html
+
+    needs_ocr_translation = bool(payload.get("needs_ocr_translation", False))
+    reason_code = _sanitize_reason_code(payload.get("reason_code"))
+    topic_key = _sanitize_topic_key(payload.get("topic_key"), raw_text)
+
+    if action == "skip":
+        summary_html = ""
+        headline_html = ""
+        story_bridge_html = ""
+
+    return FilterDecision(
+        action=action,
+        severity=severity,
+        summary_html=summary_html,
+        headline_html=headline_html,
+        story_bridge_html=story_bridge_html,
+        confidence=confidence,
+        reason_code=reason_code,
+        topic_key=topic_key,
+        needs_ocr_translation=needs_ocr_translation,
+    )
 
 
 def _importance_stars(value: Any) -> str:
@@ -1774,6 +1933,78 @@ def _fallback_query_answer(
     return sanitize_telegram_html(f"<b>{intro_title}</b><br>" + "<br>".join(lines))
 
 
+async def decide_filter_action(text: str, auth_manager: AuthManager) -> FilterDecision:
+    global _FILTER_DECISION_CACHE_HITS, _FILTER_DECISION_CACHE_MISSES
+
+    cleaned = normalize_space(text)
+    if len(cleaned) < 10:
+        return _fallback_filter_decision(cleaned)
+
+    normalized_hash = _cache_key(cleaned)
+    model = _resolve_codex_model()
+    cached_json = ai_decision_cache_get(
+        normalized_hash=normalized_hash,
+        prompt_version=FILTER_DECISION_PROMPT_VERSION,
+        model=model,
+        max_age_hours=_resolve_ai_decision_cache_hours(),
+    )
+    if cached_json:
+        cached_payload = _try_parse_digest_json(cached_json)
+        if cached_payload is not None:
+            decision = _validate_filter_decision(cached_payload, cleaned)
+            decision.cached = True
+            _FILTER_DECISION_CACHE_HITS += 1
+            return decision
+
+    _FILTER_DECISION_CACHE_MISSES += 1
+
+    if _likely_noise(cleaned):
+        decision = _fallback_filter_decision(cleaned)
+        ai_decision_cache_set(
+            normalized_hash=normalized_hash,
+            prompt_version=FILTER_DECISION_PROMPT_VERSION,
+            model=model,
+            decision_json=json.dumps(decision.__dict__, separators=(",", ":")),
+        )
+        return decision
+
+    compact = cleaned if len(cleaned) <= 2400 else f"{cleaned[:2397].rsplit(' ', 1)[0]}..."
+
+    try:
+        auth_context = await auth_manager.get_auth_context()
+        raw = await _call_codex(
+            compact,
+            auth_context,
+            instructions=_filter_decision_system_prompt(),
+            verbosity="low",
+        )
+    except _CodexAuthError:
+        try:
+            auth_context = await auth_manager.refresh_auth_context()
+            raw = await _call_codex(
+                compact,
+                auth_context,
+                instructions=_filter_decision_system_prompt(),
+                verbosity="low",
+            )
+        except Exception:
+            return _fallback_filter_decision(cleaned)
+    except (_CodexRateLimitError, httpx.HTTPError, _CodexApiError, ValueError):
+        return _fallback_filter_decision(cleaned)
+    except Exception:
+        return _fallback_filter_decision(cleaned)
+
+    payload = _try_parse_digest_json(raw)
+    decision = _validate_filter_decision(payload or {}, cleaned)
+    ai_decision_cache_set(
+        normalized_hash=normalized_hash,
+        prompt_version=FILTER_DECISION_PROMPT_VERSION,
+        model=model,
+        decision_json=json.dumps(decision.__dict__, separators=(",", ":")),
+    )
+    return decision
+
+
 async def summarize_or_skip(text: str, auth_manager: AuthManager) -> Optional[str]:
     cleaned = text.strip()
     if not cleaned or len(cleaned) < 10:
@@ -1789,58 +2020,18 @@ async def summarize_or_skip(text: str, auth_manager: AuthManager) -> Optional[st
         return None
 
     try:
-        auth_context = await auth_manager.get_auth_context()
-        content = await _call_codex(
-            cleaned,
-            auth_context,
-            instructions=_summary_system_prompt(),
-        )
-    except _CodexAuthError:
-        try:
-            auth_context = await auth_manager.refresh_auth_context()
-            content = await _call_codex(
-                cleaned,
-                auth_context,
-                instructions=_summary_system_prompt(),
-            )
-        except Exception:
-            fallback = _fallback_summary(cleaned)
-            _cache_set(key, fallback)
-            return fallback
-    except _CodexRateLimitError as exc:
-        global _QUOTA_WARNING_LOGGED
-        if not _QUOTA_WARNING_LOGGED:
-            LOGGER.error(
-                "Codex subscription limit reached (429). "
-                "Using local fallback summarizer until quota resets. %s",
-                exc,
-            )
-            _QUOTA_WARNING_LOGGED = True
-        fallback = _fallback_summary(cleaned)
-        _cache_set(key, fallback)
-        return fallback
-    except (httpx.HTTPError, _CodexApiError, ValueError) as exc:
-        LOGGER.error("Codex backend failed, using local fallback: %s", exc)
-        fallback = _fallback_summary(cleaned)
-        _cache_set(key, fallback)
-        return fallback
+        decision = await decide_filter_action(cleaned, auth_manager)
     except Exception:
         fallback = _fallback_summary(cleaned)
         _cache_set(key, fallback)
         return fallback
 
-    if not content:
-        fallback = _fallback_summary(cleaned)
-        _cache_set(key, fallback)
-        return fallback
-
-    if content.upper().startswith("SKIP"):
+    if decision.action == "skip" or not decision.summary_html:
         _cache_set(key, None)
         return None
 
-    safe = sanitize_telegram_html(content)
-    _cache_set(key, safe)
-    return safe
+    _cache_set(key, decision.summary_html)
+    return decision.summary_html
 
 
 def _normalize_severity_label(text: str) -> Literal["high", "medium", "low"] | None:
