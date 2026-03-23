@@ -388,7 +388,7 @@ Breaking alert voice:
 BREAKING_STYLE_MODE=unhinged
 ```
 
-- `unhinged` sends a single-line, hard-hitting breaking headline with no `Why it matters` bridge
+- `unhinged` sends a hard-hitting breaking headline and adds a contextual `Why it matters` bridge only when the story link is concrete enough
 - `classic` restores the prior breaking layout with the optional contextual bridge
 
 ## Query Assistant

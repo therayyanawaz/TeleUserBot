@@ -45,7 +45,8 @@ DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 DEFAULT_CODEX_ORIGINATOR = "pi"
 DEFAULT_DIGEST_MAX_POSTS = 80
 DEFAULT_DIGEST_MAX_TOKENS = 18000
-FILTER_DECISION_PROMPT_VERSION = "v2"
+FILTER_DECISION_PROMPT_VERSION = "v3"
+VITAL_VIEW_PROMPT_VERSION = "v2"
 
 _DIGIT_TOKEN_RE = re.compile(r"\b\d+(?:[.,:/-]\d+)*\b")
 _LATIN_TOKEN_RE = re.compile(r"[a-z][a-z0-9'-]{1,}", flags=re.IGNORECASE)
@@ -666,7 +667,9 @@ def _filter_decision_system_prompt() -> str:
             "\nIf severity is high, keep every factual element directly grounded in the source text."
             "\nIf severity is high and the source is uncertain or hedged, headline_html must keep that uncertainty explicit."
             "\nIf severity is high, do not invent names, numbers, locations, actors, motives, or certainty."
-            "\nIf severity is high, story_bridge_html must be an empty string."
+            "\nIf severity is high, story_bridge_html must be an empty string unless recent related updates are explicitly provided."
+            "\nIf recent related updates are provided, story_bridge_html may be one or two short lines or a compact mini context block."
+            "\nIf you do provide story_bridge_html, it must start with Why it matters:, cite concrete prior-thread details, and avoid generic stakes or obvious consequences."
         )
     return prompt
 
@@ -724,6 +727,24 @@ def _vital_rational_view_prompt() -> str:
     except Exception:
         max_words = 20
     max_words = max(10, min(max_words, 32))
+    if _breaking_style_is_unhinged():
+        return (
+            "You write contextual bridge lines for urgent Telegram breaking alerts.\n"
+            f"Output language must be {language}. Translate if needed.\n"
+            "Start the first line with: Why it matters:\n"
+            f"Usually return one line. You may use two short lines or a compact mini context block only when one line cannot explain the connection.\n"
+            f"Keep the full output under {max(18, min(max_words * 2, 40))} words.\n"
+            "Your only job is to connect the current update to the ongoing story using the recent related updates.\n"
+            "Make the bridge answer: how does this update change the story the reader was already following?\n"
+            "Reference concrete prior-thread details such as the earlier location, target, asset, exchange, report, or official confirmation.\n"
+            "Do not give generic stakes, obvious consequences, or empty escalation language.\n"
+            "Good: Why it matters: Forty minutes ago the alerts were centered on Haifa; this now pushes the same exchange toward Acre.\n"
+            "Good: Why it matters: Earlier reports focused on interceptions over Amman.\nThis now suggests the same exchange is reaching deeper into Jordanian airspace.\n"
+            "Bad: Why it matters: This raises regional stability concerns.\n"
+            "Bad: Why it matters: This shows the situation is still serious.\n"
+            "If there is no concrete, non-obvious bridge to the recent updates, reply exactly: SKIP\n"
+            "Do not speculate. Do not invent causality. No hashtags. No markdown."
+        )
     return (
         "You write one-line connective context for urgent Telegram alerts.\n"
         f"Output language must be {language}. Translate if needed.\n"
@@ -1268,7 +1289,12 @@ def _normalize_filter_action(value: Any, severity: str) -> Literal["skip", "deli
     return "deliver" if severity == "high" else "digest"
 
 
-def _validate_filter_decision(payload: Dict[str, Any], raw_text: str) -> FilterDecision:
+def _validate_filter_decision(
+    payload: Dict[str, Any],
+    raw_text: str,
+    *,
+    recent_context: Sequence[str] | None = None,
+) -> FilterDecision:
     fallback = _fallback_filter_decision(raw_text)
 
     severity = _normalize_severity_label(str(payload.get("severity") or "")) or fallback.severity
@@ -1292,7 +1318,11 @@ def _validate_filter_decision(payload: Dict[str, Any], raw_text: str) -> FilterD
             headline_html or fallback.headline_html,
         )
         if _breaking_style_is_unhinged():
-            story_bridge_html = ""
+            story_bridge_html = resolve_vital_rational_view_for_delivery(
+                raw_text,
+                story_bridge_html,
+                recent_context,
+            )
 
     needs_ocr_translation = bool(payload.get("needs_ocr_translation", False))
     reason_code = _sanitize_reason_code(payload.get("reason_code"))
@@ -2484,24 +2514,56 @@ def _cleanup_vital_view(raw: str) -> str:
             return ""
         return f"{text_value}."
 
-    text = normalize_space(raw)
+    raw_text = str(raw or "")
+    if not raw_text.strip():
+        return ""
+    if raw_text.strip().upper() == "SKIP":
+        return ""
+    raw_text = re.sub(r"<br\s*/?>", "\n", raw_text, flags=re.IGNORECASE)
+    raw_text = re.sub(r"</?[^>]+>", "", raw_text).strip()
+    try:
+        max_words = int(getattr(config, "HUMANIZED_VITAL_OPINION_MAX_WORDS", 20))
+    except Exception:
+        max_words = 20
+    max_words = max(10, min(max_words, 32))
+    if _breaking_style_is_unhinged():
+        total_word_budget = max(16, min(max_words * 2, 40))
+        lines: list[str] = []
+        for line in raw_text.splitlines():
+            cleaned_line = normalize_space(re.sub(r"^[*`#>\-\s]+", "", line))
+            cleaned_line = re.sub(r"^\s*why it matters:\s*", "", cleaned_line, flags=re.IGNORECASE)
+            cleaned_line = _trim_tail_fragment(cleaned_line)
+            cleaned_line = cleaned_line.rstrip(".,;:!?")
+            if cleaned_line:
+                lines.append(cleaned_line)
+        if not lines:
+            return ""
+        lines[0] = f"Why it matters: {lines[0]}"
+        output_lines: list[str] = []
+        used_words = 0
+        for line in lines[:3]:
+            words = line.split()
+            remaining = total_word_budget - used_words
+            if remaining <= 0:
+                break
+            if len(words) > remaining:
+                line = " ".join(words[:remaining]).rstrip(".,;:!?")
+            finalized = _finalize_sentence(line)
+            if not finalized:
+                continue
+            output_lines.append(finalized)
+            used_words += len(finalized.split())
+        return "\n".join(output_lines)
+
+    text = normalize_space(raw_text)
     if not text:
         return ""
-    if text.strip().upper() == "SKIP":
-        return ""
-    text = re.sub(r"^[*`#>\-\s]+", "", text).strip()
-    text = re.sub(r"</?[^>]+>", "", text).strip()
     if "\n" in text:
         text = text.splitlines()[0].strip()
     if not text:
         return ""
     if not text.lower().startswith("why it matters:"):
         text = f"Why it matters: {text}"
-    try:
-        max_words = int(getattr(config, "HUMANIZED_VITAL_OPINION_MAX_WORDS", 20))
-    except Exception:
-        max_words = 20
-    max_words = max(10, min(max_words, 32))
     words = text.split()
     if len(words) > max_words:
         text = " ".join(words[:max_words])
@@ -2521,6 +2583,106 @@ _VITAL_GENERIC_DETAILS = {
     "this raises immediate civilian-safety risks",
     "this can strain critical infrastructure",
     "the same story is still unfolding",
+}
+_VITAL_GENERIC_FRAGMENTS = (
+    "verify updates across multiple reliable sources",
+    "regional stability",
+    "civilian-safety risks",
+    "civilian danger",
+    "critical infrastructure",
+    "the same story is still unfolding",
+    "worth watching",
+    "raises escalation risk",
+    "shows the situation is still serious",
+    "big escalation",
+    "serious escalation",
+)
+_VITAL_UNSUPPORTED_IMPLICATION_FRAGMENTS = (
+    "all-out war",
+    "full-scale war",
+    "regime collapse",
+    "everything is now collapsing",
+    "proves",
+    "confirms a wider war",
+)
+_VITAL_CONTINUITY_MARKERS = (
+    "earlier",
+    "before",
+    "after",
+    "follows",
+    "followed",
+    "this now",
+    "same thread",
+    "same exchange",
+    "same operation",
+    "confirms",
+    "confirm",
+    "reaching",
+    "reached",
+    "centered on",
+    "pushes",
+    "pulls",
+    "widens",
+    "spreads",
+    "next turn",
+    "moved from",
+    "shifted from",
+)
+_VITAL_CONFIRMATION_MARKERS = (
+    "confirmed",
+    "confirms",
+    "confirmation",
+    "official",
+    "officials",
+    "statement",
+    "spokesperson",
+    "ministry",
+)
+_VITAL_RESPONSE_MARKERS = (
+    "retaliation",
+    "retaliatory",
+    "response",
+    "responded",
+    "responds",
+    "in response",
+    "after earlier",
+    "following earlier",
+)
+_VITAL_RELATION_STOPWORDS = {
+    "after",
+    "alert",
+    "alerts",
+    "around",
+    "earlier",
+    "late",
+    "local",
+    "near",
+    "night",
+    "official",
+    "officials",
+    "overnight",
+    "report",
+    "reports",
+    "said",
+    "says",
+    "statement",
+    "update",
+}
+_VITAL_EVENT_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("strike", ("airstrike", "airstrikes", "strike", "strikes", "raid", "raids", "bombardment", "targeted", "hit", "hits")),
+    ("interception", ("interception", "interceptions", "intercepted", "intercepts", "air defenses", "air defence", "shot down", "downed")),
+    ("launch", ("rocket", "rockets", "missile", "missiles", "drone", "drones", "launch", "launched")),
+    ("explosion", ("explosion", "explosions", "blast", "blasts", "detonation")),
+    ("statement", ("statement", "announced", "announces", "confirmed", "confirms", "official", "officials", "spokesperson", "ministry")),
+    ("warning", ("warning", "warnings", "alert", "alerts", "sirens", "evacuation")),
+)
+_VITAL_EVENT_LABELS = {
+    "strike": "strikes",
+    "interception": "interceptions",
+    "launch": "launches",
+    "explosion": "explosions",
+    "statement": "official confirmation",
+    "warning": "alerts",
 }
 
 _VITAL_ASSET_PATTERNS: tuple[str, ...] = (
@@ -2593,6 +2755,26 @@ def _is_bad_location_candidate(value: str) -> bool:
     return any(marker == lowered or lowered.startswith(f"{marker} ") for marker in actor_markers)
 
 
+def _usable_vital_location(value: str) -> str:
+    candidate = normalize_space(value)
+    if len(candidate) < 3:
+        return ""
+    if candidate.lower() in {"a", "an", "the"}:
+        return ""
+    if _is_bad_location_candidate(candidate):
+        return ""
+    return candidate
+
+
+def _usable_vital_focus(value: str) -> str:
+    candidate = normalize_space(value)
+    if len(candidate) < 3:
+        return ""
+    if candidate.lower() in {"a", "an", "the"}:
+        return ""
+    return candidate
+
+
 def _extract_vital_location(text: str) -> str:
     clean = normalize_space(strip_telegram_html(text))
     if not clean:
@@ -2630,6 +2812,165 @@ def _extract_vital_focus(text: str) -> str:
     return _extract_vital_location(clean)
 
 
+def _extract_vital_event_label(text: str) -> str:
+    lowered = normalize_space(strip_telegram_html(text)).lower()
+    if not lowered:
+        return ""
+    for label, patterns in _VITAL_EVENT_PATTERNS:
+        if any(pattern in lowered for pattern in patterns):
+            return label
+    return ""
+
+
+def _split_story_bridge_context_entry(text: str) -> tuple[str, str]:
+    clean = normalize_space(strip_telegram_html(text))
+    if not clean:
+        return "", ""
+    match = re.match(r"^(moments ago|\d+[mh] ago)\s*:\s*(.+)$", clean, flags=re.IGNORECASE)
+    if match:
+        return normalize_space(match.group(1)), normalize_space(match.group(2))
+    return "", clean
+
+
+def _story_bridge_time_prefix(age_label: str) -> str:
+    clean = normalize_space(age_label)
+    if not clean:
+        return "Earlier, "
+    return f"{clean}, "
+
+
+def _extract_story_bridge_context_markers(text: str) -> set[str]:
+    clean = normalize_space(strip_telegram_html(text))
+    markers: set[str] = set()
+    location = _usable_vital_location(_extract_vital_location(clean))
+    focus = _usable_vital_focus(_extract_vital_focus(clean))
+    event = _extract_vital_event_label(clean)
+    if location:
+        markers.add(location.lower())
+    if focus:
+        markers.add(focus.lower())
+    if event:
+        markers.add(_VITAL_EVENT_LABELS.get(event, event).lower())
+    return markers
+
+
+def _extract_story_bridge_shared_tokens(current_text: str, anchor_text: str) -> set[str]:
+    current_tokens = _extract_latin_tokens(current_text)
+    anchor_tokens = _extract_latin_tokens(anchor_text)
+    return {
+        token
+        for token in (current_tokens & anchor_tokens)
+        if len(token) >= 4 and token not in _VITAL_RELATION_STOPWORDS
+    }
+
+
+def _derive_story_bridge_relation(current_text: str, anchor_text: str) -> tuple[str | None, dict[str, str]]:
+    current_clean = normalize_space(strip_telegram_html(current_text))
+    anchor_clean = normalize_space(strip_telegram_html(anchor_text))
+    if not current_clean or not anchor_clean:
+        return None, {}
+
+    current_location = _usable_vital_location(_extract_vital_location(current_clean))
+    anchor_location = _usable_vital_location(_extract_vital_location(anchor_clean))
+    current_focus = _usable_vital_focus(_extract_vital_focus(current_clean))
+    anchor_focus = _usable_vital_focus(_extract_vital_focus(anchor_clean))
+    current_event = _extract_vital_event_label(current_clean)
+    anchor_event = _extract_vital_event_label(anchor_clean)
+    current_lower = current_clean.lower()
+    anchor_lower = anchor_clean.lower()
+    shared_tokens = _extract_story_bridge_shared_tokens(current_clean, anchor_clean)
+    details = {
+        "current_location": current_location,
+        "anchor_location": anchor_location,
+        "current_focus": current_focus,
+        "anchor_focus": anchor_focus,
+        "current_event": current_event,
+        "anchor_event": anchor_event,
+    }
+
+    if any(marker in current_lower for marker in _VITAL_CONFIRMATION_MARKERS) and _text_has_hedge_markers(anchor_lower):
+        return "confirmation", details
+    if (
+        current_location
+        and anchor_location
+        and current_location.lower() != anchor_location.lower()
+        and (shared_tokens or (current_event and anchor_event))
+    ):
+        return "spread", details
+    if (
+        current_focus
+        and anchor_focus
+        and current_focus.lower() != anchor_focus.lower()
+        and (
+            shared_tokens
+            or (current_event and anchor_event)
+            or (current_location and anchor_location and current_location.lower() == anchor_location.lower())
+        )
+    ):
+        return "focus_shift", details
+    if any(marker in current_lower for marker in _VITAL_RESPONSE_MARKERS) and (anchor_event or anchor_focus or anchor_location):
+        return "response_chain", details
+    if current_event and anchor_event and current_event != anchor_event:
+        return "phase_shift", details
+    if current_location and anchor_location and current_location.lower() == anchor_location.lower() and (shared_tokens or current_event or anchor_event):
+        return "continuation", details
+    if current_focus and anchor_focus and current_focus.lower() == anchor_focus.lower() and (shared_tokens or current_event or anchor_event):
+        return "continuation", details
+    return None, details
+
+
+def _render_story_bridge_relation(kind: str, details: dict[str, str], age_label: str) -> str:
+    prefix = _story_bridge_time_prefix(age_label)
+    current_location = normalize_space(details.get("current_location"))
+    anchor_location = normalize_space(details.get("anchor_location"))
+    current_focus = normalize_space(details.get("current_focus"))
+    anchor_focus = normalize_space(details.get("anchor_focus"))
+    current_event = normalize_space(_VITAL_EVENT_LABELS.get(details.get("current_event", ""), details.get("current_event", "")))
+    anchor_event = normalize_space(_VITAL_EVENT_LABELS.get(details.get("anchor_event", ""), details.get("anchor_event", "")))
+
+    if kind == "confirmation":
+        anchor_target = anchor_location or anchor_focus or anchor_event
+        if anchor_target:
+            return f"Why it matters: {prefix}this appears to confirm the earlier report around {anchor_target}."
+        return ""
+    if kind == "spread" and current_location and anchor_location:
+        return (
+            f"Why it matters: {prefix}the pressure was centered on {anchor_location}; "
+            f"this now pushes the same thread into {current_location}."
+        )
+    if kind == "focus_shift" and current_focus and anchor_focus:
+        return (
+            f"Why it matters: {prefix}alerts were centered on {anchor_focus}; "
+            f"this now pulls {current_focus} into the same thread."
+        )
+    if kind == "response_chain":
+        anchor_target = anchor_focus or anchor_location or anchor_event
+        if anchor_target:
+            return f"Why it matters: {prefix}this looks like the next turn after earlier pressure around {anchor_target}."
+        return ""
+    if kind == "phase_shift":
+        if anchor_event and current_event and anchor_location and current_location and anchor_location.lower() != current_location.lower():
+            return (
+                f"Why it matters: {prefix}the story has moved from {anchor_event} around {anchor_location} "
+                f"to {current_event} around {current_location}."
+            )
+        if anchor_event and current_event:
+            anchor_target = anchor_location or anchor_focus
+            current_target = current_location or current_focus
+            if anchor_target and current_target and anchor_target.lower() != current_target.lower():
+                return (
+                    f"Why it matters: {prefix}the story has shifted from {anchor_event} around {anchor_target} "
+                    f"to {current_event} around {current_target}."
+                )
+            return f"Why it matters: {prefix}the story has moved from {anchor_event} into {current_event}."
+    if kind == "continuation":
+        if current_location:
+            return f"Why it matters: {prefix}the same exchange is still centered on {current_location}."
+        if current_focus:
+            return f"Why it matters: {prefix}{current_focus} is still at the center of the same thread."
+    return ""
+
+
 def _vital_view_is_too_generic(text: str) -> bool:
     lowered = normalize_space(strip_telegram_html(text)).lower()
     if not lowered:
@@ -2641,17 +2982,7 @@ def _vital_view_is_too_generic(text: str) -> bool:
         return True
     if detail in _VITAL_GENERIC_DETAILS:
         return True
-    banned_fragments = (
-        "verify updates across multiple reliable sources",
-        "regional stability",
-        "civilian-safety risks",
-        "civilian danger",
-        "critical infrastructure",
-        "the same story is still unfolding",
-        "worth watching",
-        "raises escalation risk",
-    )
-    return any(fragment in detail for fragment in banned_fragments)
+    return any(fragment in detail for fragment in _VITAL_GENERIC_FRAGMENTS)
 
 
 def _recent_context_bridge_input(current_text: str, recent_context: Sequence[str] | None) -> str:
@@ -2669,65 +3000,62 @@ def _recent_context_bridge_input(current_text: str, recent_context: Sequence[str
     return "\n".join(lines)
 
 
+def _vital_view_is_contextual(
+    text: str,
+    current_text: str,
+    recent_context: Sequence[str] | None,
+) -> bool:
+    lowered = normalize_space(strip_telegram_html(text)).lower()
+    if not lowered:
+        return False
+    if _vital_view_is_too_generic(lowered):
+        return False
+    if any(fragment in lowered for fragment in _VITAL_UNSUPPORTED_IMPLICATION_FRAGMENTS):
+        return False
+    if not any(marker in lowered for marker in _VITAL_CONTINUITY_MARKERS):
+        return False
+
+    current_clean = normalize_space(strip_telegram_html(current_text)).lower()
+    if current_clean and SequenceMatcher(None, lowered, current_clean).ratio() >= 0.9:
+        return False
+
+    context_markers: set[str] = set()
+    for item in recent_context or ():
+        _age, body = _split_story_bridge_context_entry(str(item))
+        context_markers.update(_extract_story_bridge_context_markers(body))
+    if not context_markers:
+        return False
+    return any(marker in lowered for marker in context_markers)
+
+
 def _fallback_story_bridge(current_text: str, recent_context: Sequence[str] | None) -> str | None:
-    def _usable_location(value: str) -> str:
-        candidate = normalize_space(value)
-        if len(candidate) < 3:
-            return ""
-        if candidate.lower() in {"a", "an", "the"}:
-            return ""
-        if _is_bad_location_candidate(candidate):
-            return ""
-        return candidate
+    for item in recent_context or ():
+        age_label, body = _split_story_bridge_context_entry(str(item))
+        if not body:
+            continue
+        relation, details = _derive_story_bridge_relation(current_text, body)
+        if not relation:
+            continue
+        fallback = _render_story_bridge_relation(relation, details, age_label)
+        if fallback and _vital_view_is_contextual(fallback, current_text, recent_context):
+            return fallback
+    return None
 
-    def _usable_focus(value: str) -> str:
-        candidate = normalize_space(value)
-        if len(candidate) < 3:
-            return ""
-        if candidate.lower() in {"a", "an", "the"}:
-            return ""
-        return candidate
 
-    items = [normalize_space(strip_telegram_html(str(item))) for item in (recent_context or ())]
-    items = [item for item in items if item]
-    if not items:
-        return None
-
-    current_clean = normalize_space(strip_telegram_html(current_text))
-    current_focus = _usable_focus(_extract_vital_focus(current_clean))
-    current_location = _usable_location(_extract_vital_location(current_clean))
-    anchor = items[0]
-    anchor_focus = _usable_focus(_extract_vital_focus(anchor))
-    anchor_location = _usable_location(_extract_vital_location(anchor))
-
-    if current_location and anchor_location and current_location.lower() != anchor_location.lower():
-        return (
-            f"Why it matters: Earlier pressure centered on {anchor_location}, and this now appears to have reached {current_location}."
-        )
-    if current_location and anchor_location and current_location.lower() == anchor_location.lower():
-        return (
-            f"Why it matters: This lands after earlier pressure around {current_location}, so the same thread still appears active there."
-        )
-    if anchor_location:
-        return (
-            f"Why it matters: This comes after earlier pressure around {anchor_location}, so the same thread still appears active there."
-        )
-    if current_focus and anchor_focus and current_focus.lower() != anchor_focus.lower():
-        return (
-            f"Why it matters: Earlier alerts focused on {anchor_focus}, and this latest move now pulls {current_focus} into the same thread."
-        )
-    anchor_text = anchor
-    if anchor_text.startswith("-"):
-        anchor_text = anchor_text[1:].strip()
-    age_split = anchor_text.split(":", 1)
-    bridge_anchor = age_split[1].strip() if len(age_split) == 2 and age_split[0] else anchor_text
-    bridge_anchor = re.sub(r"^[A-Z][a-z]+\s+after\s+", "", bridge_anchor)
-    bridge_anchor = normalize_space(bridge_anchor)
-    if not bridge_anchor:
-        return None
-    if len(bridge_anchor) > 110:
-        bridge_anchor = bridge_anchor[:107].rsplit(" ", 1)[0] + "..."
-    return f"Why it matters: This follows {bridge_anchor}, so this no longer looks like a one-off update."
+def resolve_vital_rational_view_for_delivery(
+    current_text: str,
+    candidate: str | None,
+    recent_context: Sequence[str] | None,
+) -> str:
+    if not recent_context:
+        return ""
+    cleaned_candidate = _cleanup_vital_view(str(candidate or ""))
+    if cleaned_candidate and _vital_view_is_contextual(cleaned_candidate, current_text, recent_context):
+        return cleaned_candidate
+    fallback = _cleanup_vital_view(_fallback_story_bridge(current_text, recent_context) or "")
+    if fallback and _vital_view_is_contextual(fallback, current_text, recent_context):
+        return fallback
+    return ""
 
 
 async def summarize_breaking_headline(
@@ -2804,13 +3132,15 @@ async def summarize_vital_rational_view(
         return None
 
     context_key = "||".join(cleaned_context[:3])
-    key = _cache_key(f"vital_view::{cleaned}::{context_key}")
+    key = _cache_key(
+        f"vital_view::{VITAL_VIEW_PROMPT_VERSION}::{resolve_breaking_style_mode()}::{cleaned}::{context_key}"
+    )
     cached = _vital_view_cache_get(key)
     if cached is not None or key in _VITAL_VIEW_CACHE:
         return cached
 
     compact = _recent_context_bridge_input(cleaned, cleaned_context)
-    fallback = _cleanup_vital_view(_fallback_story_bridge(cleaned, cleaned_context))
+    fallback = resolve_vital_rational_view_for_delivery(cleaned, None, cleaned_context)
 
     try:
         auth_context = await auth_manager.get_auth_context()
@@ -2839,8 +3169,8 @@ async def summarize_vital_rational_view(
         _vital_view_cache_set(key, fallback)
         return fallback
 
-    view = _cleanup_vital_view(raw)
-    if view and not _vital_view_is_too_generic(view):
+    view = resolve_vital_rational_view_for_delivery(cleaned, raw, cleaned_context)
+    if view:
         _vital_view_cache_set(key, view)
         return view
 

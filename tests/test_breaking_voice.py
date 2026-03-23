@@ -59,6 +59,67 @@ def test_validate_filter_decision_clears_breaking_bridge_in_unhinged_mode(monkey
     )
 
 
+def test_validate_filter_decision_accepts_contextual_bridge_in_unhinged_mode(monkeypatch):
+    monkeypatch.setattr(ai_filter.config, "BREAKING_STYLE_MODE", "unhinged", raising=False)
+
+    decision = ai_filter._validate_filter_decision(
+        {
+            "action": "deliver",
+            "severity": "high",
+            "summary_html": "<b>Summary</b>",
+            "headline_html": "Officials say two rockets landed near Acre overnight.",
+            "story_bridge_html": "Why it matters: Earlier alerts were centered on Haifa; this now pushes the same thread into Acre.",
+            "confidence": 0.8,
+            "reason_code": "breaking_update",
+            "topic_key": "acre",
+            "needs_ocr_translation": False,
+        },
+        "Officials say two rockets landed near Acre overnight.",
+        recent_context=["42m ago: Officials said rockets landed near Haifa overnight."],
+    )
+
+    assert "Haifa" in decision.story_bridge_html
+    assert "Acre" in decision.story_bridge_html
+
+
+def test_resolve_vital_rational_view_for_delivery_rejects_generic_bridge(monkeypatch):
+    monkeypatch.setattr(ai_filter.config, "BREAKING_STYLE_MODE", "unhinged", raising=False)
+
+    resolved = ai_filter.resolve_vital_rational_view_for_delivery(
+        "Officials say two rockets landed near Acre overnight.",
+        "Why it matters: This raises regional stability concerns.",
+        ["42m ago: Officials said rockets landed near Haifa overnight."],
+    )
+
+    assert "regional stability" not in resolved.lower()
+    assert "Haifa" in resolved
+    assert "Acre" in resolved
+
+
+def test_fallback_story_bridge_builds_spread_bridge(monkeypatch):
+    monkeypatch.setattr(ai_filter.config, "BREAKING_STYLE_MODE", "unhinged", raising=False)
+
+    bridge = ai_filter._fallback_story_bridge(
+        "Officials say two rockets landed near Acre overnight.",
+        ["42m ago: Officials said rockets landed near Haifa overnight."],
+    )
+
+    assert bridge is not None
+    assert "Haifa" in bridge
+    assert "Acre" in bridge
+
+
+def test_fallback_story_bridge_omits_when_no_relation(monkeypatch):
+    monkeypatch.setattr(ai_filter.config, "BREAKING_STYLE_MODE", "unhinged", raising=False)
+
+    bridge = ai_filter._fallback_story_bridge(
+        "A court hearing was delayed in Rabat.",
+        ["2h ago: Wheat prices rose in Buenos Aires after new export guidance."],
+    )
+
+    assert bridge is None
+
+
 @pytest.mark.asyncio
 async def test_summarize_breaking_headline_uses_style_specific_cache(monkeypatch):
     monkeypatch.setattr(ai_filter.config, "BREAKING_STYLE_MODE", "classic", raising=False)
@@ -91,11 +152,41 @@ def test_format_breaking_text_unhinged_is_single_line(monkeypatch):
     monkeypatch.setattr(main, "resolve_breaking_style_mode", lambda: "unhinged")
     monkeypatch.setattr(main, "_include_source_tags", lambda: False)
 
-    rendered = main._format_breaking_text("NYT", "Two rockets landed near Haifa overnight.", "Why it matters: context")
+    rendered = main._format_breaking_text("NYT", "Two rockets landed near Haifa overnight.", None)
 
     assert "<br>" not in rendered.lower()
     assert "Why it matters" not in rendered
     assert "Two rockets landed near Haifa overnight." in rendered
+
+
+def test_format_breaking_text_unhinged_supports_context_line(monkeypatch):
+    monkeypatch.setattr(main, "resolve_breaking_style_mode", lambda: "unhinged")
+    monkeypatch.setattr(main, "_include_source_tags", lambda: False)
+
+    rendered = main._format_breaking_text(
+        "NYT",
+        "Two rockets landed near Acre overnight.",
+        "Why it matters: Earlier alerts were centered on Haifa; this now pushes the same thread into Acre.",
+    )
+
+    assert "<br>" in rendered.lower()
+    assert "Haifa" in rendered
+    assert "Acre" in rendered
+
+
+def test_format_breaking_text_unhinged_supports_context_block(monkeypatch):
+    monkeypatch.setattr(main, "resolve_breaking_style_mode", lambda: "unhinged")
+    monkeypatch.setattr(main, "_include_source_tags", lambda: False)
+
+    rendered = main._format_breaking_text(
+        "NYT",
+        "Two rockets landed near Acre overnight.",
+        "Why it matters: Earlier alerts were centered on Haifa.\nThis now pushes the same thread into Acre.",
+    )
+
+    assert "<br>" in rendered.lower()
+    assert "Haifa" in rendered
+    assert "Acre" in rendered
 
 
 def test_format_breaking_text_classic_keeps_bridge(monkeypatch):
@@ -106,3 +197,12 @@ def test_format_breaking_text_classic_keeps_bridge(monkeypatch):
 
     assert "<br><br>" in rendered
     assert "Why it matters: context." in rendered
+
+
+def test_should_attach_vital_opinion_unhinged_uses_context_not_probability(monkeypatch):
+    monkeypatch.setattr(main, "resolve_breaking_style_mode", lambda: "unhinged")
+    monkeypatch.setattr(main, "_humanized_vital_opinion_enabled", lambda: True)
+    monkeypatch.setattr(main, "_humanized_vital_opinion_probability", lambda: 0.0)
+
+    assert main._should_attach_vital_opinion("test", []) is False
+    assert main._should_attach_vital_opinion("test", ["1h ago: Earlier strike near Haifa."]) is True

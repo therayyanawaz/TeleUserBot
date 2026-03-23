@@ -1329,9 +1329,11 @@ def _humanized_vital_opinion_probability() -> float:
     return min(max(value, 0.0), 1.0)
 
 
-def _should_attach_vital_opinion(text: str) -> bool:
+def _should_attach_vital_opinion(text: str, recent_context: Sequence[str] | None = None) -> bool:
     if not _humanized_vital_opinion_enabled():
         return False
+    if resolve_breaking_style_mode() == "unhinged":
+        return bool(recent_context)
     probability = _humanized_vital_opinion_probability()
     if probability <= 0:
         return False
@@ -2885,23 +2887,22 @@ def _format_breaking_text(source_title: str, headline: str, rational_view: str |
             )
         return sanitize_telegram_html(text)
 
-    rational_part = ""
+    rational_body = ""
+    rational_is_structured = False
     if rational_view:
         lowered = str(rational_view or "").lower()
-        is_structured = (
+        rational_is_structured = (
             "<b>what:" in lowered
             or "•" in lowered
             or "<br>" in lowered
             or "\n" in str(rational_view or "")
         )
-        if is_structured:
-            block = _normalize_structured_block(str(rational_view))
-            if block:
-                rational_part = f"<br><br>{block}"
+        if rational_is_structured:
+            rational_body = _normalize_structured_block(str(rational_view))
         else:
             cleaned_rational = _clean_rational_view(rational_view)
             if cleaned_rational:
-                rational_part = f"<br><br><i>{sanitize_telegram_html(cleaned_rational)}</i>"
+                rational_body = sanitize_telegram_html(cleaned_rational)
     header = build_alert_header(
         clean_headline,
         severity="high",
@@ -2909,7 +2910,15 @@ def _format_breaking_text(source_title: str, headline: str, rational_view: str |
         include_source=_include_source_tags(),
     )
     if resolve_breaking_style_mode() == "unhinged":
-        return f"{header} {safe_headline}".strip()
+        if not rational_body:
+            return f"{header} {safe_headline}".strip()
+        return f"{header} {safe_headline}<br>{rational_body}".strip()
+    rational_part = ""
+    if rational_body:
+        if rational_is_structured:
+            rational_part = f"<br><br>{rational_body}"
+        else:
+            rational_part = f"<br><br><i>{rational_body}</i>"
     return f"{header}<br><br>{safe_headline}{rational_part}"
 
 
@@ -3921,8 +3930,8 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
             if len(headline) > 420:
                 headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
         rational_view: str | None = None
-        if auth_ready and resolve_breaking_style_mode() != "unhinged" and _should_attach_vital_opinion(text):
-            recent_context = _recent_story_bridge_context(text)
+        recent_context = _recent_story_bridge_context(text)
+        if auth_ready and _should_attach_vital_opinion(text, recent_context):
             rational_view = await summarize_vital_rational_view(
                 text,
                 _require_auth_manager(),
@@ -4064,8 +4073,8 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
             if len(headline) > 420:
                 headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
         rational_view: str | None = None
-        if auth_ready and resolve_breaking_style_mode() != "unhinged" and _should_attach_vital_opinion(combined_caption):
-            recent_context = _recent_story_bridge_context(combined_caption)
+        recent_context = _recent_story_bridge_context(combined_caption)
+        if auth_ready and _should_attach_vital_opinion(combined_caption, recent_context):
             rational_view = await summarize_vital_rational_view(
                 combined_caption,
                 _require_auth_manager(),
@@ -4457,6 +4466,23 @@ async def _handle_ai_inbound_job(job: Dict[str, object]) -> None:
         return
 
     decision = await decide_filter_action(candidate_text, _require_auth_manager())
+    if resolve_breaking_style_mode() == "unhinged" and decision.severity == "high":
+        recent_context = _recent_story_bridge_context(candidate_text)
+        if recent_context:
+            try:
+                decision.story_bridge_html = (
+                    await summarize_vital_rational_view(
+                        candidate_text,
+                        _require_auth_manager(),
+                        recent_context=recent_context,
+                    )
+                    or ""
+                )
+            except Exception:
+                LOGGER.debug("Pipeline story-bridge generation failed.", exc_info=True)
+                decision.story_bridge_html = ""
+        else:
+            decision.story_bridge_html = ""
     payload["filter_decision"] = {
         "action": decision.action,
         "severity": decision.severity,
