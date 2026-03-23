@@ -32,6 +32,7 @@ from db import (
     save_recent_breaking,
     save_recent_media_signature,
 )
+from news_signals import looks_like_live_event_update, should_downgrade_explainer_urgency
 from shared_http import get_web_http_client
 
 
@@ -246,7 +247,7 @@ _ALERT_LABEL_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def choose_alert_label(text: str, *, severity: str = "high") -> str:
+def _choose_alert_label_legacy(text: str, *, severity: str = "high") -> str:
     """
     Pick a more specific, human-readable alert label than generic "BREAKING".
     """
@@ -276,6 +277,26 @@ def build_alert_header(
         safe_source = sanitize_telegram_html(source_title)
         return f"<b>{label} • {safe_source}</b>"
     return f"<b>{label}</b>"
+
+
+def choose_alert_label(text: str, *, severity: str = "high") -> str:
+    """
+    Use themed labels only for concrete live-event headlines.
+    Generic analysis/explainer material falls back to a neutral label.
+    """
+    lowered = normalize_space(text).lower()
+    normalized_severity = normalize_space(severity).lower()
+
+    if lowered and not should_downgrade_explainer_urgency(lowered) and looks_like_live_event_update(lowered):
+        for label, markers in _ALERT_LABEL_RULES:
+            if any(marker in lowered for marker in markers):
+                return label
+
+    if normalized_severity == "high":
+        return "ðŸ”¥ Flash Update"
+    if normalized_severity == "medium":
+        return "âš ï¸ Live Update"
+    return "â„¹ï¸ Situation Update"
 
 
 @dataclass(frozen=True)

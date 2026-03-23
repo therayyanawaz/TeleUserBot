@@ -18,6 +18,7 @@ import httpx
 import config
 from auth import AuthManager
 from db import ai_decision_cache_get, ai_decision_cache_set
+from news_signals import detect_story_signals, looks_like_live_event_update, should_downgrade_explainer_urgency
 from prompts import (
     HUMAN_NEWSROOM_VOICE,
     QUERY_NO_MATCH_TEXT,
@@ -45,7 +46,7 @@ DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 DEFAULT_CODEX_ORIGINATOR = "pi"
 DEFAULT_DIGEST_MAX_POSTS = 80
 DEFAULT_DIGEST_MAX_TOKENS = 18000
-FILTER_DECISION_PROMPT_VERSION = "v3"
+FILTER_DECISION_PROMPT_VERSION = "v4"
 VITAL_VIEW_PROMPT_VERSION = "v2"
 
 _DIGIT_TOKEN_RE = re.compile(r"\b\d+(?:[.,:/-]\d+)*\b")
@@ -172,6 +173,27 @@ _CAPITALIZED_STOPWORDS = {
     "Airstrike",
     "Airstrikes",
 }
+_FEED_CONTEXT_BANNED_FRAGMENTS = (
+    "regional stability",
+    "worth watching",
+    "situation remains tense",
+    "civilian danger",
+    "what explains",
+    "reasons for",
+    "ways to address",
+    "analysis",
+    "opinion",
+    "thread",
+    "explainer",
+)
+_FEED_LINE_PREFIX_RE = re.compile(
+    r"^(?:breaking|alert|live update|update|analysis|opinion|thread|explainer)\s*[:\-–—]+\s*",
+    flags=re.IGNORECASE,
+)
+_FEED_QUESTION_RE = re.compile(
+    r"^(?:why|how|what explains|what caused|can|could|should|would|will)\b",
+    flags=re.IGNORECASE,
+)
 
 LOGGER = logging.getLogger("tg_news_userbot.ai_filter")
 _SUMMARY_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -362,34 +384,118 @@ def _likely_noise(text: str) -> bool:
     return term_hits >= 2 or (term_hits >= 1 and url_hits >= 1) or hashtag_hits >= 12
 
 
+def _truncate_feed_line(text: str, *, limit: int) -> str:
+    cleaned = normalize_space(text)
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[: limit - 3].rsplit(' ', 1)[0]}..."
+
+
+def _feed_summary_segments(*texts: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in texts:
+        if not value:
+            continue
+        plain = re.sub(r"(?i)<br\s*/?>", "\n", str(value))
+        plain = normalize_space(strip_telegram_html(plain))
+        if not plain:
+            continue
+        for part in re.split(r"\n+|(?<=[.!?])\s+", plain):
+            cleaned = normalize_space(part.strip(" \t-•"))
+            cleaned = _FEED_LINE_PREFIX_RE.sub("", cleaned).strip()
+            if not cleaned:
+                continue
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(cleaned)
+    return out
+
+
+def _is_bad_feed_headline(line: str) -> bool:
+    cleaned = normalize_space(line)
+    lowered = cleaned.lower()
+    signals = detect_story_signals(cleaned)
+    if len(cleaned) < 24:
+        return True
+    if cleaned.endswith("?") or _FEED_QUESTION_RE.search(cleaned):
+        return True
+    if bool(signals.get("downgrade_explainer")) and not bool(signals.get("live_event_update")):
+        return True
+    if any(fragment in lowered for fragment in _FEED_CONTEXT_BANNED_FRAGMENTS):
+        return True
+    if cleaned.count("...") or cleaned.endswith("..."):
+        return True
+    return False
+
+
+def _is_weak_feed_context(line: str, headline: str) -> bool:
+    cleaned = normalize_space(line)
+    lowered = cleaned.lower()
+    if not cleaned:
+        return True
+    if cleaned.endswith("?") or _FEED_QUESTION_RE.search(cleaned):
+        return True
+    if any(fragment in lowered for fragment in _FEED_CONTEXT_BANNED_FRAGMENTS):
+        return True
+    if SequenceMatcher(None, cleaned.lower(), headline.lower()).ratio() >= 0.72:
+        return True
+    if should_downgrade_explainer_urgency(cleaned) and not looks_like_live_event_update(cleaned):
+        return True
+    return False
+
+
+def _build_feed_summary_html(raw_text: str, summary_seed: str = "") -> str:
+    signals = detect_story_signals(raw_text)
+    segments = _feed_summary_segments(summary_seed, raw_text)
+    if not segments:
+        return ""
+
+    preferred = [segment for segment in segments if looks_like_live_event_update(segment) and not _is_bad_feed_headline(segment)]
+    acceptable = [segment for segment in segments if not _is_bad_feed_headline(segment)]
+
+    headline = preferred[0] if preferred else (acceptable[0] if acceptable else "")
+    if not headline:
+        return ""
+    if bool(signals.get("downgrade_explainer")) and not looks_like_live_event_update(headline):
+        return ""
+
+    headline = _truncate_feed_line(headline.rstrip(".!?"), limit=150)
+    headline_html = f"<b>{sanitize_telegram_html(headline)}</b>"
+
+    context = ""
+    for segment in acceptable:
+        if segment == headline:
+            continue
+        if _is_weak_feed_context(segment, headline):
+            continue
+        context = _truncate_feed_line(segment.rstrip(".!?"), limit=170)
+        break
+
+    if not context:
+        return headline_html
+    return f"{headline_html}<br>{sanitize_telegram_html(context)}"
+
+
+def normalize_feed_summary_html(summary_html: str, raw_text: str) -> str:
+    normalized = _build_feed_summary_html(raw_text, summary_html)
+    if normalized:
+        return normalized
+    return ""
+
+
 def _fallback_summary(text: str) -> Optional[str]:
     if _likely_noise(text):
         return None
-
-    candidates = []
-    for segment in re.split(r"\n+|(?<=[.!?])\s+", text):
-        line = segment.strip(" \t-•")
-        if len(line) < 24:
-            continue
-        if len(line) > 220:
-            line = f"{line[:217].rsplit(' ', 1)[0]}..."
-        candidates.append(line)
-        if len(candidates) >= 3:
-            break
-
-    if not candidates:
-        compact = text.strip()
-        if len(compact) < 24:
-            return None
-        if len(compact) > 280:
-            compact = f"{compact[:277].rsplit(' ', 1)[0]}..."
-        candidates = [compact]
-
-    return sanitize_telegram_html("<br>".join(candidates[:3]))
+    summary = _build_feed_summary_html(text)
+    return summary or None
 
 
 def _severity_from_text_heuristic(text: str) -> Literal["high", "medium", "low"]:
     lowered = text.lower()
+    signals = detect_story_signals(text)
 
     high_terms = (
         "explosion",
@@ -430,6 +536,8 @@ def _severity_from_text_heuristic(text: str) -> Literal["high", "medium", "low"]
     medium_hits = sum(1 for term in medium_terms if term in lowered)
 
     if high_hits >= 1:
+        if bool(signals.get("downgrade_explainer")):
+            return "medium"
         return "high"
     if medium_hits >= 1:
         return "medium"
@@ -442,6 +550,12 @@ def _fallback_headline(text: str) -> Optional[str]:
     cleaned = normalize_space(text)
     if not cleaned:
         return None
+    summary_html = _build_feed_summary_html(cleaned)
+    if summary_html:
+        plain_summary = re.sub(r"(?i)<br\s*/?>.*$", "", summary_html)
+        headline = normalize_space(strip_telegram_html(plain_summary))
+        if headline:
+            return headline
     sentence_match = re.search(r"(.{24,700}?[.!?])(?:\s|$)", cleaned)
     if sentence_match:
         first = normalize_space(sentence_match.group(1))
@@ -632,9 +746,10 @@ def _summary_system_prompt() -> str:
         f"{HUMAN_NEWSROOM_VOICE}\n"
         "Output must be Telegram HTML only.\n"
         "Allowed tags: <b>, <i>, <u>, <s>, <tg-spoiler>, <code>, <pre>, <blockquote>, <a href>, <br>.\n"
-        "If this message is real news or useful info, return a 2-3 line HTML summary.\n"
-        "Do not sound robotic, padded, or generic.\n"
-        "Lead with the clearest fact and keep the wording crisp.\n"
+        "If this message is real news or useful info, return a compact feed card: line 1 is a rewritten factual headline, line 2 is optional and must be one short contextual sentence.\n"
+        "Do not copy article titles, teaser paragraphs, rhetorical questions, or explainer framing.\n"
+        "Lead with the actual development, not with why/how framing.\n"
+        "If the second line would be obvious, generic, or padded, omit it.\n"
         "If it is spam, ads, promotional, or noise, reply only: SKIP"
     )
 
@@ -659,6 +774,11 @@ def _filter_decision_system_prompt() -> str:
         "Use skip for spam, ads, promos, noise, or clearly irrelevant updates.\n"
         "Use deliver for urgent/breaking items that should be sent immediately.\n"
         "Use digest for meaningful non-breaking items worth keeping.\n"
+        "If the text is mainly an analysis, explainer, opinion, recap, thread, or question-led piece without a concrete new event or official development, use digest or skip, not deliver.\n"
+        "For delivered non-breaking items, summary_html must be a compact feed card: line 1 is a rewritten factual headline and line 2 is optional one short contextual sentence.\n"
+        "Do not copy article titles, teaser paragraphs, rhetorical questions, or why/how/what explains framing into summary_html.\n"
+        "The first line must lead with the actual development, not the source framing.\n"
+        "Omit the second line if it would be fluff, generic stakes, or obvious common sense.\n"
         "Do not include markdown fences, comments, or extra text."
     )
     if _breaking_style_is_unhinged():
@@ -1263,7 +1383,11 @@ def _fallback_filter_decision(text: str) -> FilterDecision:
 
     summary = _fallback_summary(cleaned) or ""
     severity = _severity_from_text_heuristic(cleaned)
-    action: Literal["skip", "deliver", "digest"] = "deliver" if severity == "high" else "digest"
+    if should_downgrade_explainer_urgency(cleaned):
+        severity = "medium" if summary else "low"
+        action: Literal["skip", "deliver", "digest"] = "digest" if summary else "skip"
+    else:
+        action = "deliver" if severity == "high" else "digest"
     headline = _fallback_headline(cleaned) or ""
     return FilterDecision(
         action=action,
@@ -1296,6 +1420,7 @@ def _validate_filter_decision(
     recent_context: Sequence[str] | None = None,
 ) -> FilterDecision:
     fallback = _fallback_filter_decision(raw_text)
+    story_signals = detect_story_signals(raw_text)
 
     severity = _normalize_severity_label(str(payload.get("severity") or "")) or fallback.severity
     action = _normalize_filter_action(payload.get("action"), severity)
@@ -1306,12 +1431,19 @@ def _validate_filter_decision(
         confidence = fallback.confidence
     confidence = max(0.0, min(confidence, 1.0))
 
-    summary_html = sanitize_telegram_html(str(payload.get("summary_html") or "")).strip()
+    raw_summary_html = sanitize_telegram_html(str(payload.get("summary_html") or "")).strip()
     headline_html = sanitize_telegram_html(str(payload.get("headline_html") or "")).strip()
     story_bridge_html = sanitize_telegram_html(str(payload.get("story_bridge_html") or "")).strip()
+    summary_html = normalize_feed_summary_html(raw_summary_html, raw_text)
 
     if action != "skip" and not summary_html:
         summary_html = fallback.summary_html
+    if bool(story_signals.get("downgrade_explainer")) and (
+        action == "deliver" or severity == "high"
+    ):
+        severity = "medium" if summary_html else "low"
+        action = "digest" if summary_html else "skip"
+        confidence = min(confidence, 0.75)
     if severity == "high":
         headline_html = resolve_breaking_headline_for_delivery(
             raw_text,
@@ -1326,6 +1458,8 @@ def _validate_filter_decision(
 
     needs_ocr_translation = bool(payload.get("needs_ocr_translation", False))
     reason_code = _sanitize_reason_code(payload.get("reason_code"))
+    if bool(story_signals.get("downgrade_explainer")) and action != "deliver":
+        reason_code = "explainer_digest"
     topic_key = _sanitize_topic_key(payload.get("topic_key"), raw_text)
 
     if action == "skip":

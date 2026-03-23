@@ -46,6 +46,7 @@ from ai_filter import (
     generate_answer_from_context,
     get_filter_decision_cache_stats,
     get_quota_health,
+    normalize_feed_summary_html,
     resolve_breaking_style_mode,
     summarize_breaking_headline,
     summarize_vital_rational_view,
@@ -99,6 +100,7 @@ from db import (
     set_last_digest_timestamp,
     set_meta,
 )
+from news_signals import looks_like_live_event_update, should_downgrade_explainer_urgency
 from prompts import quiet_period_message
 from severity_classifier import classify_message_severity
 from utils import (
@@ -2051,7 +2053,7 @@ def _filename_for_bot_media(msg: Message, index: int) -> str:
     return f"file_{msg.id or index}.bin"
 
 
-def _format_summary_text(source_title: str, summary: str) -> str:
+def _format_summary_text_legacy(source_title: str, summary: str) -> str:
     safe_source = sanitize_telegram_html(source_title)
     safe_summary = str(summary or "").strip()
     if _include_source_tags():
@@ -2669,6 +2671,19 @@ def _truncate_context_line(text: str, limit: int = 240) -> str:
         return cleaned
     truncated = cleaned[: limit - 3].rsplit(" ", 1)[0].rstrip()
     return f"{truncated}..."
+
+
+def _format_summary_text(source_title: str, summary: str, *, raw_text: str | None = None) -> str:
+    safe_source = sanitize_telegram_html(source_title)
+    raw_basis = normalize_space(str(raw_text or ""))
+    safe_summary = str(summary or "").strip()
+    if raw_basis:
+        safe_summary = normalize_feed_summary_html(safe_summary, raw_basis)
+        if not safe_summary and not should_downgrade_explainer_urgency(raw_basis):
+            safe_summary = sanitize_telegram_html(_truncate_context_line(raw_basis, limit=320))
+    if _include_source_tags():
+        return f"<b>ðŸ“° {safe_source}</b><br><br>{safe_summary}"
+    return f"<b>ðŸ“° Update</b><br><br>{safe_summary}"
 
 
 def _clean_followup_context_line(text: str) -> str:
@@ -3774,7 +3789,7 @@ async def _process_single_message(msg: Message) -> None:
         reply_to = await _resolve_source_reply_target(msg)
         sent_ref = await _send_single_media(
             msg,
-            _format_summary_text(source, summary),
+            _format_summary_text(source, summary, raw_text=text),
             reply_to=reply_to,
         )
         _register_source_delivery_refs(
@@ -3795,7 +3810,10 @@ async def _process_single_message(msg: Message) -> None:
         return
 
     reply_to = await _resolve_source_reply_target(msg)
-    sent_ref = await _send_text_with_ref(_format_summary_text(source, summary), reply_to=reply_to)
+    sent_ref = await _send_text_with_ref(
+        _format_summary_text(source, summary, raw_text=text),
+        reply_to=reply_to,
+    )
     _register_source_delivery_refs(
         channel_id=channel_id,
         source_message_ids=[msg.id],
@@ -3852,7 +3870,7 @@ async def _process_album(messages: List[Message]) -> None:
     reply_to = await _resolve_source_reply_target(messages[0])
     sent_ref = await _send_album(
         messages,
-        _format_summary_text(source, summary),
+        _format_summary_text(source, summary, raw_text=combined_caption),
         reply_to=reply_to,
     )
     _register_source_delivery_refs(
@@ -3916,7 +3934,12 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
     elif _contains_breaking_keyword(text):
         severity = "high"
 
-    if severity != "high" and _contains_breaking_keyword(text):
+    if (
+        severity != "high"
+        and _contains_breaking_keyword(text)
+        and not should_downgrade_explainer_urgency(text)
+        and looks_like_live_event_update(text)
+    ):
         severity = "high"
         severity_score = max(float(severity_score), 0.82)
         severity_breakdown = dict(severity_breakdown or {})
@@ -4060,7 +4083,12 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
     elif _contains_breaking_keyword(combined_caption):
         severity = "high"
 
-    if severity != "high" and _contains_breaking_keyword(combined_caption):
+    if (
+        severity != "high"
+        and _contains_breaking_keyword(combined_caption)
+        and not should_downgrade_explainer_urgency(combined_caption)
+        and looks_like_live_event_update(combined_caption)
+    ):
         severity = "high"
         severity_score = max(float(severity_score), 0.82)
         severity_breakdown = dict(severity_breakdown or {})
@@ -4380,7 +4408,12 @@ async def _handle_triage_inbound_job(job: Dict[str, object]) -> None:
         elif _contains_breaking_keyword(combined_text):
             severity = "high"
 
-        if severity != "high" and _contains_breaking_keyword(combined_text):
+        if (
+            severity != "high"
+            and _contains_breaking_keyword(combined_text)
+            and not should_downgrade_explainer_urgency(combined_text)
+            and looks_like_live_event_update(combined_text)
+        ):
             severity = "high"
             severity_score = max(float(severity_score), 0.82)
             severity_breakdown = dict(severity_breakdown or {})
@@ -4466,6 +4499,8 @@ async def _handle_ai_inbound_job(job: Dict[str, object]) -> None:
         return
 
     decision = await decide_filter_action(candidate_text, _require_auth_manager())
+    payload["triage_severity"] = str(payload.get("severity") or "medium")
+    payload["severity"] = decision.severity
     if resolve_breaking_style_mode() == "unhinged" and decision.severity == "high":
         recent_context = _recent_story_bridge_context(candidate_text)
         if recent_context:
@@ -4559,7 +4594,7 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
         await _advance_job_to_archive(job, payload)
         return
 
-    if severity == "high" and _is_immediate_high_enabled() and candidate_text:
+    if severity == "high" and action == "deliver" and _is_immediate_high_enabled() and candidate_text:
         headline = _plain_text_from_html_fragment(str(decision.get("headline_html") or "")) or candidate_text
         if len(headline) > 420:
             headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
@@ -4633,7 +4668,7 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
     if not summary_html:
         summary_html = sanitize_telegram_html(_truncate_context_line(candidate_text, limit=700))
     reply_to = await _resolve_source_reply_target(primary)
-    formatted_summary = _format_summary_text(source, summary_html)
+    formatted_summary = _format_summary_text(source, summary_html, raw_text=candidate_text)
     if has_media:
         if kind == "album":
             sent_ref = await _send_album(messages, formatted_summary, reply_to=reply_to)

@@ -8,6 +8,8 @@ import time
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, Tuple
 
+from news_signals import detect_story_signals
+
 
 # -----------------------------------------------------------------------------
 # SEVERITY_CONFIG
@@ -421,6 +423,7 @@ def _calc_negative_penalty(
     *,
     source_name: str,
     text_tokens: int,
+    story_signals: Dict[str, Any],
 ) -> tuple[float, Dict[str, Any]]:
     cfg = SEVERITY_CONFIG["negative_penalties"]
     normalized = _normalize_key(text)
@@ -447,6 +450,11 @@ def _calc_negative_penalty(
     if noisy_source_matches:
         penalty -= float(cfg["noisy_source_penalty"])
 
+    if bool(story_signals.get("explainer_like")):
+        penalty -= 0.14
+    if bool(story_signals.get("question_led")):
+        penalty -= 0.06
+
     max_abs = float(cfg["max_penalty_abs"])
     penalty = max(-max_abs, min(0.0, penalty))
 
@@ -455,6 +463,9 @@ def _calc_negative_penalty(
         "analysis_hits": analysis_hits[:8],
         "long_text": int(text_tokens) > int(cfg["long_text_tokens_threshold"]),
         "noisy_source_matches": noisy_source_matches[:6],
+        "explainer_like": bool(story_signals.get("explainer_like")),
+        "question_led": bool(story_signals.get("question_led")),
+        "downgrade_explainer": bool(story_signals.get("downgrade_explainer")),
         "penalty": round(penalty, 4),
     }
     return penalty, details
@@ -501,6 +512,7 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
     humanized_probability = float(msg.get("humanized_vital_probability") or 0.0)
     now_ts = float(msg.get("timestamp") or time.time())
     channel_id = str(msg.get("channel_id") or "").strip()
+    story_signals = detect_story_signals(text)
 
     tier, source_score = _detect_source_tier(source_name)
     urgency_score, urgency_hits, urgency_hit_count = _calc_urgency_score(text)
@@ -515,6 +527,7 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
         text,
         source_name=source_name,
         text_tokens=text_tokens,
+        story_signals=story_signals,
     )
 
     total_score = source_score + urgency_score + style_score + humanized_score + temporal_score + penalty_score
@@ -545,6 +558,10 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
             severity = "medium"
             forced_reasons.append("downgrade_non_s_insufficient_urgency")
 
+    if severity == "high" and bool(story_signals.get("downgrade_explainer")):
+        severity = "medium"
+        forced_reasons.append("downgrade_explainer_guard")
+
     # Hard rule 3: per-source cooldown for high severity.
     source_key = channel_id or _normalize_key(source_name) or "unknown-source"
     cooldown_info = _cooldown_state(source_key, now_ts)
@@ -571,6 +588,15 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
         "temporal": temporal_details,
         "penalty_score": round(penalty_score, 4),
         "penalties": penalty_details,
+        "story_signals": {
+            "explainer_hits": list(story_signals.get("explainer_hits") or []),
+            "question_led": bool(story_signals.get("question_led")),
+            "concrete_event": bool(story_signals.get("concrete_event")),
+            "official_development": bool(story_signals.get("official_development")),
+            "recency": bool(story_signals.get("recency")),
+            "downgrade_explainer": bool(story_signals.get("downgrade_explainer")),
+            "live_event_update": bool(story_signals.get("live_event_update")),
+        },
         "has_link": has_link,
         "has_media": has_media,
         "text_tokens": text_tokens,
