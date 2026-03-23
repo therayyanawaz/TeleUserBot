@@ -51,7 +51,18 @@ from ai_filter import (
     summarize_or_skip,
     translate_ocr_text_to_english,
 )
-from auth import AuthManager, ERROR_LOG_PATH, ensure_runtime_dir
+from auth import (
+    ENV_AUTH_ENV_ONLY,
+    ENV_AUTH_JSON,
+    ENV_AUTH_JSON_B64,
+    AuthManager,
+    ERROR_LOG_PATH,
+    OAuthError,
+    bootstrap_env_oauth_payload,
+    ensure_runtime_dir,
+    normalize_oauth_error_message,
+    write_auth_payload_to_env_file,
+)
 from db import (
     ack_digest_batch,
     advance_inbound_job,
@@ -155,6 +166,8 @@ _C_CYAN = "\033[36m"
 _C_GREEN = "\033[32m"
 _C_YELLOW = "\033[33m"
 _C_RED = "\033[31m"
+_last_cli_status_signature: tuple[str, str] | None = None
+_last_cli_status_at: float = 0.0
 
 
 def _c(text: str, color: str, *, bold: bool = False, dim: bool = False) -> str:
@@ -179,8 +192,19 @@ def _print_cli_banner() -> None:
 
 
 def _print_cli_status(symbol: str, text: str, *, level: str = "info") -> None:
+    global _last_cli_status_signature, _last_cli_status_at
+
     if not sys.stdin.isatty():
         return
+    normalized_text = str(text or "").strip()
+    if normalized_text == "OpenAI auth ready" and (not auth_ready or auth_degraded):
+        return
+    now = time.time()
+    signature = (level, normalized_text)
+    if _last_cli_status_signature == signature and (now - _last_cli_status_at) < 0.5:
+        return
+    _last_cli_status_signature = signature
+    _last_cli_status_at = now
     color = _C_CYAN
     if level == "ok":
         color = _C_GREEN
@@ -266,6 +290,14 @@ started_as_user_id: int = 0
 startup_phase: str = "booting"
 startup_ready: bool = False
 startup_error: str = ""
+auth_startup_mode_configured: str = "auto"
+auth_startup_mode_effective: str = "auto"
+auth_ready: bool = False
+auth_degraded: bool = False
+auth_failure_reason: str = ""
+auth_features_disabled: List[str] = []
+startup_auth_repair_status: str = "not_needed"
+startup_auth_repair_message: str = ""
 pipeline_worker_tasks: List[asyncio.Task] = []
 pipeline_sentence_transformer_warm_task: asyncio.Task | None = None
 pipeline_query_web_semaphore: asyncio.Semaphore | None = None
@@ -394,6 +426,328 @@ def _has_manual_sources() -> bool:
 
 def _is_interactive_runtime() -> bool:
     return sys.stdin.isatty()
+
+
+def _auth_startup_mode_from_config() -> str:
+    raw = str(getattr(config, "OPENAI_AUTH_STARTUP_MODE", "auto") or "").strip().lower()
+    if raw in {"strict", "degraded", "auto"}:
+        return raw
+    return "auto"
+
+
+def _resolve_auth_startup_mode(configured: str | None = None) -> str:
+    selected = (configured or _auth_startup_mode_from_config()).strip().lower()
+    if selected == "strict":
+        return "strict"
+    if selected == "degraded":
+        return "degraded"
+    return "strict" if _is_interactive_runtime() else "degraded"
+
+
+def _auth_env_only_mode() -> bool:
+    raw = str(os.getenv("OPENAI_AUTH_ENV_ONLY", "true") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _auth_disabled_features_for_runtime() -> List[str]:
+    if auth_ready and not auth_degraded:
+        return []
+    return ["query_mode", "ocr_translation", "vital_rational_view"]
+
+
+def _trim_runtime_reason(text: str, *, limit: int = 220) -> str:
+    cleaned = normalize_space(text)
+    if len(cleaned) <= limit:
+        return cleaned
+    shortened = cleaned[: limit - 3].rsplit(" ", 1)[0].rstrip()
+    return f"{shortened}..."
+
+
+def _auth_fix_commands() -> List[str]:
+    if _auth_env_only_mode():
+        return [
+            "python auth.py bootstrap-env",
+            "python auth.py setup-env",
+        ]
+    return ["python auth.py login"]
+
+
+def _auth_fix_guidance_text() -> str:
+    commands = _auth_fix_commands()
+    if _auth_env_only_mode():
+        return (
+            "Generate env auth locally with "
+            f"{' or '.join(commands)}. "
+            "Then set TG_USERBOT_AUTH_JSON or TG_USERBOT_AUTH_JSON_B64 and restart."
+        )
+    return f"Run {commands[0]} and restart."
+
+
+def _set_auth_runtime_state(
+    *,
+    configured_mode: str,
+    effective_mode: str,
+    ready: bool,
+    degraded: bool,
+    failure_reason: str = "",
+    features_disabled: Sequence[str] | None = None,
+) -> None:
+    global auth_startup_mode_configured, auth_startup_mode_effective
+    global auth_ready, auth_degraded, auth_failure_reason, auth_features_disabled
+
+    auth_startup_mode_configured = configured_mode
+    auth_startup_mode_effective = effective_mode
+    auth_ready = bool(ready)
+    auth_degraded = bool(degraded)
+    auth_failure_reason = normalize_space(failure_reason)
+    disabled = [normalize_space(item) for item in (features_disabled or []) if normalize_space(item)]
+    auth_features_disabled = disabled
+
+
+def _set_startup_auth_repair_state(*, status: str, message: str = "") -> None:
+    global startup_auth_repair_status, startup_auth_repair_message
+
+    startup_auth_repair_status = normalize_space(status) or "not_needed"
+    startup_auth_repair_message = normalize_space(message)
+
+
+def _extract_auth_startup_reason(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return "OpenAI auth unavailable."
+    first_line = cleaned.splitlines()[0].strip()
+    return normalize_space(first_line or cleaned)
+
+
+def _is_interactive_auth_repair_candidate(reason: str) -> bool:
+    lowered = _extract_auth_startup_reason(reason).lower()
+    if not lowered:
+        return False
+    markers = (
+        "missing oauth token in env",
+        "oauth access token missing in env payload",
+        "no refresh_token available in env payload",
+        "oauth refresh failed in env-only mode",
+        "stored env refresh token is stale",
+        "refresh token is stale",
+        "refresh token has already been used",
+        "refresh_token_reused",
+        "authentication token has been invalidated",
+        "re-authenticate disabled in env-only mode",
+        "update tg_userbot_auth_json",
+        "update tg_userbot_auth_json/b64",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _startup_auth_requires_guided_bootstrap() -> bool:
+    if not _is_interactive_runtime():
+        return False
+    try:
+        status = AuthManager(logger=LOGGER).status()
+    except Exception:
+        return False
+    return not bool(status.get("has_access_token"))
+
+
+def _refresh_runtime_from_env_mutation(updates: Dict[str, str | None]) -> None:
+    global config, destination_peer, bot_destination_token, bot_destination_chat_id
+    global query_allowed_bot_user_id, query_bot_user_id_checked
+
+    for key, value in updates.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = str(value)
+
+    config = importlib.reload(config)
+    destination_peer = None
+    bot_destination_token = None
+    bot_destination_chat_id = None
+    query_allowed_bot_user_id = None
+    query_bot_user_id_checked = False
+
+
+async def _repair_auth_startup_env(reason: str) -> None:
+    primary_reason = _extract_auth_startup_reason(reason)
+    _set_startup_auth_repair_state(status="failed", message=primary_reason)
+    LOGGER.warning(
+        "OpenAI auth unavailable at startup; attempting guided env bootstrap: %s",
+        primary_reason,
+    )
+    _print_cli_status(
+        "!",
+        "OpenAI auth missing or stale; starting guided browser login and saving to .env",
+        level="warn",
+    )
+
+    try:
+        payload = await bootstrap_env_oauth_payload(logger=LOGGER)
+        env_path = write_auth_payload_to_env_file(payload, ENV_PATH)
+        _refresh_runtime_from_env_mutation(
+            {
+                ENV_AUTH_ENV_ONLY: "true",
+                ENV_AUTH_JSON: "",
+                ENV_AUTH_JSON_B64: str(payload.get("b64") or ""),
+            }
+        )
+    except Exception as exc:
+        repaired_reason = normalize_oauth_error_message(exc)
+        _set_startup_auth_repair_state(status="failed", message=repaired_reason)
+        raise RuntimeError(
+            f"OpenAI guided auth bootstrap failed: {repaired_reason}\n"
+            "Run python auth.py setup-env and retry startup."
+        ) from exc
+
+    account_id = normalize_space(str(payload.get("account_id") or ""))
+    repaired_message = f"Saved OpenAI env auth to {env_path.name}"
+    if account_id:
+        repaired_message = f"{repaired_message} (account_id={account_id})"
+    _set_startup_auth_repair_state(status="repaired", message=repaired_message)
+    _print_cli_status(
+        "+",
+        "OpenAI auth saved to .env; retrying startup auth validation",
+        level="ok",
+    )
+
+
+async def _prepare_auth_runtime_for_startup() -> None:
+    _set_startup_auth_repair_state(status="not_needed", message="")
+    attempted_repair = False
+
+    if _startup_auth_requires_guided_bootstrap():
+        await _repair_auth_startup_env("OpenAI auth is not configured for startup.")
+        attempted_repair = True
+    else:
+        try:
+            await _prepare_auth_runtime()
+        except RuntimeError as exc:
+            reason = _extract_auth_startup_reason(str(exc))
+            if not _is_interactive_runtime() or not _is_interactive_auth_repair_candidate(reason):
+                _set_startup_auth_repair_state(status="skipped", message=reason)
+                raise
+            await _repair_auth_startup_env(reason)
+            attempted_repair = True
+        else:
+            if auth_ready:
+                return
+            if not _is_interactive_runtime():
+                if auth_failure_reason:
+                    _set_startup_auth_repair_state(
+                        status="skipped",
+                        message=_extract_auth_startup_reason(auth_failure_reason),
+                    )
+                return
+            if not auth_failure_reason or not _is_interactive_auth_repair_candidate(auth_failure_reason):
+                if auth_failure_reason:
+                    _set_startup_auth_repair_state(
+                        status="skipped",
+                        message=_extract_auth_startup_reason(auth_failure_reason),
+                    )
+                return
+            await _repair_auth_startup_env(auth_failure_reason)
+            attempted_repair = True
+
+    if not attempted_repair:
+        return
+
+    try:
+        await _prepare_auth_runtime()
+    except RuntimeError as exc:
+        reason = _extract_auth_startup_reason(str(exc))
+        _set_startup_auth_repair_state(status="failed", message=reason)
+        raise RuntimeError(
+            f"{reason}\nGuided browser auth saved env credentials, but startup still could not validate them."
+        ) from exc
+
+    if not auth_ready:
+        reason = _extract_auth_startup_reason(auth_failure_reason or "OpenAI auth unavailable.")
+        _set_startup_auth_repair_state(status="failed", message=reason)
+        raise RuntimeError(
+            f"{reason}\nGuided browser auth completed, but startup still could not validate OpenAI auth."
+        )
+
+def _query_mode_temporarily_unavailable_text() -> str:
+    reason = sanitize_telegram_html(_trim_runtime_reason(auth_failure_reason or "OpenAI auth unavailable."))
+    command_text = " | ".join(sanitize_telegram_html(item) for item in _auth_fix_commands())
+    return (
+        "<b>Query mode temporarily unavailable</b><br>"
+        "The bot is running in degraded auth mode, so AI-backed private queries are disabled.<br>"
+        f"Reason: <code>{reason}</code><br>"
+        f"Fix: <code>{command_text}</code>, then restart."
+    )
+
+
+def _auth_status_summary() -> str:
+    if auth_ready and not auth_degraded:
+        return "ready"
+    if auth_degraded:
+        return "degraded"
+    return "unavailable"
+
+
+def _is_query_runtime_available() -> bool:
+    return _is_query_mode_enabled() and auth_ready and not auth_degraded
+
+
+def _format_strict_auth_startup_error(reason: str) -> str:
+    guidance = _auth_fix_guidance_text()
+    if guidance:
+        return f"{reason}\n{guidance}"
+    return reason
+
+
+async def _prepare_auth_runtime() -> None:
+    global auth_manager
+
+    configured_mode = _auth_startup_mode_from_config()
+    effective_mode = _resolve_auth_startup_mode(configured_mode)
+    auth_manager = AuthManager(logger=LOGGER)
+    _set_auth_runtime_state(
+        configured_mode=configured_mode,
+        effective_mode=effective_mode,
+        ready=False,
+        degraded=False,
+        failure_reason="",
+        features_disabled=[],
+    )
+
+    try:
+        await auth_manager.get_access_token()
+    except OAuthError as exc:
+        reason = normalize_oauth_error_message(exc)
+        features_disabled = _auth_disabled_features_for_runtime()
+        if effective_mode == "degraded":
+            _set_auth_runtime_state(
+                configured_mode=configured_mode,
+                effective_mode=effective_mode,
+                ready=False,
+                degraded=True,
+                failure_reason=reason,
+                features_disabled=features_disabled,
+            )
+            LOGGER.warning("OpenAI auth unavailable; continuing in degraded mode: %s", reason)
+            LOGGER.warning("%s", _auth_fix_guidance_text())
+            return
+
+        _set_auth_runtime_state(
+            configured_mode=configured_mode,
+            effective_mode=effective_mode,
+            ready=False,
+            degraded=False,
+            failure_reason=reason,
+            features_disabled=features_disabled,
+        )
+        raise RuntimeError(_format_strict_auth_startup_error(reason)) from exc
+
+    _set_auth_runtime_state(
+        configured_mode=configured_mode,
+        effective_mode=effective_mode,
+        ready=True,
+        degraded=False,
+        failure_reason="",
+        features_disabled=[],
+    )
 
 
 def _is_missing_destination() -> bool:
@@ -2150,6 +2504,8 @@ async def _extract_media_ocr_translation(msg: Message) -> str | None:
         return None
     if not getattr(msg, "media", None):
         return None
+    if not auth_ready:
+        return None
 
     ocr_text = ""
 
@@ -3562,7 +3918,7 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
             if len(headline) > 420:
                 headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
         rational_view: str | None = None
-        if _should_attach_vital_opinion(text):
+        if auth_ready and _should_attach_vital_opinion(text):
             recent_context = _recent_story_bridge_context(text)
             rational_view = await summarize_vital_rational_view(
                 text,
@@ -3705,7 +4061,7 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
             if len(headline) > 420:
                 headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
         rational_view: str | None = None
-        if _should_attach_vital_opinion(combined_caption):
+        if auth_ready and _should_attach_vital_opinion(combined_caption):
             recent_context = _recent_story_bridge_context(combined_caption)
             rational_view = await summarize_vital_rational_view(
                 combined_caption,
@@ -5481,8 +5837,21 @@ def _web_status_payload() -> Dict[str, object]:
         "dupe_detection": _is_dupe_detection_enabled(),
         "severity_routing": _is_severity_routing_enabled(),
         "query_mode": _is_query_mode_enabled(),
+        "query_mode_available": _is_query_runtime_available(),
         "html_formatting": _is_html_formatting_enabled(),
         "breaking_sla_seconds": int(getattr(config, "BREAKING_SLA_SECONDS", 15) or 15),
+        "auth": {
+            "mode_configured": auth_startup_mode_configured,
+            "mode_effective": auth_startup_mode_effective,
+            "ready": auth_ready,
+            "degraded": auth_degraded,
+            "status": _auth_status_summary(),
+            "failure_reason": auth_failure_reason or None,
+            "features_disabled": list(auth_features_disabled),
+            "fix_commands": _auth_fix_commands(),
+            "startup_repair_status": startup_auth_repair_status,
+            "startup_repair_message": startup_auth_repair_message or None,
+        },
         "pipeline_workers": _pipeline_worker_targets(),
         "pipeline_queue_depth": inbound_counts,
         "pipeline_oldest_pending_seconds": inbound_oldest,
@@ -5519,6 +5888,12 @@ def _digest_status_text() -> str:
     )
     queue_clear_scope = _digest_queue_clear_scope() if queue_clear_interval_seconds > 0 else "disabled"
     daily_window_hours = _digest_daily_window_hours()
+    auth_status = _auth_status_summary()
+    auth_reason = sanitize_telegram_html(_trim_runtime_reason(auth_failure_reason or ""))
+    disabled_features = ", ".join(auth_features_disabled) if auth_features_disabled else "none"
+    query_state = "on" if _is_query_mode_enabled() else "off"
+    if _is_query_mode_enabled() and not _is_query_runtime_available():
+        query_state = "degraded"
 
     return (
         "<b>🧠 Digest Status</b><br>"
@@ -5542,9 +5917,36 @@ def _digest_status_text() -> str:
     )
 
 
+def _digest_auth_status_suffix() -> str:
+    auth_status = sanitize_telegram_html(_auth_status_summary())
+    disabled_features = ", ".join(auth_features_disabled) if auth_features_disabled else "none"
+    reason = sanitize_telegram_html(_trim_runtime_reason(auth_failure_reason or ""))
+    repair_status = sanitize_telegram_html(startup_auth_repair_status)
+    repair_message = sanitize_telegram_html(_trim_runtime_reason(startup_auth_repair_message or ""))
+    query_state = "on" if _is_query_runtime_available() else ("degraded" if _is_query_mode_enabled() else "off")
+
+    lines = [
+        "",
+        "<b>Auth Status</b>",
+        (
+            f"Configured/effective: <code>{sanitize_telegram_html(auth_startup_mode_configured)} -> "
+            f"{sanitize_telegram_html(auth_startup_mode_effective)}</code>"
+        ),
+        f"State: <code>{auth_status}</code>",
+        f"Startup repair: <code>{repair_status}</code>",
+        f"Query mode: <code>{sanitize_telegram_html(query_state)}</code>",
+        f"Disabled features: <code>{sanitize_telegram_html(disabled_features)}</code>",
+    ]
+    if repair_message:
+        lines.append(f"Repair detail: <code>{repair_message}</code>")
+    if reason:
+        lines.append(f"Reason: <code>{reason}</code>")
+    return "<br>".join(lines)
+
+
 async def _on_digest_status_command(event: events.NewMessage.Event) -> None:
     try:
-        status_text = _digest_status_text()
+        status_text = f"{_digest_status_text()}{_digest_auth_status_suffix()}"
         if _is_html_formatting_enabled():
             status_text = _render_outbound_text(status_text, allow_premium_tags=False) or status_text
         await event.reply(
@@ -6030,6 +6432,16 @@ async def _handle_query_request(
     prefer_bot_identity: bool,
     bot_chat_id: int | None,
 ) -> None:
+    if not _is_query_runtime_available():
+        await _safe_reply_markdown(
+            event_ref,  # type: ignore[arg-type]
+            _query_mode_temporarily_unavailable_text(),
+            reply_to=reply_to,
+            prefer_bot_identity=prefer_bot_identity,
+            bot_chat_id=bot_chat_id,
+        )
+        return
+
     now = time.time()
     last = query_last_request_ts.get(sender_id, 0.0)
     if now - last < 10:
@@ -6729,7 +7141,6 @@ async def main() -> None:
             startup_ready = False
             startup_phase = "error"
             LOGGER.error("%s", exc)
-            print(exc)
             _print_cli_status("✗", "Configuration invalid. Fix values and re-run.", level="error")
             if _is_web_server_enabled() and _should_hold_on_startup_error():
                 LOGGER.warning("Holding process alive after config validation error for health visibility.")
@@ -6747,7 +7158,6 @@ async def main() -> None:
             startup_ready = False
             startup_phase = "error"
             LOGGER.error("%s", exc)
-            print(exc)
             _print_cli_status("✗", "Another instance is already running", level="error")
             if _is_web_server_enabled() and _should_hold_on_startup_error():
                 LOGGER.warning("Holding process alive after startup lock error for health visibility.")
@@ -6765,9 +7175,28 @@ async def main() -> None:
 
             startup_phase = "auth"
             _print_cli_status("•", "Preparing OpenAI auth context...", level="info")
-            auth_manager = AuthManager(logger=LOGGER)
-            await auth_manager.get_access_token()
-            _print_cli_status("✓", "OpenAI auth ready", level="ok")
+            await _prepare_auth_runtime_for_startup()
+            log_structured(
+                LOGGER,
+                "auth_startup_state",
+                mode_configured=auth_startup_mode_configured,
+                mode_effective=auth_startup_mode_effective,
+                ready=auth_ready,
+                degraded=auth_degraded,
+                failure_reason=auth_failure_reason or None,
+                features_disabled=list(auth_features_disabled),
+                startup_repair_status=startup_auth_repair_status,
+                startup_repair_message=startup_auth_repair_message or None,
+            )
+            if auth_ready and not auth_degraded:
+                _print_cli_status("+", "OpenAI auth ready", level="ok")
+            else:
+                summary = _trim_runtime_reason(auth_failure_reason or "OpenAI auth unavailable.", limit=96)
+                _print_cli_status(
+                    "!",
+                    f"OpenAI auth degraded; disabled: {', '.join(auth_features_disabled) or 'none'} ({summary})",
+                    level="warn",
+                )
 
             startup_phase = "telegram_login"
             _print_cli_status("•", "Connecting Telegram user session...", level="info")
@@ -6886,7 +7315,6 @@ async def main() -> None:
             startup_ready = False
             startup_phase = "error"
             LOGGER.error("%s", exc)
-            print(exc)
             _print_cli_status("✗", "Startup failed", level="error")
             if _is_web_server_enabled() and _should_hold_on_startup_error():
                 LOGGER.warning("Holding process alive after startup error for health visibility.")

@@ -241,6 +241,10 @@ Then log in locally with browser OAuth:
 python auth.py login
 ```
 
+Interactive `python main.py` startup can now repair missing or stale OpenAI auth automatically.
+When run in a local terminal, it will launch browser OAuth, save env-backed auth into the repo `.env`,
+switch `OPENAI_AUTH_ENV_ONLY=true`, and continue startup in the same process.
+
 ### Auth commands
 
 Local login:
@@ -285,7 +289,7 @@ The bot will:
 1. validate config
 2. ensure only one instance is running
 3. initialize runtime DB and caches
-4. validate auth
+4. repair auth inline when interactive startup detects missing or stale OpenAI auth
 5. connect Telegram user session
 6. resolve source channels/folder chats
 7. start feed/query/digest pipelines

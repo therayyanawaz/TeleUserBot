@@ -146,6 +146,7 @@ BOT_DESTINATION_CHAT_ID = _env_str("BOT_DESTINATION_CHAT_ID", "")  # type: str
 CODEX_BASE_URL = _env_str("CODEX_BASE_URL", "https://chatgpt.com/backend-api")  # type: str
 CODEX_MODEL = _env_str("CODEX_MODEL", "gpt-5.3-codex")  # type: str
 CODEX_ORIGINATOR = _env_str("CODEX_ORIGINATOR", "pi")  # type: str
+OPENAI_AUTH_STARTUP_MODE = _env_str("OPENAI_AUTH_STARTUP_MODE", "auto").lower()  # type: str
 
 # -----------------------------------------------------------------------------
 # Digest Mode Core
