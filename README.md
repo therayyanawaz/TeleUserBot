@@ -382,6 +382,15 @@ High-level flow:
 
 You can tune routing with config values in `config.py` / `.env`, including severity toggles and duplicate behavior.
 
+Breaking alert voice:
+
+```env
+BREAKING_STYLE_MODE=unhinged
+```
+
+- `unhinged` sends a single-line, hard-hitting breaking headline with no `Why it matters` bridge
+- `classic` restores the prior breaking layout with the optional contextual bridge
+
 ## Query Assistant
 
 The query assistant is intentionally restricted.

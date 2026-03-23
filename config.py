@@ -226,6 +226,7 @@ BREAKING_TOPIC_CONTINUITY_PREFIX = _env_str(
     "BREAKING_TOPIC_CONTINUITY_PREFIX",
     "",
 )  # type: str
+BREAKING_STYLE_MODE = _env_str("BREAKING_STYLE_MODE", "unhinged").lower()  # type: str
 # Optional humanized rational viewpoint for vital/high-severity alerts.
 HUMANIZED_VITAL_OPINION_ENABLED = _env_bool("HUMANIZED_VITAL_OPINION_ENABLED", True)  # type: bool
 HUMANIZED_VITAL_OPINION_PROBABILITY = _env_float("HUMANIZED_VITAL_OPINION_PROBABILITY", 0.35)  # type: float

@@ -45,7 +45,132 @@ DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 DEFAULT_CODEX_ORIGINATOR = "pi"
 DEFAULT_DIGEST_MAX_POSTS = 80
 DEFAULT_DIGEST_MAX_TOKENS = 18000
-FILTER_DECISION_PROMPT_VERSION = "v1"
+FILTER_DECISION_PROMPT_VERSION = "v2"
+
+_DIGIT_TOKEN_RE = re.compile(r"\b\d+(?:[.,:/-]\d+)*\b")
+_LATIN_TOKEN_RE = re.compile(r"[a-z][a-z0-9'-]{1,}", flags=re.IGNORECASE)
+_CAPITALIZED_TOKEN_RE = re.compile(r"\b[A-Z][a-z]{2,}(?:['-][A-Za-z]{2,})?\b")
+_NUMBER_WORD_MAP = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+    "thirteen": "13",
+    "fourteen": "14",
+    "fifteen": "15",
+    "sixteen": "16",
+    "seventeen": "17",
+    "eighteen": "18",
+    "nineteen": "19",
+    "twenty": "20",
+    "thirty": "30",
+    "forty": "40",
+    "fifty": "50",
+    "sixty": "60",
+    "seventy": "70",
+    "eighty": "80",
+    "ninety": "90",
+    "hundred": "100",
+    "thousand": "1000",
+}
+_NUMBER_WORD_RE = re.compile(
+    r"\b(" + "|".join(sorted((re.escape(key) for key in _NUMBER_WORD_MAP), key=len, reverse=True)) + r")\b",
+    flags=re.IGNORECASE,
+)
+_HEDGE_MARKERS = (
+    "reportedly",
+    "reported",
+    "reports",
+    "according to",
+    "claims",
+    "claimed",
+    "claims of",
+    "appears",
+    "appear to",
+    "apparently",
+    "allegedly",
+    "alleged",
+    "unconfirmed",
+    "suggests",
+    "suggested",
+    "possible",
+    "possibly",
+    "suspected",
+)
+_HEADLINE_HEDGE_MARKERS = (
+    "reportedly",
+    "appears",
+    "apparently",
+    "allegedly",
+    "unconfirmed",
+    "suspected",
+    "likely",
+    "said to",
+)
+_ACTOR_TOKENS = {
+    "army",
+    "forces",
+    "military",
+    "police",
+    "officials",
+    "government",
+    "israel",
+    "israeli",
+    "iran",
+    "iranian",
+    "hamas",
+    "hezbollah",
+    "houthi",
+    "houthis",
+    "idf",
+    "irgc",
+    "air force",
+}
+_EDITORIAL_ESCALATION_TOKENS = {
+    "massacre",
+    "slaughter",
+    "bloodbath",
+    "carnage",
+    "collapse",
+    "humiliation",
+    "chaos",
+    "fiasco",
+    "shitshow",
+    "meltdown",
+    "rout",
+    "panic",
+}
+_CAPITALIZED_STOPWORDS = {
+    "A",
+    "An",
+    "The",
+    "This",
+    "That",
+    "These",
+    "Those",
+    "Officials",
+    "Forces",
+    "Troops",
+    "Strike",
+    "Strikes",
+    "Attack",
+    "Attacks",
+    "Blast",
+    "Blasts",
+    "Missile",
+    "Missiles",
+    "Airstrike",
+    "Airstrikes",
+}
 
 LOGGER = logging.getLogger("tg_news_userbot.ai_filter")
 _SUMMARY_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -353,6 +478,124 @@ def _resolve_output_language() -> str:
     return language or "English"
 
 
+def resolve_breaking_style_mode() -> Literal["unhinged", "classic"]:
+    raw = normalize_space(str(getattr(config, "BREAKING_STYLE_MODE", "unhinged") or "")).lower()
+    if raw == "classic":
+        return "classic"
+    return "unhinged"
+
+
+def _breaking_style_is_unhinged() -> bool:
+    return resolve_breaking_style_mode() == "unhinged"
+
+
+def _extract_digit_tokens(text: str) -> set[str]:
+    return {token.strip() for token in _DIGIT_TOKEN_RE.findall(str(text or "")) if token.strip()}
+
+
+def _extract_numeric_tokens(text: str) -> set[str]:
+    normalized = normalize_space(str(text or ""))
+    tokens = {token.strip() for token in _DIGIT_TOKEN_RE.findall(normalized) if token.strip()}
+    for token in _NUMBER_WORD_RE.findall(normalized):
+        canonical = _NUMBER_WORD_MAP.get(str(token).lower())
+        if canonical:
+            tokens.add(canonical)
+    return tokens
+
+
+def _extract_latin_tokens(text: str) -> set[str]:
+    return {
+        token.lower()
+        for token in _LATIN_TOKEN_RE.findall(normalize_space(str(text or "")))
+        if len(token) >= 2
+    }
+
+
+def _source_has_latin_grounding(text: str) -> bool:
+    return len(_extract_latin_tokens(text)) >= 4
+
+
+def _text_has_hedge_markers(text: str, *, headline_mode: bool = False) -> bool:
+    lowered = normalize_space(str(text or "")).lower()
+    if not lowered:
+        return False
+    markers = _HEADLINE_HEDGE_MARKERS if headline_mode else _HEDGE_MARKERS
+    return any(marker in lowered for marker in markers)
+
+
+def _extract_candidate_named_tokens(text: str) -> set[str]:
+    out: set[str] = set()
+    for token in _CAPITALIZED_TOKEN_RE.findall(normalize_space(str(text or ""))):
+        if token in _CAPITALIZED_STOPWORDS:
+            continue
+        out.add(token.lower())
+    return out
+
+
+def _safe_breaking_headline_fallback(text: str) -> str:
+    fallback = _cleanup_headline(_fallback_headline(text) or "")
+    if fallback:
+        return fallback
+    cleaned = normalize_space(strip_telegram_html(str(text or "")))
+    if len(cleaned) > 220:
+        cleaned = f"{cleaned[:217].rsplit(' ', 1)[0]}..."
+    return cleaned
+
+
+def _breaking_headline_is_grounded(source_text: str, candidate: str) -> bool:
+    source_clean = normalize_space(strip_telegram_html(str(source_text or "")))
+    candidate_clean = normalize_space(strip_telegram_html(str(candidate or "")))
+    if not source_clean or not candidate_clean:
+        return False
+
+    source_numbers = _extract_numeric_tokens(source_clean)
+    candidate_numbers = _extract_numeric_tokens(candidate_clean)
+    if candidate_numbers and not candidate_numbers.issubset(source_numbers):
+        return False
+
+    if _text_has_hedge_markers(source_clean) and not _text_has_hedge_markers(
+        candidate_clean,
+        headline_mode=True,
+    ):
+        return False
+
+    source_tokens = _extract_latin_tokens(source_clean)
+    candidate_tokens = _extract_latin_tokens(candidate_clean)
+
+    if _source_has_latin_grounding(source_clean):
+        unsupported_actors = {
+            token for token in candidate_tokens if token in _ACTOR_TOKENS and token not in source_tokens
+        }
+        if unsupported_actors:
+            return False
+
+        unsupported_named_tokens = _extract_candidate_named_tokens(candidate_clean) - source_tokens
+        if unsupported_named_tokens:
+            return False
+
+    unsupported_editorial = {
+        token
+        for token in candidate_tokens
+        if token in _EDITORIAL_ESCALATION_TOKENS and token not in source_tokens
+    }
+    if unsupported_editorial:
+        return False
+
+    return True
+
+
+def resolve_breaking_headline_for_delivery(source_text: str, candidate: str | None) -> str:
+    fallback = _safe_breaking_headline_fallback(source_text)
+    cleaned_candidate = _cleanup_headline(str(candidate or ""))
+    if not cleaned_candidate:
+        return fallback
+    if not _breaking_style_is_unhinged():
+        return cleaned_candidate
+    if _breaking_headline_is_grounded(source_text, cleaned_candidate):
+        return cleaned_candidate
+    return fallback
+
+
 def _include_source_tags() -> bool:
     raw = getattr(config, "INCLUDE_SOURCE_TAGS", False)
     if isinstance(raw, bool):
@@ -397,7 +640,7 @@ def _summary_system_prompt() -> str:
 
 def _filter_decision_system_prompt() -> str:
     language = _resolve_output_language()
-    return (
+    prompt = (
         "You are a strict newsroom intake classifier for Telegram news monitoring.\n"
         f"Always write HTML fields in {language}. Translate if needed.\n"
         f"{HUMAN_NEWSROOM_VOICE}\n"
@@ -417,6 +660,15 @@ def _filter_decision_system_prompt() -> str:
         "Use digest for meaningful non-breaking items worth keeping.\n"
         "Do not include markdown fences, comments, or extra text."
     )
+    if _breaking_style_is_unhinged():
+        prompt += (
+            "\nIf severity is high, headline_html must be exactly one Telegram-safe line in an uncensored, hard-hitting, commentary-heavy live-news voice."
+            "\nIf severity is high, keep every factual element directly grounded in the source text."
+            "\nIf severity is high and the source is uncertain or hedged, headline_html must keep that uncertainty explicit."
+            "\nIf severity is high, do not invent names, numbers, locations, actors, motives, or certainty."
+            "\nIf severity is high, story_bridge_html must be an empty string."
+        )
+    return prompt
 
 
 def _severity_system_prompt() -> str:
@@ -433,6 +685,21 @@ def _severity_system_prompt() -> str:
 
 def _breaking_headline_prompt() -> str:
     language = _resolve_output_language()
+    if _breaking_style_is_unhinged():
+        return (
+            "You write savage one-line breaking-news alerts for Telegram.\n"
+            f"Output language must be {language}. Translate if needed.\n"
+            "Return exactly one complete sentence on one line.\n"
+            "Use an uncensored, hard-hitting, commentary-heavy voice.\n"
+            "Profanity is allowed. Sharp editorial phrasing is allowed.\n"
+            "But every factual element must be directly grounded in the source text.\n"
+            "Do not invent names, numbers, casualties, locations, actors, motives, or certainty.\n"
+            "If the source is hedged or uncertain, your line must keep that uncertainty explicit.\n"
+            "Lead with the most important fact and make the wording hit hard.\n"
+            "Target 10-24 words.\n"
+            "Never end with ellipsis.\n"
+            "No prefix, no source tag, no markdown, no extra explanation, no slurs."
+        )
     return (
         "You write sharp live-news one-liners for Telegram alerts.\n"
         f"Output language must be {language}. Translate if needed.\n"
@@ -1019,8 +1286,13 @@ def _validate_filter_decision(payload: Dict[str, Any], raw_text: str) -> FilterD
 
     if action != "skip" and not summary_html:
         summary_html = fallback.summary_html
-    if not headline_html and severity == "high":
-        headline_html = fallback.headline_html
+    if severity == "high":
+        headline_html = resolve_breaking_headline_for_delivery(
+            raw_text,
+            headline_html or fallback.headline_html,
+        )
+        if _breaking_style_is_unhinged():
+            story_bridge_html = ""
 
     needs_ocr_translation = bool(payload.get("needs_ocr_translation", False))
     reason_code = _sanitize_reason_code(payload.get("reason_code"))
@@ -2466,7 +2738,7 @@ async def summarize_breaking_headline(
     if not cleaned:
         return None
 
-    key = _cache_key(f"headline::{cleaned}")
+    key = _cache_key(f"headline::{resolve_breaking_style_mode()}::{cleaned}")
     cached = _headline_cache_get(key)
     if cached is not None or key in _HEADLINE_CACHE:
         return cached
@@ -2491,24 +2763,24 @@ async def summarize_breaking_headline(
                 verbosity="low",
             )
         except Exception:
-            fallback = _fallback_headline(cleaned)
+            fallback = resolve_breaking_headline_for_delivery(cleaned, None)
             _headline_cache_set(key, fallback)
             return fallback
     except (_CodexRateLimitError, httpx.HTTPError, _CodexApiError, ValueError):
-        fallback = _fallback_headline(cleaned)
+        fallback = resolve_breaking_headline_for_delivery(cleaned, None)
         _headline_cache_set(key, fallback)
         return fallback
     except Exception:
-        fallback = _fallback_headline(cleaned)
+        fallback = resolve_breaking_headline_for_delivery(cleaned, None)
         _headline_cache_set(key, fallback)
         return fallback
 
-    headline = _cleanup_headline(raw)
+    headline = resolve_breaking_headline_for_delivery(cleaned, raw)
     if headline:
         _headline_cache_set(key, headline)
         return headline
 
-    fallback = _fallback_headline(cleaned)
+    fallback = resolve_breaking_headline_for_delivery(cleaned, None)
     _headline_cache_set(key, fallback)
     return fallback
 

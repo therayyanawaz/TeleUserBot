@@ -46,6 +46,7 @@ from ai_filter import (
     generate_answer_from_context,
     get_filter_decision_cache_stats,
     get_quota_health,
+    resolve_breaking_style_mode,
     summarize_breaking_headline,
     summarize_vital_rational_view,
     summarize_or_skip,
@@ -2907,6 +2908,8 @@ def _format_breaking_text(source_title: str, headline: str, rational_view: str |
         source_title=source_title,
         include_source=_include_source_tags(),
     )
+    if resolve_breaking_style_mode() == "unhinged":
+        return f"{header} {safe_headline}".strip()
     return f"{header}<br><br>{safe_headline}{rational_part}"
 
 
@@ -3918,7 +3921,7 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
             if len(headline) > 420:
                 headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
         rational_view: str | None = None
-        if auth_ready and _should_attach_vital_opinion(text):
+        if auth_ready and resolve_breaking_style_mode() != "unhinged" and _should_attach_vital_opinion(text):
             recent_context = _recent_story_bridge_context(text)
             rational_view = await summarize_vital_rational_view(
                 text,
@@ -4061,7 +4064,7 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
             if len(headline) > 420:
                 headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
         rational_view: str | None = None
-        if auth_ready and _should_attach_vital_opinion(combined_caption):
+        if auth_ready and resolve_breaking_style_mode() != "unhinged" and _should_attach_vital_opinion(combined_caption):
             recent_context = _recent_story_bridge_context(combined_caption)
             rational_view = await summarize_vital_rational_view(
                 combined_caption,
