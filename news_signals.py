@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List
 
+from news_taxonomy import find_news_category_matches, match_breaking_category
 
 _EXPLAINER_MARKERS = (
     "analysis",
@@ -27,48 +28,6 @@ _EXPLAINER_MARKERS = (
 _QUESTION_LEAD_RE = re.compile(
     r"^(?:why|how|what explains|what caused|what does|can|could|should|would|will)\b",
     flags=re.IGNORECASE,
-)
-_CONCRETE_EVENT_MARKERS = (
-    "intercepted",
-    "interception",
-    "interceptions",
-    "shot down",
-    "air defense",
-    "air-defence",
-    "air defence",
-    "strike",
-    "strikes",
-    "airstrike",
-    "air strike",
-    "missile",
-    "missiles",
-    "rocket",
-    "rockets",
-    "drone strike",
-    "explosion",
-    "explosions",
-    "blast",
-    "blasts",
-    "bombing",
-    "shelling",
-    "raid",
-    "raids",
-    "attacked",
-    "attack",
-    "attacks",
-    "killed",
-    "dead",
-    "injured",
-    "wounded",
-    "casualties",
-    "fatalities",
-    "evacuation order",
-    "sirens",
-    "launched",
-    "fired",
-    "hit",
-    "hits",
-    "landed",
 )
 _OFFICIAL_PATTERNS = (
     r"\b(?:ministry|army|military|government|president|prime minister|defense minister|foreign minister|spokesperson|spokesman|spokeswoman|officials?)\s+(?:said|says|announced|confirmed|declared|ordered|issued|warned|approved)\b",
@@ -101,18 +60,22 @@ def detect_story_signals(text: str) -> Dict[str, Any]:
     normalized = normalize_space(text)
     lowered = normalized.lower()
     lead = normalize_space(re.split(r"(?<=[.!?])\s+|\n+", normalized, maxsplit=1)[0])
+    category_matches = find_news_category_matches(normalized)
+    top_category = category_matches[0] if category_matches else None
+    breaking_category = match_breaking_category(normalized)
 
     explainer_hits: List[str] = [marker for marker in _EXPLAINER_MARKERS if marker in lowered]
     question_led = bool(_QUESTION_LEAD_RE.search(lead)) or (
         "?" in lead and bool(_QUESTION_LEAD_RE.search(lead.rstrip("?").strip()))
     )
-    concrete_event = any(marker in lowered for marker in _CONCRETE_EVENT_MARKERS)
     official_development = any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in _OFFICIAL_PATTERNS)
     recency = any(marker in lowered for marker in _RECENCY_MARKERS)
+    concrete_event = bool(top_category)
+    breaking_eligible = bool(breaking_category)
 
     explainer_like = bool(explainer_hits) or question_led
     downgrade_explainer = explainer_like and not (
-        official_development or (concrete_event and recency)
+        official_development or (breaking_eligible and recency)
     )
     live_event_update = not downgrade_explainer and (
         official_development or (concrete_event and (recency or len(normalized) <= 280))
@@ -123,11 +86,15 @@ def detect_story_signals(text: str) -> Dict[str, Any]:
         "explainer_hits": explainer_hits,
         "question_led": question_led,
         "concrete_event": concrete_event,
+        "breaking_eligible": breaking_eligible,
         "official_development": official_development,
         "recency": recency,
         "explainer_like": explainer_like,
         "downgrade_explainer": downgrade_explainer,
         "live_event_update": live_event_update,
+        "category_key": top_category.category_key if top_category else "",
+        "category_label": top_category.label if top_category else "",
+        "all_category_keys": [match.category_key for match in category_matches[:6]],
     }
 
 

@@ -100,6 +100,7 @@ from db import (
     set_last_digest_timestamp,
     set_meta,
 )
+from news_taxonomy import load_news_taxonomy, match_breaking_category
 from news_signals import looks_like_live_event_update, should_downgrade_explainer_urgency
 from prompts import quiet_period_message
 from severity_classifier import classify_message_severity
@@ -1226,22 +1227,6 @@ def _should_hold_on_startup_error() -> bool:
 
 
 def _breaking_keywords() -> List[str]:
-    default_keywords = [
-        "breaking",
-        "urgent",
-        "just now",
-        "alert",
-        "explosion",
-        "strike",
-        "airstrike",
-        "missile",
-        "attack",
-        "air raid",
-        "drone strike",
-        "casualties",
-        "killed",
-        "intercepted",
-    ]
     raw = getattr(config, "BREAKING_NEWS_KEYWORDS", [])
     result: List[str] = []
     if isinstance(raw, list):
@@ -1251,9 +1236,6 @@ def _breaking_keywords() -> List[str]:
             normalized = item.strip().lower()
             if normalized and normalized not in result:
                 result.append(normalized)
-    for keyword in default_keywords:
-        if keyword not in result:
-            result.append(keyword)
     return result
 
 
@@ -1350,10 +1332,17 @@ def _should_attach_vital_opinion(text: str, recent_context: Sequence[str] | None
 
 
 def _contains_breaking_keyword(text: str) -> bool:
+    normalized = normalize_space(text)
+    if not normalized:
+        return False
+    if should_downgrade_explainer_urgency(normalized) or not looks_like_live_event_update(normalized):
+        return False
+    if match_breaking_category(normalized) is not None:
+        return True
     keywords = _breaking_keywords()
     if not keywords:
         return False
-    lowered = text.lower()
+    lowered = normalized.lower()
     hits = sum(1 for keyword in keywords if keyword in lowered)
     return hits >= _breaking_match_threshold()
 
@@ -2684,6 +2673,18 @@ def _format_summary_text(source_title: str, summary: str, *, raw_text: str | Non
     if _include_source_tags():
         return f"<b>ðŸ“° {safe_source}</b><br><br>{safe_summary}"
     return f"<b>ðŸ“° Update</b><br><br>{safe_summary}"
+
+def _format_summary_text(source_title: str, summary: str, *, raw_text: str | None = None) -> str:
+    safe_source = sanitize_telegram_html(source_title)
+    raw_basis = normalize_space(str(raw_text or ""))
+    safe_summary = str(summary or "").strip()
+    if raw_basis:
+        safe_summary = normalize_feed_summary_html(safe_summary, raw_basis)
+        if not safe_summary and not should_downgrade_explainer_urgency(raw_basis):
+            safe_summary = sanitize_telegram_html(_truncate_context_line(raw_basis, limit=320))
+    if _include_source_tags():
+        return f"<b>\U0001F4F0 {safe_source}</b><br><br>{safe_summary}"
+    return f"<b>\U0001F4F0 Update</b><br><br>{safe_summary}"
 
 
 def _clean_followup_context_line(text: str) -> str:
@@ -7199,6 +7200,7 @@ async def main() -> None:
         try:
             _prompt_for_missing_config()
             _validate_config()
+            load_news_taxonomy(force_reload=True)
             _print_cli_status("✓", "Configuration validated", level="ok")
         except (RuntimeError, ValueError) as exc:
             startup_error = str(exc)

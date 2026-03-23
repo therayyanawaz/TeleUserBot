@@ -8,6 +8,7 @@ import time
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, Tuple
 
+from news_taxonomy import find_news_category_matches, match_news_category
 from news_signals import detect_story_signals
 
 
@@ -67,16 +68,10 @@ SEVERITY_CONFIG: Dict[str, Any] = {
         "just in",
         "moments ago",
         "happening now",
-        "massive strike",
-        "direct hit",
-        "heavy casualties",
-        "confirmed killed",
-        "explosion in",
-        "missile attack",
-        "air raid",
         "live update",
         "urgent",
         "alert",
+        "confirmed",
     ],
     # Emoji/symbol urgency triggers.
     "strong_urgency_emoji_signals": [
@@ -109,23 +104,17 @@ SEVERITY_CONFIG: Dict[str, Any] = {
     # This score is multiplied by existing humanized_vital_probability.
     "humanized": {
         "max_score": 0.15,
-        "vital_keywords": [
-            "killed",
-            "dead",
-            "casualties",
-            "injured",
-            "strike",
-            "missile",
-            "air raid",
-            "explosion",
-            "shelling",
-            "drone",
-            "evacuation",
-            "nuclear",
-            "chemical",
-            "hostage",
-            "intercepted",
-        ],
+        "vital_keywords": [],
+    },
+    # -------------------------------------------------------------------------
+    # Taxonomy-derived event signals
+    # -------------------------------------------------------------------------
+    "taxonomy": {
+        "bias_bonus": {
+            "high": 0.16,
+            "medium": 0.09,
+            "low": 0.03,
+        },
     },
     # -------------------------------------------------------------------------
     # Temporal/context signals (max 0.05)
@@ -324,6 +313,28 @@ def _calc_urgency_score(text: str) -> tuple[float, list[str], int]:
     return score, all_hits, strong_count
 
 
+def _calc_taxonomy_score(text: str) -> tuple[float, Dict[str, Any], list[str]]:
+    match = match_news_category(text)
+    if match is None:
+        return 0.0, {"category_key": "", "label": "", "confidence_score": 0.0, "severity_bias": ""}, []
+
+    bias_bonus = SEVERITY_CONFIG["taxonomy"]["bias_bonus"]
+    score = float(bias_bonus.get(match.severity_bias, 0.0))
+    matched_terms = list(match.matched_primary + match.matched_aliases)
+    details = {
+        "category_key": match.category_key,
+        "label": match.label,
+        "confidence_score": round(match.confidence_score, 4),
+        "severity_bias": match.severity_bias,
+        "breaking_eligible": match.breaking_eligible,
+        "matched_primary": list(match.matched_primary),
+        "matched_aliases": list(match.matched_aliases),
+        "matched_required": list(match.matched_required),
+        "score": round(score, 4),
+    }
+    return score, details, matched_terms
+
+
 def _calc_style_score(text: str, *, has_link: bool, has_media: bool) -> tuple[float, Dict[str, Any]]:
     style_cfg = SEVERITY_CONFIG["style"]
     score = 0.0
@@ -370,10 +381,17 @@ def _calc_humanized_score(
     urgency_hits: int,
 ) -> tuple[float, Dict[str, Any]]:
     cfg = SEVERITY_CONFIG["humanized"]
-    keywords = cfg["vital_keywords"]
-    normalized = _normalize_key(text)
-
-    vital_hits = _find_matches(normalized, keywords)
+    taxonomy_matches = find_news_category_matches(text)
+    vital_hits: list[str] = []
+    seen: set[str] = set()
+    for match in taxonomy_matches:
+        if not match.breaking_eligible and match.severity_bias == "low":
+            continue
+        for phrase in (*match.matched_primary, *match.matched_aliases):
+            if phrase in seen:
+                continue
+            seen.add(phrase)
+            vital_hits.append(phrase)
     vital_density = min(1.0, len(vital_hits) / 3.0)
     if vital_density <= 0 and urgency_hits >= 3:
         vital_density = 0.5
@@ -516,6 +534,7 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
 
     tier, source_score = _detect_source_tier(source_name)
     urgency_score, urgency_hits, urgency_hit_count = _calc_urgency_score(text)
+    taxonomy_score, taxonomy_details, taxonomy_hits = _calc_taxonomy_score(text)
     style_score, style_details = _calc_style_score(text, has_link=has_link, has_media=has_media)
     humanized_score, humanized_details = _calc_humanized_score(
         text,
@@ -530,7 +549,15 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
         story_signals=story_signals,
     )
 
-    total_score = source_score + urgency_score + style_score + humanized_score + temporal_score + penalty_score
+    total_score = (
+        source_score
+        + urgency_score
+        + taxonomy_score
+        + style_score
+        + humanized_score
+        + temporal_score
+        + penalty_score
+    )
     total_score = max(0.0, min(1.0, total_score))
 
     thresholds = SEVERITY_CONFIG["thresholds"]
@@ -551,10 +578,12 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
         forced_reasons.append("downgrade_recap_guard")
 
     # Hard rule 2: non-S sources need at least 2 urgency hits OR very high humanized probability.
+    effective_urgency_hit_count = urgency_hit_count + (1 if bool(taxonomy_details.get("breaking_eligible")) else 0)
+
     if severity == "high" and tier != "S":
         min_hits = int(hard_rules["non_s_min_urgency_signals_for_high"])
         override_prob = float(hard_rules["non_s_humanized_override_prob"])
-        if urgency_hit_count < min_hits and humanized_probability <= override_prob:
+        if effective_urgency_hit_count < min_hits and humanized_probability <= override_prob:
             severity = "medium"
             forced_reasons.append("downgrade_non_s_insufficient_urgency")
 
@@ -580,6 +609,10 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
         "urgency_score": round(urgency_score, 4),
         "urgency_hits": urgency_hits[:12],
         "urgency_hit_count": urgency_hit_count,
+        "effective_urgency_hit_count": effective_urgency_hit_count,
+        "taxonomy_score": round(taxonomy_score, 4),
+        "taxonomy": taxonomy_details,
+        "taxonomy_hits": taxonomy_hits[:12],
         "style_score": round(style_score, 4),
         "style": style_details,
         "humanized_score": round(humanized_score, 4),

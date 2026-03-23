@@ -32,6 +32,7 @@ from db import (
     save_recent_breaking,
     save_recent_media_signature,
 )
+from news_taxonomy import match_news_category
 from news_signals import looks_like_live_event_update, should_downgrade_explainer_urgency
 from shared_http import get_web_http_client
 
@@ -247,6 +248,20 @@ _ALERT_LABEL_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+_GENERIC_FLASH_UPDATE = "\U0001F525 Flash Update"
+_GENERIC_LIVE_UPDATE = "\u26A0\uFE0F Live Update"
+_GENERIC_SITUATION_UPDATE = "\u2139\uFE0F Situation Update"
+
+
+def _generic_alert_label(severity: str) -> str:
+    normalized_severity = normalize_space(severity).lower()
+    if normalized_severity == "high":
+        return _GENERIC_FLASH_UPDATE
+    if normalized_severity == "medium":
+        return _GENERIC_LIVE_UPDATE
+    return _GENERIC_SITUATION_UPDATE
+
+
 def _choose_alert_label_legacy(text: str, *, severity: str = "high") -> str:
     """
     Pick a more specific, human-readable alert label than generic "BREAKING".
@@ -297,6 +312,36 @@ def choose_alert_label(text: str, *, severity: str = "high") -> str:
     if normalized_severity == "medium":
         return "âš ï¸ Live Update"
     return "â„¹ï¸ Situation Update"
+
+def build_alert_header(
+    text: str,
+    *,
+    severity: str,
+    source_title: str,
+    include_source: bool,
+) -> str:
+    label = choose_alert_label(text, severity=severity)
+    if include_source:
+        safe_source = sanitize_telegram_html(source_title)
+        return f"<b>{label} \u2022 {safe_source}</b>"
+    return f"<b>{label}</b>"
+
+
+def choose_alert_label(text: str, *, severity: str = "high") -> str:
+    """
+    Use taxonomy-backed themed labels only for concrete live-event headlines.
+    Generic analysis/explainer material falls back to a neutral label.
+    """
+    normalized = normalize_space(text)
+    if (
+        normalized
+        and not should_downgrade_explainer_urgency(normalized)
+        and looks_like_live_event_update(normalized)
+    ):
+        match = match_news_category(normalized)
+        if match is not None:
+            return match.label
+    return _generic_alert_label(severity)
 
 
 @dataclass(frozen=True)

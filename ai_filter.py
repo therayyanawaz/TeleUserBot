@@ -18,6 +18,7 @@ import httpx
 import config
 from auth import AuthManager
 from db import ai_decision_cache_get, ai_decision_cache_set
+from news_taxonomy import match_news_category, normalize_taxonomy_text
 from news_signals import detect_story_signals, looks_like_live_event_update, should_downgrade_explainer_urgency
 from prompts import (
     HUMAN_NEWSROOM_VOICE,
@@ -46,7 +47,7 @@ DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 DEFAULT_CODEX_ORIGINATOR = "pi"
 DEFAULT_DIGEST_MAX_POSTS = 80
 DEFAULT_DIGEST_MAX_TOKENS = 18000
-FILTER_DECISION_PROMPT_VERSION = "v4"
+FILTER_DECISION_PROMPT_VERSION = "v5"
 VITAL_VIEW_PROMPT_VERSION = "v2"
 
 _DIGIT_TOKEN_RE = re.compile(r"\b\d+(?:[.,:/-]\d+)*\b")
@@ -447,14 +448,40 @@ def _is_weak_feed_context(line: str, headline: str) -> bool:
     return False
 
 
+def _feed_segment_taxonomy_score(segment: str, category_match: Any | None) -> int:
+    if category_match is None:
+        return 0
+    normalized = normalize_taxonomy_text(segment)
+    if not normalized:
+        return 0
+
+    score = 0
+    for phrase in category_match.matched_primary:
+        if re.search(rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])", normalized):
+            score += 3
+    for phrase in category_match.matched_aliases:
+        if re.search(rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])", normalized):
+            score += 2
+    return score
+
+
 def _build_feed_summary_html(raw_text: str, summary_seed: str = "") -> str:
     signals = detect_story_signals(raw_text)
+    category_match = match_news_category(raw_text)
     segments = _feed_summary_segments(summary_seed, raw_text)
     if not segments:
         return ""
 
-    preferred = [segment for segment in segments if looks_like_live_event_update(segment) and not _is_bad_feed_headline(segment)]
     acceptable = [segment for segment in segments if not _is_bad_feed_headline(segment)]
+    acceptable.sort(
+        key=lambda segment: (
+            1 if looks_like_live_event_update(segment) else 0,
+            _feed_segment_taxonomy_score(segment, category_match),
+            -len(segment),
+        ),
+        reverse=True,
+    )
+    preferred = [segment for segment in acceptable if looks_like_live_event_update(segment)]
 
     headline = preferred[0] if preferred else (acceptable[0] if acceptable else "")
     if not headline:
@@ -496,6 +523,19 @@ def _fallback_summary(text: str) -> Optional[str]:
 def _severity_from_text_heuristic(text: str) -> Literal["high", "medium", "low"]:
     lowered = text.lower()
     signals = detect_story_signals(text)
+    category_match = match_news_category(text)
+
+    if category_match is not None:
+        bias = category_match.severity_bias
+        if bias == "high":
+            if bool(signals.get("downgrade_explainer")):
+                return "medium"
+            return "high"
+        if bias == "medium":
+            return "medium"
+        if len(text.strip()) < 24 or _likely_noise(text):
+            return "low"
+        return "medium"
 
     high_terms = (
         "explosion",
