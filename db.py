@@ -98,6 +98,49 @@ def _to_inbound_job_rows(rows: Iterable[sqlite3.Row]) -> List[Dict[str, object]]
     return result
 
 
+def _to_breaking_story_cluster_rows(rows: Iterable[sqlite3.Row]) -> List[Dict[str, object]]:
+    result: List[Dict[str, object]] = []
+    for row in rows:
+        result.append(
+            {
+                "cluster_id": str(row["cluster_id"]),
+                "cluster_key": str(row["cluster_key"]),
+                "topic_key": str(row["topic_key"] or ""),
+                "taxonomy_key": str(row["taxonomy_key"] or ""),
+                "root_message_id": int(row["root_message_id"] or 0),
+                "root_sent_ref": str(row["root_sent_ref"] or ""),
+                "current_headline": str(row["current_headline"] or ""),
+                "current_facts_json": str(row["current_facts_json"] or "{}"),
+                "opened_ts": int(row["opened_ts"] or 0),
+                "updated_ts": int(row["updated_ts"] or 0),
+                "last_delivery_ts": int(row["last_delivery_ts"] or 0),
+                "update_count": int(row["update_count"] or 0),
+                "status": str(row["status"] or "active"),
+            }
+        )
+    return result
+
+
+def _to_breaking_story_event_rows(rows: Iterable[sqlite3.Row]) -> List[Dict[str, object]]:
+    result: List[Dict[str, object]] = []
+    for row in rows:
+        result.append(
+            {
+                "id": int(row["id"]),
+                "cluster_id": str(row["cluster_id"]),
+                "source_channel_id": str(row["source_channel_id"] or ""),
+                "source_message_id": int(row["source_message_id"] or 0),
+                "delivery_message_id": int(row["delivery_message_id"] or 0),
+                "normalized_text": str(row["normalized_text"] or ""),
+                "display_text": str(row["display_text"] or ""),
+                "facts_json": str(row["facts_json"] or "{}"),
+                "delta_kind": str(row["delta_kind"] or ""),
+                "created_ts": int(row["created_ts"] or 0),
+            }
+        )
+    return result
+
+
 def init_db() -> None:
     ensure_runtime_dir()
     with _transaction() as conn:
@@ -244,6 +287,43 @@ def init_db() -> None:
         )
 
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS breaking_story_clusters (
+                cluster_id TEXT PRIMARY KEY,
+                cluster_key TEXT NOT NULL UNIQUE,
+                topic_key TEXT NOT NULL,
+                taxonomy_key TEXT NOT NULL,
+                root_message_id INTEGER NOT NULL,
+                root_sent_ref TEXT,
+                current_headline TEXT NOT NULL,
+                current_facts_json TEXT NOT NULL,
+                opened_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL,
+                last_delivery_ts INTEGER NOT NULL,
+                update_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active'
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS breaking_story_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster_id TEXT NOT NULL,
+                source_channel_id TEXT NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                delivery_message_id INTEGER NOT NULL,
+                normalized_text TEXT NOT NULL,
+                display_text TEXT,
+                facts_json TEXT NOT NULL,
+                delta_kind TEXT NOT NULL,
+                created_ts INTEGER NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_digest_queue_pending "
             "ON digest_queue(processed, timestamp, id)"
         )
@@ -294,6 +374,22 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ai_decision_cache_created_at "
             "ON ai_decision_cache(created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_breaking_story_clusters_status_updated "
+            "ON breaking_story_clusters(status, updated_ts DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_breaking_story_clusters_topic "
+            "ON breaking_story_clusters(topic_key, updated_ts DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_breaking_story_events_cluster_created "
+            "ON breaking_story_events(cluster_id, created_ts DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_breaking_story_events_created "
+            "ON breaking_story_events(created_ts DESC)"
         )
 
 
@@ -1424,3 +1520,212 @@ def purge_source_delivery_refs(*, history_hours: int = 168) -> int:
             (cutoff,),
         )
     return int(cur.rowcount or 0)
+
+
+def save_breaking_story_cluster(
+    *,
+    cluster_id: str,
+    cluster_key: str,
+    topic_key: str,
+    taxonomy_key: str,
+    root_message_id: int,
+    root_sent_ref: str,
+    current_headline: str,
+    current_facts_json: str,
+    opened_ts: int,
+    updated_ts: int,
+    last_delivery_ts: int,
+    update_count: int,
+    status: str = "active",
+) -> None:
+    with _transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO breaking_story_clusters (
+                cluster_id,
+                cluster_key,
+                topic_key,
+                taxonomy_key,
+                root_message_id,
+                root_sent_ref,
+                current_headline,
+                current_facts_json,
+                opened_ts,
+                updated_ts,
+                last_delivery_ts,
+                update_count,
+                status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cluster_id) DO UPDATE SET
+                cluster_key = excluded.cluster_key,
+                topic_key = excluded.topic_key,
+                taxonomy_key = excluded.taxonomy_key,
+                root_message_id = excluded.root_message_id,
+                root_sent_ref = excluded.root_sent_ref,
+                current_headline = excluded.current_headline,
+                current_facts_json = excluded.current_facts_json,
+                opened_ts = excluded.opened_ts,
+                updated_ts = excluded.updated_ts,
+                last_delivery_ts = excluded.last_delivery_ts,
+                update_count = excluded.update_count,
+                status = excluded.status
+            """,
+            (
+                str(cluster_id),
+                str(cluster_key),
+                str(topic_key),
+                str(taxonomy_key),
+                int(root_message_id),
+                str(root_sent_ref or ""),
+                str(current_headline or ""),
+                str(current_facts_json or "{}"),
+                int(opened_ts),
+                int(updated_ts),
+                int(last_delivery_ts),
+                int(update_count),
+                str(status or "active"),
+            ),
+        )
+
+
+def load_active_breaking_story_clusters(*, since_ts: int, limit: int = 200) -> List[Dict[str, object]]:
+    resolved_limit = max(1, min(int(limit), 1000))
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                cluster_id,
+                cluster_key,
+                topic_key,
+                taxonomy_key,
+                root_message_id,
+                root_sent_ref,
+                current_headline,
+                current_facts_json,
+                opened_ts,
+                updated_ts,
+                last_delivery_ts,
+                update_count,
+                status
+            FROM breaking_story_clusters
+            WHERE status = 'active' AND updated_ts >= ?
+            ORDER BY updated_ts DESC, cluster_id DESC
+            LIMIT ?
+            """,
+            (int(since_ts), resolved_limit),
+        ).fetchall()
+    return _to_breaking_story_cluster_rows(rows)
+
+
+def save_breaking_story_event(
+    *,
+    cluster_id: str,
+    source_channel_id: str,
+    source_message_id: int,
+    delivery_message_id: int,
+    normalized_text: str,
+    display_text: str,
+    facts_json: str,
+    delta_kind: str,
+    created_ts: int | None = None,
+) -> None:
+    ts = int(created_ts if created_ts is not None else time.time())
+    with _transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO breaking_story_events (
+                cluster_id,
+                source_channel_id,
+                source_message_id,
+                delivery_message_id,
+                normalized_text,
+                display_text,
+                facts_json,
+                delta_kind,
+                created_ts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(cluster_id),
+                str(source_channel_id),
+                int(source_message_id),
+                int(delivery_message_id),
+                re.sub(r"\s+", " ", str(normalized_text or "")).strip(),
+                str(display_text or ""),
+                str(facts_json or "{}"),
+                str(delta_kind or ""),
+                ts,
+            ),
+        )
+
+
+def load_breaking_story_events(*, cluster_id: str, limit: int = 20) -> List[Dict[str, object]]:
+    resolved_limit = max(1, min(int(limit), 500))
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                cluster_id,
+                source_channel_id,
+                source_message_id,
+                delivery_message_id,
+                normalized_text,
+                display_text,
+                facts_json,
+                delta_kind,
+                created_ts
+            FROM breaking_story_events
+            WHERE cluster_id = ?
+            ORDER BY created_ts DESC, id DESC
+            LIMIT ?
+            """,
+            (str(cluster_id), resolved_limit),
+        ).fetchall()
+    out = _to_breaking_story_event_rows(rows)
+    out.reverse()
+    return out
+
+
+def count_active_breaking_story_clusters(*, since_ts: int) -> int:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM breaking_story_clusters
+            WHERE status = 'active' AND updated_ts >= ?
+            """,
+            (int(since_ts),),
+        ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def load_breaking_story_decision_counts(*, since_ts: int) -> Dict[str, int]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT delta_kind, COUNT(*) AS total
+            FROM breaking_story_events
+            WHERE created_ts >= ?
+            GROUP BY delta_kind
+            """,
+            (int(since_ts),),
+        ).fetchall()
+    counts: Dict[str, int] = {}
+    for row in rows:
+        counts[str(row["delta_kind"] or "")] = int(row["total"] or 0)
+    return counts
+
+
+def purge_breaking_story_history(*, older_than_ts: int) -> Tuple[int, int]:
+    cutoff = int(max(0, older_than_ts))
+    with _transaction() as conn:
+        deleted_events = conn.execute(
+            "DELETE FROM breaking_story_events WHERE created_ts < ?",
+            (cutoff,),
+        )
+        deleted_clusters = conn.execute(
+            "DELETE FROM breaking_story_clusters WHERE updated_ts < ?",
+            (cutoff,),
+        )
+    return int(deleted_clusters.rowcount or 0), int(deleted_events.rowcount or 0)

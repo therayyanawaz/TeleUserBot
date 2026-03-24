@@ -228,6 +228,9 @@ BREAKING_TOPIC_CONTINUITY_PREFIX = _env_str(
     "BREAKING_TOPIC_CONTINUITY_PREFIX",
     "",
 )  # type: str
+ENABLE_BREAKING_STORY_CLUSTERS = _env_bool("ENABLE_BREAKING_STORY_CLUSTERS", True)  # type: bool
+BREAKING_STORY_WINDOW_MINUTES = _env_int("BREAKING_STORY_WINDOW_MINUTES", 180)  # type: int
+BREAKING_STORY_BURST_SECONDS = _env_int("BREAKING_STORY_BURST_SECONDS", 60)  # type: int
 BREAKING_STYLE_MODE = _env_str("BREAKING_STYLE_MODE", "unhinged").lower()  # type: str
 # Optional humanized rational viewpoint for vital/high-severity alerts.
 HUMANIZED_VITAL_OPINION_ENABLED = _env_bool("HUMANIZED_VITAL_OPINION_ENABLED", True)  # type: bool

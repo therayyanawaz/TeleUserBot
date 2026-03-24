@@ -67,9 +67,17 @@ from auth import (
     normalize_oauth_error_message,
     write_auth_payload_to_env_file,
 )
+from breaking_story import (
+    BreakingStoryCandidate,
+    build_breaking_story_candidate,
+    compute_breaking_story_cluster_key,
+    resolve_breaking_story_cluster,
+    serialize_breaking_story_facts,
+)
 from db import (
     ack_digest_batch,
     advance_inbound_job,
+    count_active_breaking_story_clusters,
     claim_inbound_jobs,
     claim_digest_batch,
     clear_digest_queue_scoped,
@@ -84,6 +92,9 @@ from db import (
     is_seen,
     load_inbound_job_counts,
     load_recent_inbound_job_failures,
+    load_breaking_story_decision_counts,
+    load_active_breaking_story_clusters,
+    load_breaking_story_events,
     load_source_delivery_ref,
     load_archive_since,
     load_queue_since,
@@ -96,11 +107,14 @@ from db import (
     reset_in_progress_inbound_jobs,
     retry_or_dead_letter_inbound_job,
     restore_digest_batch,
+    save_breaking_story_cluster,
+    save_breaking_story_event,
     save_source_delivery_ref,
     save_to_digest_archive,
     save_to_digest_queue,
     set_last_digest_timestamp,
     set_meta,
+    purge_breaking_story_history,
 )
 from news_taxonomy import load_news_taxonomy, match_breaking_category
 from news_signals import looks_like_live_event_update, should_downgrade_explainer_urgency
@@ -286,6 +300,7 @@ query_conversation_history: Dict[int, Deque[Dict[str, str]]] = defaultdict(
 query_bot_updates_offset: int = 0
 query_bot_poll_started_at: int = 0
 breaking_delivery_refs: Dict[str, Dict[str, object]] = {}
+breaking_story_ref_cache: Dict[str, object] = {}
 breaking_topic_threads: List[Dict[str, object]] = []
 breaking_topic_lock = asyncio.Lock()
 query_allowed_bot_user_id: int | None = None
@@ -1308,6 +1323,28 @@ def _breaking_topic_continuity_prefix() -> str:
         or ""
     ).strip()
     return raw
+
+
+def _is_breaking_story_clusters_enabled() -> bool:
+    return _bool_flag(getattr(config, "ENABLE_BREAKING_STORY_CLUSTERS", True), True)
+
+
+def _breaking_story_window_seconds() -> int:
+    raw = getattr(config, "BREAKING_STORY_WINDOW_MINUTES", 180)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 180
+    return max(30 * 60, min(value * 60, 24 * 60 * 60))
+
+
+def _breaking_story_burst_seconds() -> int:
+    raw = getattr(config, "BREAKING_STORY_BURST_SECONDS", 60)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 60
+    return max(15, min(value, 15 * 60))
 
 
 def _humanized_vital_opinion_enabled() -> bool:
@@ -3162,6 +3199,432 @@ def _register_breaking_delivery(
     }
 
 
+def _breaking_story_history_cutoff_ts(now_ts: int | None = None) -> int:
+    now = int(now_ts if now_ts is not None else time.time())
+    return now - max(_breaking_story_window_seconds() * 4, 24 * 60 * 60)
+
+
+def _load_active_breaking_story_clusters_snapshot(now_ts: int | None = None) -> List[Dict[str, object]]:
+    if not _is_breaking_story_clusters_enabled():
+        return []
+    now = int(now_ts if now_ts is not None else time.time())
+    with contextlib.suppress(Exception):
+        purge_breaking_story_history(older_than_ts=_breaking_story_history_cutoff_ts(now))
+    with contextlib.suppress(Exception):
+        return load_active_breaking_story_clusters(
+            since_ts=now - _breaking_story_window_seconds(),
+            limit=250,
+        )
+    return []
+
+
+async def _resolve_breaking_story_root_ref(cluster: Dict[str, object]) -> object | None:
+    cluster_id = str(cluster.get("cluster_id") or "")
+    root_message_id = int(cluster.get("root_message_id") or 0)
+    if not cluster_id or root_message_id <= 0:
+        return None
+
+    cached = breaking_story_ref_cache.get(cluster_id)
+    if _message_ref_id(cached) == root_message_id:
+        return cached
+
+    stored_ref = _deserialize_sent_ref(str(cluster.get("root_sent_ref") or ""))
+    has_media = bool(isinstance(stored_ref, dict) and stored_ref.get("has_media"))
+    ref = await _load_destination_message_ref(root_message_id, has_media=has_media)
+    if ref is not None:
+        breaking_story_ref_cache[cluster_id] = ref
+    return ref
+
+
+def _breaking_story_cluster_context(cluster_id: str, *, limit: int = 3) -> List[str]:
+    if not cluster_id:
+        return []
+    now = int(time.time())
+    out: List[str] = []
+    with contextlib.suppress(Exception):
+        events = load_breaking_story_events(cluster_id=cluster_id, limit=max(6, limit + 3))
+        for event in reversed(events):
+            if str(event.get("delta_kind") or "") == "duplicate_echo":
+                continue
+            display_text = normalize_space(
+                str(event.get("display_text") or event.get("normalized_text") or "")
+            )
+            if not display_text:
+                continue
+            age = max(0, now - int(event.get("created_ts") or now))
+            out.append(f"{_format_story_bridge_age(age)}: {_truncate_context_line(display_text, limit=140)}")
+            if len(out) >= limit:
+                break
+    out.reverse()
+    return out
+
+
+async def _cluster_story_bridge(candidate_text: str, cluster_id: str) -> str:
+    recent_context = _breaking_story_cluster_context(cluster_id)
+    if not recent_context or not auth_ready:
+        return ""
+    if not _should_attach_vital_opinion(candidate_text, recent_context):
+        return ""
+    try:
+        return (
+            await summarize_vital_rational_view(
+                candidate_text,
+                _require_auth_manager(),
+                recent_context=recent_context,
+            )
+            or ""
+        )
+    except Exception:
+        LOGGER.debug("Cluster-local story bridge generation failed.", exc_info=True)
+        return ""
+
+
+def _persist_breaking_story_cluster(
+    *,
+    cluster_id: str,
+    cluster_key: str,
+    topic_key: str,
+    taxonomy_key: str,
+    root_message_id: int,
+    root_ref: object | None,
+    current_headline: str,
+    candidate: BreakingStoryCandidate,
+    opened_ts: int,
+    updated_ts: int,
+    last_delivery_ts: int,
+    update_count: int,
+    stored_root_sent_ref: str = "",
+    current_facts_json_override: str | None = None,
+) -> None:
+    serialized_ref = _serialize_sent_ref(root_ref) or str(stored_root_sent_ref or "")
+    save_breaking_story_cluster(
+        cluster_id=cluster_id,
+        cluster_key=cluster_key,
+        topic_key=topic_key,
+        taxonomy_key=taxonomy_key,
+        root_message_id=root_message_id,
+        root_sent_ref=serialized_ref,
+        current_headline=current_headline,
+        current_facts_json=(
+            str(current_facts_json_override)
+            if current_facts_json_override is not None
+            else serialize_breaking_story_facts(candidate.facts)
+        ),
+        opened_ts=opened_ts,
+        updated_ts=updated_ts,
+        last_delivery_ts=last_delivery_ts,
+        update_count=update_count,
+        status="active",
+    )
+    if root_ref is not None and cluster_id:
+        breaking_story_ref_cache[cluster_id] = _primary_message_ref(root_ref) or root_ref
+
+
+async def _apply_breaking_story_cluster_policy(
+    *,
+    messages: Sequence[Message],
+    source: str,
+    candidate_text: str,
+    headline: str,
+    topic_key: str = "",
+    story_bridge: str | None = None,
+) -> Dict[str, object]:
+    primary = messages[0]
+    message_ids = [int(item.id or 0) for item in messages if int(item.id or 0) > 0]
+    channel_id = str(primary.chat_id)
+    now = int(time.time())
+    candidate = build_breaking_story_candidate(
+        text=candidate_text,
+        headline=headline,
+        topic_key=topic_key,
+        source=source,
+        timestamp=now,
+    )
+
+    resolution = resolve_breaking_story_cluster(
+        candidate,
+        _load_active_breaking_story_clusters_snapshot(now),
+        now_ts=now,
+        burst_seconds=_breaking_story_burst_seconds(),
+    ) if _is_breaking_story_clusters_enabled() else None
+
+    if resolution is not None and resolution.mismatch_reason:
+        log_structured(
+            LOGGER,
+            "story_cluster_mismatch",
+            channel_id=channel_id,
+            message_id=int(primary.id or 0),
+            reason=resolution.mismatch_reason,
+            topic_key=candidate.topic_key,
+            taxonomy_key=candidate.taxonomy_key,
+        )
+
+    cluster = dict(resolution.cluster) if resolution and resolution.cluster else None
+    decision = resolution.decision if resolution is not None else "new_story"
+    effective_bridge = story_bridge or ""
+    if decision == "material_update" and cluster is not None:
+        effective_bridge = await _cluster_story_bridge(candidate_text, str(cluster.get("cluster_id") or ""))
+    elif decision in {"duplicate_echo", "minor_refinement"}:
+        effective_bridge = ""
+
+    payload_text = _format_breaking_text(source, headline, effective_bridge or None)
+    topic_seed = f"{headline}\n{candidate_text}"
+
+    if decision == "new_story" or cluster is None:
+        reply_to = await _resolve_source_reply_target(primary, fallback_topic_seed=topic_seed)
+        if any(bool(item.media) for item in messages):
+            sent_ref = (
+                await _send_album(list(messages), payload_text, reply_to=reply_to)
+                if len(messages) > 1
+                else await _send_single_media(primary, payload_text, reply_to=reply_to)
+            )
+        else:
+            sent_ref = await _send_text_with_ref(payload_text, reply_to=reply_to)
+        root_ref = _primary_message_ref(sent_ref)
+        root_message_id = int(_message_ref_id(root_ref) or 0)
+        cluster_id = uuid.uuid4().hex
+        _persist_breaking_story_cluster(
+            cluster_id=cluster_id,
+            cluster_key=compute_breaking_story_cluster_key(candidate),
+            topic_key=candidate.topic_key,
+            taxonomy_key=candidate.taxonomy_key,
+            root_message_id=root_message_id,
+            root_ref=root_ref,
+            current_headline=headline,
+            candidate=candidate,
+            opened_ts=now,
+            updated_ts=now,
+            last_delivery_ts=now,
+            update_count=0,
+        )
+        save_breaking_story_event(
+            cluster_id=cluster_id,
+            source_channel_id=channel_id,
+            source_message_id=int(primary.id or 0),
+            delivery_message_id=root_message_id,
+            normalized_text=candidate.facts.normalized_text,
+            display_text=headline,
+            facts_json=serialize_breaking_story_facts(candidate.facts),
+            delta_kind="new_story",
+            created_ts=now,
+        )
+        _register_source_delivery_refs(
+            channel_id=channel_id,
+            source_message_ids=message_ids,
+            sent_ref=root_ref,
+        )
+        _register_breaking_delivery(
+            text_hash=candidate.facts.text_hash,
+            ref=root_ref,
+            base_text=payload_text,
+            primary_source=source,
+        )
+        await _register_breaking_topic_thread(topic_seed=topic_seed, sent_ref=root_ref)
+        log_structured(
+            LOGGER,
+            "story_cluster_created",
+            channel_id=channel_id,
+            message_id=int(primary.id or 0),
+            cluster_id=cluster_id,
+            topic_key=candidate.topic_key,
+            taxonomy_key=candidate.taxonomy_key,
+            root_message_id=root_message_id,
+        )
+        return {
+            "final_action": "breaking_delivery",
+            "delivery_message_id": root_message_id,
+            "reply_to": int(reply_to or 0),
+            "cluster_id": cluster_id,
+            "cluster_decision": "new_story",
+            "sent_ref": sent_ref,
+            "payload_text": payload_text,
+        }
+
+    cluster_id = str(cluster.get("cluster_id") or "")
+    root_message_id = int(cluster.get("root_message_id") or 0)
+    cluster_key = str(cluster.get("cluster_key") or "")
+    opened_ts = int(cluster.get("opened_ts") or now)
+    update_count = int(cluster.get("update_count") or 0)
+    root_ref = await _resolve_breaking_story_root_ref(cluster)
+
+    if decision == "minor_refinement" and bool(resolution and resolution.should_edit_root) and root_ref is not None:
+        updated_ref = await _edit_sent_text(root_ref, payload_text)
+        root_message_id = int(_message_ref_id(updated_ref) or root_message_id)
+        _persist_breaking_story_cluster(
+            cluster_id=cluster_id,
+            cluster_key=cluster_key,
+            topic_key=candidate.topic_key,
+            taxonomy_key=candidate.taxonomy_key,
+            root_message_id=root_message_id,
+            root_ref=updated_ref,
+            current_headline=headline,
+            candidate=candidate,
+            opened_ts=opened_ts,
+            updated_ts=now,
+            last_delivery_ts=now,
+            update_count=update_count,
+            stored_root_sent_ref=str(cluster.get("root_sent_ref") or ""),
+        )
+        save_breaking_story_event(
+            cluster_id=cluster_id,
+            source_channel_id=channel_id,
+            source_message_id=int(primary.id or 0),
+            delivery_message_id=root_message_id,
+            normalized_text=candidate.facts.normalized_text,
+            display_text=headline,
+            facts_json=serialize_breaking_story_facts(candidate.facts),
+            delta_kind="minor_refinement",
+            created_ts=now,
+        )
+        _register_source_delivery_refs(
+            channel_id=channel_id,
+            source_message_ids=message_ids,
+            sent_ref=updated_ref,
+        )
+        _register_breaking_delivery(
+            text_hash=candidate.facts.text_hash,
+            ref=updated_ref,
+            base_text=payload_text,
+            primary_source=source,
+        )
+        log_structured(
+            LOGGER,
+            "story_cluster_edited",
+            channel_id=channel_id,
+            message_id=int(primary.id or 0),
+            cluster_id=cluster_id,
+            root_message_id=root_message_id,
+        )
+        return {
+            "final_action": "breaking_root_edited",
+            "delivery_message_id": root_message_id,
+            "reply_to": root_message_id,
+            "cluster_id": cluster_id,
+            "cluster_decision": "minor_refinement",
+            "sent_ref": updated_ref,
+            "payload_text": payload_text,
+        }
+
+    if decision == "material_update":
+        reply_to = root_message_id or None
+        if any(bool(item.media) for item in messages):
+            sent_ref = (
+                await _send_album(list(messages), payload_text, reply_to=reply_to)
+                if len(messages) > 1
+                else await _send_single_media(primary, payload_text, reply_to=reply_to)
+            )
+        else:
+            sent_ref = await _send_text_with_ref(payload_text, reply_to=reply_to)
+        sent_message_id = int(_message_ref_id(sent_ref) or 0)
+        _persist_breaking_story_cluster(
+            cluster_id=cluster_id,
+            cluster_key=cluster_key,
+            topic_key=candidate.topic_key,
+            taxonomy_key=candidate.taxonomy_key,
+            root_message_id=root_message_id,
+            root_ref=root_ref,
+            current_headline=headline,
+            candidate=candidate,
+            opened_ts=opened_ts,
+            updated_ts=now,
+            last_delivery_ts=now,
+            update_count=update_count + 1,
+            stored_root_sent_ref=str(cluster.get("root_sent_ref") or ""),
+        )
+        save_breaking_story_event(
+            cluster_id=cluster_id,
+            source_channel_id=channel_id,
+            source_message_id=int(primary.id or 0),
+            delivery_message_id=sent_message_id,
+            normalized_text=candidate.facts.normalized_text,
+            display_text=headline,
+            facts_json=serialize_breaking_story_facts(candidate.facts),
+            delta_kind="material_update",
+            created_ts=now,
+        )
+        _register_source_delivery_refs(
+            channel_id=channel_id,
+            source_message_ids=message_ids,
+            sent_ref=sent_ref,
+        )
+        _register_breaking_delivery(
+            text_hash=candidate.facts.text_hash,
+            ref=sent_ref,
+            base_text=payload_text,
+            primary_source=source,
+        )
+        await _register_breaking_topic_thread(topic_seed=topic_seed, sent_ref=sent_ref)
+        log_structured(
+            LOGGER,
+            "story_cluster_threaded",
+            channel_id=channel_id,
+            message_id=int(primary.id or 0),
+            cluster_id=cluster_id,
+            root_message_id=root_message_id,
+            delivery_message_id=sent_message_id,
+        )
+        return {
+            "final_action": "breaking_delivery_threaded",
+            "delivery_message_id": sent_message_id,
+            "reply_to": root_message_id,
+            "cluster_id": cluster_id,
+            "cluster_decision": "material_update",
+            "sent_ref": sent_ref,
+            "payload_text": payload_text,
+        }
+
+    _persist_breaking_story_cluster(
+        cluster_id=cluster_id,
+        cluster_key=cluster_key,
+        topic_key=str(cluster.get("topic_key") or candidate.topic_key),
+        taxonomy_key=str(cluster.get("taxonomy_key") or candidate.taxonomy_key),
+        root_message_id=root_message_id,
+        root_ref=root_ref,
+        current_headline=str(cluster.get("current_headline") or headline),
+        candidate=candidate,
+        opened_ts=opened_ts,
+        updated_ts=now,
+        last_delivery_ts=int(cluster.get("last_delivery_ts") or opened_ts),
+        update_count=update_count,
+        stored_root_sent_ref=str(cluster.get("root_sent_ref") or ""),
+        current_facts_json_override=str(cluster.get("current_facts_json") or "{}"),
+    )
+    save_breaking_story_event(
+        cluster_id=cluster_id,
+        source_channel_id=channel_id,
+        source_message_id=int(primary.id or 0),
+        delivery_message_id=root_message_id,
+        normalized_text=candidate.facts.normalized_text,
+        display_text=headline,
+        facts_json=serialize_breaking_story_facts(candidate.facts),
+        delta_kind="duplicate_echo",
+        created_ts=now,
+    )
+    _register_source_delivery_refs(
+        channel_id=channel_id,
+        source_message_ids=message_ids,
+        sent_ref={"message_id": root_message_id},
+    )
+    log_structured(
+        LOGGER,
+        "story_cluster_suppressed",
+        channel_id=channel_id,
+        message_id=int(primary.id or 0),
+        cluster_id=cluster_id,
+        root_message_id=root_message_id,
+        decision=decision,
+    )
+    return {
+        "final_action": "breaking_suppressed",
+        "delivery_message_id": root_message_id,
+        "reply_to": root_message_id,
+        "cluster_id": cluster_id,
+        "cluster_decision": decision,
+        "sent_ref": None,
+        "payload_text": payload_text,
+    }
+
+
 _BREAKING_TOPIC_STOPWORDS = {
     "a",
     "an",
@@ -3576,6 +4039,67 @@ def _message_ref_id(ref: object) -> int | None:
         return None
 
 
+def _primary_message_ref(ref: object) -> object | None:
+    if isinstance(ref, (list, tuple)):
+        for item in ref:
+            if item is not None:
+                return item
+        return None
+    return ref
+
+
+def _message_ref_has_media(ref: object) -> bool:
+    target = _primary_message_ref(ref)
+    if isinstance(target, Message):
+        return bool(target.media)
+    if isinstance(target, dict):
+        return any(
+            key in target
+            for key in (
+                "animation",
+                "audio",
+                "document",
+                "photo",
+                "sticker",
+                "video",
+                "video_note",
+                "voice",
+            )
+        )
+    return False
+
+
+def _serialize_sent_ref(ref: object) -> str:
+    target = _primary_message_ref(ref)
+    message_id = _message_ref_id(target)
+    if not message_id:
+        return ""
+    payload = {
+        "message_id": int(message_id),
+        "has_media": bool(_message_ref_has_media(target)),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _deserialize_sent_ref(value: str) -> object | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        return None
+    message_id = int(payload.get("message_id") or 0)
+    if message_id <= 0:
+        return None
+    return {
+        "message_id": message_id,
+        "has_media": bool(payload.get("has_media")),
+    }
+
+
 def _acquire_instance_lock():
     """
     Ensure only one process uses the Telethon session DB at a time.
@@ -3692,19 +4216,27 @@ async def _edit_sent_text(ref: object, text: str) -> object:
             if _is_html_formatting_enabled()
             else text
         )
-        message_id = _message_ref_id(ref)
+        target_ref = _primary_message_ref(ref)
+        message_id = _message_ref_id(target_ref)
         if not message_id:
             raise RuntimeError("Cannot edit Bot API message without message_id.")
+        is_media_ref = _message_ref_has_media(target_ref)
 
         data = {
             "chat_id": _require_bot_destination_chat_id(),
             "message_id": str(message_id),
-            "text": _to_bot_text(payload_text) or "",
             "disable_web_page_preview": "true",
             "parse_mode": "HTML" if _is_html_formatting_enabled() else "Markdown",
         }
+        method = "editMessageText"
+        if is_media_ref:
+            data["caption"] = _to_bot_text(payload_text) or ""
+            method = "editMessageCaption"
+            data.pop("disable_web_page_preview", None)
+        else:
+            data["text"] = _to_bot_text(payload_text) or ""
         try:
-            result = await _bot_api_request("editMessageText", data=data)
+            result = await _bot_api_request(method, data=data)
             # Bot API can return `True` for some cases; keep original ref for continuity.
             if isinstance(result, dict):
                 return result
@@ -3714,13 +4246,17 @@ async def _edit_sent_text(ref: object, text: str) -> object:
             fallback_text = (
                 strip_telegram_html(payload_text) if _is_html_formatting_enabled() else payload_text
             )
-            data["text"] = _to_plain_text(fallback_text) or ""
-            result = await _bot_api_request("editMessageText", data=data)
+            if is_media_ref:
+                data["caption"] = _to_plain_text(fallback_text) or ""
+            else:
+                data["text"] = _to_plain_text(fallback_text) or ""
+            result = await _bot_api_request(method, data=data)
             if isinstance(result, dict):
                 return result
             return ref
 
-    if not isinstance(ref, Message):
+    target_ref = _primary_message_ref(ref)
+    if not isinstance(target_ref, Message):
         raise RuntimeError("Telethon edit requires Message reference.")
     payload_text = (
         _render_outbound_text(text, allow_premium_tags=False)
@@ -3728,7 +4264,7 @@ async def _edit_sent_text(ref: object, text: str) -> object:
         else text
     )
     try:
-        return await ref.edit(
+        return await target_ref.edit(
             payload_text,
             parse_mode="html" if _is_html_formatting_enabled() else "md",
             link_preview=False,
@@ -3737,7 +4273,29 @@ async def _edit_sent_text(ref: object, text: str) -> object:
         fallback_text = (
             strip_telegram_html(payload_text) if _is_html_formatting_enabled() else payload_text
         )
-        return await ref.edit(fallback_text, parse_mode=None, link_preview=False)
+        return await target_ref.edit(fallback_text, parse_mode=None, link_preview=False)
+
+
+async def _load_destination_message_ref(message_id: int, *, has_media: bool = False) -> object | None:
+    resolved_id = int(message_id or 0)
+    if resolved_id <= 0:
+        return None
+    if _destination_uses_bot_api():
+        return {"message_id": resolved_id, "has_media": bool(has_media)}
+
+    tg = _require_client()
+    fetched = await _call_with_floodwait(
+        tg.get_messages,
+        _require_destination_peer(),
+        ids=resolved_id,
+    )
+    if isinstance(fetched, Message):
+        return fetched
+    if isinstance(fetched, list):
+        for item in fetched:
+            if isinstance(item, Message):
+                return item
+    return None
 
 
 async def _send_single_media(
@@ -4149,33 +4707,12 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
             headline = normalize_space(text)
             if len(headline) > 420:
                 headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
-        rational_view: str | None = None
-        recent_context = _recent_story_bridge_context(text)
-        if auth_ready and _should_attach_vital_opinion(text, recent_context):
-            rational_view = await summarize_vital_rational_view(
-                text,
-                _require_auth_manager(),
-                recent_context=recent_context,
-            )
-        payload = _format_breaking_text(source, headline, rational_view)
-        topic_seed = f"{headline}\n{text}"
-        reply_to = await _resolve_source_reply_target(msg, fallback_topic_seed=topic_seed)
-        if msg.media:
-            sent_ref = await _send_single_media(msg, payload, reply_to=reply_to)
-        else:
-            sent_ref = await _send_text_with_ref(payload, reply_to=reply_to)
-            _register_breaking_delivery(
-                text_hash=text_hash,
-                ref=sent_ref,
-                base_text=payload,
-                primary_source=source,
-            )
-        _register_source_delivery_refs(
-            channel_id=channel_id,
-            source_message_ids=[msg.id],
-            sent_ref=sent_ref,
+        cluster_result = await _apply_breaking_story_cluster_policy(
+            messages=[msg],
+            source=source,
+            candidate_text=text,
+            headline=headline,
         )
-        await _register_breaking_topic_thread(topic_seed=topic_seed, sent_ref=sent_ref)
         _archive_for_query_search(
             channel_id,
             msg.id,
@@ -4192,9 +4729,10 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
             source=source,
             severity=severity,
             severity_score=severity_score,
-            rational_view=bool(rational_view),
             dedupe_hash=text_hash,
-            reply_to=reply_to or 0,
+            final_action=str(cluster_result.get("final_action") or ""),
+            cluster_decision=str(cluster_result.get("cluster_decision") or ""),
+            reply_to=int(cluster_result.get("reply_to") or 0),
             severity_breakdown=severity_breakdown,
         )
         return
@@ -4297,24 +4835,12 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
             headline = normalize_space(combined_caption)
             if len(headline) > 420:
                 headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
-        rational_view: str | None = None
-        recent_context = _recent_story_bridge_context(combined_caption)
-        if auth_ready and _should_attach_vital_opinion(combined_caption, recent_context):
-            rational_view = await summarize_vital_rational_view(
-                combined_caption,
-                _require_auth_manager(),
-                recent_context=recent_context,
-            )
-        payload = _format_breaking_text(source, headline, rational_view)
-        topic_seed = f"{headline}\n{combined_caption}"
-        reply_to = await _resolve_source_reply_target(messages[0], fallback_topic_seed=topic_seed)
-        sent_ref = await _send_album(messages, payload, reply_to=reply_to)
-        _register_source_delivery_refs(
-            channel_id=channel_id,
-            source_message_ids=message_ids,
-            sent_ref=sent_ref,
+        cluster_result = await _apply_breaking_story_cluster_policy(
+            messages=messages,
+            source=source,
+            candidate_text=combined_caption,
+            headline=headline,
         )
-        await _register_breaking_topic_thread(topic_seed=topic_seed, sent_ref=sent_ref)
         _archive_for_query_search(
             channel_id,
             messages[0].id,
@@ -4332,8 +4858,9 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
             source=source,
             severity=severity,
             severity_score=severity_score,
-            rational_view=bool(rational_view),
-            reply_to=reply_to or 0,
+            final_action=str(cluster_result.get("final_action") or ""),
+            cluster_decision=str(cluster_result.get("cluster_decision") or ""),
+            reply_to=int(cluster_result.get("reply_to") or 0),
             severity_breakdown=severity_breakdown,
         )
         return
@@ -4796,34 +5323,19 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
         if len(headline) > 420:
             headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
         story_bridge = _plain_text_from_html_fragment(str(decision.get("story_bridge_html") or ""))
-        payload_text = _format_breaking_text(source, headline, story_bridge or None)
-        topic_seed = f"{headline}\n{candidate_text}"
-        reply_to = await _resolve_source_reply_target(primary, fallback_topic_seed=topic_seed)
-
-        if has_media:
-            if kind == "album":
-                sent_ref = await _send_album(messages, payload_text, reply_to=reply_to)
-            else:
-                sent_ref = await _send_single_media(primary, payload_text, reply_to=reply_to)
-        else:
-            sent_ref = await _send_text_with_ref(payload_text, reply_to=reply_to)
-            _normalized, text_hash = build_dupe_fingerprint(candidate_text)
-            _register_breaking_delivery(
-                text_hash=text_hash,
-                ref=sent_ref,
-                base_text=payload_text,
-                primary_source=source,
-            )
-
-        _register_source_delivery_refs(
-            channel_id=channel_id,
-            source_message_ids=message_ids,
-            sent_ref=sent_ref,
+        cluster_result = await _apply_breaking_story_cluster_policy(
+            messages=messages,
+            source=source,
+            candidate_text=candidate_text,
+            headline=headline,
+            topic_key=str(decision.get("topic_key") or ""),
+            story_bridge=story_bridge or None,
         )
-        await _register_breaking_topic_thread(topic_seed=topic_seed, sent_ref=sent_ref)
-        payload["delivery_message_id"] = int(_message_ref_id(sent_ref) or 0)
+        payload["delivery_message_id"] = int(cluster_result.get("delivery_message_id") or 0)
         payload["archive_text"] = candidate_text
-        payload["final_action"] = "breaking_delivery"
+        payload["final_action"] = str(cluster_result.get("final_action") or "breaking_delivery")
+        payload["story_cluster_decision"] = str(cluster_result.get("cluster_decision") or "")
+        payload["story_cluster_id"] = str(cluster_result.get("cluster_id") or "")
         log_structured(
             LOGGER,
             "breaking_pipeline_sent",
@@ -4832,8 +5344,10 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
             source=source,
             severity=severity,
             severity_score=float(payload.get("severity_score") or 0.0),
-            reply_to=reply_to or 0,
+            reply_to=int(cluster_result.get("reply_to") or 0),
             kind=kind,
+            final_action=str(cluster_result.get("final_action") or ""),
+            cluster_decision=str(cluster_result.get("cluster_decision") or ""),
         )
         await _advance_job_to_archive(job, payload)
         return
@@ -4899,7 +5413,15 @@ async def _handle_archive_inbound_job(job: Dict[str, object]) -> None:
     source_name = normalize_space(str(payload.get("source") or ""))
     message_link = normalize_space(str(payload.get("message_link") or ""))
 
-    if final_action in {"digest_queued", "breaking_delivery", "delivered", "media_passthrough"} and archive_text:
+    if final_action in {
+        "digest_queued",
+        "breaking_delivery",
+        "breaking_delivery_threaded",
+        "breaking_root_edited",
+        "breaking_suppressed",
+        "delivered",
+        "media_passthrough",
+    } and archive_text:
         _archive_for_query_search(
             channel_id,
             primary_message_id,
@@ -6086,6 +6608,18 @@ def _web_status_payload() -> Dict[str, object]:
         recent_failures = load_recent_inbound_job_failures(limit=5)
     except Exception:
         recent_failures = []
+    try:
+        active_story_clusters = count_active_breaking_story_clusters(
+            since_ts=int(now) - _breaking_story_window_seconds()
+        )
+    except Exception:
+        active_story_clusters = 0
+    try:
+        recent_story_decisions = load_breaking_story_decision_counts(
+            since_ts=int(now) - 3600
+        )
+    except Exception:
+        recent_story_decisions = {}
     return {
         "ok": not bool(startup_error),
         "ready": bool(startup_ready),
@@ -6102,6 +6636,11 @@ def _web_status_payload() -> Dict[str, object]:
         "sources_monitored": len(monitored_source_chat_ids),
         "dupe_detection": _is_dupe_detection_enabled(),
         "severity_routing": _is_severity_routing_enabled(),
+        "breaking_story_clusters": {
+            "enabled": _is_breaking_story_clusters_enabled(),
+            "active": active_story_clusters,
+            "recent_decisions_1h": recent_story_decisions,
+        },
         "query_mode": _is_query_mode_enabled(),
         "query_mode_available": _is_query_runtime_available(),
         "html_formatting": _is_html_formatting_enabled(),
@@ -7237,6 +7776,7 @@ async def _shutdown_client() -> None:
     global web_status_server, pipeline_sentence_transformer_warm_task
     configure_duplicate_runtime(None)
     breaking_delivery_refs.clear()
+    breaking_story_ref_cache.clear()
     breaking_topic_threads.clear()
 
     await _stop_pipeline_workers()
