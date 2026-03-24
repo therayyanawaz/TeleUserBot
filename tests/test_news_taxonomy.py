@@ -99,7 +99,7 @@ def test_unmatched_post_falls_back_to_generic_label() -> None:
         severity="medium",
     )
 
-    assert "Live Update" in label
+    assert label == "News Update"
 
 
 def test_breaking_keyword_detection_requires_live_event_context() -> None:
@@ -117,4 +117,4 @@ def test_legacy_breaking_keywords_do_not_create_specific_labels(monkeypatch) -> 
         severity="high",
     )
 
-    assert label == "\U0001F525 Flash Update"
+    assert label == "Breaking"

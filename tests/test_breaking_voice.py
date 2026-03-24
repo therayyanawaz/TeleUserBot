@@ -148,50 +148,59 @@ async def test_summarize_breaking_headline_uses_style_specific_cache(monkeypatch
     assert calls["count"] == 2
 
 
-def test_format_breaking_text_unhinged_is_single_line(monkeypatch):
+def test_format_breaking_text_unhinged_uses_editorial_card_without_context(monkeypatch):
     monkeypatch.setattr(main, "resolve_breaking_style_mode", lambda: "unhinged")
     monkeypatch.setattr(main, "_include_source_tags", lambda: False)
+    monkeypatch.setattr(main, "_resolve_outbound_post_layout", lambda: "editorial_card")
 
     rendered = main._format_breaking_text("NYT", "Two rockets landed near Haifa overnight.", None)
+    plain = ai_filter.strip_telegram_html(rendered)
 
-    assert "<br>" not in rendered.lower()
+    assert "〔" in rendered
     assert "Why it matters" not in rendered
-    assert "Two rockets landed near Haifa overnight." in rendered
+    assert "Two rockets landed near Haifa overnight" in plain
+    assert "NYT" not in plain
 
 
 def test_format_breaking_text_unhinged_supports_context_line(monkeypatch):
     monkeypatch.setattr(main, "resolve_breaking_style_mode", lambda: "unhinged")
     monkeypatch.setattr(main, "_include_source_tags", lambda: False)
+    monkeypatch.setattr(main, "_resolve_outbound_post_layout", lambda: "editorial_card")
 
     rendered = main._format_breaking_text(
         "NYT",
         "Two rockets landed near Acre overnight.",
         "Why it matters: Earlier alerts were centered on Haifa; this now pushes the same thread into Acre.",
     )
+    plain = ai_filter.strip_telegram_html(rendered)
 
-    assert "<br>" in rendered.lower()
-    assert "Haifa" in rendered
-    assert "Acre" in rendered
+    assert "Why it matters" in plain
+    assert "Haifa" in plain
+    assert "Acre" in plain
+    assert "〔" in rendered
 
 
 def test_format_breaking_text_unhinged_supports_context_block(monkeypatch):
     monkeypatch.setattr(main, "resolve_breaking_style_mode", lambda: "unhinged")
     monkeypatch.setattr(main, "_include_source_tags", lambda: False)
+    monkeypatch.setattr(main, "_resolve_outbound_post_layout", lambda: "editorial_card")
 
     rendered = main._format_breaking_text(
         "NYT",
         "Two rockets landed near Acre overnight.",
         "Why it matters: Earlier alerts were centered on Haifa.\nThis now pushes the same thread into Acre.",
     )
+    plain = ai_filter.strip_telegram_html(rendered)
 
-    assert "<br>" in rendered.lower()
-    assert "Haifa" in rendered
-    assert "Acre" in rendered
+    assert "Why it matters" in plain
+    assert "Haifa" in plain
+    assert "Acre" in plain
 
 
-def test_format_breaking_text_classic_keeps_bridge(monkeypatch):
+def test_format_breaking_text_classic_keeps_bridge_in_legacy_mode(monkeypatch):
     monkeypatch.setattr(main, "resolve_breaking_style_mode", lambda: "classic")
     monkeypatch.setattr(main, "_include_source_tags", lambda: False)
+    monkeypatch.setattr(main, "_resolve_outbound_post_layout", lambda: "legacy")
 
     rendered = main._format_breaking_text("NYT", "Two rockets landed near Haifa overnight.", "Why it matters: context")
 

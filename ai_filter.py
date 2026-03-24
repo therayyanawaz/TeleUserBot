@@ -513,6 +513,21 @@ def normalize_feed_summary_html(summary_html: str, raw_text: str) -> str:
     return ""
 
 
+def extract_feed_summary_parts(summary_html: str, raw_text: str) -> tuple[str, str]:
+    normalized = normalize_feed_summary_html(summary_html, raw_text)
+    plain = re.sub(r"(?i)<br\s*/?>", "\n", normalized or "")
+    lines = [
+        normalize_space(strip_telegram_html(line))
+        for line in re.split(r"\n+", plain)
+        if normalize_space(strip_telegram_html(line))
+    ]
+    headline = lines[0] if lines else normalize_space(strip_telegram_html(summary_html or ""))
+    if not headline:
+        headline = _fallback_headline(raw_text) or normalize_space(raw_text)
+    context = " ".join(lines[1:]).strip()
+    return headline, context
+
+
 def _fallback_summary(text: str) -> Optional[str]:
     if _likely_noise(text):
         return None

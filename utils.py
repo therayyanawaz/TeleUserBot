@@ -248,18 +248,15 @@ _ALERT_LABEL_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-_GENERIC_FLASH_UPDATE = "\U0001F525 Flash Update"
-_GENERIC_LIVE_UPDATE = "\u26A0\uFE0F Live Update"
-_GENERIC_SITUATION_UPDATE = "\u2139\uFE0F Situation Update"
+_GENERIC_BREAKING = "Breaking"
+_GENERIC_NEWS_UPDATE = "News Update"
 
 
 def _generic_alert_label(severity: str) -> str:
     normalized_severity = normalize_space(severity).lower()
     if normalized_severity == "high":
-        return _GENERIC_FLASH_UPDATE
-    if normalized_severity == "medium":
-        return _GENERIC_LIVE_UPDATE
-    return _GENERIC_SITUATION_UPDATE
+        return _GENERIC_BREAKING
+    return _GENERIC_NEWS_UPDATE
 
 
 def _choose_alert_label_legacy(text: str, *, severity: str = "high") -> str:
@@ -280,38 +277,18 @@ def _choose_alert_label_legacy(text: str, *, severity: str = "high") -> str:
     return "ℹ️ Situation Update"
 
 
-def build_alert_header(
-    text: str,
-    *,
-    severity: str,
-    source_title: str,
-    include_source: bool,
-) -> str:
-    label = choose_alert_label(text, severity=severity)
-    if include_source:
-        safe_source = sanitize_telegram_html(source_title)
-        return f"<b>{label} • {safe_source}</b>"
-    return f"<b>{label}</b>"
-
-
 def choose_alert_label(text: str, *, severity: str = "high") -> str:
     """
-    Use themed labels only for concrete live-event headlines.
-    Generic analysis/explainer material falls back to a neutral label.
+    Use taxonomy-backed themed labels when a concrete category is present.
+    Explainer material falls back to a calm generic label.
     """
-    lowered = normalize_space(text).lower()
-    normalized_severity = normalize_space(severity).lower()
+    normalized = normalize_space(text)
+    if normalized and not should_downgrade_explainer_urgency(normalized):
+        match = match_news_category(normalized)
+        if match is not None:
+            return match.label
+    return _generic_alert_label(severity)
 
-    if lowered and not should_downgrade_explainer_urgency(lowered) and looks_like_live_event_update(lowered):
-        for label, markers in _ALERT_LABEL_RULES:
-            if any(marker in lowered for marker in markers):
-                return label
-
-    if normalized_severity == "high":
-        return "ðŸ”¥ Flash Update"
-    if normalized_severity == "medium":
-        return "âš ï¸ Live Update"
-    return "â„¹ï¸ Situation Update"
 
 def build_alert_header(
     text: str,
@@ -325,23 +302,6 @@ def build_alert_header(
         safe_source = sanitize_telegram_html(source_title)
         return f"<b>{label} \u2022 {safe_source}</b>"
     return f"<b>{label}</b>"
-
-
-def choose_alert_label(text: str, *, severity: str = "high") -> str:
-    """
-    Use taxonomy-backed themed labels only for concrete live-event headlines.
-    Generic analysis/explainer material falls back to a neutral label.
-    """
-    normalized = normalize_space(text)
-    if (
-        normalized
-        and not should_downgrade_explainer_urgency(normalized)
-        and looks_like_live_event_update(normalized)
-    ):
-        match = match_news_category(normalized)
-        if match is not None:
-            return match.label
-    return _generic_alert_label(severity)
 
 
 @dataclass(frozen=True)

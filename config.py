@@ -193,6 +193,8 @@ DIGEST_INCLUDE_READ_MORE_LINKS = _env_bool("DIGEST_INCLUDE_READ_MORE_LINKS", Fal
 
 # Include source/channel tags in outbound messages.
 INCLUDE_SOURCE_TAGS = _env_bool("INCLUDE_SOURCE_TAGS", False)  # type: bool
+# Outbound Telegram message presentation layout.
+OUTBOUND_POST_LAYOUT = _env_str("OUTBOUND_POST_LAYOUT", "editorial_card").lower()  # type: str
 
 # -----------------------------------------------------------------------------
 # Media OCR Translation

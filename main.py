@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from difflib import SequenceMatcher
 import hashlib
 import json
 import logging
@@ -43,6 +44,7 @@ import config
 from ai_filter import (
     create_digest_summary,
     decide_filter_action,
+    extract_feed_summary_parts,
     generate_answer_from_context,
     get_filter_decision_cache_stats,
     get_quota_health,
@@ -109,6 +111,7 @@ from utils import (
     build_alert_header,
     build_media_signature_digest,
     check_and_store_media_duplicate,
+    choose_alert_label,
     compute_visual_media_hash,
     LiveTelegramStreamer,
     DuplicateRuntime,
@@ -959,6 +962,13 @@ def _is_immediate_high_enabled() -> bool:
 
 def _include_source_tags() -> bool:
     return _bool_flag(getattr(config, "INCLUDE_SOURCE_TAGS", False), False)
+
+
+def _resolve_outbound_post_layout() -> str:
+    raw = normalize_space(str(getattr(config, "OUTBOUND_POST_LAYOUT", "editorial_card") or "")).lower()
+    if raw == "legacy":
+        return "legacy"
+    return "editorial_card"
 
 
 def _is_html_formatting_enabled() -> bool:
@@ -2662,29 +2672,190 @@ def _truncate_context_line(text: str, limit: int = 240) -> str:
     return f"{truncated}..."
 
 
-def _format_summary_text(source_title: str, summary: str, *, raw_text: str | None = None) -> str:
-    safe_source = sanitize_telegram_html(source_title)
-    raw_basis = normalize_space(str(raw_text or ""))
-    safe_summary = str(summary or "").strip()
-    if raw_basis:
-        safe_summary = normalize_feed_summary_html(safe_summary, raw_basis)
-        if not safe_summary and not should_downgrade_explainer_urgency(raw_basis):
-            safe_summary = sanitize_telegram_html(_truncate_context_line(raw_basis, limit=320))
-    if _include_source_tags():
-        return f"<b>ðŸ“° {safe_source}</b><br><br>{safe_summary}"
-    return f"<b>ðŸ“° Update</b><br><br>{safe_summary}"
+_EDITORIAL_CONTEXT_BANNED_FRAGMENTS = (
+    "regional stability",
+    "worth watching",
+    "situation remains tense",
+    "civilian danger",
+    "what explains",
+    "reasons for",
+    "ways to address",
+)
+_EDITORIAL_PROMO_PREFIX_RE = re.compile(
+    r"^(?:flash update|live update|news update|breaking|alert|update)\s*[:\-–—]+\s*",
+    flags=re.IGNORECASE,
+)
+_EDITORIAL_FLAG_PREFIX_RE = re.compile(r"^(?:[\U0001F1E6-\U0001F1FF]{2}\s*)+")
+_EDITORIAL_EMOJI_PREFIX_RE = re.compile(r"^(?:[\U0001F300-\U0001FAFF\u2600-\u26FF\u2700-\u27BF\uFE0F]+\s*)+")
+_EDITORIAL_HEADLINE_MAX_STANDARD = 160
+_EDITORIAL_HEADLINE_MAX_BREAKING = 180
+_EDITORIAL_CONTEXT_MAX_STANDARD = 200
+_EDITORIAL_CONTEXT_MAX_BREAKING = 220
 
-def _format_summary_text(source_title: str, summary: str, *, raw_text: str | None = None) -> str:
-    safe_source = sanitize_telegram_html(source_title)
+
+def _plain_category_label(label: str) -> str:
+    plain = normalize_space(strip_telegram_html(str(label or "")))
+    plain = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u26FF\u2700-\u27BF\uFE0F]", " ", plain)
+    plain = plain.strip("[](){}〔〕|:- ")
+    return normalize_space(plain)
+
+
+def _strip_editorial_prefixes(
+    text: str,
+    *,
+    source_title: str = "",
+    category_label: str = "",
+) -> str:
+    cleaned = normalize_space(strip_telegram_html(str(text or "")))
+    source_plain = normalize_space(strip_telegram_html(source_title))
+    category_plain = _plain_category_label(category_label)
+    for _ in range(4):
+        previous = cleaned
+        cleaned = _EDITORIAL_FLAG_PREFIX_RE.sub("", cleaned)
+        cleaned = _EDITORIAL_EMOJI_PREFIX_RE.sub("", cleaned)
+        cleaned = _EDITORIAL_PROMO_PREFIX_RE.sub("", cleaned)
+        cleaned = re.sub(r"^\s*why it matters\s*[:\-–—]+\s*", "", cleaned, flags=re.IGNORECASE)
+        if source_plain:
+            cleaned = re.sub(
+                rf"^\s*{re.escape(source_plain)}\s*[:\-–—|]+\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+        if category_plain:
+            cleaned = re.sub(
+                rf"^\s*{re.escape(category_plain)}\s*[:\-–—|]+\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(
+                rf"^\s*{re.escape(category_plain)}\s+",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+        cleaned = cleaned.strip(" -–—:|•")
+        cleaned = normalize_space(cleaned)
+        if cleaned == previous:
+            break
+    return cleaned
+
+
+def _clean_editorial_headline(
+    value: str,
+    *,
+    source_title: str,
+    category_label: str,
+    severity: str,
+) -> str:
+    cleaned = _strip_editorial_prefixes(value, source_title=source_title, category_label=category_label)
+    cleaned = cleaned.rstrip(".")
+    if cleaned.endswith("?"):
+        cleaned = cleaned.rstrip("?").rstrip()
+    headline_limit = (
+        _EDITORIAL_HEADLINE_MAX_BREAKING
+        if normalize_space(severity).lower() == "high"
+        else _EDITORIAL_HEADLINE_MAX_STANDARD
+    )
+    return _truncate_context_line(cleaned, limit=headline_limit)
+
+
+def _clean_editorial_context(
+    value: str,
+    *,
+    headline: str,
+    source_title: str,
+    category_label: str,
+    severity: str,
+) -> str:
+    text = str(value or "").replace("\r", "\n")
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    lines: list[str] = []
+    for raw_line in re.split(r"\n+", text):
+        cleaned = _strip_editorial_prefixes(raw_line, source_title=source_title, category_label=category_label)
+        cleaned = normalize_space(cleaned)
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if any(fragment in lowered for fragment in _EDITORIAL_CONTEXT_BANNED_FRAGMENTS):
+            continue
+        if SequenceMatcher(None, lowered, headline.lower()).ratio() >= 0.72:
+            continue
+        lines.append(cleaned)
+    if not lines:
+        return ""
+    context = " ".join(lines)
+    context = normalize_space(context).rstrip(".")
+    if not context:
+        return ""
+    context_limit = (
+        _EDITORIAL_CONTEXT_MAX_BREAKING
+        if normalize_space(severity).lower() == "high"
+        else _EDITORIAL_CONTEXT_MAX_STANDARD
+    )
+    return _truncate_context_line(context, limit=context_limit)
+
+
+def _render_editorial_post(
+    *,
+    category_label: str,
+    headline: str,
+    context: str = "",
+) -> str:
+    safe_category = sanitize_telegram_html(normalize_space(category_label))
+    safe_headline = sanitize_telegram_html(normalize_space(headline))
+    if not context:
+        return f"<b>〔{safe_category}〕</b><br><br><b>{safe_headline}</b>"
+    safe_context = sanitize_telegram_html(normalize_space(context))
+    return (
+        f"<b>〔{safe_category}〕</b><br><br><b>{safe_headline}</b>"
+        f"<br><br><b>Why it matters</b><br>{safe_context}"
+    )
+
+
+def _format_summary_text(
+    source_title: str,
+    summary: str,
+    *,
+    raw_text: str | None = None,
+    severity: str = "medium",
+) -> str:
     raw_basis = normalize_space(str(raw_text or ""))
     safe_summary = str(summary or "").strip()
-    if raw_basis:
-        safe_summary = normalize_feed_summary_html(safe_summary, raw_basis)
-        if not safe_summary and not should_downgrade_explainer_urgency(raw_basis):
-            safe_summary = sanitize_telegram_html(_truncate_context_line(raw_basis, limit=320))
-    if _include_source_tags():
-        return f"<b>\U0001F4F0 {safe_source}</b><br><br>{safe_summary}"
-    return f"<b>\U0001F4F0 Update</b><br><br>{safe_summary}"
+    normalized_summary = normalize_feed_summary_html(safe_summary, raw_basis) if raw_basis else safe_summary
+    if _resolve_outbound_post_layout() == "legacy":
+        if raw_basis and not normalized_summary and not should_downgrade_explainer_urgency(raw_basis):
+            normalized_summary = sanitize_telegram_html(_truncate_context_line(raw_basis, limit=320))
+        return _format_summary_text_legacy(source_title, normalized_summary)
+
+    headline, context = extract_feed_summary_parts(normalized_summary or safe_summary, raw_basis or safe_summary)
+    category_label = choose_alert_label(raw_basis or headline, severity=severity)
+    clean_headline = _clean_editorial_headline(
+        headline or raw_basis or safe_summary,
+        source_title=source_title,
+        category_label=category_label,
+        severity=severity,
+    )
+    if not clean_headline:
+        clean_headline = _clean_editorial_headline(
+            raw_basis or safe_summary,
+            source_title=source_title,
+            category_label=category_label,
+            severity=severity,
+        )
+    clean_context = _clean_editorial_context(
+        context,
+        headline=clean_headline,
+        source_title=source_title,
+        category_label=category_label,
+        severity=severity,
+    )
+    return _render_editorial_post(
+        category_label=category_label,
+        headline=clean_headline,
+        context=clean_context,
+    )
 
 
 def _clean_followup_context_line(text: str) -> str:
@@ -2843,7 +3014,7 @@ def _classify_severity_with_breakdown(
     return severity, score, breakdown
 
 
-def _format_breaking_text(source_title: str, headline: str, rational_view: str | None = None) -> str:
+def _format_breaking_text_legacy(source_title: str, headline: str, rational_view: str | None = None) -> str:
     def _clean_rational_view(value: str) -> str:
         text = normalize_space(str(value or ""))
         if not text:
@@ -2936,6 +3107,31 @@ def _format_breaking_text(source_title: str, headline: str, rational_view: str |
         else:
             rational_part = f"<br><br><i>{rational_body}</i>"
     return f"{header}<br><br>{safe_headline}{rational_part}"
+
+
+def _format_breaking_text(source_title: str, headline: str, rational_view: str | None = None) -> str:
+    if _resolve_outbound_post_layout() == "legacy":
+        return _format_breaking_text_legacy(source_title, headline, rational_view)
+
+    category_label = choose_alert_label(headline, severity="high")
+    clean_headline = _clean_editorial_headline(
+        headline,
+        source_title=source_title,
+        category_label=category_label,
+        severity="high",
+    )
+    clean_context = _clean_editorial_context(
+        rational_view or "",
+        headline=clean_headline,
+        source_title=source_title,
+        category_label=category_label,
+        severity="high",
+    )
+    return _render_editorial_post(
+        category_label=category_label,
+        headline=clean_headline,
+        context=clean_context,
+    )
 
 
 def _cleanup_breaking_refs(now_ts: int | None = None) -> None:
@@ -4669,7 +4865,12 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
     if not summary_html:
         summary_html = sanitize_telegram_html(_truncate_context_line(candidate_text, limit=700))
     reply_to = await _resolve_source_reply_target(primary)
-    formatted_summary = _format_summary_text(source, summary_html, raw_text=candidate_text)
+    formatted_summary = _format_summary_text(
+        source,
+        summary_html,
+        raw_text=candidate_text,
+        severity=severity,
+    )
     if has_media:
         if kind == "album":
             sent_ref = await _send_album(messages, formatted_summary, reply_to=reply_to)

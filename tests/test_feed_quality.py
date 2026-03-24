@@ -47,7 +47,7 @@ def test_choose_alert_label_falls_back_to_generic_for_explainer_copy():
     )
 
     assert "Interception Alert" not in label
-    assert "Flash Update" in label
+    assert label == "Breaking"
 
 
 def test_choose_alert_label_keeps_thematic_label_for_concrete_event():
@@ -84,6 +84,7 @@ def test_severity_classifier_downgrades_explainer_with_shot_down_keyword():
 
 def test_format_summary_text_normalizes_bad_feed_copy(monkeypatch):
     monkeypatch.setattr(main, "_include_source_tags", lambda: False)
+    monkeypatch.setattr(main, "_resolve_outbound_post_layout", lambda: "editorial_card")
 
     rendered = main._format_summary_text(
         "NYT",
@@ -95,8 +96,45 @@ def test_format_summary_text_normalizes_bad_feed_copy(monkeypatch):
     )
     plain = ai_filter.strip_telegram_html(rendered)
 
+    assert "〔" in rendered
     assert "How the port reopening" not in plain
     assert "Officials confirmed the port will reopen Friday" in plain
+    assert "NYT" not in plain
+
+
+def test_format_summary_text_hides_source_even_when_source_tags_enabled(monkeypatch):
+    monkeypatch.setattr(main, "_include_source_tags", lambda: True)
+    monkeypatch.setattr(main, "_resolve_outbound_post_layout", lambda: "editorial_card")
+
+    rendered = main._format_summary_text(
+        "Bellum Acta",
+        "<b>Port reopened overnight</b><br>Operations resumed after a three-day shutdown.",
+        raw_text="Officials confirmed the port reopened overnight after a three-day shutdown.",
+        severity="medium",
+    )
+    plain = ai_filter.strip_telegram_html(rendered)
+
+    assert "Bellum Acta" not in plain
+    assert plain.splitlines()[0].startswith("〔")
+
+
+def test_format_summary_text_removes_duplicate_alert_prefixes(monkeypatch):
+    monkeypatch.setattr(main, "_include_source_tags", lambda: False)
+    monkeypatch.setattr(main, "_resolve_outbound_post_layout", lambda: "editorial_card")
+
+    rendered = main._format_summary_text(
+        "War & News Alert",
+        "<b>Flash Update Hezbollah claims a direct drone hit on an army vehicle</b><br>1h ago the story moved from launches into strikes.",
+        raw_text=(
+            "Hezbollah claims a direct drone hit on an army vehicle in Mays al-Jabal."
+        ),
+        severity="high",
+    )
+    plain = ai_filter.strip_telegram_html(rendered)
+
+    assert "Flash Update Flash Update" not in plain
+    assert "War & News Alert" not in plain
+    assert "Why it matters" in plain
 
 
 @pytest.mark.asyncio
