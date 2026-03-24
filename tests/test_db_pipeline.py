@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 import db
 
 
@@ -93,3 +95,76 @@ def test_ai_decision_cache_round_trip(isolated_db):
         max_age_hours=72,
     )
     assert cached == '{"action":"deliver"}'
+
+
+def test_digest_writes_do_not_depend_on_created_at_default(tmp_path, monkeypatch):
+    db_path = tmp_path / "teleuserbot-legacy-defaults.db"
+    monkeypatch.setattr(db, "DB_PATH", str(db_path))
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE digest_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            source_name TEXT,
+            raw_text TEXT NOT NULL,
+            message_link TEXT,
+            timestamp INTEGER NOT NULL,
+            processed INTEGER NOT NULL DEFAULT 0,
+            batch_id TEXT,
+            created_at INTEGER NOT NULL,
+            UNIQUE(channel_id, message_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE digest_archive (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            source_name TEXT,
+            raw_text TEXT NOT NULL,
+            message_link TEXT,
+            timestamp INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(channel_id, message_id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db.save_to_digest_queue(
+        "chan-1",
+        101,
+        "Queued text",
+        timestamp=1700000000,
+        source_name="Source",
+        message_link="https://t.me/example/101",
+    )
+    db.save_to_digest_archive(
+        "chan-2",
+        202,
+        "Archived text",
+        timestamp=1700000100,
+        source_name="Source",
+        message_link="https://t.me/example/202",
+    )
+
+    conn = sqlite3.connect(str(db_path))
+    queue_row = conn.execute(
+        "SELECT timestamp, created_at FROM digest_queue WHERE channel_id = 'chan-1' AND message_id = 101"
+    ).fetchone()
+    archive_rows = conn.execute(
+        "SELECT timestamp, created_at FROM digest_archive ORDER BY channel_id, message_id"
+    ).fetchall()
+    conn.close()
+
+    assert queue_row == (1700000000, 1700000000)
+    assert archive_rows == [
+        (1700000000, 1700000000),
+        (1700000100, 1700000100),
+    ]

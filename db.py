@@ -123,7 +123,7 @@ def init_db() -> None:
                 timestamp INTEGER NOT NULL,
                 processed INTEGER NOT NULL DEFAULT 0,
                 batch_id TEXT,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),
                 UNIQUE(channel_id, message_id)
             )
             """
@@ -134,7 +134,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS digest_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT,
-                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
             )
             """
         )
@@ -149,7 +149,7 @@ def init_db() -> None:
                 raw_text TEXT NOT NULL,
                 message_link TEXT,
                 timestamp INTEGER NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),
                 UNIQUE(channel_id, message_id)
             )
             """
@@ -224,8 +224,8 @@ def init_db() -> None:
                 last_error_at INTEGER,
                 claimed_by TEXT,
                 claimed_at INTEGER,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),
+                updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
             )
             """
         )
@@ -238,7 +238,7 @@ def init_db() -> None:
                 prompt_version TEXT NOT NULL,
                 model TEXT NOT NULL,
                 decision_json TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
             )
             """
         )
@@ -791,9 +791,10 @@ def save_to_digest_queue(
                 raw_text,
                 message_link,
                 timestamp,
+                created_at,
                 processed,
                 batch_id
-            ) VALUES (?, ?, ?, ?, ?, ?, 0, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)
             """,
             (
                 channel_id,
@@ -801,6 +802,7 @@ def save_to_digest_queue(
                 (source_name or "").strip() or None,
                 cleaned,
                 (message_link or "").strip() or None,
+                ts,
                 ts,
             ),
         )
@@ -812,8 +814,9 @@ def save_to_digest_queue(
                 source_name,
                 raw_text,
                 message_link,
-                timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                timestamp,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 channel_id,
@@ -821,6 +824,7 @@ def save_to_digest_queue(
                 (source_name or "").strip() or None,
                 cleaned,
                 (message_link or "").strip() or None,
+                ts,
                 ts,
             ),
         )
@@ -849,8 +853,9 @@ def save_to_digest_archive(
                 source_name,
                 raw_text,
                 message_link,
-                timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                timestamp,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 channel_id,
@@ -858,6 +863,7 @@ def save_to_digest_archive(
                 (source_name or "").strip() or None,
                 cleaned,
                 (message_link or "").strip() or None,
+                ts,
                 ts,
             ),
         )
