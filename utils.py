@@ -32,7 +32,7 @@ from db import (
     save_recent_breaking,
     save_recent_media_signature,
 )
-from news_taxonomy import match_news_category
+from news_taxonomy import match_news_category, record_ontology_label_resolution
 from news_signals import looks_like_live_event_update, should_downgrade_explainer_urgency
 from shared_http import get_web_http_client
 
@@ -286,7 +286,9 @@ def choose_alert_label(text: str, *, severity: str = "high") -> str:
     if normalized and not should_downgrade_explainer_urgency(normalized):
         match = match_news_category(normalized)
         if match is not None:
+            record_ontology_label_resolution(matched=True)
             return match.label
+    record_ontology_label_resolution(matched=False)
     return _generic_alert_label(severity)
 
 

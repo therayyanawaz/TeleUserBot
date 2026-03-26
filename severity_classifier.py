@@ -300,17 +300,44 @@ def _detect_source_tier(source_name: str) -> tuple[str, float]:
     return "C", float(tier_bonus.get("C", tier_bonus.get("UNKNOWN", 0.0)))
 
 
-def _calc_urgency_score(text: str) -> tuple[float, list[str], int]:
-    normalized = _normalize_key(text)
-    phrase_hits = _find_matches(normalized, SEVERITY_CONFIG["strong_urgency_signals"])
+def _calc_urgency_score(text: str, *, story_signals: Dict[str, Any]) -> tuple[float, list[str], int]:
+    ontology = story_signals.get("ontology") or {}
+    signal_breakdown = ontology.get("signal_breakdown") or {}
+    frame = ontology.get("event_frame") or {}
+
+    action_hits = [str(item) for item in frame.get("actions") or []]
+    target_hits = [str(item) for item in frame.get("targets") or []]
+    recency_hits = [str(item) for item in frame.get("recency_hits") or []]
+    official_hits = [str(item) for item in frame.get("official_hits") or []]
     emoji_hits = _alert_emoji_hits(text)
-    all_hits = phrase_hits + emoji_hits
-    strong_count = len(set(all_hits))
-    score = min(
-        float(SEVERITY_CONFIG["urgency_max_score"]),
-        strong_count * float(SEVERITY_CONFIG["urgency_per_signal"]),
-    )
-    return score, all_hits, strong_count
+
+    weighted_hits: list[str] = []
+    weighted_hits.extend(action_hits[:3])
+    weighted_hits.extend(target_hits[:2])
+    weighted_hits.extend(recency_hits[:2])
+    weighted_hits.extend(official_hits[:2])
+    weighted_hits.extend(emoji_hits)
+    if bool(ontology.get("breaking_eligible")):
+        weighted_hits.append("breaking_eligible")
+
+    score = 0.0
+    score += min(0.12, 0.04 * len(set(action_hits[:3])))
+    score += min(0.06, 0.03 * len(set(target_hits[:2])))
+    if recency_hits:
+        score += 0.08
+    if official_hits:
+        score += 0.06
+    if bool(ontology.get("breaking_eligible")):
+        score += 0.05
+    score += min(0.04, 0.02 * len(set(emoji_hits)))
+
+    live_event_score = float(signal_breakdown.get("live_event_score") or 0.0)
+    if live_event_score >= 1.6:
+        score += 0.05
+
+    score = min(float(SEVERITY_CONFIG["urgency_max_score"]), score)
+    unique_hits = list(dict.fromkeys(weighted_hits))
+    return score, unique_hits, len(unique_hits)
 
 
 def _calc_taxonomy_score(text: str) -> tuple[float, Dict[str, Any], list[str]]:
@@ -409,16 +436,22 @@ def _calc_humanized_score(
     return score, details
 
 
-def _calc_temporal_context_score(text: str, *, reply_to: int) -> tuple[float, Dict[str, Any]]:
+def _calc_temporal_context_score(
+    text: str,
+    *,
+    reply_to: int,
+    story_signals: Dict[str, Any],
+) -> tuple[float, Dict[str, Any]]:
     cfg = SEVERITY_CONFIG["temporal_context"]
-    normalized = _normalize_key(text)
     score = 0.0
+    ontology = story_signals.get("ontology") or {}
+    frame = ontology.get("event_frame") or {}
 
-    city_hits = _find_matches(normalized, cfg["cities"])
+    city_hits = [str(item) for item in frame.get("places") or []]
     if city_hits:
         score += float(cfg["city_bonus"])
 
-    right_now_hits = _find_matches(normalized, cfg["right_now_phrases"])
+    right_now_hits = [str(item) for item in frame.get("recency_hits") or []]
     if right_now_hits:
         score += float(cfg["right_now_bonus"])
 
@@ -444,17 +477,16 @@ def _calc_negative_penalty(
     story_signals: Dict[str, Any],
 ) -> tuple[float, Dict[str, Any]]:
     cfg = SEVERITY_CONFIG["negative_penalties"]
-    normalized = _normalize_key(text)
     penalty = 0.0
 
-    recap_hits = _find_matches(normalized, cfg["recap_keywords"])
+    recap_hits = [str(item) for item in story_signals.get("explainer_hits") or []]
     if recap_hits:
         penalty -= float(cfg["recap_penalty"])
 
     analysis_hits = [
         hit
         for hit in recap_hits
-        if hit in {"analysis", "thread", "opinion", "overview", "what we know"}
+        if hit in {"analysis", "thread", "opinion", "overview", "what we know", "recap", "roundup"}
     ]
     if analysis_hits:
         penalty -= float(cfg["analysis_penalty"])
@@ -533,7 +565,7 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
     story_signals = detect_story_signals(text)
 
     tier, source_score = _detect_source_tier(source_name)
-    urgency_score, urgency_hits, urgency_hit_count = _calc_urgency_score(text)
+    urgency_score, urgency_hits, urgency_hit_count = _calc_urgency_score(text, story_signals=story_signals)
     taxonomy_score, taxonomy_details, taxonomy_hits = _calc_taxonomy_score(text)
     style_score, style_details = _calc_style_score(text, has_link=has_link, has_media=has_media)
     humanized_score, humanized_details = _calc_humanized_score(
@@ -541,7 +573,11 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
         humanized_probability=humanized_probability,
         urgency_hits=urgency_hit_count,
     )
-    temporal_score, temporal_details = _calc_temporal_context_score(text, reply_to=reply_to)
+    temporal_score, temporal_details = _calc_temporal_context_score(
+        text,
+        reply_to=reply_to,
+        story_signals=story_signals,
+    )
     penalty_score, penalty_details = _calc_negative_penalty(
         text,
         source_name=source_name,

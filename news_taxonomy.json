@@ -1,5 +1,39 @@
 {
-  "version": 1,
+  "version": 2,
+  "compiler": {
+    "action_aliases": {
+      "strike": ["strike", "strikes", "struck", "air strike", "airstrike", "air-strike", "bombardment", "bombing", "raid", "raids", "shelling"],
+      "intercept": ["intercept", "intercepts", "intercepted", "interception", "interceptions", "shot down", "downed", "neutralized"],
+      "launch": ["launch", "launches", "launched", "launching", "rocket fire", "fired", "barrage", "salvo", "volley"],
+      "impact": ["impact", "impacts", "hit", "hits", "landed", "lands", "crashed", "exploded", "explosion", "blast"],
+      "warn": ["warning", "warnings", "warned", "sirens", "alert", "alerts", "evacuate", "evacuation", "shelter"],
+      "kill": ["killed", "dead", "deaths", "fatality", "fatalities", "casualty", "casualties", "injured", "wounded"],
+      "confirm": ["confirmed", "announced", "declared", "ordered", "issued", "approved", "warned", "statement", "communique"],
+      "resign": ["resign", "resigns", "resigned", "steps down", "step down", "ousted", "sacked", "dismissed"],
+      "protest": ["protest", "protests", "unrest", "demonstration", "demonstrations", "riot", "riots", "clashes"],
+      "disrupt": ["outage", "blackout", "shutdown", "disruption", "disruptions", "network disruption", "internet down", "power outage"]
+    },
+    "actor_aliases": {
+      "officials": ["officials", "authorities", "government", "ministry", "military", "army", "defense ministry", "defence ministry", "spokesperson", "spokesman", "spokeswoman"],
+      "united states": ["united states", "u.s.", "u.s", "us", "american", "america", "washington"],
+      "israel": ["israel", "israeli", "idf", "israeli army", "israeli military"],
+      "iran": ["iran", "iranian", "tehran", "irgc"],
+      "hezbollah": ["hezbollah", "islamic resistance"],
+      "russia": ["russia", "russian", "moscow"],
+      "ukraine": ["ukraine", "ukrainian", "kyiv"]
+    },
+    "target_aliases": {
+      "air defense": ["air defense", "air defence", "air-defense", "iron dome", "surface to air", "surface-to-air", "anti-aircraft", "missile defense", "missile-defence"],
+      "missile": ["missile", "missiles", "ballistic missile", "cruise missile", "rocket", "rockets"],
+      "drone": ["drone", "drones", "uav", "uavs", "unmanned aerial vehicle", "attack drone", "loitering munition"],
+      "shipping": ["ship", "ships", "shipping", "merchant vessel", "cargo ship", "tanker", "port", "harbor", "harbour"],
+      "grid": ["grid", "power grid", "electricity", "substation", "telecom", "network", "internet"]
+    },
+    "recency_cues": ["today", "tonight", "overnight", "this morning", "this afternoon", "this evening", "just now", "moments ago", "minutes ago", "hours ago", "latest", "new", "earlier today", "happening now", "live"],
+    "official_source_cues": ["officials said", "officials say", "officials confirmed", "official statement", "the ministry said", "military said", "the army said", "the president said", "prime minister said", "government announced", "confirmed", "announced", "declared", "ordered", "approved", "issued", "statement", "communique"],
+    "negative_framing_markers": ["analysis", "opinion", "thread", "explainer", "deep dive", "what we know", "what explains", "reasons for", "ways to address", "takeaways", "lessons from", "overview", "recap", "roundup", "full report", "full analysis"],
+    "hedge_markers": ["reportedly", "unconfirmed", "appears to", "appeared to", "may have", "might have", "could have", "according to reports", "report says", "reports say", "alleged", "allegedly"]
+  },
   "categories": [
     {
       "key": "casualty",
@@ -57,7 +91,7 @@
       "breaking_eligible": true,
       "severity_bias": "high",
       "primary_phrases": ["missile strike", "missile attack", "ballistic missile", "cruise missile", "missile barrage"],
-      "alias_phrases": ["missiles launched", "missile launched", "missiles fired", "missile fired"],
+      "alias_phrases": ["missiles launched", "missile launched", "missiles fired", "missile fired", "air strike", "airstrike", "air-strike"],
       "required_any": [],
       "blocked_phrases": []
     },

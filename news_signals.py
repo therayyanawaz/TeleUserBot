@@ -1,54 +1,14 @@
-"""Shared heuristics for explainer routing and live-event labeling."""
+"""Shared ontology-backed signals for explainer routing and live-event labeling."""
 
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-from news_taxonomy import find_news_category_matches, match_breaking_category
-
-_EXPLAINER_MARKERS = (
-    "analysis",
-    "opinion",
-    "thread",
-    "explainer",
-    "deep dive",
-    "what we know",
-    "what explains",
-    "reasons for",
-    "ways to address",
-    "takeaways",
-    "lessons from",
-    "overview",
-    "recap",
-    "roundup",
-    "full report",
-    "full analysis",
-)
-_QUESTION_LEAD_RE = re.compile(
-    r"^(?:why|how|what explains|what caused|what does|can|could|should|would|will)\b",
-    flags=re.IGNORECASE,
-)
-_OFFICIAL_PATTERNS = (
-    r"\b(?:ministry|army|military|government|president|prime minister|defense minister|foreign minister|spokesperson|spokesman|spokeswoman|officials?)\s+(?:said|says|announced|confirmed|declared|ordered|issued|warned|approved)\b",
-    r"\b(?:statement|decree|order|directive|communique)\b",
-    r"\b(?:confirmed|announced|declared|ordered|issued|approved|warned)\b",
-)
-_RECENCY_MARKERS = (
-    "today",
-    "tonight",
-    "overnight",
-    "this morning",
-    "this afternoon",
-    "this evening",
-    "this weekend",
-    "just now",
-    "moments ago",
-    "minutes ago",
-    "hours ago",
-    "earlier today",
-    "latest",
-    "new",
+from news_taxonomy import (
+    _QUESTION_LEAD_RE,
+    analyze_news_ontology,
+    record_ontology_live_event_resolution,
 )
 
 
@@ -58,28 +18,35 @@ def normalize_space(text: str) -> str:
 
 def detect_story_signals(text: str) -> Dict[str, Any]:
     normalized = normalize_space(text)
-    lowered = normalized.lower()
     lead = normalize_space(re.split(r"(?<=[.!?])\s+|\n+", normalized, maxsplit=1)[0])
-    category_matches = find_news_category_matches(normalized)
-    top_category = category_matches[0] if category_matches else None
-    breaking_category = match_breaking_category(normalized)
+    analysis = analyze_news_ontology(normalized)
+    match = analysis.top_match
+    frame = analysis.event_frame
+    signal = analysis.signal_breakdown
 
-    explainer_hits: List[str] = [marker for marker in _EXPLAINER_MARKERS if marker in lowered]
     question_led = bool(_QUESTION_LEAD_RE.search(lead)) or (
         "?" in lead and bool(_QUESTION_LEAD_RE.search(lead.rstrip("?").strip()))
     )
-    official_development = any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in _OFFICIAL_PATTERNS)
-    recency = any(marker in lowered for marker in _RECENCY_MARKERS)
-    concrete_event = bool(top_category)
-    breaking_eligible = bool(breaking_category)
-
+    explainer_hits = list(frame.negative_hits)
+    official_development = bool(frame.official_hits) and not frame.hedged
+    recency = bool(frame.recency_hits)
+    concrete_event = bool(match) or bool(frame.actions or frame.targets or frame.counts)
+    breaking_eligible = bool(match and match.breaking_eligible)
     explainer_like = bool(explainer_hits) or question_led
+    live_event_update = bool(
+        signal.live_event_score >= 1.6
+        or (
+            concrete_event
+            and (official_development or recency)
+            and signal.explainer_score < 0.8
+        )
+    )
     downgrade_explainer = explainer_like and not (
-        official_development or (breaking_eligible and recency)
+        official_development or (breaking_eligible and recency and concrete_event)
     )
-    live_event_update = not downgrade_explainer and (
-        official_development or (concrete_event and (recency or len(normalized) <= 280))
-    )
+
+    if concrete_event or frame.actions or frame.targets or frame.places:
+        record_ontology_live_event_resolution(frame, matched=bool(match))
 
     return {
         "normalized_text": normalized,
@@ -91,23 +58,54 @@ def detect_story_signals(text: str) -> Dict[str, Any]:
         "recency": recency,
         "explainer_like": explainer_like,
         "downgrade_explainer": downgrade_explainer,
-        "live_event_update": live_event_update,
-        "category_key": top_category.category_key if top_category else "",
-        "category_label": top_category.label if top_category else "",
-        "all_category_keys": [match.category_key for match in category_matches[:6]],
+        "live_event_update": live_event_update and not downgrade_explainer,
+        "category_key": match.category_key if match else "",
+        "category_label": match.label if match else "",
+        "all_category_keys": [item.category_key for item in analysis.matches[:6]],
+        "ontology": {
+            "category_key": match.category_key if match else "",
+            "label": match.label if match else "",
+            "confidence_score": float(match.confidence_score) if match else 0.0,
+            "severity_bias": match.severity_bias if match else "",
+            "breaking_eligible": bool(match.breaking_eligible) if match else False,
+            "signal_breakdown": {
+                "event_hit_count": signal.event_hit_count,
+                "action_hit_count": signal.action_hit_count,
+                "actor_hit_count": signal.actor_hit_count,
+                "target_hit_count": signal.target_hit_count,
+                "place_hit_count": signal.place_hit_count,
+                "recency_hit_count": signal.recency_hit_count,
+                "official_hit_count": signal.official_hit_count,
+                "negative_hit_count": signal.negative_hit_count,
+                "hedge_hit_count": signal.hedge_hit_count,
+                "live_event_score": signal.live_event_score,
+                "recency_score": signal.recency_score,
+                "official_score": signal.official_score,
+                "explainer_score": signal.explainer_score,
+            },
+            "event_frame": {
+                "actors": list(frame.actors),
+                "actions": list(frame.actions),
+                "targets": list(frame.targets),
+                "places": list(frame.places),
+                "counts": list(frame.counts),
+                "recency_hits": list(frame.recency_hits),
+                "official_hits": list(frame.official_hits),
+                "negative_hits": list(frame.negative_hits),
+                "hedge_hits": list(frame.hedge_hits),
+                "confirmation_state": frame.confirmation_state,
+            },
+        },
     }
 
 
 def looks_like_explainer_text(text: str) -> bool:
-    signals = detect_story_signals(text)
-    return bool(signals["explainer_like"])
+    return bool(detect_story_signals(text)["explainer_like"])
 
 
 def should_downgrade_explainer_urgency(text: str) -> bool:
-    signals = detect_story_signals(text)
-    return bool(signals["downgrade_explainer"])
+    return bool(detect_story_signals(text)["downgrade_explainer"])
 
 
 def looks_like_live_event_update(text: str) -> bool:
-    signals = detect_story_signals(text)
-    return bool(signals["live_event_update"])
+    return bool(detect_story_signals(text)["live_event_update"])

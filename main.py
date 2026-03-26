@@ -120,8 +120,13 @@ from db import (
     set_meta,
     purge_breaking_story_history,
 )
-from news_taxonomy import load_news_taxonomy, match_breaking_category, match_news_category
-from news_signals import looks_like_live_event_update, should_downgrade_explainer_urgency
+from news_taxonomy import (
+    get_ontology_health_snapshot,
+    load_news_taxonomy,
+    match_breaking_category,
+    match_news_category,
+)
+from news_signals import detect_story_signals, looks_like_live_event_update, should_downgrade_explainer_urgency
 from prompts import quiet_period_message
 from severity_classifier import classify_message_severity
 from utils import (
@@ -1387,9 +1392,10 @@ def _contains_breaking_keyword(text: str) -> bool:
     normalized = normalize_space(text)
     if not normalized:
         return False
-    if should_downgrade_explainer_urgency(normalized) or not looks_like_live_event_update(normalized):
+    signals = detect_story_signals(normalized)
+    if bool(signals.get("downgrade_explainer")) or not bool(signals.get("live_event_update")):
         return False
-    if match_breaking_category(normalized) is not None:
+    if bool(signals.get("breaking_eligible")) or match_breaking_category(normalized) is not None:
         return True
     keywords = _breaking_keywords()
     if not keywords:
@@ -6815,6 +6821,16 @@ def _web_status_payload() -> Dict[str, object]:
     except Exception:
         ai_cache_stats = {"hits": 0.0, "misses": 0.0, "hit_rate": 0.0}
     try:
+        ontology_health = get_ontology_health_snapshot()
+    except Exception:
+        ontology_health = {
+            "version": 0,
+            "compiled_category_count": 0,
+            "fallback_label_rate": 0.0,
+            "unmatched_live_event_rate": 0.0,
+            "top_unmatched_event_tokens": [],
+        }
+    try:
         ai_cache_entries = count_ai_decision_cache_entries()
     except Exception:
         ai_cache_entries = 0
@@ -6856,6 +6872,7 @@ def _web_status_payload() -> Dict[str, object]:
             "active": active_story_clusters,
             "recent_decisions_1h": recent_story_decisions,
         },
+        "ontology": ontology_health,
         "delivery_context": context_stats,
         "query_mode": _is_query_mode_enabled(),
         "query_mode_available": _is_query_runtime_available(),

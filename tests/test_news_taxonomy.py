@@ -6,6 +6,7 @@ import pytest
 
 import main
 import news_taxonomy
+import news_signals
 import utils
 
 
@@ -72,7 +73,17 @@ def test_taxonomy_schema_requires_valid_entries(tmp_path) -> None:
 def test_taxonomy_contains_expected_category_count() -> None:
     taxonomy = news_taxonomy.get_news_taxonomy()
 
+    assert taxonomy.version == 2
     assert len(taxonomy.categories) == 60
+
+
+def test_phrase_expansion_matches_compact_airstrike_variant() -> None:
+    match = news_taxonomy.match_news_category(
+        "Officials confirmed an airstrike on the depot overnight."
+    )
+
+    assert match is not None
+    assert match.category_key == "missile_strike"
 
 
 def test_precedence_prefers_higher_scoring_category() -> None:
@@ -118,3 +129,36 @@ def test_legacy_breaking_keywords_do_not_create_specific_labels(monkeypatch) -> 
     )
 
     assert label == "Breaking"
+
+
+def test_ontology_health_snapshot_tracks_fallback_and_unmatched_live_events() -> None:
+    news_taxonomy.reset_ontology_health_stats()
+    utils.choose_alert_label("A museum exhibition reopened downtown after renovation work finished.", severity="medium")
+    news_signals.detect_story_signals("Sirens and warnings sounded over the coast minutes ago.")
+
+    snapshot = news_taxonomy.get_ontology_health_snapshot()
+
+    assert snapshot["version"] == 2
+    assert snapshot["compiled_category_count"] == 60
+    assert snapshot["fallback_label_rate"] >= 0.0
+    assert snapshot["unmatched_live_event_rate"] >= 0.0
+    assert isinstance(snapshot["top_unmatched_event_tokens"], list)
+
+
+def test_status_payload_exposes_ontology_health(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main,
+        "get_ontology_health_snapshot",
+        lambda: {
+            "version": 2,
+            "compiled_category_count": 60,
+            "fallback_label_rate": 0.12,
+            "unmatched_live_event_rate": 0.08,
+            "top_unmatched_event_tokens": ["sirens", "coast"],
+        },
+    )
+
+    payload = main._web_status_payload()
+
+    assert payload["ontology"]["version"] == 2
+    assert payload["ontology"]["compiled_category_count"] == 60

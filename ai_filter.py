@@ -537,9 +537,12 @@ def _fallback_summary(text: str) -> Optional[str]:
 
 
 def _severity_from_text_heuristic(text: str) -> Literal["high", "medium", "low"]:
-    lowered = text.lower()
     signals = detect_story_signals(text)
     category_match = match_news_category(text)
+    ontology = signals.get("ontology") or {}
+    frame = ontology.get("event_frame") or {}
+    signal_breakdown = ontology.get("signal_breakdown") or {}
+    live_event_score = float(signal_breakdown.get("live_event_score") or 0.0)
 
     if category_match is not None:
         bias = category_match.severity_bias
@@ -553,49 +556,17 @@ def _severity_from_text_heuristic(text: str) -> Literal["high", "medium", "low"]
             return "low"
         return "medium"
 
-    high_terms = (
-        "explosion",
-        "missile",
-        "strike",
-        "killed",
-        "dead",
-        "casualties",
-        "airstrike",
-        "attack",
-        "evacuation",
-        "war",
-        "mobilization",
-        "state of emergency",
-        "martial law",
-        "earthquake",
-        "flood",
-        "wildfire",
-        "blast",
-        "drone strike",
-    )
-    medium_terms = (
-        "sanction",
-        "outage",
-        "cyberattack",
-        "ban",
-        "shutdown",
-        "airspace",
-        "rates",
-        "inflation",
-        "policy",
-        "military exercise",
-        "warning",
-        "evacuate",
-    )
-
-    high_hits = sum(1 for term in high_terms if term in lowered)
-    medium_hits = sum(1 for term in medium_terms if term in lowered)
-
-    if high_hits >= 1:
+    if bool(signals.get("live_event_update")) and (
+        live_event_score >= 1.6
+        or (
+            frame.get("actions")
+            and (frame.get("recency_hits") or frame.get("official_hits"))
+        )
+    ):
         if bool(signals.get("downgrade_explainer")):
             return "medium"
         return "high"
-    if medium_hits >= 1:
+    if bool(signals.get("concrete_event")) or frame.get("targets") or frame.get("official_hits"):
         return "medium"
     if len(text.strip()) < 24 or _likely_noise(text):
         return "low"
