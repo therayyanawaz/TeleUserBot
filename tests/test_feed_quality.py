@@ -181,3 +181,86 @@ async def test_handle_ai_inbound_job_uses_ai_decision_severity(monkeypatch):
     assert payload["severity"] == "medium"
     assert payload["filter_decision"]["action"] == "digest"
     assert captured["priority"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_resolve_dynamic_delivery_context_uses_evidence_backed_candidate(monkeypatch):
+    main.delivery_context_stats.clear()
+    monkeypatch.setattr(main.time, "time", lambda: 1700003600)
+    monkeypatch.setattr(
+        main,
+        "load_archive_since",
+        lambda *_args, **_kwargs: [
+            {
+                "raw_text": "Officials said rockets landed near Haifa overnight.",
+                "timestamp": 1700000000,
+                "source_name": "Wire",
+            }
+        ],
+    )
+    monkeypatch.setattr(main, "auth_ready", False)
+
+    resolved = await main._resolve_dynamic_delivery_context(
+        current_text="Officials say two rockets landed near Acre overnight.",
+        headline="Officials say two rockets landed near Acre overnight.",
+        candidate_context="Why it matters: Earlier reports centered on Haifa; this update places the same exchange in Acre.",
+        source_title="Wire",
+    )
+
+    assert "Haifa" in resolved
+    assert "Acre" in resolved
+    assert main.delivery_context_stats["context_generated"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_dynamic_delivery_context_omits_without_anchor(monkeypatch):
+    main.delivery_context_stats.clear()
+    monkeypatch.setattr(main.time, "time", lambda: 1700003600)
+    monkeypatch.setattr(
+        main,
+        "load_archive_since",
+        lambda *_args, **_kwargs: [
+            {
+                "raw_text": "Wheat prices rose in Buenos Aires after new export guidance.",
+                "timestamp": 1700000000,
+                "source_name": "Desk",
+            }
+        ],
+    )
+    monkeypatch.setattr(main, "auth_ready", False)
+
+    resolved = await main._resolve_dynamic_delivery_context(
+        current_text="Officials confirmed the port reopened overnight in Basra.",
+        headline="Officials confirmed the port reopened overnight in Basra.",
+        source_title="Desk",
+    )
+
+    assert resolved == ""
+    assert main.delivery_context_stats["context_omitted_no_anchor"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_dynamic_delivery_context_omits_without_delta(monkeypatch):
+    main.delivery_context_stats.clear()
+    monkeypatch.setattr(main.time, "time", lambda: 1700003600)
+    monkeypatch.setattr(
+        main,
+        "load_archive_since",
+        lambda *_args, **_kwargs: [
+            {
+                "raw_text": "Officials said rockets landed near Haifa overnight.",
+                "timestamp": 1700000000,
+                "source_name": "Wire",
+            }
+        ],
+    )
+    monkeypatch.setattr(main, "auth_ready", False)
+
+    resolved = await main._resolve_dynamic_delivery_context(
+        current_text="Officials say rockets landed near Haifa overnight.",
+        headline="Officials say rockets landed near Haifa overnight.",
+        source_title="Wire",
+    )
+
+    assert resolved == ""
+    assert main.delivery_context_stats["context_omitted_no_delta"] >= 1

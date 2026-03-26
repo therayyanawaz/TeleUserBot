@@ -50,6 +50,7 @@ from ai_filter import (
     get_quota_health,
     normalize_feed_summary_html,
     resolve_breaking_style_mode,
+    resolve_vital_rational_view_for_delivery,
     summarize_breaking_headline,
     summarize_vital_rational_view,
     summarize_or_skip,
@@ -69,8 +70,11 @@ from auth import (
 )
 from breaking_story import (
     BreakingStoryCandidate,
+    ContextEvidence,
     build_breaking_story_candidate,
     compute_breaking_story_cluster_key,
+    derive_context_evidence,
+    deserialize_breaking_story_facts,
     resolve_breaking_story_cluster,
     serialize_breaking_story_facts,
 )
@@ -116,7 +120,7 @@ from db import (
     set_meta,
     purge_breaking_story_history,
 )
-from news_taxonomy import load_news_taxonomy, match_breaking_category
+from news_taxonomy import load_news_taxonomy, match_breaking_category, match_news_category
 from news_signals import looks_like_live_event_update, should_downgrade_explainer_urgency
 from prompts import quiet_period_message
 from severity_classifier import classify_message_severity
@@ -303,6 +307,7 @@ breaking_delivery_refs: Dict[str, Dict[str, object]] = {}
 breaking_story_ref_cache: Dict[str, object] = {}
 breaking_topic_threads: List[Dict[str, object]] = []
 breaking_topic_lock = asyncio.Lock()
+delivery_context_stats: Dict[str, int] = defaultdict(int)
 query_allowed_bot_user_id: int | None = None
 query_bot_user_id_checked: bool = False
 instance_lock_handle = None
@@ -2834,6 +2839,199 @@ def _clean_editorial_context(
     return _truncate_context_line(context, limit=context_limit)
 
 
+def _record_delivery_context_stat(key: str) -> None:
+    delivery_context_stats[str(key or "").strip()] += 1
+
+
+def _delivery_context_stats_snapshot() -> Dict[str, int]:
+    keys = (
+        "context_generated",
+        "context_omitted_no_anchor",
+        "context_omitted_no_delta",
+        "context_rejected_generic",
+    )
+    return {key: int(delivery_context_stats.get(key, 0)) for key in keys}
+
+
+def _resolve_story_candidate_taxonomy(text: str) -> str:
+    match = match_news_category(text) or match_breaking_category(text)
+    if match is None:
+        return ""
+    return normalize_space(str(getattr(match, "category_key", "") or ""))
+
+
+def _build_story_context_candidate(
+    *,
+    text: str,
+    headline: str = "",
+    topic_key: str = "",
+    taxonomy_key: str = "",
+    source: str = "",
+    timestamp: int | None = None,
+) -> BreakingStoryCandidate:
+    resolved_text = normalize_space(text or headline)
+    resolved_headline = normalize_space(headline or resolved_text)
+    resolved_taxonomy = normalize_space(taxonomy_key or "")
+    if not resolved_taxonomy:
+        resolved_taxonomy = _resolve_story_candidate_taxonomy("\n".join(part for part in (resolved_headline, resolved_text) if part))
+    return build_breaking_story_candidate(
+        text=resolved_text,
+        headline=resolved_headline,
+        topic_key=topic_key,
+        source=source,
+        timestamp=timestamp,
+        taxonomy_key=resolved_taxonomy,
+    )
+
+
+def _best_archive_context_evidence(
+    candidate: BreakingStoryCandidate,
+    *,
+    hours: int = 6,
+    limit: int = 160,
+) -> tuple[ContextEvidence | None, str]:
+    now = int(time.time())
+    since_ts = max(0, now - max(1, hours) * 3600)
+    best: ContextEvidence | None = None
+    best_score = 0.0
+    best_ts = 0
+    saw_related = False
+    for row in load_archive_since(since_ts, limit):
+        raw_text = normalize_space(str(row.get("raw_text") or ""))
+        if not raw_text:
+            continue
+        ts = int(row.get("timestamp") or 0)
+        if raw_text == candidate.text or (ts and abs(candidate.timestamp - ts) <= 1 and raw_text == candidate.headline):
+            continue
+        anchor = _build_story_context_candidate(
+            text=raw_text,
+            headline=raw_text,
+            source=str(row.get("source_name") or ""),
+            timestamp=ts or None,
+        )
+        evidence, score, reason = derive_context_evidence(
+            candidate,
+            anchor,
+            age_label=_format_story_bridge_age(max(0, now - max(0, ts))),
+        )
+        if reason != "no_anchor":
+            saw_related = True
+        if evidence is None:
+            continue
+        if score > best_score or (abs(score - best_score) < 0.001 and ts > best_ts):
+            best = evidence
+            best_score = score
+            best_ts = ts
+    if best is not None:
+        return best, "context_generated"
+    return None, ("context_omitted_no_delta" if saw_related else "context_omitted_no_anchor")
+
+
+def _best_cluster_context_evidence(
+    candidate: BreakingStoryCandidate,
+    cluster_id: str,
+) -> tuple[ContextEvidence | None, str]:
+    if not cluster_id:
+        return None, "context_omitted_no_anchor"
+    now = int(time.time())
+    best: ContextEvidence | None = None
+    best_score = 0.0
+    best_ts = 0
+    saw_related = False
+    events = load_breaking_story_events(cluster_id=cluster_id, limit=8)
+    for event in reversed(events):
+        if str(event.get("delta_kind") or "") == "duplicate_echo":
+            continue
+        display_text = normalize_space(str(event.get("display_text") or event.get("normalized_text") or ""))
+        if not display_text:
+            continue
+        ts = int(event.get("created_ts") or 0)
+        facts = deserialize_breaking_story_facts(event.get("facts_json"))
+        anchor = BreakingStoryCandidate(
+            topic_key=candidate.topic_key,
+            taxonomy_key=candidate.taxonomy_key,
+            headline=display_text,
+            text=display_text,
+            source="",
+            timestamp=ts or candidate.timestamp,
+            facts=facts,
+        )
+        evidence, score, reason = derive_context_evidence(
+            candidate,
+            anchor,
+            age_label=_format_story_bridge_age(max(0, now - max(0, ts))),
+        )
+        if reason != "no_anchor":
+            saw_related = True
+        if evidence is None:
+            continue
+        if score > best_score or (abs(score - best_score) < 0.001 and ts > best_ts):
+            best = evidence
+            best_score = score
+            best_ts = ts
+    if best is not None:
+        return best, "context_generated"
+    return None, ("context_omitted_no_delta" if saw_related else "context_omitted_no_anchor")
+
+
+async def _resolve_dynamic_delivery_context(
+    *,
+    current_text: str,
+    headline: str,
+    candidate_context: str = "",
+    topic_key: str = "",
+    taxonomy_key: str = "",
+    source_title: str = "",
+    cluster_id: str = "",
+) -> str:
+    candidate = _build_story_context_candidate(
+        text=current_text,
+        headline=headline,
+        topic_key=topic_key,
+        taxonomy_key=taxonomy_key,
+        source=source_title,
+    )
+    if not candidate.text:
+        return ""
+
+    if cluster_id:
+        evidence, miss_key = _best_cluster_context_evidence(candidate, cluster_id)
+    else:
+        evidence, miss_key = _best_archive_context_evidence(candidate)
+    if evidence is None:
+        _record_delivery_context_stat(miss_key)
+        return ""
+
+    cleaned_candidate = resolve_vital_rational_view_for_delivery(
+        candidate.text,
+        candidate_context,
+        None,
+        evidence=evidence,
+    )
+    if cleaned_candidate:
+        _record_delivery_context_stat("context_generated")
+        return cleaned_candidate
+
+    if candidate_context:
+        _record_delivery_context_stat("context_rejected_generic")
+    if not auth_ready:
+        return ""
+
+    try:
+        generated = await summarize_vital_rational_view(
+            candidate.text,
+            _require_auth_manager(),
+            evidence=evidence,
+        )
+    except Exception:
+        LOGGER.debug("Dynamic context generation failed.", exc_info=True)
+        return ""
+    if generated:
+        _record_delivery_context_stat("context_generated")
+        return generated
+    return ""
+
+
 def _render_editorial_post(
     *,
     category_label: str,
@@ -2857,6 +3055,7 @@ def _format_summary_text(
     *,
     raw_text: str | None = None,
     severity: str = "medium",
+    context_override: str | None = None,
 ) -> str:
     raw_basis = normalize_space(str(raw_text or ""))
     safe_summary = str(summary or "").strip()
@@ -2882,7 +3081,7 @@ def _format_summary_text(
             severity=severity,
         )
     clean_context = _clean_editorial_context(
-        context,
+        context_override if context_override is not None else context,
         headline=clean_headline,
         source_title=source_title,
         category_label=category_label,
@@ -3236,47 +3435,25 @@ async def _resolve_breaking_story_root_ref(cluster: Dict[str, object]) -> object
     return ref
 
 
-def _breaking_story_cluster_context(cluster_id: str, *, limit: int = 3) -> List[str]:
-    if not cluster_id:
-        return []
-    now = int(time.time())
-    out: List[str] = []
-    with contextlib.suppress(Exception):
-        events = load_breaking_story_events(cluster_id=cluster_id, limit=max(6, limit + 3))
-        for event in reversed(events):
-            if str(event.get("delta_kind") or "") == "duplicate_echo":
-                continue
-            display_text = normalize_space(
-                str(event.get("display_text") or event.get("normalized_text") or "")
-            )
-            if not display_text:
-                continue
-            age = max(0, now - int(event.get("created_ts") or now))
-            out.append(f"{_format_story_bridge_age(age)}: {_truncate_context_line(display_text, limit=140)}")
-            if len(out) >= limit:
-                break
-    out.reverse()
-    return out
-
-
-async def _cluster_story_bridge(candidate_text: str, cluster_id: str) -> str:
-    recent_context = _breaking_story_cluster_context(cluster_id)
-    if not recent_context or not auth_ready:
-        return ""
-    if not _should_attach_vital_opinion(candidate_text, recent_context):
-        return ""
-    try:
-        return (
-            await summarize_vital_rational_view(
-                candidate_text,
-                _require_auth_manager(),
-                recent_context=recent_context,
-            )
-            or ""
-        )
-    except Exception:
-        LOGGER.debug("Cluster-local story bridge generation failed.", exc_info=True)
-        return ""
+async def _cluster_story_bridge(
+    candidate_text: str,
+    headline: str,
+    cluster_id: str,
+    *,
+    topic_key: str = "",
+    taxonomy_key: str = "",
+    source_title: str = "",
+    candidate_context: str = "",
+) -> str:
+    return await _resolve_dynamic_delivery_context(
+        current_text=candidate_text,
+        headline=headline,
+        candidate_context=candidate_context,
+        topic_key=topic_key,
+        taxonomy_key=taxonomy_key,
+        source_title=source_title,
+        cluster_id=cluster_id,
+    )
 
 
 def _persist_breaking_story_cluster(
@@ -3363,7 +3540,24 @@ async def _apply_breaking_story_cluster_policy(
     decision = resolution.decision if resolution is not None else "new_story"
     effective_bridge = story_bridge or ""
     if decision == "material_update" and cluster is not None:
-        effective_bridge = await _cluster_story_bridge(candidate_text, str(cluster.get("cluster_id") or ""))
+        effective_bridge = await _cluster_story_bridge(
+            candidate_text,
+            headline,
+            str(cluster.get("cluster_id") or ""),
+            topic_key=candidate.topic_key,
+            taxonomy_key=candidate.taxonomy_key,
+            source_title=source,
+            candidate_context=effective_bridge,
+        )
+    elif decision == "new_story" or cluster is None:
+        effective_bridge = await _resolve_dynamic_delivery_context(
+            current_text=candidate_text,
+            headline=headline,
+            candidate_context=effective_bridge,
+            topic_key=candidate.topic_key,
+            taxonomy_key=candidate.taxonomy_key,
+            source_title=source,
+        )
     elif decision in {"duplicate_echo", "minor_refinement"}:
         effective_bridge = ""
 
@@ -4542,9 +4736,16 @@ async def _process_single_message(msg: Message) -> None:
             mark_seen(channel_id, msg.id)
             return
         reply_to = await _resolve_source_reply_target(msg)
+        summary_headline, summary_context = extract_feed_summary_parts(summary, text)
+        resolved_context = await _resolve_dynamic_delivery_context(
+            current_text=text,
+            headline=summary_headline,
+            candidate_context=summary_context,
+            source_title=source,
+        )
         sent_ref = await _send_single_media(
             msg,
-            _format_summary_text(source, summary, raw_text=text),
+            _format_summary_text(source, summary, raw_text=text, context_override=resolved_context),
             reply_to=reply_to,
         )
         _register_source_delivery_refs(
@@ -4565,8 +4766,15 @@ async def _process_single_message(msg: Message) -> None:
         return
 
     reply_to = await _resolve_source_reply_target(msg)
+    summary_headline, summary_context = extract_feed_summary_parts(summary, text)
+    resolved_context = await _resolve_dynamic_delivery_context(
+        current_text=text,
+        headline=summary_headline,
+        candidate_context=summary_context,
+        source_title=source,
+    )
     sent_ref = await _send_text_with_ref(
-        _format_summary_text(source, summary, raw_text=text),
+        _format_summary_text(source, summary, raw_text=text, context_override=resolved_context),
         reply_to=reply_to,
     )
     _register_source_delivery_refs(
@@ -4623,9 +4831,21 @@ async def _process_album(messages: List[Message]) -> None:
         return
 
     reply_to = await _resolve_source_reply_target(messages[0])
+    summary_headline, summary_context = extract_feed_summary_parts(summary, combined_caption)
+    resolved_context = await _resolve_dynamic_delivery_context(
+        current_text=combined_caption,
+        headline=summary_headline,
+        candidate_context=summary_context,
+        source_title=source,
+    )
     sent_ref = await _send_album(
         messages,
-        _format_summary_text(source, summary, raw_text=combined_caption),
+        _format_summary_text(
+            source,
+            summary,
+            raw_text=combined_caption,
+            context_override=resolved_context,
+        ),
         reply_to=reply_to,
     )
     _register_source_delivery_refs(
@@ -5225,23 +5445,8 @@ async def _handle_ai_inbound_job(job: Dict[str, object]) -> None:
     decision = await decide_filter_action(candidate_text, _require_auth_manager())
     payload["triage_severity"] = str(payload.get("severity") or "medium")
     payload["severity"] = decision.severity
-    if resolve_breaking_style_mode() == "unhinged" and decision.severity == "high":
-        recent_context = _recent_story_bridge_context(candidate_text)
-        if recent_context:
-            try:
-                decision.story_bridge_html = (
-                    await summarize_vital_rational_view(
-                        candidate_text,
-                        _require_auth_manager(),
-                        recent_context=recent_context,
-                    )
-                    or ""
-                )
-            except Exception:
-                LOGGER.debug("Pipeline story-bridge generation failed.", exc_info=True)
-                decision.story_bridge_html = ""
-        else:
-            decision.story_bridge_html = ""
+    if decision.severity == "high":
+        decision.story_bridge_html = ""
     payload["filter_decision"] = {
         "action": decision.action,
         "severity": decision.severity,
@@ -5379,11 +5584,20 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
     if not summary_html:
         summary_html = sanitize_telegram_html(_truncate_context_line(candidate_text, limit=700))
     reply_to = await _resolve_source_reply_target(primary)
+    summary_headline, summary_context = extract_feed_summary_parts(summary_html, candidate_text)
+    resolved_context = await _resolve_dynamic_delivery_context(
+        current_text=candidate_text,
+        headline=summary_headline,
+        candidate_context=summary_context,
+        topic_key=str(decision.get("topic_key") or ""),
+        source_title=source,
+    )
     formatted_summary = _format_summary_text(
         source,
         summary_html,
         raw_text=candidate_text,
         severity=severity,
+        context_override=resolved_context,
     )
     if has_media:
         if kind == "album":
@@ -6620,6 +6834,7 @@ def _web_status_payload() -> Dict[str, object]:
         )
     except Exception:
         recent_story_decisions = {}
+    context_stats = _delivery_context_stats_snapshot()
     return {
         "ok": not bool(startup_error),
         "ready": bool(startup_ready),
@@ -6641,6 +6856,7 @@ def _web_status_payload() -> Dict[str, object]:
             "active": active_story_clusters,
             "recent_decisions_1h": recent_story_decisions,
         },
+        "delivery_context": context_stats,
         "query_mode": _is_query_mode_enabled(),
         "query_mode_available": _is_query_runtime_available(),
         "html_formatting": _is_html_formatting_enabled(),
@@ -6696,6 +6912,7 @@ def _digest_status_text() -> str:
     auth_status = _auth_status_summary()
     auth_reason = sanitize_telegram_html(_trim_runtime_reason(auth_failure_reason or ""))
     disabled_features = ", ".join(auth_features_disabled) if auth_features_disabled else "none"
+    context_stats = _delivery_context_stats_snapshot()
     query_state = "on" if _is_query_mode_enabled() else "off"
     if _is_query_mode_enabled() and not _is_query_runtime_available():
         query_state = "degraded"
@@ -6716,6 +6933,10 @@ def _digest_status_text() -> str:
         f"• Severity router: <code>{severity_state}</code><br>"
         f"• Query mode: <code>{query_state}</code><br>"
         f"• HTML formatting: <code>{'on' if _is_html_formatting_enabled() else 'off'}</code><br>"
+        f"• Dynamic context: <code>{context_stats.get('context_generated', 0)}</code> shown, "
+        f"<code>{context_stats.get('context_omitted_no_anchor', 0)}</code> no anchor, "
+        f"<code>{context_stats.get('context_omitted_no_delta', 0)}</code> no delta, "
+        f"<code>{context_stats.get('context_rejected_generic', 0)}</code> rejected<br>"
         f"• Quota health: <code>{quota.get('status', 'unknown')}</code><br>"
         f"• Recent 429 (1h): <code>{quota.get('recent_429_count', 0)}</code> / "
         f"threshold <code>{threshold}</code>"

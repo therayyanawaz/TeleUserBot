@@ -9,6 +9,7 @@ import main
 from breaking_story import (
     build_breaking_story_candidate,
     compute_breaking_story_cluster_key,
+    derive_context_evidence,
     resolve_breaking_story_cluster,
     serialize_breaking_story_facts,
 )
@@ -108,6 +109,48 @@ def test_story_cluster_detects_official_confirmation():
 
     assert resolution.decision == "material_update"
     assert resolution.reason in {"official_confirmation", "casualty_change"}
+
+
+def test_derive_context_evidence_detects_casualty_change():
+    earlier = build_breaking_story_candidate(
+        text="Iranian rocket impact in Bnei Brak leaves 9 injured.",
+        headline="Iranian rocket impact in Bnei Brak leaves 9 injured.",
+        topic_key="bnei_brak_impact",
+        timestamp=1700000000,
+    )
+    later = build_breaking_story_candidate(
+        text="Iranian rocket impact in Bnei Brak leaves 12 injured, according to Magen David Adom.",
+        headline="Iranian rocket impact in Bnei Brak leaves 12 injured.",
+        topic_key="bnei_brak_impact",
+        timestamp=1700000060,
+    )
+
+    evidence, _score, reason = derive_context_evidence(later, earlier, age_label="1m ago")
+
+    assert reason == "casualty_change"
+    assert evidence is not None
+    assert "9" in evidence.anchor_detail
+    assert "12" in evidence.delta_detail
+
+
+def test_derive_context_evidence_rejects_no_delta_continuation():
+    earlier = build_breaking_story_candidate(
+        text="Officials said rockets landed near Haifa overnight.",
+        headline="Officials said rockets landed near Haifa overnight.",
+        topic_key="haifa_rockets",
+        timestamp=1700000000,
+    )
+    later = build_breaking_story_candidate(
+        text="Officials say rockets landed near Haifa overnight.",
+        headline="Officials say rockets landed near Haifa overnight.",
+        topic_key="haifa_rockets",
+        timestamp=1700000030,
+    )
+
+    evidence, _score, reason = derive_context_evidence(later, earlier, age_label="moments ago")
+
+    assert evidence is None
+    assert reason == "no_delta"
 
 
 def test_breaking_story_cluster_db_round_trip(isolated_db):

@@ -179,6 +179,15 @@ _ACTOR_PATTERNS = {
     "united_states": ("u.s.", "u.s", "us", "american", "united states"),
     "mda": ("magen david adom", "mda"),
 }
+_ACTOR_LABELS = {
+    "iran": "Iran",
+    "israel": "Israel",
+    "hezbollah": "Hezbollah",
+    "hamas": "Hamas",
+    "houthis": "the Houthis",
+    "united_states": "the United States",
+    "mda": "Magen David Adom",
+}
 _PHASE_MARKERS = {
     "launch": ("launch", "launches", "fired", "fire", "barrage", "salvo", "sirens"),
     "interception": ("intercept", "intercepted", "interception", "downed", "air defense"),
@@ -186,6 +195,14 @@ _PHASE_MARKERS = {
     "damage": ("damage", "damaged", "destroyed", "fire", "burning"),
     "casualties": ("casualties", "wounded", "injured", "dead", "killed", "fatalities", "hurt"),
     "retaliation": ("retaliation", "retaliatory", "response", "counterstrike", "counter-strike"),
+}
+_PHASE_LABELS = {
+    "launch": "launches",
+    "interception": "interceptions",
+    "impact": "impacts",
+    "damage": "damage reports",
+    "casualties": "casualty reports",
+    "retaliation": "retaliation",
 }
 
 
@@ -223,6 +240,20 @@ class BreakingStoryResolution:
     reason: str
     should_edit_root: bool = False
     mismatch_reason: str = ""
+
+
+@dataclass(frozen=True)
+class ContextEvidence:
+    delta_kind: str
+    score: float
+    anchor_text: str
+    anchor_age_label: str
+    anchor_detail: str
+    delta_detail: str
+    anchor_markers: tuple[str, ...]
+    delta_markers: tuple[str, ...]
+    topic_key: str
+    taxonomy_key: str
 
 
 def _clean_text(value: str) -> str:
@@ -487,6 +518,20 @@ def _normalized_similarity(left: str, right: str) -> float:
     return SequenceMatcher(None, left, right).ratio()
 
 
+def _shared_story_token_count(left: str, right: str) -> int:
+    left_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", normalize_taxonomy_text(left))
+        if len(token) >= 4 and token not in _TOPIC_STOPWORDS
+    }
+    right_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", normalize_taxonomy_text(right))
+        if len(token) >= 4 and token not in _TOPIC_STOPWORDS
+    }
+    return len(left_tokens & right_tokens)
+
+
 def _cluster_match_score(
     candidate: BreakingStoryCandidate,
     cluster: Mapping[str, object],
@@ -579,6 +624,197 @@ def _has_material_delta(candidate: BreakingStoryCandidate, cluster_facts: Breaki
     if new_phases and (set(candidate.facts.locations) & set(cluster_facts.locations) or set(candidate.facts.actors) & set(cluster_facts.actors)):
         return True, "phase_change"
     return False, ""
+
+
+def _display_actor(value: str) -> str:
+    clean = normalize_space(str(value or "")).lower()
+    return _ACTOR_LABELS.get(clean, normalize_space(clean.replace("_", " ")).title())
+
+
+def _display_phase(value: str) -> str:
+    clean = normalize_space(str(value or "")).lower()
+    return _PHASE_LABELS.get(clean, clean.replace("_", " "))
+
+
+def _first_value(values: Sequence[str]) -> str:
+    return normalize_space(str(values[0])) if values else ""
+
+
+def _token_markers(*values: str) -> tuple[str, ...]:
+    markers: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        clean = normalize_taxonomy_text(value)
+        if not clean:
+            continue
+        if clean not in seen and len(clean) >= 3:
+            seen.add(clean)
+            markers.append(clean)
+        for token in _DIGIT_RE.findall(clean):
+            if token not in seen:
+                seen.add(token)
+                markers.append(token)
+        for token in re.findall(r"[a-z0-9]+", clean):
+            if len(token) < 4 or token in _TOPIC_STOPWORDS or token in seen:
+                continue
+            seen.add(token)
+            markers.append(token)
+    return tuple(markers)
+
+
+def _detail_with_location(detail: str, location: str) -> str:
+    clean_detail = normalize_space(detail)
+    clean_location = normalize_space(location)
+    if not clean_detail:
+        return ""
+    if not clean_location:
+        return clean_detail
+    if clean_location.lower() in clean_detail.lower():
+        return clean_detail
+    return f"{clean_detail} in {clean_location}"
+
+
+def _pseudo_cluster(candidate: BreakingStoryCandidate) -> Mapping[str, object]:
+    return {
+        "topic_key": candidate.topic_key,
+        "taxonomy_key": candidate.taxonomy_key,
+    }
+
+
+def derive_context_evidence(
+    current: BreakingStoryCandidate,
+    anchor: BreakingStoryCandidate,
+    *,
+    age_label: str = "",
+    min_match_score: float = 42.0,
+) -> tuple[ContextEvidence | None, float, str]:
+    score, conflict, _reason = _cluster_match_score(current, _pseudo_cluster(anchor), anchor.facts)
+    shared_story_tokens = _shared_story_token_count(current.facts.normalized_text, anchor.facts.normalized_text)
+    if conflict or (score < float(min_match_score) and shared_story_tokens < 2):
+        return None, score, "no_anchor"
+
+    anchor_location = _first_value(anchor.facts.locations)
+    current_location = _first_value(current.facts.locations)
+    anchor_target = _first_value(anchor.facts.targets)
+    current_target = _first_value(current.facts.targets)
+    anchor_actor = _display_actor(_first_value(anchor.facts.actors))
+    current_actor = _display_actor(_first_value(current.facts.actors))
+    anchor_phase = _display_phase(_first_value(anchor.facts.phases))
+    current_phase = _display_phase(_first_value(current.facts.phases))
+    shared_location = bool(set(current.facts.locations) & set(anchor.facts.locations))
+    shared_actor = bool(set(current.facts.actors) & set(anchor.facts.actors))
+    shared_target = bool(set(current.facts.targets) & set(anchor.facts.targets))
+    shared_phase = bool(set(current.facts.phases) & set(anchor.facts.phases))
+
+    delta_kind = ""
+    anchor_detail = ""
+    delta_detail = ""
+    anchor_markers: tuple[str, ...] = ()
+    delta_markers: tuple[str, ...] = ()
+
+    current_casualty = _first_value(current.facts.casualty_numbers)
+    anchor_casualty = _first_value(anchor.facts.casualty_numbers)
+    current_event_count = _first_value(current.facts.event_numbers)
+    anchor_event_count = _first_value(anchor.facts.event_numbers)
+
+    if current_casualty and anchor_casualty and current_casualty != anchor_casualty:
+        delta_kind = "casualty_change"
+        anchor_detail = _detail_with_location(f"Earlier reports put casualties at {anchor_casualty}", anchor_location)
+        delta_detail = _detail_with_location(f"this update puts them at {current_casualty}", current_location or anchor_location)
+        anchor_markers = _token_markers(anchor_casualty, anchor_location)
+        delta_markers = _token_markers(current_casualty, current_location or anchor_location)
+    elif current_event_count and anchor_event_count and current_event_count != anchor_event_count:
+        delta_kind = "event_count_change"
+        event_label = current_phase or anchor_phase or "projectiles"
+        anchor_detail = _detail_with_location(
+            f"Earlier reports counted {anchor_event_count} {event_label}",
+            anchor_location,
+        )
+        delta_detail = _detail_with_location(
+            f"this update counts {current_event_count}",
+            current_location or anchor_location,
+        )
+        anchor_markers = _token_markers(anchor_event_count, anchor_location, event_label)
+        delta_markers = _token_markers(current_event_count, current_location or anchor_location, event_label)
+    elif current.facts.official_confirmation and not anchor.facts.official_confirmation:
+        delta_kind = "official_confirmation"
+        anchor_detail = _detail_with_location("Earlier reports were unconfirmed", anchor_location or current_location)
+        if current_casualty:
+            delta_detail = _detail_with_location(
+                f"this update adds official confirmation and reports {current_casualty} casualties",
+                current_location or anchor_location,
+            )
+        else:
+            delta_detail = _detail_with_location(
+                "this update adds official confirmation",
+                current_location or anchor_location,
+            )
+        anchor_markers = _token_markers(anchor_location or current_location, "unconfirmed")
+        delta_markers = _token_markers(current_location or anchor_location, current_casualty, "confirmation")
+    elif current_location and anchor_location and current_location.lower() != anchor_location.lower() and (shared_actor or shared_target or shared_phase):
+        delta_kind = "location_spread"
+        anchor_detail = f"Earlier reports centered on {anchor_location}"
+        delta_detail = f"this update places the same thread in {current_location}"
+        anchor_markers = _token_markers(anchor_location)
+        delta_markers = _token_markers(current_location)
+    elif current_target and anchor_target and current_target.lower() != anchor_target.lower() and (shared_actor or shared_location or shared_phase):
+        delta_kind = "target_shift"
+        anchor_scope = anchor_location or anchor_actor
+        anchor_detail = f"Earlier reports focused on {anchor_target}{f' near {anchor_scope}' if anchor_scope else ''}"
+        delta_detail = f"this update shifts the focus to {current_target}{f' near {current_location}' if current_location and not shared_location else ''}"
+        anchor_markers = _token_markers(anchor_target, anchor_location, anchor_actor)
+        delta_markers = _token_markers(current_target, current_location, current_actor)
+    elif current_actor and anchor_actor and current_actor.lower() != anchor_actor.lower() and (shared_target or shared_location):
+        delta_kind = "actor_shift"
+        anchor_detail = _detail_with_location(f"Earlier reports pointed to {anchor_actor}", anchor_location)
+        delta_detail = _detail_with_location(f"this update points to {current_actor}", current_location or anchor_location)
+        anchor_markers = _token_markers(anchor_actor, anchor_location, anchor_target)
+        delta_markers = _token_markers(current_actor, current_location or anchor_location, current_target)
+    else:
+        new_phases = [phase for phase in current.facts.phases if phase not in anchor.facts.phases]
+        if new_phases and (shared_actor or shared_location or shared_target):
+            delta_kind = "phase_change"
+            anchor_scope = anchor_location or anchor_target or anchor_actor
+            current_scope = current_location or current_target or current_actor or anchor_scope
+            anchor_detail = f"Earlier reports focused on {anchor_phase or 'the earlier phase'}{f' around {anchor_scope}' if anchor_scope else ''}"
+            delta_detail = f"this update moves the story to {current_phase or _display_phase(new_phases[0])}{f' around {current_scope}' if current_scope else ''}"
+            anchor_markers = _token_markers(anchor_phase, anchor_scope)
+            delta_markers = _token_markers(current_phase or _display_phase(new_phases[0]), current_scope)
+        elif not anchor_location and current_location and (shared_actor or shared_target or shared_phase):
+            delta_kind = "sharper_attribution"
+            anchor_detail = "Earlier reports did not pin down the location"
+            delta_detail = f"this update places it in {current_location}"
+            anchor_markers = _token_markers("location")
+            delta_markers = _token_markers(current_location)
+        elif not anchor_target and current_target and (shared_actor or shared_location or shared_phase):
+            delta_kind = "sharper_attribution"
+            anchor_detail = "Earlier reports did not identify the target"
+            delta_detail = f"this update identifies the target as {current_target}"
+            anchor_markers = _token_markers("target")
+            delta_markers = _token_markers(current_target)
+        elif not anchor_actor and current_actor and (shared_target or shared_location or shared_phase):
+            delta_kind = "sharper_attribution"
+            anchor_detail = "Earlier reports did not pin down the actor"
+            delta_detail = f"this update points to {current_actor}"
+            anchor_markers = _token_markers("actor")
+            delta_markers = _token_markers(current_actor)
+
+    if not delta_kind or not anchor_detail or not delta_detail:
+        return None, score, "no_delta"
+
+    evidence = ContextEvidence(
+        delta_kind=delta_kind,
+        score=score,
+        anchor_text=anchor.text or anchor.headline,
+        anchor_age_label=normalize_space(age_label),
+        anchor_detail=anchor_detail,
+        delta_detail=delta_detail,
+        anchor_markers=anchor_markers,
+        delta_markers=delta_markers,
+        topic_key=current.topic_key or anchor.topic_key,
+        taxonomy_key=current.taxonomy_key or anchor.taxonomy_key,
+    )
+    return evidence, score, delta_kind
 
 
 def resolve_breaking_story_cluster(

@@ -4,6 +4,7 @@ import pytest
 
 import ai_filter
 import main
+from breaking_story import build_breaking_story_candidate, derive_context_evidence
 
 
 class _FakeAuthManager:
@@ -12,6 +13,24 @@ class _FakeAuthManager:
 
     async def refresh_auth_context(self):
         return {"token": "fake"}
+
+
+def _spread_evidence():
+    anchor = build_breaking_story_candidate(
+        text="Officials said rockets landed near Haifa overnight.",
+        headline="Officials said rockets landed near Haifa overnight.",
+        topic_key="haifa_rockets",
+        timestamp=1700000000,
+    )
+    current = build_breaking_story_candidate(
+        text="Officials say two rockets landed near Acre overnight.",
+        headline="Officials say two rockets landed near Acre overnight.",
+        topic_key="haifa_rockets",
+        timestamp=1700000300,
+    )
+    evidence, _score, _reason = derive_context_evidence(current, anchor, age_label="42m ago")
+    assert evidence is not None
+    return evidence
 
 
 def test_resolve_breaking_headline_for_delivery_rejects_invented_numbers(monkeypatch):
@@ -61,6 +80,7 @@ def test_validate_filter_decision_clears_breaking_bridge_in_unhinged_mode(monkey
 
 def test_validate_filter_decision_accepts_contextual_bridge_in_unhinged_mode(monkeypatch):
     monkeypatch.setattr(ai_filter.config, "BREAKING_STYLE_MODE", "unhinged", raising=False)
+    evidence = _spread_evidence()
 
     decision = ai_filter._validate_filter_decision(
         {
@@ -76,6 +96,7 @@ def test_validate_filter_decision_accepts_contextual_bridge_in_unhinged_mode(mon
         },
         "Officials say two rockets landed near Acre overnight.",
         recent_context=["42m ago: Officials said rockets landed near Haifa overnight."],
+        context_evidence=evidence,
     )
 
     assert "Haifa" in decision.story_bridge_html
@@ -84,40 +105,46 @@ def test_validate_filter_decision_accepts_contextual_bridge_in_unhinged_mode(mon
 
 def test_resolve_vital_rational_view_for_delivery_rejects_generic_bridge(monkeypatch):
     monkeypatch.setattr(ai_filter.config, "BREAKING_STYLE_MODE", "unhinged", raising=False)
+    evidence = _spread_evidence()
 
     resolved = ai_filter.resolve_vital_rational_view_for_delivery(
         "Officials say two rockets landed near Acre overnight.",
         "Why it matters: This raises regional stability concerns.",
-        ["42m ago: Officials said rockets landed near Haifa overnight."],
+        None,
+        evidence=evidence,
     )
 
-    assert "regional stability" not in resolved.lower()
-    assert "Haifa" in resolved
-    assert "Acre" in resolved
+    assert resolved == ""
 
 
-def test_fallback_story_bridge_builds_spread_bridge(monkeypatch):
+def test_resolve_vital_rational_view_for_delivery_accepts_evidence_backed_bridge(monkeypatch):
     monkeypatch.setattr(ai_filter.config, "BREAKING_STYLE_MODE", "unhinged", raising=False)
+    evidence = _spread_evidence()
 
-    bridge = ai_filter._fallback_story_bridge(
+    bridge = ai_filter.resolve_vital_rational_view_for_delivery(
         "Officials say two rockets landed near Acre overnight.",
-        ["42m ago: Officials said rockets landed near Haifa overnight."],
+        "Why it matters: Earlier reports centered on Haifa; this update places the same exchange in Acre.",
+        None,
+        evidence=evidence,
     )
 
-    assert bridge is not None
+    assert bridge
     assert "Haifa" in bridge
     assert "Acre" in bridge
 
 
-def test_fallback_story_bridge_omits_when_no_relation(monkeypatch):
+def test_resolve_vital_rational_view_for_delivery_rejects_headline_restate(monkeypatch):
     monkeypatch.setattr(ai_filter.config, "BREAKING_STYLE_MODE", "unhinged", raising=False)
+    evidence = _spread_evidence()
 
-    bridge = ai_filter._fallback_story_bridge(
-        "A court hearing was delayed in Rabat.",
-        ["2h ago: Wheat prices rose in Buenos Aires after new export guidance."],
+    bridge = ai_filter.resolve_vital_rational_view_for_delivery(
+        "Officials say two rockets landed near Acre overnight.",
+        "Why it matters: Officials say two rockets landed near Acre overnight.",
+        None,
+        evidence=evidence,
     )
 
-    assert bridge is None
+    assert bridge == ""
 
 
 @pytest.mark.asyncio
