@@ -1,60 +1,87 @@
-# Telegram News Intelligence Userbot
+# ✨ TeleUserBot
 
-A production-grade Telegram userbot for real-time conflict/news monitoring, high-signal filtering, digest publishing, and private query/search.
+> 🛰️ A newsroom-grade Telegram userbot for real-time news monitoring, duplicate suppression, breaking alert routing, smart digests, and private evidence-first queries.
 
-It runs on your **personal Telegram account** with **Telethon**, while optionally delivering output through the **Telegram Bot API** to a destination chat, channel, or group.
+TeleUserBot turns a noisy pile of Telegram channels into a cleaner, sharper, more useful intelligence feed.
 
-## Why This Project Exists
+It runs on your **personal Telegram account** with **Telethon**, listens to channels and folder feeds in real time, filters weak or repeated posts, pushes urgent developments fast, rolls everything else into polished digests, and lets you ask private questions against recent coverage.
 
-Most Telegram news feeds have the same problems:
-- too much noise
-- too many duplicate reposts
-- too many weak alerts marked as urgent
-- no clean way to ask questions against recent coverage
+If you want something that feels closer to a private monitoring desk than a repost bot, this is what the project is built for. 💎
 
-This project fixes that by combining:
+## 🌍 Why TeleUserBot Exists
+
+Most Telegram monitoring setups break in the same places:
+
+- 🔁 the same update gets reposted everywhere
+- 🚨 weak signals get dressed up as breaking news
+- 🧱 raw channel dumps are hard to read at scale
+- 🔎 searching recent coverage inside Telegram is painful
+- 🧠 media-only posts often carry important text that never gets surfaced
+
+TeleUserBot fixes that by combining:
+
 - real-time Telegram intake
-- duplicate suppression
-- severity routing
-- digest generation
-- private search/query mode
-- Codex OAuth-backed summarization
+- multi-layer duplicate suppression
+- severity-aware routing
+- breaking-story continuity
+- hourly and daily digest generation
+- OCR translation for media-only posts
+- private query mode with Telegram-first evidence search
+- optional trusted web fallback when Telegram evidence is thin
+- Telegram HTML output with optional premium emoji rendering
 
-The result is a bot that can act like a private newsroom desk instead of a raw repost machine.
+## 🧠 Core Capabilities
 
-## Highlights
+### ⚡ Real-Time Intake
 
-- Real-time intake from:
-  - shared Telegram folder invite links (`FOLDER_INVITE_LINK`)
-  - manual extra sources (`EXTRA_SOURCES`)
-- Runs as a **userbot**, not a bot-token listener
-- Optional **Bot API destination mode** for clean delivery to a private feed chat
-- Strong duplicate suppression:
-  - text duplicate detection
-  - media duplicate detection
-  - visual media hashing for same-image/same-video reposts
-- Severity routing:
-  - high-severity updates can go out immediately
-  - medium/low updates go to digest
-- Digest system:
-  - hourly digest
-  - 24-hour digest
-  - optional digest pin rotation (`pinChatMessage` / `unpinChatMessage`)
-- Query assistant:
-  - ask questions in **Saved Messages** or your own bot PM
-  - Telegram-first evidence search
-  - optional trusted web fallback
-- OCR translation for media-only posts:
-  - image OCR
-  - first-frame video OCR
-  - translate only when non-English text is found
-- Reply-thread preservation:
-  - source reply chains can be carried into destination output
-  - follow-up media can stay attached to the right story thread
-- Telegram HTML output + optional premium emoji mapping
-- Replit/UptimeRobot-ready status server
+- Listen from a shared Telegram folder invite via `FOLDER_INVITE_LINK`
+- Add manual sources through `EXTRA_SOURCES`
+- Run as a real **userbot**, not only a bot-token listener
+- Deliver output to a user destination or through the Telegram Bot API
 
-## Project Structure
+### 🛡️ Strong Duplicate Defense
+
+- Text fingerprinting and hybrid duplicate scoring
+- Media signature checks for reposted images and albums
+- Visual media hashing for same-image or recompressed media
+- SQLite-backed memory so duplicate defense survives restarts
+
+### 🚨 Breaking News Routing
+
+- High-severity posts can go out immediately
+- Medium and low priority updates can be queued for digest
+- Breaking follow-ups can stay attached to the same evolving story
+- Optional opinionated breaking style via `BREAKING_STYLE_MODE`
+
+### 📰 Digest Publishing
+
+- Hourly digest mode
+- Daily 24-hour digest mode
+- Configurable queue windows and size limits
+- Optional pin rotation for latest digest posts
+
+### 🔎 Private Query Assistant
+
+- Ask questions in **Saved Messages**
+- Or use a **private chat with your own bot**
+- Search recent Telegram evidence first
+- Fall back to trusted web coverage only when configured and necessary
+
+### 🖼️ OCR for Media-Only Posts
+
+- Image OCR for posts without captions
+- First-frame video OCR for media-only videos
+- Translation only when non-English text is detected
+- No invented visual descriptions, no fake captions
+
+### 🎨 Clean Telegram Output
+
+- Telegram HTML formatting
+- Optional premium emoji mapping
+- Reply-thread continuity when source posts are part of a thread
+- Delivery tuned for feed readability instead of channel spam
+
+## 🏗️ Project Structure
 
 ```text
 TeleUserBot/
@@ -62,128 +89,145 @@ TeleUserBot/
 ├── config.py
 ├── auth.py
 ├── ai_filter.py
+├── breaking_story.py
 ├── db.py
-├── utils.py
-├── prompts.py
+├── news_signals.py
+├── news_taxonomy.py
 ├── severity_classifier.py
+├── utils.py
 ├── web_server.py
-├── requirements.txt
-├── requirements.optional.txt
+├── tests/
+├── install-all.ps1
+├── install-all-ubuntu.sh
 ├── .env.example
 └── README.md
 ```
 
-Runtime state is stored outside the repo in:
+Runtime state lives outside the repo in:
 
 ```text
 ~/.tg_userbot/
 ```
 
-That includes:
-- SQLite runtime DB
-- OAuth state
+That directory stores runtime metadata such as:
+
+- SQLite state
+- auth payloads and caches
 - logs
-- other runtime metadata
+- delivery and pipeline metadata
 
-## Core Modes
+## 🧭 How It Works
 
-### 1. Feed / Alert Mode
+1. TeleUserBot connects to your Telegram account.
+2. It resolves sources from your shared folder and extra channels.
+3. Incoming posts pass through duplicate, OCR, and severity logic.
+4. High-signal updates can be delivered instantly.
+5. Everything else is organized into digest workflows and searchable history.
 
-The bot listens to source channels and decides what to do with each update:
-- suppress duplicate
-- send immediately as breaking/high-severity
-- queue for digest
-- attach to an earlier related thread when appropriate
-
-### 2. Digest Mode
-
-Instead of dumping every post, the bot can collect recent updates and produce:
-- an hourly digest
-- a daily digest
-
-You can also pin those digests automatically.
-
-### 3. Query Mode
-
-You can ask questions like:
-- `latest tehran news`
-- `what happened in last 24 hours`
-- `who died recently in iran`
-
-The bot searches recent Telegram evidence first, then optionally trusted web news if Telegram evidence is weak.
-
-## Requirements
+## ✅ Requirements
 
 - Python **3.11+**
-- Telegram `api_id` and `api_hash` from `my.telegram.org`
-- A Telegram user account for Telethon login
-- Optional bot token if you want Bot API delivery or bot-PM query mode
-- Linux/macOS shell recommended
+- Latest available Python 3 release is preferred
+- Telegram `api_id` and `api_hash` from `https://my.telegram.org`
+- A Telegram account for Telethon login
+- Optional bot token for Bot API delivery or bot-PM query mode
+- Optional OCR system packages if you want image/video text extraction
 
-## Install
+## 🚀 Quick Start
 
-### 1. Clone
+### 1. Clone the repo
 
 ```bash
 git clone https://github.com/therayyanawaz/TeleUserBot.git
 cd TeleUserBot
 ```
 
-### 2. Create and activate virtual environment
+### 2. Create a virtual environment
 
 ```bash
-python3.11 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 ```
 
 Windows PowerShell:
 
 ```powershell
-py -3.11 -m venv .venv
-.venv\Scripts\Activate.ps1
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
 
-### 3. Install core dependencies
+The examples above intentionally use the default Python 3 launcher behavior so your fork can pick up the newest installed Python 3 version, while still expecting **3.11 or newer**.
+
+### 3. Install dependencies
 
 ```bash
 python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 ```
 
-### 4. Optional extras
+### 4. Install optional extras
 
 ```bash
 pip install -r requirements.optional.txt
 ```
 
-This enables optional capabilities like:
-- OCR dependencies (`Pillow`, `pytesseract`)
-- optional `sentence-transformers` runtime if you explicitly turn it on
+Optional extras enable heavier features like OCR helpers and `sentence-transformers` support if you explicitly choose to use them.
 
-## System Packages
-
-If you want OCR for media-only images or videos:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y tesseract-ocr ffmpeg
-```
-
-For multilingual OCR, also install language packs:
-
-```bash
-sudo apt-get install -y tesseract-ocr-ara tesseract-ocr-fas tesseract-ocr-urd tesseract-ocr-rus
-```
-
-## Configuration
-
-Create a working config file:
+### 5. Copy the environment template
 
 ```bash
 cp .env.example .env
 ```
 
-### Minimum required `.env`
+Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+### 6. Start the bot
+
+```bash
+python main.py
+```
+
+## ⚙️ One-Command Install Scripts
+
+If you want the faster path:
+
+### Windows
+
+```powershell
+.\install-all.ps1
+```
+
+This script:
+
+- selects the newest installed Python 3.11+ interpreter, or installs the newest available Python 3 package if needed
+- creates `.venv`
+- installs `requirements.txt` and `requirements.optional.txt`
+- installs FFmpeg
+- installs Tesseract OCR
+- warms the `sentence-transformers` cache
+
+### Ubuntu
+
+```bash
+bash install-all-ubuntu.sh
+```
+
+This script:
+
+- selects the newest installed Python 3.11+ interpreter, or installs the newest available `python3.x` package when needed
+- installs FFmpeg and Tesseract
+- installs multilingual OCR language packs
+- creates `.venv`
+- installs all Python dependencies
+- warms the `sentence-transformers` cache
+
+## 🔐 Minimum Configuration
+
+A lean starter `.env` looks like this:
 
 ```env
 TELEGRAM_API_ID=123456
@@ -192,38 +236,39 @@ TELEGRAM_API_HASH="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 FOLDER_INVITE_LINK="https://t.me/addlist/xxxxxxxxxx"
 # EXTRA_SOURCES=["@channel1","https://t.me/+privateInviteHash"]
 
-# Choose one destination mode:
+# Choose one destination mode
 DESTINATION="@your_private_channel_or_chat"
 # OR
 # BOT_DESTINATION_TOKEN="123456:ABCDEF..."
 # BOT_DESTINATION_CHAT_ID="7777826640"
 ```
 
-Important:
-- if both `DESTINATION` and bot destination values are set, **bot destination mode wins**
-- `FOLDER_INVITE_LINK` is optional if you use `EXTRA_SOURCES`
-- `BOT_DESTINATION_CHAT_ID` should be a real destination feed chat, not your bot PM, unless you intentionally want to mix them
+Important behavior:
 
-## OpenAI / Codex Auth
+- If both `DESTINATION` and bot-destination values are set, **bot destination mode wins**
+- `FOLDER_INVITE_LINK` is optional if you prefer `EXTRA_SOURCES`
+- `BOT_DESTINATION_CHAT_ID` should usually be your delivery chat, not your query PM
 
-This project uses **Codex-style OAuth**, not a normal API key flow.
+## 🤖 OpenAI / Codex Auth
 
-### Server / Replit mode
+This project uses a **Codex-style OAuth flow**, not a plain API key setup.
 
-Recommended for hosted deployments:
+### Hosted or headless mode
+
+Recommended for Replit, servers, and long-running deployments:
 
 ```env
 OPENAI_AUTH_ENV_ONLY=true
 TG_USERBOT_AUTH_JSON_B64="..."
 ```
 
-Generate env auth locally:
+Bootstrap auth into environment form:
 
 ```bash
 python auth.py bootstrap-env
 ```
 
-Or write it directly into `.env`:
+Or write auth values into `.env`:
 
 ```bash
 python auth.py setup-env
@@ -235,80 +280,56 @@ python auth.py setup-env
 OPENAI_AUTH_ENV_ONLY=false
 ```
 
-Then log in locally with browser OAuth:
+Then log in with browser OAuth:
 
 ```bash
 python auth.py login
 ```
 
-Interactive `python main.py` startup can now repair missing or stale OpenAI auth automatically.
-When run in a local terminal, it will launch browser OAuth, save env-backed auth into the repo `.env`,
-switch `OPENAI_AUTH_ENV_ONLY=true`, and continue startup in the same process.
+Local interactive startup can repair missing or stale auth automatically and continue startup in the same process.
 
-### Auth commands
-
-Local login:
+### Useful auth commands
 
 ```bash
 python auth.py login
-```
-
-Env login and `.env` update:
-
-```bash
 python auth.py login --env-file .env
-```
-
-Check auth source and status:
-
-```bash
 python auth.py status
-```
-
-Logout local auth:
-
-```bash
 python auth.py logout
-```
-
-Logout and clear `.env` secrets too:
-
-```bash
 python auth.py logout --env-file .env
 ```
 
-## Running the Bot
+## 🧩 Operating Modes
 
-Single entrypoint:
+### 1. Feed / Alert Mode
 
-```bash
-python main.py
-```
+Each incoming Telegram post is evaluated and can be:
 
-The bot will:
-1. validate config
-2. ensure only one instance is running
-3. initialize runtime DB and caches
-4. repair auth inline when interactive startup detects missing or stale OpenAI auth
-5. connect Telegram user session
-6. resolve source channels/folder chats
-7. start feed/query/digest pipelines
-8. optionally start web status server
+- skipped as a duplicate
+- routed as a fast breaking alert
+- added to digest
+- attached to an existing story thread
 
-## Recommended Local Workflow
+### 2. Digest Mode
 
-```bash
-source .venv/bin/activate
-python main.py
-```
+Instead of forwarding every post as-is, TeleUserBot can publish:
 
-If you do not want to activate manually each time, use the venv Python directly:
+- hourly digests
+- daily digests
 
-```bash
-./.venv/bin/python main.py
-```
+Digest mode is designed for people who want signal density without raw-feed chaos.
 
-## Digest Configuration
+### 3. Query Mode
+
+Ask natural-language questions such as:
+
+- `latest tehran news`
+- `what happened in last 24 hours`
+- `recent beirut updates`
+- `who died recently in iran`
+
+The assistant checks recent Telegram evidence first and only uses trusted web fallback when configured and when Telegram results are too weak.
+
+## 📰 Digest Configuration
 
 Recommended baseline:
 
@@ -322,7 +343,7 @@ DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES=0
 OUTPUT_LANGUAGE="English"
 ```
 
-### Digest pin rotation
+Optional digest pin rotation:
 
 ```env
 DIGEST_PIN_HOURLY=false
@@ -330,23 +351,61 @@ DIGEST_PIN_DAILY=false
 ```
 
 When enabled:
+
 - the newest digest of that type is pinned
-- the older pinned digest of the same type is unpinned
-- failure to pin does **not** block digest delivery
+- the previous pinned digest of that type is unpinned
+- pin failure does not block digest delivery
 
-## OCR Translation for Media-only Posts
+## 🧪 Duplicate Suppression
 
-OCR is intentionally narrow and conservative.
+Duplicate defense runs in layers.
 
-Behavior:
-- captioned media uses the real Telegram caption
-- media-only image posts get a caption **only if** OCR finds non-English text and translation succeeds
-- media-only videos use first-frame OCR only
+### Text-level
+
+- normalized text fingerprinting
+- hybrid similarity scoring
+- recent duplicate memory
+
+### Media-level
+
+- same-image detection
+- recompressed-media detection
+- album signature tracking
+- persistent dedupe memory in SQLite
+
+### Story continuity
+
+When follow-up posts arrive as replies in the source channel, the bot can preserve that relationship in the destination feed.
+
+## 🚨 Severity Routing
+
+High-level flow:
+
+- `high` → immediate alert
+- `medium` / `low` → digest queue
+
+Breaking tone can be tuned with:
+
+```env
+BREAKING_STYLE_MODE=unhinged
+```
+
+Modes:
+
+- `unhinged` gives harder-hitting breaking formatting and adds context only when the story linkage is strong enough
+- `classic` restores a more restrained layout
+
+## 🖼️ OCR Translation for Media-Only Posts
+
+OCR behavior is intentionally conservative.
+
+- captioned media keeps the original Telegram caption
+- image-only posts get a caption only if OCR finds meaningful non-English text and translation succeeds
+- video-only posts use first-frame OCR
 - English OCR text is ignored
 - failed OCR adds nothing
-- no invented visual descriptions are generated
 
-Config:
+Example config:
 
 ```env
 MEDIA_TEXT_OCR_ENABLED=true
@@ -357,62 +416,32 @@ MEDIA_TEXT_OCR_VIDEO_MAX_MB=25
 MEDIA_TEXT_OCR_LANGS=eng+ara+fas+urd+rus
 ```
 
-## Duplicate Suppression
+If you want OCR on Linux:
 
-The bot uses multiple layers of duplicate defense.
-
-### Text-level duplicate suppression
-- normalized text fingerprinting
-- hybrid duplicate scoring
-- recent breaking cache
-
-### Media-level duplicate suppression
-- visual media hashing for same images / recompressed reposts
-- album-level media signatures
-- persistent dedupe memory in SQLite
-
-### Reply-thread continuity
-When a media-only follow-up is shared as a reply in the source channel, the bot can preserve that relationship in the destination feed.
-
-## Severity Routing
-
-High-level flow:
-- `high` -> immediate alert
-- `medium` / `low` -> digest queue
-
-You can tune routing with config values in `config.py` / `.env`, including severity toggles and duplicate behavior.
-
-Breaking alert voice:
-
-```env
-BREAKING_STYLE_MODE=unhinged
+```bash
+sudo apt-get update
+sudo apt-get install -y tesseract-ocr ffmpeg
+sudo apt-get install -y tesseract-ocr-ara tesseract-ocr-fas tesseract-ocr-urd tesseract-ocr-rus
 ```
 
-- `unhinged` sends a hard-hitting breaking headline and adds a contextual `Why it matters` bridge only when the story link is concrete enough
-- `classic` restores the prior breaking layout with the optional contextual bridge
-
-## Query Assistant
-
-The query assistant is intentionally restricted.
+## 🔎 Query Assistant Rules
 
 Allowed contexts:
+
 - **Saved Messages**
 - **private chat with your own bot account**
 
 Not allowed:
+
 - groups
 - channels
-- random private chats with other users
+- arbitrary private chats with other users
 
-Typical queries:
-- `latest tehran news`
-- `what happened in last 24 hours`
-- `recent beirut updates`
-- `who died recently in iran`
+This restriction is intentional and keeps the query workflow private and predictable.
 
-## Query Web Fallback
+## 🌐 Query Web Fallback
 
-When Telegram evidence is weak, the bot can search trusted web news sources.
+When Telegram evidence is not strong enough, the bot can search trusted news sites:
 
 ```env
 QUERY_WEB_FALLBACK_ENABLED=true
@@ -425,13 +454,31 @@ QUERY_WEB_ALLOWED_DOMAINS=["reuters.com","apnews.com","bbc.com","aljazeera.com",
 ```
 
 Notes:
-- Telegram evidence is preferred
-- web fallback is only used when Telegram evidence is too weak
-- high-risk queries are treated more conservatively
 
-## Replit / UptimeRobot
+- Telegram evidence stays the primary source
+- web fallback is used only when needed
+- higher-risk questions are handled more conservatively
 
-Recommended hosted settings:
+## 🧵 Output and Delivery Details
+
+TeleUserBot can deliver with:
+
+- Telegram HTML formatting
+- optional premium emoji support
+- source-aware reply continuity
+- digest-first readability
+
+Useful rendering flags from `.env.example`:
+
+```env
+ENABLE_HTML_FORMATTING=true
+ENABLE_PREMIUM_EMOJI=true
+PREMIUM_EMOJI_MAP_FILE="nezami_emoji_map.json"
+```
+
+## 🩺 Health Checks and Hosting
+
+For Replit or uptime-monitored deployments:
 
 ```env
 ENABLE_WEB_SERVER=true
@@ -442,36 +489,56 @@ OPENAI_AUTH_ENV_ONLY=true
 TG_USERBOT_AUTH_JSON_B64="..."
 ```
 
-Suggested Replit commands:
-- Build command:
-  - `pip install -r requirements.txt`
-- Optional extras:
-  - `pip install -r requirements.optional.txt`
-- Run command:
-  - `python main.py`
-
 Health endpoints:
+
+- `/`
 - `/health`
 - `/status`
-- `/`
 
-## Runtime Data
+Suggested hosted commands:
 
-Stored outside the repo in:
+- install: `pip install -r requirements.txt`
+- optional extras: `pip install -r requirements.optional.txt`
+- run: `python main.py`
 
-```text
-~/.tg_userbot/
+## 🛠️ Running the Bot
+
+Single entrypoint:
+
+```bash
+python main.py
 ```
 
-Typical runtime files:
-- DB
-- token cache
-- logs
-- runtime metadata
+Startup flow:
 
-## Operator Commands
+1. validates config
+2. ensures only one instance is active
+3. initializes runtime DB and caches
+4. repairs auth inline when interactive mode detects stale or missing auth
+5. connects your Telegram session
+6. resolves sources
+7. starts feed, digest, query, and optional web server pipelines
 
-Digest status command:
+## 🧪 Tests
+
+The repo includes test coverage for major pipeline pieces.
+
+Run:
+
+```bash
+pytest
+```
+
+Or install dev requirements first:
+
+```bash
+pip install -r requirements.dev.txt
+pytest
+```
+
+## 💬 Operator Command
+
+Default digest status command:
 
 ```text
 /digest_status
@@ -479,11 +546,11 @@ Digest status command:
 
 This reports queue state, scheduler status, and runtime health details.
 
-## Troubleshooting
+## 🧯 Troubleshooting
 
 ### `sentence-transformers unavailable`
 
-Not an error if you intentionally run no-HF mode.
+Not a problem if you intentionally run without Hugging Face support.
 
 Install optional extras only if you want that backend:
 
@@ -493,13 +560,14 @@ pip install -r requirements.optional.txt
 
 ### `database is locked`
 
-Another process is using the same Telethon session or runtime DB.
+Another process is probably using the same Telethon session or SQLite DB.
 
 Fix:
-- stop duplicate processes
-- run only one active instance
 
-### Repeated OAuth login prompts on a server
+- stop duplicate processes
+- keep only one active instance
+
+### Repeated OAuth prompts on a server
 
 Use env-only auth:
 
@@ -510,7 +578,6 @@ TG_USERBOT_AUTH_JSON_B64="..."
 
 ### `PhoneNumberInvalidError`
 
-The number format may look valid, but Telegram rejected it.
 Use full E.164 format with country code.
 
 Example:
@@ -522,61 +589,73 @@ Example:
 ### Media-only post has no useful caption
 
 Check:
+
 - OCR is enabled
 - Tesseract is installed
 - language packs are installed
 - the media actually contains readable non-English text
 
-### Digest header count looks wrong
+### Query replies look wrong or missing
 
-Latest code distinguishes:
-- digest headlines published
-- raw updates reviewed
+Keep query mode limited to:
 
-### Query reply thread is wrong or missing
-
-Use latest code and keep query mode in:
 - Saved Messages
-- or your own bot PM
+- your own bot PM
 
-### Bot API upload timeout / connection reset
+### Bot API upload timeout or connection reset
 
-Latest code retries transient transport errors automatically once.
-If it still fails often, check:
-- network stability
-- VPS quality
-- proxy/VPN path
+The bot retries transient delivery errors once. If failures continue, check:
+
+- network quality
+- VPS stability
+- proxy or VPN path
 - oversized media uploads
 
-## Security
+## 🔒 Security
 
 Never commit:
+
 - `.env`
 - `userbot.session*`
 - `~/.tg_userbot/*` secrets
-- exported auth JSON
+- exported auth payloads
 - private token dumps
 
-If anything sensitive was exposed, rotate it immediately.
+If anything sensitive leaks, rotate it immediately.
 
-## Upgrade Workflow
+## 📦 Upgrade Workflow
 
 ```bash
 git pull
 source .venv/bin/activate
 pip install -r requirements.txt --upgrade
-pip install -r requirements.optional.txt --upgrade  # optional
+pip install -r requirements.optional.txt --upgrade
 python main.py
 ```
 
-## Practical Deployment Advice
+## 🧠 Practical Deployment Advice
 
-Best separation:
+Best results usually come from separating roles:
+
 - one chat for **feed delivery**
 - one private bot PM or Saved Messages for **queries**
 
-Do not mix high-volume feed output with your interactive query workflow unless you intentionally accept a noisier UX.
+Mixing both into a single high-volume chat works, but the experience becomes noisier and less controlled.
 
-## License / Usage
+## ⚠️ Responsible Use
 
-Use responsibly and comply with Telegram terms, local laws, and the rules of the sources you monitor.
+This project operates on a real Telegram account and may process content from many sources. Use it responsibly, follow Telegram rules, respect local laws, and handle monitored content with care.
+
+---
+
+## 💫 Summary
+
+TeleUserBot is for operators who want Telegram monitoring to feel sharper, calmer, and more intelligent:
+
+- fewer duplicates
+- better urgency control
+- cleaner digests
+- stronger private search
+- more useful media handling
+
+If your current setup feels like chaos in a trench coat, this is the upgrade. ✨

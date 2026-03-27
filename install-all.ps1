@@ -1,4 +1,5 @@
 $ErrorActionPreference = "Stop"
+$MinimumPythonVersion = [version]"3.11"
 
 function Write-Step {
     param([string]$Message)
@@ -11,19 +12,101 @@ function Test-CommandExists {
     return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
-function Get-Python311Path {
-    $candidates = @(
-        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"),
-        (Join-Path $env:ProgramFiles "Python311\python.exe")
+function Get-PythonCommandInfo {
+    param(
+        [Parameter(Mandatory = $true)][string]$Command,
+        [string[]]$Args = @()
     )
 
-    foreach ($candidate in $candidates) {
-        if (Test-Path $candidate) {
-            return $candidate
+    try {
+        $details = & $Command @Args -c "import sys; print(sys.executable); print('.'.join(map(str, sys.version_info[:3])))"
+        if ($LASTEXITCODE -ne 0 -or -not $details -or $details.Count -lt 2) {
+            return $null
+        }
+
+        $path = [string]$details[0]
+        $versionText = [string]$details[1]
+        $version = [version]$versionText.Trim()
+
+        return [pscustomobject]@{
+            Path = $path.Trim()
+            Version = $version
+        }
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-BestInstalledPython {
+    $candidates = @()
+
+    if (Test-CommandExists "py") {
+        $info = Get-PythonCommandInfo -Command "py" -Args @("-3")
+        if ($info) {
+            $candidates += $info
         }
     }
 
-    return $null
+    foreach ($name in @("python", "python3")) {
+        if (-not (Test-CommandExists $name)) {
+            continue
+        }
+
+        $info = Get-PythonCommandInfo -Command $name
+        if ($info) {
+            $candidates += $info
+        }
+    }
+
+    if (-not $candidates) {
+        return $null
+    }
+
+    $deduped = $candidates |
+        Where-Object { $_ -and $_.Path } |
+        Group-Object Path |
+        ForEach-Object { $_.Group | Sort-Object Version -Descending | Select-Object -First 1 }
+
+    return $deduped |
+        Where-Object { $_.Version -ge $MinimumPythonVersion } |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+}
+
+function Get-LatestWingetPythonPackage {
+    if (-not (Test-CommandExists "winget")) {
+        return $null
+    }
+
+    try {
+        $output = & winget search --id Python.Python --source winget --accept-source-agreements 2>$null
+    }
+    catch {
+        return $null
+    }
+
+    $candidates = foreach ($line in $output) {
+        if ($line -match "(Python\.Python\.3\.(\d+))") {
+            $minor = [int]$Matches[2]
+            if ($minor -ge 11) {
+                [pscustomobject]@{
+                    Id = $Matches[1]
+                    Version = [version]"3.$minor"
+                }
+            }
+        }
+    }
+
+    if (-not $candidates) {
+        return $null
+    }
+
+    return $candidates |
+        Group-Object Id |
+        ForEach-Object { $_.Group | Select-Object -First 1 } |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
 }
 
 function Ensure-WingetPackage {
@@ -64,18 +147,24 @@ function Get-RepoRoot {
 $repoRoot = Get-RepoRoot
 Set-Location $repoRoot
 
-Write-Step "Ensuring Python 3.11 is installed"
-$pythonExe = Get-Python311Path
-if (-not $pythonExe) {
-    Ensure-WingetPackage -Id "Python.Python.3.11" -UserScope
-    $pythonExe = Get-Python311Path
+Write-Step "Ensuring Python 3.11+ is available"
+$pythonInfo = Get-BestInstalledPython
+if (-not $pythonInfo) {
+    $latestPackage = Get-LatestWingetPythonPackage
+    if (-not $latestPackage) {
+        throw "No installed Python 3.11+ was found, and winget could not resolve a current Python 3 package."
+    }
+
+    Ensure-WingetPackage -Id $latestPackage.Id -UserScope
+    $pythonInfo = Get-BestInstalledPython
 }
 
-if (-not $pythonExe) {
-    throw "Python 3.11 installation did not produce a usable python.exe."
+if (-not $pythonInfo) {
+    throw "Python 3.11+ installation did not produce a usable python.exe."
 }
 
-Write-Host "Using Python: $pythonExe"
+$pythonExe = $pythonInfo.Path
+Write-Host "Using Python: $pythonExe ($($pythonInfo.Version))"
 
 Write-Step "Creating virtual environment"
 if (-not (Test-Path ".venv\Scripts\python.exe")) {
