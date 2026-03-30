@@ -11,6 +11,32 @@ import severity_classifier
 import utils
 
 
+def _severity_payload(
+    text: str,
+    *,
+    source: str = "Desk Wire",
+    channel_id: str = "-1001",
+    message_id: int = 1,
+    has_media: bool = False,
+    has_link: bool = True,
+    reply_to: int = 0,
+    text_tokens: int | None = None,
+    humanized_vital_probability: float = 0.35,
+) -> dict[str, object]:
+    return {
+        "text": text,
+        "source": source,
+        "channel_id": channel_id,
+        "message_id": message_id,
+        "has_media": has_media,
+        "has_link": has_link,
+        "reply_to": reply_to,
+        "timestamp": 1774275669,
+        "text_tokens": text_tokens or len(text.split()),
+        "humanized_vital_probability": humanized_vital_probability,
+    }
+
+
 def test_fallback_filter_decision_downgrades_explainer_with_urgent_keywords():
     text = (
         "Reasons for MQ-9 Reaper losses and ways to address them. "
@@ -61,26 +87,159 @@ def test_choose_alert_label_keeps_thematic_label_for_concrete_event():
 
 
 def test_severity_classifier_downgrades_explainer_with_shot_down_keyword():
+    severity_classifier._HIGH_SEVERITY_HISTORY.clear()
     severity, _score, breakdown = severity_classifier.classify_message_severity(
-        {
-            "text": (
+        _severity_payload(
+            (
                 "Analysis: Why Iran keeps shooting down MQ-9 Reapers. "
                 "The piece looks at recurring losses and possible fixes."
             ),
-            "source": "Research Desk",
-            "channel_id": "-1001",
-            "message_id": 7,
-            "has_media": False,
-            "has_link": True,
-            "reply_to": 0,
-            "timestamp": 1774275669,
-            "text_tokens": 42,
-            "humanized_vital_probability": 0.35,
-        }
+            source="Research Desk",
+            channel_id="-1001",
+            message_id=7,
+            has_media=False,
+            text_tokens=42,
+        )
     )
 
     assert severity != "high"
     assert breakdown["story_signals"]["downgrade_explainer"] is True
+    assert breakdown["score_band"] != "high"
+    assert breakdown["final_score"] < severity_classifier.severity_score_floor("high")
+
+
+def test_severity_classifier_returns_high_band_for_trusted_breaking_post():
+    severity_classifier._HIGH_SEVERITY_HISTORY.clear()
+    severity, score, breakdown = severity_classifier.classify_message_severity(
+        _severity_payload(
+            "Breaking: Officials confirm missile strike hit Haifa moments ago after air raid sirens. 🚨🔥",
+            source="The War Reporter",
+            channel_id="-2001",
+            message_id=1,
+            has_media=False,
+        )
+    )
+
+    thresholds = severity_classifier.severity_thresholds()
+    assert severity == "high"
+    assert breakdown["score_band"] == "high"
+    assert breakdown["raw_score"] >= thresholds["high"]
+    assert score >= thresholds["high"]
+    assert score == breakdown["final_score"]
+
+
+def test_severity_classifier_returns_medium_band_for_meaningful_update():
+    severity_classifier._HIGH_SEVERITY_HISTORY.clear()
+    severity, score, breakdown = severity_classifier.classify_message_severity(
+        _severity_payload(
+            "Officials confirmed the port reopened overnight after three days of disruption and cargo traffic resumed in stages.",
+            source="Desk Wire",
+            channel_id="-2002",
+            message_id=2,
+            has_media=True,
+        )
+    )
+
+    thresholds = severity_classifier.severity_thresholds()
+    assert severity == "medium"
+    assert breakdown["score_band"] == "medium"
+    assert thresholds["medium"] <= score < thresholds["high"]
+    assert score == breakdown["final_score"]
+
+
+def test_severity_classifier_returns_low_band_for_noisy_context_post():
+    severity_classifier._HIGH_SEVERITY_HISTORY.clear()
+    severity, score, breakdown = severity_classifier.classify_message_severity(
+        _severity_payload(
+            "Analysis: Why regional shipping patterns could change if officials keep adjusting port schedules over the coming weeks.",
+            source="Research Desk",
+            channel_id="-2003",
+            message_id=3,
+            has_media=False,
+        )
+    )
+
+    thresholds = severity_classifier.severity_thresholds()
+    assert severity == "low"
+    assert breakdown["score_band"] == "low"
+    assert 0.0 <= score < thresholds["medium"]
+    assert score == breakdown["final_score"]
+
+
+def test_severity_classifier_cooldown_downgrade_stays_out_of_high_band():
+    severity_classifier._HIGH_SEVERITY_HISTORY.clear()
+    payload = _severity_payload(
+        "Breaking: Officials confirm missile strike hit Haifa moments ago after air raid sirens. 🚨🔥",
+        source="The War Reporter",
+        channel_id="-2401",
+        has_media=False,
+    )
+    final = None
+    for message_id in range(1, 5):
+        final = severity_classifier.classify_message_severity(
+            dict(payload, message_id=message_id)
+        )
+
+    assert final is not None
+    severity, score, breakdown = final
+    assert severity == "medium"
+    assert breakdown["raw_score"] >= severity_classifier.severity_score_floor("high")
+    assert breakdown["score_band"] == "medium"
+    assert score < severity_classifier.severity_score_floor("high")
+    assert "downgrade_source_high_cooldown" in breakdown["forced_reasons"]
+    assert breakdown["calibration_reason"] == "downgrade_source_high_cooldown"
+
+
+def test_severity_classifier_preserves_medium_band_ordering():
+    severity_classifier._HIGH_SEVERITY_HISTORY.clear()
+    base = severity_classifier.classify_message_severity(
+        _severity_payload(
+            "Officials confirmed services resumed overnight after three days of disruption at the main cargo port, but inspections are still ongoing.",
+            source="Desk Wire",
+            channel_id="-2501",
+            message_id=1,
+            has_media=True,
+        )
+    )
+    stronger = severity_classifier.classify_message_severity(
+        _severity_payload(
+            "Officials confirmed the port reopened overnight after three days of disruption and cargo traffic resumed in stages.",
+            source="Desk Wire",
+            channel_id="-2502",
+            message_id=2,
+            has_media=True,
+        )
+    )
+
+    assert base[0] == stronger[0] == "medium"
+    assert base[2]["score_band"] == stronger[2]["score_band"] == "medium"
+    assert stronger[1] > base[1]
+
+
+def test_severity_classifier_preserves_high_band_ordering():
+    severity_classifier._HIGH_SEVERITY_HISTORY.clear()
+    lower = severity_classifier.classify_message_severity(
+        _severity_payload(
+            "Breaking: Officials confirm missile strike hit Haifa moments ago after air raid sirens. 🚨🔥",
+            source="The War Reporter",
+            channel_id="-2601",
+            message_id=1,
+            has_media=False,
+        )
+    )
+    higher = severity_classifier.classify_message_severity(
+        _severity_payload(
+            "Breaking: Officials confirm multiple missile strikes hit Haifa and Tel Aviv just now, casualties reported, interception failure under review. 🚨🔥⚡",
+            source="The War Reporter",
+            channel_id="-2602",
+            message_id=2,
+            has_media=True,
+        )
+    )
+
+    assert lower[0] == higher[0] == "high"
+    assert lower[2]["score_band"] == higher[2]["score_band"] == "high"
+    assert higher[1] > lower[1]
 
 
 def test_format_summary_text_normalizes_bad_feed_copy(monkeypatch):
@@ -367,6 +526,53 @@ async def test_handle_ai_inbound_job_uses_ai_decision_severity(monkeypatch):
     assert payload["severity"] == "medium"
     assert payload["filter_decision"]["action"] == "digest"
     assert captured["priority"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_handle_triage_inbound_job_keyword_override_uses_high_band_floor(monkeypatch):
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(main, "_load_inbound_payload", lambda _job: {})
+    monkeypatch.setattr(main, "_is_severity_routing_enabled", lambda: True)
+    monkeypatch.setattr(
+        main,
+        "_classify_severity_with_breakdown",
+        lambda **_kwargs: ("medium", 0.12, {"raw_score": 0.12}),
+    )
+    monkeypatch.setattr(main, "_contains_breaking_keyword", lambda _text: True)
+    monkeypatch.setattr(main, "should_downgrade_explainer_urgency", lambda _text: False)
+    monkeypatch.setattr(main, "looks_like_live_event_update", lambda _text: True)
+    monkeypatch.setattr(main, "_pipeline_payload_json", lambda payload: json.dumps(payload))
+    monkeypatch.setattr(main, "_pipeline_priority_for_severity", lambda severity: severity)
+
+    async def fake_fetch_messages(_payload):
+        return [
+            SimpleNamespace(
+                id=91,
+                chat_id=-10077,
+                media=None,
+                message="Breaking update: officials confirm new strikes and intercept activity near Haifa right now.",
+            )
+        ]
+
+    async def fake_source_info(_msg):
+        return "Desk Wire", "https://t.me/example/91"
+
+    def fake_advance_inbound_job(job_id, **kwargs):
+        captured["job_id"] = job_id
+        captured.update(kwargs)
+
+    monkeypatch.setattr(main, "_fetch_messages_for_payload", fake_fetch_messages)
+    monkeypatch.setattr(main, "_source_info", fake_source_info)
+    monkeypatch.setattr(main, "advance_inbound_job", fake_advance_inbound_job)
+
+    await main._handle_triage_inbound_job({"id": 51})
+
+    payload = json.loads(str(captured["payload_json"]))
+    assert payload["severity"] == "high"
+    assert payload["severity_score"] == severity_classifier.severity_score_floor("high")
+    assert payload["severity_breakdown"]["keyword_override"] is True
+    assert captured["priority"] == "high"
 
 
 @pytest.mark.asyncio

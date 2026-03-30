@@ -128,7 +128,7 @@ from news_taxonomy import (
 )
 from news_signals import detect_story_signals, looks_like_live_event_update, should_downgrade_explainer_urgency
 from prompts import quiet_period_message
-from severity_classifier import classify_message_severity
+from severity_classifier import classify_message_severity, severity_score_floor
 from utils import (
     apply_premium_emoji_html,
     build_alert_header,
@@ -2999,6 +2999,10 @@ def _severity_emoji(level: str) -> str:
     return "ℹ️"
 
 
+def _high_severity_score_floor() -> float:
+    return float(severity_score_floor("high"))
+
+
 def _reply_to_message_id(msg: Message) -> int:
     reply = getattr(msg, "reply_to", None)
     value = int(getattr(reply, "reply_to_msg_id", 0) or 0)
@@ -5600,7 +5604,7 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
         and looks_like_live_event_update(text)
     ):
         severity = "high"
-        severity_score = max(float(severity_score), 0.82)
+        severity_score = max(float(severity_score), _high_severity_score_floor())
         severity_breakdown = dict(severity_breakdown or {})
         severity_breakdown["keyword_override"] = True
 
@@ -5729,7 +5733,7 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
         and looks_like_live_event_update(combined_caption)
     ):
         severity = "high"
-        severity_score = max(float(severity_score), 0.82)
+        severity_score = max(float(severity_score), _high_severity_score_floor())
         severity_breakdown = dict(severity_breakdown or {})
         severity_breakdown["keyword_override"] = True
 
@@ -6053,7 +6057,7 @@ async def _handle_triage_inbound_job(job: Dict[str, object]) -> None:
             and looks_like_live_event_update(combined_text)
         ):
             severity = "high"
-            severity_score = max(float(severity_score), 0.82)
+            severity_score = max(float(severity_score), _high_severity_score_floor())
             severity_breakdown = dict(severity_breakdown or {})
             severity_breakdown["keyword_override"] = True
 

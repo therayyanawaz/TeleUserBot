@@ -89,7 +89,7 @@ SEVERITY_CONFIG: Dict[str, Any] = {
     # -------------------------------------------------------------------------
     "style": {
         "short_text_threshold_chars": 220,
-        "short_with_link_or_media_bonus": 0.09,
+        "short_with_link_or_media_bonus": 0.08,
         "emoji_density_min_count": 4,
         "emoji_density_bonus": 0.04,
         "alert_emoji_extra_bonus": 0.02,
@@ -186,6 +186,9 @@ SEVERITY_CONFIG: Dict[str, Any] = {
         "high": 0.82,
         "medium": 0.55,
     },
+    "score_calibration": {
+        "band_epsilon": 0.015,
+    },
     # -------------------------------------------------------------------------
     # Hard rules
     # -------------------------------------------------------------------------
@@ -216,6 +219,108 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
 _HIGH_SEVERITY_HISTORY: Dict[str, Deque[float]] = defaultdict(deque)
 _COOLDOWN_LOCK = threading.Lock()
+
+
+def severity_thresholds() -> Dict[str, float]:
+    raw = SEVERITY_CONFIG.get("thresholds", {})
+    medium = float(raw.get("medium", 0.55) or 0.55)
+    high = float(raw.get("high", 0.82) or 0.82)
+    medium = max(0.0, min(medium, 0.95))
+    high = max(medium + 0.01, min(high, 0.99))
+    return {
+        "medium": round(medium, 4),
+        "high": round(high, 4),
+    }
+
+
+def severity_score_floor(severity: str) -> float:
+    thresholds = severity_thresholds()
+    normalized = _normalize_key(severity)
+    if normalized == "high":
+        return float(thresholds["high"])
+    if normalized == "medium":
+        return float(thresholds["medium"])
+    return 0.0
+
+
+def _score_calibration_epsilon(thresholds: Dict[str, float]) -> float:
+    raw = float(SEVERITY_CONFIG.get("score_calibration", {}).get("band_epsilon", 0.015) or 0.015)
+    medium = float(thresholds["medium"])
+    high = float(thresholds["high"])
+    max_allowed = min(0.05, medium * 0.45 if medium > 0 else raw, (high - medium) * 0.45)
+    return max(0.001, min(raw, max_allowed if max_allowed > 0 else raw))
+
+
+def _score_band(score: float, thresholds: Dict[str, float]) -> str:
+    high = float(thresholds["high"])
+    medium = float(thresholds["medium"])
+    if score >= high:
+        return "high"
+    if score >= medium:
+        return "medium"
+    return "low"
+
+
+def _map_score_to_band(
+    raw_score: float,
+    *,
+    source_floor: float,
+    source_ceiling: float,
+    target_floor: float,
+    target_ceiling: float,
+) -> float:
+    if target_ceiling <= target_floor:
+        return target_floor
+    clipped = max(source_floor, min(source_ceiling, raw_score))
+    if source_ceiling <= source_floor:
+        return target_floor
+    ratio = (clipped - source_floor) / (source_ceiling - source_floor)
+    return target_floor + (ratio * (target_ceiling - target_floor))
+
+
+def _calibrate_severity_score(
+    raw_score: float,
+    *,
+    severity: str,
+    thresholds: Dict[str, float],
+) -> tuple[float, str]:
+    medium = float(thresholds["medium"])
+    high = float(thresholds["high"])
+    epsilon = _score_calibration_epsilon(thresholds)
+    low_ceiling = max(0.0, medium - epsilon)
+    medium_floor = medium
+    medium_ceiling = max(medium_floor, high - epsilon)
+    high_floor = high
+    normalized = _normalize_key(severity)
+
+    if normalized == "high":
+        score = _map_score_to_band(
+            raw_score,
+            source_floor=high,
+            source_ceiling=1.0,
+            target_floor=high_floor,
+            target_ceiling=1.0,
+        )
+        return min(1.0, max(high_floor, score)), "high"
+
+    if normalized == "medium":
+        score = _map_score_to_band(
+            raw_score,
+            source_floor=medium,
+            source_ceiling=1.0,
+            target_floor=medium_floor,
+            target_ceiling=medium_ceiling,
+        )
+        return min(medium_ceiling, max(medium_floor, score)), "medium"
+
+    score = _map_score_to_band(
+        raw_score,
+        source_floor=0.0,
+        source_ceiling=medium,
+        target_floor=0.0,
+        target_ceiling=low_ceiling,
+    )
+    return min(low_ceiling, max(0.0, score)), "low"
 
 
 def _normalize_space(text: str) -> str:
@@ -585,7 +690,7 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
         story_signals=story_signals,
     )
 
-    total_score = (
+    raw_score = (
         source_score
         + urgency_score
         + taxonomy_score
@@ -594,12 +699,12 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
         + temporal_score
         + penalty_score
     )
-    total_score = max(0.0, min(1.0, total_score))
+    raw_score = max(0.0, min(1.0, raw_score))
 
-    thresholds = SEVERITY_CONFIG["thresholds"]
-    if total_score >= float(thresholds["high"]):
+    thresholds = severity_thresholds()
+    if raw_score >= float(thresholds["high"]):
         severity = "high"
-    elif total_score >= float(thresholds["medium"]):
+    elif raw_score >= float(thresholds["medium"]):
         severity = "medium"
     else:
         severity = "low"
@@ -638,9 +743,25 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
             severity = "medium"
             forced_reasons.append("downgrade_source_high_cooldown")
 
+    final_score, score_band = _calibrate_severity_score(
+        raw_score,
+        severity=severity,
+        thresholds=thresholds,
+    )
+    calibration_reason = None
+    if score_band != _score_band(raw_score, thresholds):
+        if forced_reasons:
+            calibration_reason = ",".join(forced_reasons)
+        else:
+            calibration_reason = "score_band_alignment"
+
     breakdown: Dict[str, Any] = {
         "source": source_name,
         "source_tier": tier,
+        "raw_score": round(raw_score, 4),
+        "final_score": round(final_score, 4),
+        "score_band": score_band,
+        "thresholds": thresholds,
         "source_score": round(source_score, 4),
         "urgency_score": round(urgency_score, 4),
         "urgency_hits": urgency_hits[:12],
@@ -674,4 +795,6 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
         "cooldown": cooldown_info,
         "forced_reasons": forced_reasons,
     }
-    return severity, round(total_score, 4), breakdown
+    if calibration_reason:
+        breakdown["calibration_reason"] = calibration_reason
+    return severity, round(final_score, 4), breakdown
