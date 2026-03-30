@@ -1967,7 +1967,12 @@ class LiveTelegramStreamer:
         self._rendered_chars = target
         self._last_edit_ts = time.time()
 
-    async def finalize(self, final_text: str | None = None) -> LiveStreamStats:
+    async def finalize(
+        self,
+        final_text: str | None = None,
+        *,
+        chunks: Sequence[str] | None = None,
+    ) -> LiveStreamStats:
         if final_text is not None:
             self._full_text = final_text
 
@@ -1978,24 +1983,35 @@ class LiveTelegramStreamer:
         if not cleaned_final:
             cleaned_final = "<b>🟢 No relevant information found.</b>" if self._html_mode else "No relevant information found."
 
-        chunks = (
-            split_html_chunks(cleaned_final, max_chars=self._max_message_chars)
-            if self._html_mode
-            else split_markdown_chunks(cleaned_final, max_chars=self._max_message_chars)
-        )
-        if not chunks:
-            chunks = [cleaned_final]
+        final_chunks = list(chunks or ())
+        if final_chunks:
+            if self._html_mode:
+                final_chunks = [
+                    sanitize_telegram_html(str(chunk).strip())
+                    for chunk in final_chunks
+                    if str(chunk or "").strip()
+                ]
+            else:
+                final_chunks = [str(chunk).strip() for chunk in final_chunks if str(chunk or "").strip()]
+        else:
+            final_chunks = (
+                split_html_chunks(cleaned_final, max_chars=self._max_message_chars)
+                if self._html_mode
+                else split_markdown_chunks(cleaned_final, max_chars=self._max_message_chars)
+            )
+        if not final_chunks:
+            final_chunks = [cleaned_final]
 
         if self._primary_ref is None:
-            self._primary_ref = await self._send_message(chunks[0], None)
+            self._primary_ref = await self._send_message(final_chunks[0], None)
             self._all_refs = [self._primary_ref]
         else:
-            self._primary_ref = await self._edit_message(self._primary_ref, chunks[0])
+            self._primary_ref = await self._edit_message(self._primary_ref, final_chunks[0])
             self._all_refs = [self._primary_ref]
             self._edit_count += 1
 
         reply_to = self._get_message_id(self._primary_ref)
-        for extra in chunks[1:]:
+        for extra in final_chunks[1:]:
             ref = await self._send_message(extra, reply_to)
             self._all_refs.append(ref)
             reply_to = self._get_message_id(ref)

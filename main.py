@@ -164,6 +164,7 @@ from utils import (
     search_recent_messages,
     seconds_until_next_daily_time,
     split_html_chunks,
+    split_markdown_chunks,
     strip_telegram_html,
 )
 from web_server import WebStatusServer
@@ -7840,6 +7841,249 @@ def _strip_query_answer_citations(text: str) -> str:
     return sanitize_telegram_html(value.strip())
 
 
+_QUERY_REPLY_MAX_CHARS = 3600
+
+
+def _normalize_query_final_answer(text: str) -> str:
+    cleaned = (str(text or "")).rstrip()
+    cleaned = re.sub(r"\s+\.\.\.$", "", cleaned).strip()
+    if _is_html_formatting_enabled():
+        cleaned = sanitize_telegram_html(cleaned)
+    if cleaned:
+        return cleaned
+    return (
+        "<b>🟢 No relevant information found.</b>"
+        if _is_html_formatting_enabled()
+        else "No relevant information found."
+    )
+
+
+def _is_query_bullet_block(text: str) -> bool:
+    plain = normalize_space(strip_telegram_html(str(text or "")))
+    if not plain:
+        return False
+    return bool(re.match(r"^(?:[•▪◦●‣-]\s+|\d+\.\s+)", plain))
+
+
+def _render_query_block(text: str, *, html_mode: bool) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    if html_mode:
+        return sanitize_telegram_html(value)
+    raw = re.sub(r"(?i)<br\s*/?>", "\n", value)
+    return raw.strip()
+
+
+def _split_query_bullet_block(
+    text: str,
+    *,
+    max_chars: int,
+    html_mode: bool,
+) -> List[str]:
+    plain = normalize_space(strip_telegram_html(str(text or "")))
+    if not plain:
+        return []
+
+    match = re.match(r"^(?P<prefix>(?:[•▪◦●‣-]|\d+\.)\s+(?:\S+\s+)?)?(?P<body>.+)$", plain)
+    prefix = normalize_space(str(match.group("prefix") or "")) if match else ""
+    body = normalize_space(str(match.group("body") or plain)) if match else plain
+    prefix_with_space = f"{prefix} " if prefix else ""
+    body_limit = max(60, max_chars - len(prefix_with_space) - 16)
+
+    sentences = [
+        normalize_space(part)
+        for part in re.split(r"(?<=[.!?;])\s+", body)
+        if normalize_space(part)
+    ]
+
+    if len(sentences) <= 1:
+        pieces = split_markdown_chunks(body, max_chars=body_limit)
+        return [f"{prefix_with_space}{piece}".strip() for piece in pieces if piece.strip()]
+
+    segments: List[str] = []
+    current = ""
+    for sentence in sentences:
+        candidate = f"{current} {sentence}".strip() if current else sentence
+        rendered_candidate = _render_query_block(
+            f"{prefix_with_space}{candidate}".strip(),
+            html_mode=html_mode,
+        )
+        if current and len(rendered_candidate) > max_chars:
+            segments.append(current)
+            current = ""
+            if len(_render_query_block(f"{prefix_with_space}{sentence}".strip(), html_mode=html_mode)) > max_chars:
+                pieces = split_markdown_chunks(sentence, max_chars=body_limit)
+                segments.extend(piece for piece in pieces if piece.strip())
+            else:
+                current = sentence
+            continue
+        if len(rendered_candidate) > max_chars:
+            pieces = split_markdown_chunks(sentence, max_chars=body_limit)
+            segments.extend(piece for piece in pieces if piece.strip())
+            continue
+        current = candidate
+
+    if current:
+        segments.append(current)
+
+    return [f"{prefix_with_space}{segment}".strip() for segment in segments if segment.strip()]
+
+
+def _join_query_rendered_blocks(
+    blocks: Sequence[Tuple[str, bool]],
+    *,
+    html_mode: bool,
+) -> str:
+    pieces: List[str] = []
+    prev_is_bullet: bool | None = None
+    single_sep = "<br>" if html_mode else "\n"
+    double_sep = "<br><br>" if html_mode else "\n\n"
+
+    for text, is_bullet in blocks:
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            continue
+        if pieces:
+            pieces.append(single_sep if (prev_is_bullet or is_bullet) else double_sep)
+        pieces.append(cleaned)
+        prev_is_bullet = is_bullet
+    return "".join(pieces).strip()
+
+
+def _prepare_query_answer_chunks(text: str, *, max_chars: int | None = None) -> List[str]:
+    resolved_max = max(160, min(int(max_chars or _QUERY_REPLY_MAX_CHARS), 3900))
+    html_mode = _is_html_formatting_enabled()
+    cleaned = _normalize_query_final_answer(text)
+    raw = re.sub(r"(?i)<br\s*/?>", "\n", cleaned).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return [cleaned]
+
+    blocks: List[str] = []
+    current: List[str] = []
+    for line in raw.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                blocks.append("\n".join(current))
+                current = []
+            continue
+        if _is_query_bullet_block(stripped):
+            if current:
+                blocks.append("\n".join(current))
+                current = []
+            blocks.append(stripped)
+            continue
+        current.append(stripped)
+    if current:
+        blocks.append("\n".join(current))
+    if not blocks:
+        return [cleaned]
+
+    rendered_blocks: List[Tuple[str, bool]] = []
+    for block in blocks:
+        is_bullet = _is_query_bullet_block(block)
+        rendered = _render_query_block(block, html_mode=html_mode)
+        if not rendered:
+            continue
+        if len(rendered) <= resolved_max:
+            rendered_blocks.append((rendered, is_bullet))
+            continue
+        if is_bullet:
+            split_blocks = _split_query_bullet_block(block, max_chars=resolved_max, html_mode=html_mode)
+            for split_block in split_blocks:
+                rendered_split = _render_query_block(split_block, html_mode=html_mode)
+                if rendered_split and len(rendered_split) <= resolved_max:
+                    rendered_blocks.append((rendered_split, True))
+                elif rendered_split:
+                    fallback_parts = (
+                        split_html_chunks(rendered_split, max_chars=resolved_max)
+                        if html_mode
+                        else split_markdown_chunks(rendered_split, max_chars=resolved_max)
+                    )
+                    rendered_blocks.extend(
+                        (part, True)
+                        for part in fallback_parts
+                        if str(part or "").strip()
+                    )
+            continue
+
+        fallback_parts = (
+            split_html_chunks(rendered, max_chars=resolved_max)
+            if html_mode
+            else split_markdown_chunks(rendered, max_chars=resolved_max)
+        )
+        rendered_blocks.extend(
+            (part, is_bullet)
+            for part in fallback_parts
+            if str(part or "").strip()
+        )
+
+    if not rendered_blocks:
+        return [cleaned]
+
+    chunks: List[str] = []
+    current_blocks: List[Tuple[str, bool]] = []
+    for block in rendered_blocks:
+        candidate_blocks = current_blocks + [block]
+        candidate_text = _join_query_rendered_blocks(candidate_blocks, html_mode=html_mode)
+        if current_blocks and len(candidate_text) > resolved_max:
+            chunks.append(_join_query_rendered_blocks(current_blocks, html_mode=html_mode))
+            current_blocks = [block]
+        else:
+            current_blocks = candidate_blocks
+    if current_blocks:
+        chunks.append(_join_query_rendered_blocks(current_blocks, html_mode=html_mode))
+
+    return [chunk for chunk in chunks if str(chunk or "").strip()] or [cleaned]
+
+
+async def _deliver_query_final_answer(
+    event: events.NewMessage.Event,
+    *,
+    progress_message: Message | Dict[str, object],
+    final_text: str,
+    prefer_bot_identity: bool = False,
+    bot_chat_id: int | None = None,
+    root_reply_to: int | None = None,
+    streamer: LiveTelegramStreamer | None = None,
+    max_chars: int | None = None,
+) -> object:
+    chunks = _prepare_query_answer_chunks(final_text, max_chars=max_chars)
+    if streamer is not None:
+        return await streamer.finalize(final_text, chunks=chunks)
+
+    first_ref = await _safe_reply_markdown(
+        event,
+        chunks[0],
+        edit_message=progress_message,
+        prefer_bot_identity=prefer_bot_identity,
+        bot_chat_id=bot_chat_id,
+    )
+    reply_to = _message_ref_id(first_ref if first_ref is not None else progress_message) or root_reply_to
+    for extra in chunks[1:]:
+        sent_ref = await _safe_reply_markdown(
+            event,
+            extra,
+            reply_to=reply_to,
+            prefer_bot_identity=prefer_bot_identity,
+            bot_chat_id=bot_chat_id,
+        )
+        reply_to = _message_ref_id(sent_ref) or reply_to
+
+    normalized_final = _normalize_query_final_answer(final_text)
+    plain_final = strip_telegram_html(normalized_final) if _is_html_formatting_enabled() else normalized_final
+    estimated_tokens = estimate_tokens_rough(plain_final)
+    return SimpleNamespace(
+        total_chars=len(plain_final),
+        estimated_tokens=estimated_tokens,
+        duration_seconds=0.0,
+        tokens_per_second=0.0,
+        edit_count=1,
+        message_count=len(chunks),
+    )
+
+
 def _merge_query_context(
     telegram_rows: Sequence[Dict[str, object]],
     web_rows: Sequence[Dict[str, object]],
@@ -8162,7 +8406,15 @@ async def _stream_query_answer(
     if final_suffix_html.strip() and "no relevant information found" not in strip_telegram_html(answer).lower():
         answer = f"{answer.strip()}<br><br>{final_suffix_html.strip()}"
 
-    stats = await streamer.finalize(answer)
+    stats = await _deliver_query_final_answer(
+        event,
+        progress_message=progress_message,
+        final_text=answer,
+        prefer_bot_identity=prefer_bot_identity,
+        bot_chat_id=bot_chat_id,
+        root_reply_to=root_reply_to,
+        streamer=streamer,
+    )
     return answer, stats
 
 async def _search_recent_news_web_bounded(*args, **kwargs) -> list[dict[str, object]]:
@@ -8411,14 +8663,14 @@ async def _handle_query_request(
                 and "no relevant information found" not in strip_telegram_html(answer).lower()
             ):
                 answer = f"{answer.strip()}<br><br>{evidence_split_section}"
-            await _safe_reply_markdown(
+            stream_stats = await _deliver_query_final_answer(
                 event_ref,  # type: ignore[arg-type]
-                answer,
-                edit_message=progress,
+                progress_message=progress,
+                final_text=answer,
                 prefer_bot_identity=prefer_bot_identity,
                 bot_chat_id=bot_chat_id,
+                root_reply_to=reply_to,
             )
-            stream_stats = None
 
         _append_query_history(sender_id, text, answer)
         log_structured(

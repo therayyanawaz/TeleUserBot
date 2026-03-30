@@ -365,6 +365,54 @@ def test_validate_filter_decision_strips_source_prefixes_and_promo_from_model_ou
     assert "Officials say the port reopened overnight" in plain
 
 
+def test_fallback_query_answer_preserves_full_long_evidence_line():
+    long_line = (
+        "Esmaeil Baghaei said Iran was not involved in the Pakistan-led talks and "
+        "described the latest rumors as politically motivated spin while reiterating "
+        "that no direct negotiation channel is currently active. The final marker is cobalt horizon."
+    )
+
+    answer = ai_filter._fallback_query_answer(
+        "What's the update in war?",
+        [{"text": long_line, "source": "Wire", "timestamp": 1700000000}],
+        detailed=False,
+    )
+    plain = ai_filter.strip_telegram_html(answer)
+
+    assert "cobalt horizon." in plain
+    assert "cobalt horizon..." not in plain
+
+
+def test_fallback_query_answer_keeps_selection_limit():
+    context = [
+        {"text": f"War update {idx} closes cleanly with a distinct marker {idx}.", "source": "Wire", "timestamp": 1700000000 - idx}
+        for idx in range(1, 9)
+    ]
+
+    answer = ai_filter._fallback_query_answer("What's the update in war?", context, detailed=False)
+    plain = ai_filter.strip_telegram_html(answer)
+
+    assert 1 <= plain.count("•") <= 4
+
+
+def test_fallback_query_answer_splits_oversize_single_evidence_line_cleanly():
+    long_line = " ".join(
+        f"Sentence {idx} closes cleanly."
+        for idx in range(1, 140)
+    )
+
+    answer = ai_filter._fallback_query_answer(
+        "What's the update in war?",
+        [{"text": long_line, "source": "Wire", "timestamp": 1700000000}],
+        detailed=False,
+    )
+    plain = ai_filter.strip_telegram_html(answer)
+
+    assert plain.count("•") >= 2
+    assert "Sentence 139 closes cleanly." in plain
+    assert not plain.rstrip().endswith("...")
+
+
 def test_prepare_media_caption_chunks_preserves_complete_sentences():
     caption = (
         "〔Breaking〕<br><br>"
@@ -427,6 +475,71 @@ async def test_send_media_caption_overflow_replies_to_media(monkeypatch):
     )
 
     assert sent_calls == [("Overflow one.", 321), ("Overflow two.", 321)]
+
+
+def test_prepare_query_answer_chunks_prefers_bullet_boundaries():
+    answer = (
+        "<b>What's the update in war</b><br>"
+        "• 🔥 First long bullet closes cleanly after several clauses and still ends with a full stop. "
+        "Sentence two also closes cleanly.<br>"
+        "• ⚠️ Second long bullet closes cleanly after several clauses and still ends with a full stop. "
+        "Sentence two also closes cleanly.<br>"
+        "• ⚠️ Third long bullet closes cleanly after several clauses and still ends with a full stop. "
+        "Sentence two also closes cleanly."
+    )
+
+    chunks = main._prepare_query_answer_chunks(answer, max_chars=160)
+
+    assert len(chunks) >= 2
+    assert all(len(chunk) <= 160 for chunk in chunks)
+    assert ai_filter.strip_telegram_html(chunks[0]).startswith("What's the update in war")
+    assert ai_filter.strip_telegram_html(chunks[1]).lstrip().startswith("•")
+
+
+@pytest.mark.asyncio
+async def test_deliver_query_final_answer_threads_continuations(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    async def fake_safe_reply_markdown(_event, text, *, edit_message=None, reply_to=None, prefer_bot_identity=False, bot_chat_id=None):
+        if edit_message is not None:
+            ref = {"message_id": int(edit_message.get("message_id", 0) or 900)}
+        else:
+            ref = {"message_id": 900 + len(calls) + 1}
+        calls.append(
+            {
+                "text": text,
+                "edit_message": edit_message,
+                "reply_to": reply_to,
+                "prefer_bot_identity": prefer_bot_identity,
+                "bot_chat_id": bot_chat_id,
+                "message_id": ref["message_id"],
+            }
+        )
+        return ref
+
+    monkeypatch.setattr(main, "_safe_reply_markdown", fake_safe_reply_markdown)
+
+    answer = (
+        "<b>What's the update in war</b><br>"
+        + "<br>".join(
+            f"• ⚠️ Bullet {idx} closes cleanly after several clauses and still ends with a full stop."
+            for idx in range(1, 7)
+        )
+    )
+
+    stats = await main._deliver_query_final_answer(
+        SimpleNamespace(chat_id=12345),
+        progress_message={"message_id": 900},
+        final_text=answer,
+        max_chars=160,
+    )
+
+    assert len(calls) >= 2
+    assert calls[0]["edit_message"] == {"message_id": 900}
+    assert calls[1]["reply_to"] == 900
+    if len(calls) >= 3:
+        assert calls[2]["reply_to"] == calls[1]["message_id"]
+    assert stats.message_count == len(calls)
 
 
 @pytest.mark.asyncio
@@ -573,6 +686,65 @@ async def test_handle_triage_inbound_job_keyword_override_uses_high_band_floor(m
     assert payload["severity_score"] == severity_classifier.severity_score_floor("high")
     assert payload["severity_breakdown"]["keyword_override"] is True
     assert captured["priority"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_stream_query_answer_uses_threaded_final_delivery(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    async def fake_safe_reply_markdown(_event, text, *, edit_message=None, reply_to=None, prefer_bot_identity=False, bot_chat_id=None):
+        if edit_message is not None:
+            ref = {"message_id": int(edit_message.get("message_id", 0) or 1000)}
+        else:
+            ref = {"message_id": 1000 + len(calls) + 1}
+        calls.append(
+            {
+                "text": text,
+                "edit_message": edit_message,
+                "reply_to": reply_to,
+                "message_id": ref["message_id"],
+            }
+        )
+        return ref
+
+    async def fake_generate_answer_from_context(*_args, **_kwargs):
+        return (
+            "<b>What's the update in war</b><br>"
+            + "<br>".join(
+                f"• ⚠️ Bullet {idx} closes cleanly after several clauses and still ends with a full stop."
+                for idx in range(1, 7)
+            )
+        )
+
+    monkeypatch.setattr(main, "_safe_reply_markdown", fake_safe_reply_markdown)
+    monkeypatch.setattr(main, "generate_answer_from_context", fake_generate_answer_from_context)
+    monkeypatch.setattr(main, "_require_auth_manager", lambda: object())
+    original_prepare_chunks = main._prepare_query_answer_chunks
+    monkeypatch.setattr(
+        main,
+        "_prepare_query_answer_chunks",
+        lambda text, max_chars=None: original_prepare_chunks(text, max_chars=160),
+    )
+
+    answer, stats = await main._stream_query_answer(
+        SimpleNamespace(chat_id=777),
+        progress_message={"message_id": 1000},
+        query_text="What's the update in war?",
+        results=[{"text": "placeholder"}],
+        history=[],
+        prefer_bot_identity=False,
+        bot_chat_id=None,
+        root_reply_to=77,
+        final_suffix_html="",
+    )
+
+    assert "What's the update in war" in answer
+    assert len(calls) >= 2
+    assert calls[0]["edit_message"] == {"message_id": 1000}
+    assert calls[1]["reply_to"] == 1000
+    if len(calls) >= 3:
+        assert calls[2]["reply_to"] == calls[1]["message_id"]
+    assert stats.message_count == len(calls)
 
 
 @pytest.mark.asyncio

@@ -2521,6 +2521,75 @@ def _build_query_context_lines(
     return lines, used
 
 
+def _hard_wrap_query_fallback_segment(text: str, *, limit: int) -> list[str]:
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return []
+    if len(cleaned) <= limit:
+        return [cleaned]
+
+    chunks: list[str] = []
+    remaining = cleaned
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        window = remaining[:limit].rstrip()
+        cut = max(
+            window.rfind(". "),
+            window.rfind("; "),
+            window.rfind(", "),
+            window.rfind(" - "),
+            window.rfind(" — "),
+        )
+        if cut < int(limit * 0.55):
+            cut = window.rfind(" ")
+        if cut < int(limit * 0.55):
+            cut = len(window)
+        piece = normalize_space(window[:cut].rstrip(" ,;:-/"))
+        if not piece:
+            piece = normalize_space(window)
+        if not piece:
+            break
+        chunks.append(piece)
+        remaining = normalize_space(remaining[cut:].lstrip(" ,;:-/"))
+    return chunks
+
+
+def _split_query_fallback_segments(text: str, *, limit: int = 3200) -> list[str]:
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return []
+    if len(cleaned) <= limit:
+        return [cleaned]
+
+    sentences = [
+        normalize_space(part)
+        for part in re.split(r"(?<=[.!?;])\s+", cleaned)
+        if normalize_space(part)
+    ]
+    if len(sentences) <= 1:
+        return _hard_wrap_query_fallback_segment(cleaned, limit=limit)
+
+    segments: list[str] = []
+    current = ""
+    for sentence in sentences:
+        candidate = f"{current} {sentence}".strip() if current else sentence
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            segments.append(current)
+            current = ""
+        if len(sentence) <= limit:
+            current = sentence
+            continue
+        segments.extend(_hard_wrap_query_fallback_segment(sentence, limit=limit))
+    if current:
+        segments.append(current)
+    return segments or _hard_wrap_query_fallback_segment(cleaned, limit=limit)
+
+
 def _fallback_query_answer(
     query: str,
     context_messages: Sequence[Dict[str, object]],
@@ -2557,11 +2626,10 @@ def _fallback_query_answer(
             text,
             flags=re.IGNORECASE,
         )
-        if len(text) > 180:
-            text = f"{text[:177].rsplit(' ', 1)[0]}..."
         prefix = "🔥" if _severity_from_text_heuristic(text) == "high" else "⚠️"
-        line = f"• {prefix} {text}"
-        lines.append(line)
+        for segment in _split_query_fallback_segments(text):
+            line = f"• {prefix} {segment}"
+            lines.append(line)
 
     if not lines:
         return QUERY_NO_MATCH_TEXT
