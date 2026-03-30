@@ -184,6 +184,8 @@ def test_format_breaking_text_unhinged_uses_editorial_card_without_context(monke
     plain = ai_filter.strip_telegram_html(rendered)
 
     assert "〔" in rendered
+    assert rendered.count("<b>") == 1
+    assert "<u>" not in rendered
     assert "Why it matters" not in rendered
     assert "Two rockets landed near Haifa overnight" in plain
     assert "NYT" not in plain
@@ -204,7 +206,10 @@ def test_format_breaking_text_unhinged_supports_context_line(monkeypatch):
     assert "Why it matters" in plain
     assert "Haifa" in plain
     assert "Acre" in plain
+    assert "same thread into Acre" in plain
     assert "〔" in rendered
+    assert rendered.count("<b>") == 1
+    assert "<u>" not in rendered
 
 
 def test_format_breaking_text_unhinged_supports_context_block(monkeypatch):
@@ -233,6 +238,7 @@ def test_format_breaking_text_classic_keeps_bridge_in_legacy_mode(monkeypatch):
 
     assert "<br><br>" in rendered
     assert "Why it matters: context." in rendered
+    assert "<u>" not in rendered
 
 
 def test_should_attach_vital_opinion_unhinged_uses_context_not_probability(monkeypatch):

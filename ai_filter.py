@@ -185,8 +185,14 @@ _FEED_CONTEXT_BANNED_FRAGMENTS = (
     "ways to address",
     "analysis",
     "opinion",
-    "thread",
     "explainer",
+    "our channel",
+    "subscribe",
+    "follow",
+    "join",
+    "livestream",
+    "live stream",
+    "watch here",
 )
 _FEED_LINE_PREFIX_RE = re.compile(
     r"^(?:breaking|alert|live update|update|analysis|opinion|thread|explainer)\s*[:\-–—]+\s*",
@@ -196,6 +202,59 @@ _FEED_QUESTION_RE = re.compile(
     r"^(?:why|how|what explains|what caused|can|could|should|would|will)\b",
     flags=re.IGNORECASE,
 )
+_FEED_HANDLE_RE = re.compile(r"(?<!\w)@[A-Za-z0-9_]{2,}\b")
+_FEED_TELEGRAM_LINK_RE = re.compile(
+    r"(?i)\b(?:https?://)?(?:t\.me|telegram\.me)/[A-Za-z0-9_+./-]+"
+)
+_FEED_PROMO_TO_END_RE = re.compile(
+    r"(?i)\b(?:our channel|subscribe|follow(?: us)?|join(?: us| our channel)?|"
+    r"watch here|watch live|livestream|live stream)\b.*$"
+)
+_FEED_INCOMPLETE_TAIL_WORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "via",
+    "with",
+}
+_FEED_GEO_PREFIX_ALLOWLIST = {
+    "beirut",
+    "damascus",
+    "gaza",
+    "haifa",
+    "iran",
+    "iraq",
+    "israel",
+    "lebanon",
+    "syria",
+    "tehran",
+    "u.s.",
+    "us",
+    "usa",
+    "yemen",
+}
+_FEED_SOURCE_PREFIX_CONNECTORS = {
+    "al",
+    "and",
+    "de",
+    "el",
+    "en",
+    "la",
+    "of",
+    "the",
+}
 
 LOGGER = logging.getLogger("tg_news_userbot.ai_filter")
 _SUMMARY_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -393,6 +452,93 @@ def _truncate_feed_line(text: str, *, limit: int) -> str:
     return f"{cleaned[: limit - 3].rsplit(' ', 1)[0]}..."
 
 
+def _looks_like_generated_source_prefix(prefix: str) -> bool:
+    cleaned = normalize_space(prefix).strip(" .")
+    lowered = cleaned.lower()
+    if not cleaned or lowered in _FEED_GEO_PREFIX_ALLOWLIST:
+        return False
+    if lowered.startswith(("why it matters", "what", "where", "when", "status", "location")):
+        return False
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9&'._/-]*", cleaned)
+    if not tokens or len(tokens) > 5:
+        return False
+    has_signal = False
+    for token in tokens:
+        bare = token.strip(".")
+        lower = bare.lower()
+        if lower in _FEED_SOURCE_PREFIX_CONNECTORS:
+            continue
+        if bare.isdigit():
+            has_signal = True
+            continue
+        if bare.isupper() and len(bare) >= 2:
+            has_signal = True
+            continue
+        if bare[:1].isupper():
+            has_signal = True
+            continue
+        return False
+    return has_signal
+
+
+def _clean_generated_delivery_segment(line: str) -> str:
+    cleaned = normalize_space(strip_telegram_html(str(line or "")))
+    if not cleaned:
+        return ""
+    cleaned = _FEED_LINE_PREFIX_RE.sub("", cleaned).strip()
+    cleaned = cleaned.lstrip("/\\| ").strip()
+    cleaned = _FEED_TELEGRAM_LINK_RE.sub("", cleaned)
+    cleaned = _FEED_HANDLE_RE.sub("", cleaned)
+    cleaned = _FEED_PROMO_TO_END_RE.sub("", cleaned)
+    cleaned = re.sub(r"(?i)\b(?:channel|source)\s*[:\-–—|]+\s*$", "", cleaned)
+    prefix_match = re.match(
+        r"^(?P<prefix>[A-Za-z][A-Za-z0-9&'._ /-]{1,50})\s*[:\-–—|]+\s*(?P<rest>.+)$",
+        cleaned,
+    )
+    if prefix_match and _looks_like_generated_source_prefix(prefix_match.group("prefix")):
+        cleaned = normalize_space(prefix_match.group("rest"))
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    return normalize_space(cleaned.strip(" ,;:-|/[](){}"))
+
+
+def _feed_segment_is_incomplete(line: str) -> bool:
+    cleaned = normalize_space(line)
+    if not cleaned:
+        return True
+    if cleaned.endswith((':', '/', '-', '|', '•')):
+        return True
+    if cleaned.startswith(("@", "/", "\\")):
+        return True
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9.'/-]*", cleaned)
+    if not words:
+        return True
+    if words[-1].strip(".,;:!?").lower() in _FEED_INCOMPLETE_TAIL_WORDS:
+        return True
+    match = re.match(
+        r"^(?P<prefix>[A-Za-z][A-Za-z0-9&'._ -]{1,40})\s*:\s*(?P<rest>.+)$",
+        cleaned,
+    )
+    if match:
+        prefix = normalize_space(match.group("prefix")).lower().strip(" .")
+        rest_words = re.findall(r"[A-Za-z0-9][A-Za-z0-9.'/-]*", normalize_space(match.group("rest")))
+        if len(rest_words) <= 2 and prefix not in _FEED_GEO_PREFIX_ALLOWLIST:
+            return True
+    return False
+
+
+def _clean_generated_delivery_html(text: str, *, max_lines: int) -> str:
+    out: list[str] = []
+    raw = re.sub(r"(?i)<br\s*/?>", "\n", str(text or ""))
+    for part in re.split(r"\n+", raw):
+        cleaned = _clean_generated_delivery_segment(part)
+        if not cleaned or _feed_segment_is_incomplete(cleaned):
+            continue
+        out.append(sanitize_telegram_html(cleaned))
+        if len(out) >= max_lines:
+            break
+    return "<br>".join(out)
+
+
 def _feed_summary_segments(*texts: str) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -404,8 +550,7 @@ def _feed_summary_segments(*texts: str) -> list[str]:
         if not plain:
             continue
         for part in re.split(r"\n+|(?<=[.!?])\s+", plain):
-            cleaned = normalize_space(part.strip(" \t-•"))
-            cleaned = _FEED_LINE_PREFIX_RE.sub("", cleaned).strip()
+            cleaned = _clean_generated_delivery_segment(part.strip(" \t-•"))
             if not cleaned:
                 continue
             key = cleaned.lower()
@@ -430,6 +575,8 @@ def _is_bad_feed_headline(line: str) -> bool:
         return True
     if cleaned.count("...") or cleaned.endswith("..."):
         return True
+    if _feed_segment_is_incomplete(cleaned):
+        return True
     return False
 
 
@@ -445,6 +592,8 @@ def _is_weak_feed_context(line: str, headline: str) -> bool:
     if SequenceMatcher(None, cleaned.lower(), headline.lower()).ratio() >= 0.72:
         return True
     if should_downgrade_explainer_urgency(cleaned) and not looks_like_live_event_update(cleaned):
+        return True
+    if _feed_segment_is_incomplete(cleaned):
         return True
     return False
 
@@ -794,6 +943,8 @@ def _filter_decision_system_prompt() -> str:
         "summary_html must be Telegram-safe HTML using only <b>, <i>, <u>, <s>, <tg-spoiler>, <code>, <pre>, <blockquote>, <a href>, <br>\n"
         "headline_html must be a concise one-line Telegram-safe HTML headline or empty string\n"
         "story_bridge_html must be a concise Telegram-safe HTML contextual bridge or empty string\n"
+        "Never include channel names, channel usernames, source handles, t.me links, outlet/source prefixes, or self-promo text like our channel / subscribe / follow in any field.\n"
+        "If cleanup would leave only promo, source attribution, or an incomplete fragment, output an empty string instead of that fragment.\n"
         "confidence must be a number from 0 to 1\n"
         "reason_code must be a short snake_case code\n"
         "topic_key must be a short normalized topic label\n"
@@ -1461,6 +1612,9 @@ def _validate_filter_decision(
     raw_summary_html = sanitize_telegram_html(str(payload.get("summary_html") or "")).strip()
     headline_html = sanitize_telegram_html(str(payload.get("headline_html") or "")).strip()
     story_bridge_html = sanitize_telegram_html(str(payload.get("story_bridge_html") or "")).strip()
+    raw_summary_html = _clean_generated_delivery_html(raw_summary_html, max_lines=2)
+    headline_html = _clean_generated_delivery_html(headline_html, max_lines=1)
+    story_bridge_html = _clean_generated_delivery_html(story_bridge_html, max_lines=2)
     summary_html = normalize_feed_summary_html(raw_summary_html, raw_text)
 
     if action != "skip" and not summary_html:

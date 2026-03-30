@@ -297,6 +297,7 @@ daily_digest_scheduler_task: asyncio.Task | None = None
 queue_clear_scheduler_task: asyncio.Task | None = None
 query_bot_poll_task: asyncio.Task | None = None
 source_title_cache: Dict[str, str] = {}
+source_alias_cache: Dict[str, set[str]] = defaultdict(set)
 digest_next_run_ts: float | None = None
 digest_retry_backoff_seconds: int = 0
 digest_loop_lock = asyncio.Lock()
@@ -2101,8 +2102,27 @@ def _filename_for_bot_media(msg: Message, index: int) -> str:
 
 
 def _format_summary_text_legacy(source_title: str, summary: str) -> str:
+    category_label = "Update"
+    headline, context = extract_feed_summary_parts(str(summary or ""), str(summary or ""))
+    clean_headline = _clean_editorial_headline(
+        headline or str(summary or ""),
+        source_title=source_title,
+        category_label=category_label,
+        severity="medium",
+    )
+    if not clean_headline:
+        return ""
+    clean_context = _clean_editorial_context(
+        context,
+        headline=clean_headline,
+        source_title=source_title,
+        category_label=category_label,
+        severity="medium",
+    )
     safe_source = sanitize_telegram_html(source_title)
-    safe_summary = str(summary or "").strip()
+    safe_summary = sanitize_telegram_html(clean_headline)
+    if clean_context:
+        safe_summary = f"{safe_summary}<br><br>Why it matters: {sanitize_telegram_html(clean_context)}"
     if _include_source_tags():
         return f"<b>📰 {safe_source}</b><br><br>{safe_summary}"
     return f"<b>📰 Update</b><br><br>{safe_summary}"
@@ -2144,6 +2164,216 @@ def _to_plain_text(text: str | None, max_len: int | None = None) -> str | None:
     if max_len is not None and len(cleaned) > max_len:
         cleaned = cleaned[: max_len - 3].rstrip() + "..."
     return cleaned
+
+
+def _caption_lines_from_fragment(text: str | None) -> List[str]:
+    raw = re.sub(r"(?i)<br\s*/?>", "\n", str(text or ""))
+    lines: List[str] = []
+    for part in re.split(r"\n+", raw):
+        cleaned = normalize_space(strip_telegram_html(part))
+        if cleaned:
+            lines.append(cleaned)
+    return lines
+
+
+def _render_caption_lines_html(lines: Sequence[str], *, bold_first: bool = False) -> str:
+    rendered: List[str] = []
+    for idx, line in enumerate(lines):
+        safe_line = sanitize_telegram_html(normalize_space(line))
+        if not safe_line:
+            continue
+        if idx == 0 and bold_first:
+            rendered.append(f"<b>{safe_line}</b>")
+        else:
+            rendered.append(safe_line)
+    return "<br><br>".join(rendered)
+
+
+def _render_caption_lines_plain(lines: Sequence[str]) -> str:
+    rendered = [normalize_space(line) for line in lines if normalize_space(line)]
+    return "\n\n".join(rendered)
+
+
+def _hard_wrap_caption_text(text: str, *, limit: int) -> List[str]:
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return []
+    if len(cleaned) <= limit:
+        return [cleaned]
+
+    chunks: List[str] = []
+    remaining = cleaned
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        window = remaining[:limit].rstrip()
+        cut = max(
+            window.rfind(". "),
+            window.rfind("; "),
+            window.rfind(", "),
+            window.rfind(" - "),
+            window.rfind(" — "),
+        )
+        if cut < int(limit * 0.55):
+            cut = window.rfind(" ")
+        if cut < int(limit * 0.55):
+            cut = len(window)
+        piece = normalize_space(window[:cut].rstrip(" ,;:-/"))
+        words = piece.split()
+        while words and words[-1].strip(".,;:!?").lower() in _CAPTION_INCOMPLETE_TAIL_WORDS:
+            words.pop()
+        piece = normalize_space(" ".join(words)) or normalize_space(window[:cut])
+        if not piece:
+            break
+        chunks.append(piece)
+        remaining = normalize_space(remaining[cut:].lstrip(" ,;:-/"))
+    return chunks
+
+
+def _split_caption_line_segments(text: str, *, limit: int) -> List[str]:
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return []
+    if len(cleaned) <= limit:
+        return [cleaned]
+
+    sentences = [
+        normalize_space(part)
+        for part in re.split(r"(?<=[.!?;])\s+", cleaned)
+        if normalize_space(part)
+    ]
+    if len(sentences) <= 1:
+        return _hard_wrap_caption_text(cleaned, limit=limit)
+
+    segments: List[str] = []
+    current = ""
+    for sentence in sentences:
+        candidate = f"{current} {sentence}".strip() if current else sentence
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            segments.append(current)
+            current = ""
+        if len(sentence) <= limit:
+            current = sentence
+            continue
+        segments.extend(_hard_wrap_caption_text(sentence, limit=limit))
+    if current:
+        segments.append(current)
+    return segments or _hard_wrap_caption_text(cleaned, limit=limit)
+
+
+def _fit_caption_segments(
+    segments: Sequence[str],
+    *,
+    limit: int,
+    use_html: bool,
+) -> tuple[List[str], List[str]]:
+    if not segments:
+        return [], []
+    renderer = _render_caption_lines_html if use_html else _render_caption_lines_plain
+    fitted: List[str] = []
+    for idx, segment in enumerate(segments):
+        candidate = fitted + [segment]
+        if fitted and len(renderer(candidate)) > limit:
+            return fitted, list(segments[idx:])
+        fitted = candidate
+    return fitted, []
+
+
+def _render_caption_chunk_batch(
+    segments: Sequence[str],
+    *,
+    use_html: bool,
+) -> List[str]:
+    if not segments:
+        return []
+    renderer = _render_caption_lines_html if use_html else _render_caption_lines_plain
+    chunks: List[str] = []
+    remaining = list(segments)
+    while remaining:
+        fitted, overflow = _fit_caption_segments(
+            remaining,
+            limit=_MEDIA_CAPTION_MAX_CHARS,
+            use_html=use_html,
+        )
+        if not fitted:
+            fitted = [remaining[0]]
+            overflow = remaining[1:]
+        rendered = renderer(fitted)
+        if rendered:
+            chunks.append(rendered)
+        remaining = overflow
+    return chunks
+
+
+def _prepare_media_caption_chunks(
+    caption: str | None,
+    *,
+    allow_premium_tags: bool,
+) -> tuple[str | None, List[str]]:
+    if not caption:
+        return None, []
+
+    lines = _caption_lines_from_fragment(caption)
+    if not lines:
+        return None, []
+
+    use_html = _is_html_formatting_enabled()
+    header = lines[0] if re.fullmatch(r"〔.+〕", lines[0]) else ""
+    body_lines = lines[1:] if header else lines
+    body_segments: List[str] = []
+    body_segment_limit = max(140, _MEDIA_CAPTION_MAX_CHARS - 120)
+    for line in body_lines:
+        body_segments.extend(_split_caption_line_segments(line, limit=body_segment_limit))
+
+    if use_html:
+        header_raw = _render_caption_lines_html([header], bold_first=True) if header else ""
+        renderer = _render_caption_lines_html
+    else:
+        header_raw = _render_caption_lines_plain([header]) if header else ""
+        renderer = _render_caption_lines_plain
+
+    separator_len = len("<br><br>") if use_html else len("\n\n")
+    if header_raw and body_segments:
+        first_limit = max(160, _MEDIA_CAPTION_MAX_CHARS - len(header_raw) - separator_len)
+    else:
+        first_limit = _MEDIA_CAPTION_MAX_CHARS
+
+    first_body_segments, remaining_segments = _fit_caption_segments(
+        body_segments,
+        limit=first_limit,
+        use_html=use_html,
+    )
+    first_body_raw = renderer(first_body_segments) if first_body_segments else ""
+    if header_raw and first_body_raw:
+        separator = "<br><br>" if use_html else "\n\n"
+        first_raw = f"{header_raw}{separator}{first_body_raw}"
+    else:
+        first_raw = header_raw or first_body_raw
+    overflow_raw = _render_caption_chunk_batch(remaining_segments, use_html=use_html)
+
+    first = _render_outbound_text(first_raw, allow_premium_tags=allow_premium_tags) if first_raw else None
+    overflow = [
+        rendered
+        for chunk in overflow_raw
+        if chunk and (rendered := _render_outbound_text(chunk, allow_premium_tags=allow_premium_tags))
+    ]
+    return first, overflow
+
+
+async def _send_media_caption_overflow(
+    overflow_chunks: Sequence[str],
+    *,
+    sent_ref: object | None,
+) -> None:
+    if not overflow_chunks:
+        return
+    reply_to = _message_ref_id(_primary_message_ref(sent_ref))
+    for chunk in overflow_chunks:
+        await _send_text_with_ref(chunk, reply_to=reply_to)
 
 
 def _extract_addlist_hash(folder_invite_link: str) -> str:
@@ -2261,6 +2491,9 @@ async def _source_info(msg: Message) -> Tuple[str, str | None]:
     else:
         source = str(msg.chat_id)
 
+    source_title_cache[str(msg.chat_id)] = source
+    _register_source_aliases(str(msg.chat_id), source, title, username)
+
     link = build_telegram_message_link(
         username=username if isinstance(username, str) else None,
         chat_id=msg.chat_id,
@@ -2285,10 +2518,11 @@ async def _source_title_from_channel_id(channel_id: str) -> str:
         try:
             entity = await _call_with_floodwait(tg.get_entity, candidate)
             candidate_title = getattr(entity, "title", None)
+            username = getattr(entity, "username", None)
+            _register_source_aliases(channel_id, candidate_title, username)
             if isinstance(candidate_title, str) and candidate_title.strip():
                 title = candidate_title.strip()
                 break
-            username = getattr(entity, "username", None)
             if isinstance(username, str) and username.strip():
                 title = username.strip()
                 break
@@ -2545,10 +2779,13 @@ def _format_ocr_translation_caption(translated_text: str) -> str | None:
     cleaned = normalize_space(strip_telegram_html(translated_text))
     if not cleaned:
         return None
-    capped = _truncate_context_line(cleaned, limit=min(_media_text_ocr_max_chars(), 700))
-    if not capped:
+    capped = _truncate_caption_fragment_complete(
+        cleaned,
+        limit=min(_media_text_ocr_max_chars(), 700),
+    )
+    if not capped or not _caption_fragment_is_usable(capped):
         return None
-    return f"<i>Translate:</i> {sanitize_telegram_html(capped)}"
+    return f"Translate: {sanitize_telegram_html(capped)}"
 
 
 async def _extract_media_ocr_translation(msg: Message) -> str | None:
@@ -2739,6 +2976,72 @@ _EDITORIAL_HEADLINE_MAX_STANDARD = 160
 _EDITORIAL_HEADLINE_MAX_BREAKING = 180
 _EDITORIAL_CONTEXT_MAX_STANDARD = 200
 _EDITORIAL_CONTEXT_MAX_BREAKING = 220
+_CAPTION_HANDLE_RE = re.compile(r"(?<!\w)@[A-Za-z0-9_]{2,}\b")
+_CAPTION_TELEGRAM_LINK_RE = re.compile(
+    r"(?i)\b(?:https?://)?(?:t\.me|telegram\.me)/[A-Za-z0-9_+./-]+"
+)
+_CAPTION_PROMO_TO_END_RE = re.compile(
+    r"(?i)\b(?:our channel|subscribe|follow(?: us)?|join(?: us| our channel)?|"
+    r"watch here|watch live|livestream|live stream|full stream|full video|"
+    r"watch the livestream|watch the full livestream)\b.*$"
+)
+_CAPTION_SOURCE_CLAUSE_RE = re.compile(
+    r"(?i)\b(?:our channel|source|channel)\s*[:\-–—|]+\s*$"
+)
+_CAPTION_INCOMPLETE_TAIL_WORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "because",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "via",
+    "with",
+}
+_CAPTION_GEO_PREFIX_ALLOWLIST = {
+    "beirut",
+    "damascus",
+    "egypt",
+    "eu",
+    "gaza",
+    "haifa",
+    "iran",
+    "iraq",
+    "israel",
+    "jordan",
+    "lebanon",
+    "russia",
+    "syria",
+    "tehran",
+    "uae",
+    "u.s.",
+    "uk",
+    "ukraine",
+    "us",
+    "usa",
+    "yemen",
+}
+_CAPTION_SOURCE_PREFIX_CONNECTORS = {
+    "al",
+    "and",
+    "de",
+    "el",
+    "en",
+    "la",
+    "of",
+    "the",
+}
+_MEDIA_CAPTION_MAX_CHARS = 980
 
 
 def _plain_category_label(label: str) -> str:
@@ -2746,6 +3049,228 @@ def _plain_category_label(label: str) -> str:
     plain = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u26FF\u2700-\u27BF\uFE0F]", " ", plain)
     plain = plain.strip("[](){}〔〕|:- ")
     return normalize_space(plain)
+
+
+def _looks_like_caption_source_prefix(prefix: str) -> bool:
+    cleaned = normalize_space(prefix).strip(" .")
+    lowered = cleaned.lower()
+    if not cleaned or lowered in _CAPTION_GEO_PREFIX_ALLOWLIST:
+        return False
+    if lowered.startswith(("why it matters", "what", "where", "when", "status", "location")):
+        return False
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9&'._/-]*", cleaned)
+    if not tokens or len(tokens) > 5:
+        return False
+    has_signal = False
+    for token in tokens:
+        bare = token.strip(".")
+        lower = bare.lower()
+        if lower in _CAPTION_SOURCE_PREFIX_CONNECTORS:
+            continue
+        if bare.isdigit():
+            has_signal = True
+            continue
+        if bare.isupper() and len(bare) >= 2:
+            has_signal = True
+            continue
+        if bare[:1].isupper():
+            has_signal = True
+            continue
+        return False
+    return has_signal
+
+
+def _source_alias_variants(value: object) -> set[str]:
+    raw = normalize_space(strip_telegram_html(str(value or "")))
+    if not raw or raw.lstrip("-").isdigit():
+        return set()
+
+    variants = {raw}
+    bare = raw.lstrip("@").strip()
+    if bare:
+        variants.add(bare)
+        if re.fullmatch(r"[A-Za-z0-9_]{2,}", bare):
+            variants.add(f"@{bare}")
+    return {normalize_space(item) for item in variants if normalize_space(item)}
+
+
+def _register_source_aliases(channel_id: str, *values: object) -> None:
+    key = normalize_space(str(channel_id or ""))
+    if not key:
+        return
+    aliases = source_alias_cache[key]
+    for value in values:
+        aliases.update(_source_alias_variants(value))
+
+
+def _collect_monitored_source_aliases(source_title: str = "") -> list[str]:
+    aliases: set[str] = set()
+    for cached_title in source_title_cache.values():
+        aliases.update(_source_alias_variants(cached_title))
+    for cached_aliases in source_alias_cache.values():
+        aliases.update({normalize_space(item) for item in cached_aliases if normalize_space(item)})
+    aliases.update(_source_alias_variants(source_title))
+    for entry in _manual_source_entries():
+        aliases.update(_source_alias_variants(entry))
+        username = _extract_public_username(entry)
+        if username:
+            aliases.update(_source_alias_variants(username))
+    aliases.discard("")
+    return sorted(aliases, key=len, reverse=True)
+
+
+def _strip_known_source_aliases(text: str, *, source_title: str = "") -> str:
+    cleaned = str(text or "")
+    for alias in _collect_monitored_source_aliases(source_title):
+        bare = alias.lstrip("@")
+        if not bare:
+            continue
+        if alias.startswith("@") or re.fullmatch(r"[A-Za-z0-9_]{2,}", bare):
+            cleaned = re.sub(
+                rf"(?<!\w)@?{re.escape(bare)}(?!\w)",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+        if " " in bare or len(bare) >= 6:
+            cleaned = re.sub(
+                rf"(?<![A-Za-z0-9]){re.escape(bare)}(?![A-Za-z0-9])",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+        else:
+            cleaned = re.sub(
+                rf"^\s*{re.escape(bare)}\s*[:\-–—|]+\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+    return cleaned
+
+
+def _strip_caption_promo_noise(text: str, *, source_title: str = "") -> str:
+    cleaned = str(text or "")
+    for _ in range(4):
+        previous = cleaned
+        cleaned = _CAPTION_TELEGRAM_LINK_RE.sub("", cleaned)
+        cleaned = _strip_known_source_aliases(cleaned, source_title=source_title)
+        cleaned = _CAPTION_HANDLE_RE.sub("", cleaned)
+        cleaned = _CAPTION_PROMO_TO_END_RE.sub("", cleaned)
+        cleaned = _CAPTION_SOURCE_CLAUSE_RE.sub("", cleaned)
+        prefix_match = re.match(
+            r"^(?P<prefix>[A-Za-z][A-Za-z0-9&'._ /-]{1,50})\s*[:\-–—|]+\s*(?P<rest>.+)$",
+            cleaned,
+        )
+        if prefix_match and _looks_like_caption_source_prefix(prefix_match.group("prefix")):
+            cleaned = normalize_space(prefix_match.group("rest"))
+        cleaned = re.sub(r"(?i)\b(?:via|from)\s*[:\-–—|]+\s*$", "", cleaned)
+        cleaned = normalize_space(cleaned.strip(" ,;:-|/[](){}"))
+        if cleaned == previous:
+            break
+    return cleaned
+
+
+def _normalize_caption_fragment(
+    text: str,
+    *,
+    source_title: str = "",
+    category_label: str = "",
+) -> str:
+    cleaned = _strip_editorial_prefixes(
+        text,
+        source_title=source_title,
+        category_label=category_label,
+    )
+    cleaned = cleaned.lstrip("/\\| ").strip()
+    cleaned = _strip_caption_promo_noise(cleaned, source_title=source_title)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"[|•]+", " ", cleaned)
+    cleaned = normalize_space(cleaned.strip(" ,;:-|/[](){}"))
+    return cleaned
+
+
+def _looks_like_incomplete_source_fragment(text: str) -> bool:
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return True
+
+    match = re.match(
+        r"^(?P<prefix>[A-Za-z][A-Za-z0-9&'._ -]{1,40})\s*:\s*(?P<rest>.+)$",
+        cleaned,
+    )
+    if not match:
+        return False
+
+    prefix = normalize_space(match.group("prefix")).lower().strip(" .")
+    rest = normalize_space(match.group("rest"))
+    rest_tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9.'/-]*", rest)
+    if not rest:
+        return True
+    if len(rest_tokens) <= 2 and prefix not in _CAPTION_GEO_PREFIX_ALLOWLIST:
+        return True
+    return False
+
+
+def _caption_fragment_is_usable(text: str) -> bool:
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return False
+    lowered = cleaned.lower()
+    if cleaned.endswith((':', '/', '-', '|', '•')):
+        return False
+    if cleaned.startswith(("@", "/", "\\")):
+        return False
+    if any(fragment in lowered for fragment in _EDITORIAL_CONTEXT_BANNED_FRAGMENTS):
+        return False
+    if any(
+        lowered.startswith(marker)
+        for marker in (
+            "our channel",
+            "subscribe",
+            "follow",
+            "join",
+            "watch here",
+            "watch live",
+            "livestream",
+            "live stream",
+            "thread",
+        )
+    ):
+        return False
+    if _looks_like_incomplete_source_fragment(cleaned):
+        return False
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9.'/-]*", cleaned)
+    if not words:
+        return False
+    if words[-1].strip(".,;:!?").lower() in _CAPTION_INCOMPLETE_TAIL_WORDS:
+        return False
+    return True
+
+
+def _truncate_caption_fragment_complete(text: str, *, limit: int) -> str:
+    cleaned = normalize_space(text)
+    if len(cleaned) <= limit:
+        return cleaned
+
+    window = cleaned[:limit].rstrip()
+    cut = max(
+        window.rfind(". "),
+        window.rfind("; "),
+        window.rfind(", "),
+        window.rfind(" - "),
+        window.rfind(" — "),
+    )
+    if cut < int(limit * 0.55):
+        cut = window.rfind(" ")
+    if cut < int(limit * 0.55):
+        cut = len(window)
+
+    truncated = normalize_space(window[:cut].rstrip(" ,;:-/"))
+    words = truncated.split()
+    while words and words[-1].strip(".,;:!?").lower() in _CAPTION_INCOMPLETE_TAIL_WORDS:
+        words.pop()
+    return normalize_space(" ".join(words))
 
 
 def _strip_editorial_prefixes(
@@ -2797,16 +3322,23 @@ def _clean_editorial_headline(
     category_label: str,
     severity: str,
 ) -> str:
-    cleaned = _strip_editorial_prefixes(value, source_title=source_title, category_label=category_label)
+    cleaned = _normalize_caption_fragment(
+        value,
+        source_title=source_title,
+        category_label=category_label,
+    )
     cleaned = cleaned.rstrip(".")
     if cleaned.endswith("?"):
         cleaned = cleaned.rstrip("?").rstrip()
+    if not _caption_fragment_is_usable(cleaned):
+        return ""
     headline_limit = (
         _EDITORIAL_HEADLINE_MAX_BREAKING
         if normalize_space(severity).lower() == "high"
         else _EDITORIAL_HEADLINE_MAX_STANDARD
     )
-    return _truncate_context_line(cleaned, limit=headline_limit)
+    truncated = _truncate_caption_fragment_complete(cleaned, limit=headline_limit)
+    return truncated if _caption_fragment_is_usable(truncated) else ""
 
 
 def _clean_editorial_context(
@@ -2821,14 +3353,14 @@ def _clean_editorial_context(
     text = re.sub(r"(?i)<br\s*/?>", "\n", text)
     lines: list[str] = []
     for raw_line in re.split(r"\n+", text):
-        cleaned = _strip_editorial_prefixes(raw_line, source_title=source_title, category_label=category_label)
-        cleaned = normalize_space(cleaned)
-        if not cleaned:
+        cleaned = _normalize_caption_fragment(
+            raw_line,
+            source_title=source_title,
+            category_label=category_label,
+        )
+        if not _caption_fragment_is_usable(cleaned):
             continue
-        lowered = cleaned.lower()
-        if any(fragment in lowered for fragment in _EDITORIAL_CONTEXT_BANNED_FRAGMENTS):
-            continue
-        if SequenceMatcher(None, lowered, headline.lower()).ratio() >= 0.72:
+        if SequenceMatcher(None, cleaned.lower(), headline.lower()).ratio() >= 0.72:
             continue
         lines.append(cleaned)
     if not lines:
@@ -2842,7 +3374,8 @@ def _clean_editorial_context(
         if normalize_space(severity).lower() == "high"
         else _EDITORIAL_CONTEXT_MAX_STANDARD
     )
-    return _truncate_context_line(context, limit=context_limit)
+    truncated = _truncate_caption_fragment_complete(context, limit=context_limit)
+    return truncated if _caption_fragment_is_usable(truncated) else ""
 
 
 def _record_delivery_context_stat(key: str) -> None:
@@ -3047,11 +3580,11 @@ def _render_editorial_post(
     safe_category = sanitize_telegram_html(normalize_space(category_label))
     safe_headline = sanitize_telegram_html(normalize_space(headline))
     if not context:
-        return f"<b>〔{safe_category}〕</b><br><br><b>{safe_headline}</b>"
+        return f"<b>〔{safe_category}〕</b><br><br>{safe_headline}"
     safe_context = sanitize_telegram_html(normalize_space(context))
     return (
-        f"<b>〔{safe_category}〕</b><br><br><b>{safe_headline}</b>"
-        f"<br><br><b>Why it matters</b><br>{safe_context}"
+        f"<b>〔{safe_category}〕</b><br><br>{safe_headline}"
+        f"<br><br>Why it matters: {safe_context}"
     )
 
 
@@ -3086,6 +3619,8 @@ def _format_summary_text(
             category_label=category_label,
             severity=severity,
         )
+    if not clean_headline:
+        return ""
     clean_context = _clean_editorial_context(
         context_override if context_override is not None else context,
         headline=clean_headline,
@@ -3101,7 +3636,7 @@ def _format_summary_text(
 
 
 def _clean_followup_context_line(text: str) -> str:
-    cleaned = normalize_space(text)
+    cleaned = _normalize_caption_fragment(text)
     if not cleaned:
         return ""
 
@@ -3131,16 +3666,18 @@ def _clean_followup_context_line(text: str) -> str:
     )
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,;:-")
-    return normalize_space(cleaned)
+    cleaned = _truncate_caption_fragment_complete(normalize_space(cleaned), limit=260)
+    return cleaned if _caption_fragment_is_usable(cleaned) else ""
 
 
 def _format_followup_media_caption(source_title: str, context_line: str) -> str | None:
-    cleaned = _clean_followup_context_line(context_line)
-    cleaned = _truncate_context_line(cleaned, limit=260)
+    cleaned = _clean_followup_context_line(
+        _strip_known_source_aliases(context_line, source_title=source_title)
+    )
     if not cleaned:
         return None
     context_html = sanitize_telegram_html(cleaned)
-    return f"<i>Follow-up visuals:</i> {context_html}"
+    return f"Follow-up visuals: {context_html}"
 
 
 async def _build_reply_context_caption(
@@ -3296,7 +3833,15 @@ def _format_breaking_text_legacy(source_title: str, headline: str, rational_view
         text = text.rstrip(".,;:!?")
         return f"{text}."
 
-    clean_headline = normalize_space(headline)
+    category_label = choose_alert_label(headline, severity="high")
+    clean_headline = _clean_editorial_headline(
+        headline,
+        source_title=source_title,
+        category_label=category_label,
+        severity="high",
+    )
+    if not clean_headline:
+        return ""
     safe_headline = sanitize_telegram_html(clean_headline)
     def _normalize_structured_block(value: str) -> str:
         text = str(value or "").strip()
@@ -3329,7 +3874,13 @@ def _format_breaking_text_legacy(source_title: str, headline: str, rational_view
         if rational_is_structured:
             rational_body = _normalize_structured_block(str(rational_view))
         else:
-            cleaned_rational = _clean_rational_view(rational_view)
+            cleaned_rational = _clean_editorial_context(
+                _clean_rational_view(rational_view),
+                headline=clean_headline,
+                source_title=source_title,
+                category_label=category_label,
+                severity="high",
+            )
             if cleaned_rational:
                 rational_body = sanitize_telegram_html(cleaned_rational)
     header = build_alert_header(
@@ -3347,7 +3898,10 @@ def _format_breaking_text_legacy(source_title: str, headline: str, rational_view
         if rational_is_structured:
             rational_part = f"<br><br>{rational_body}"
         else:
-            rational_part = f"<br><br><i>{rational_body}</i>"
+            plain_rational = rational_body.rstrip()
+            if plain_rational and plain_rational[-1] not in ".!?":
+                plain_rational = f"{plain_rational}."
+            rational_part = f"<br><br>Why it matters: {plain_rational}"
     return f"{header}<br><br>{safe_headline}{rational_part}"
 
 
@@ -3362,6 +3916,8 @@ def _format_breaking_text(source_title: str, headline: str, rational_view: str |
         category_label=category_label,
         severity="high",
     )
+    if not clean_headline:
+        return ""
     clean_context = _clean_editorial_context(
         rational_view or "",
         headline=clean_headline,
@@ -3568,6 +4124,16 @@ async def _apply_breaking_story_cluster_policy(
         effective_bridge = ""
 
     payload_text = _format_breaking_text(source, headline, effective_bridge or None)
+    if not payload_text:
+        return {
+            "final_action": "skip",
+            "delivery_message_id": 0,
+            "reply_to": 0,
+            "cluster_id": "",
+            "cluster_decision": "caption_redacted_empty",
+            "sent_ref": None,
+            "payload_text": "",
+        }
     topic_seed = f"{headline}\n{candidate_text}"
 
     if decision == "new_story" or cluster is None:
@@ -4505,10 +5071,9 @@ async def _send_single_media(
     reply_to: int | None = None,
 ) -> object:
     if _destination_uses_bot_api():
-        safe_caption = (
-            _render_outbound_text(caption or "", allow_premium_tags=True)
-            if (caption and _is_html_formatting_enabled())
-            else caption
+        safe_caption, overflow_chunks = _prepare_media_caption_chunks(
+            caption,
+            allow_premium_tags=True,
         )
         raw = await msg.download_media(file=bytes)
         if raw is None:
@@ -4540,13 +5105,15 @@ async def _send_single_media(
             )
         }
         try:
-            return await _bot_api_request(method_map[media_type], data=data, files=files)
+            sent_ref = await _bot_api_request(method_map[media_type], data=data, files=files)
         except Exception as exc:
             if reply_to and _is_reply_target_missing_error(exc):
                 LOGGER.debug("Reply target missing for media send; retrying without reply_to.")
                 retry_data = dict(data)
                 retry_data.pop("reply_to_message_id", None)
-                return await _bot_api_request(method_map[media_type], data=retry_data, files=files)
+                sent_ref = await _bot_api_request(method_map[media_type], data=retry_data, files=files)
+                await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
+                return sent_ref
             data.pop("parse_mode", None)
             if safe_caption:
                 fallback_caption = (
@@ -4555,16 +5122,20 @@ async def _send_single_media(
                     else safe_caption
                 )
                 data["caption"] = _to_plain_text(fallback_caption, max_len=1024) or ""
-            return await _bot_api_request(method_map[media_type], data=data, files=files)
+            sent_ref = await _bot_api_request(method_map[media_type], data=data, files=files)
+            await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
+            return sent_ref
+
+        await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
+        return sent_ref
 
     tg = _require_client()
-    safe_caption = (
-        _render_outbound_text(caption or "", allow_premium_tags=False)
-        if (caption and _is_html_formatting_enabled())
-        else caption
+    safe_caption, overflow_chunks = _prepare_media_caption_chunks(
+        caption,
+        allow_premium_tags=False,
     )
     try:
-        return await _call_with_floodwait(
+        sent_ref = await _call_with_floodwait(
             tg.send_file,
             _require_destination_peer(),
             msg.media,
@@ -4576,7 +5147,7 @@ async def _send_single_media(
         raw = await msg.download_media(file=bytes)
         if raw is None:
             raise RuntimeError("Failed to download restricted media for re-send.")
-        return await _call_with_floodwait(
+        sent_ref = await _call_with_floodwait(
             tg.send_file,
             _require_destination_peer(),
             raw,
@@ -4584,6 +5155,8 @@ async def _send_single_media(
             parse_mode="html" if _is_html_formatting_enabled() else "md",
             reply_to=reply_to,
         )
+    await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
+    return sent_ref
 
 
 async def _send_album(
@@ -4593,18 +5166,18 @@ async def _send_album(
     reply_to: int | None = None,
 ) -> object | None:
     if _destination_uses_bot_api():
-        safe_caption = (
-            _render_outbound_text(caption or "", allow_premium_tags=True)
-            if (caption and _is_html_formatting_enabled())
-            else caption
+        if len(messages) == 1:
+            return await _send_single_media(messages[0], caption, reply_to=reply_to)
+        safe_caption, overflow_chunks = _prepare_media_caption_chunks(
+            caption,
+            allow_premium_tags=True,
         )
         if not messages:
             if safe_caption:
-                return await _send_text_with_ref(safe_caption, reply_to=reply_to)
+                sent_ref = await _send_text_with_ref(safe_caption, reply_to=reply_to)
+                await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
+                return sent_ref
             return
-
-        if len(messages) == 1:
-            return await _send_single_media(messages[0], safe_caption, reply_to=reply_to)
 
         media_entries: List[dict] = []
         files: Dict[str, tuple[str, bytes, str]] = {}
@@ -4633,7 +5206,7 @@ async def _send_album(
 
         if len(media_entries) == 1:
             only_msg = downloaded_messages[0]
-            return await _send_single_media(only_msg, safe_caption, reply_to=reply_to)
+            return await _send_single_media(only_msg, caption, reply_to=reply_to)
 
         data = {
             "chat_id": _require_bot_destination_chat_id(),
@@ -4642,13 +5215,15 @@ async def _send_album(
         if reply_to:
             data["reply_to_message_id"] = str(reply_to)
         try:
-            return await _bot_api_request("sendMediaGroup", data=data, files=files)
+            sent_ref = await _bot_api_request("sendMediaGroup", data=data, files=files)
         except Exception as exc:
             if reply_to and _is_reply_target_missing_error(exc):
                 LOGGER.debug("Reply target missing for media group send; retrying without reply_to.")
                 retry_data = dict(data)
                 retry_data.pop("reply_to_message_id", None)
-                return await _bot_api_request("sendMediaGroup", data=retry_data, files=files)
+                sent_ref = await _bot_api_request("sendMediaGroup", data=retry_data, files=files)
+                await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
+                return sent_ref
             if safe_caption and media_entries:
                 fallback_caption = (
                     strip_telegram_html(safe_caption)
@@ -4661,23 +5236,27 @@ async def _send_album(
                 ) or ""
                 media_entries[0].pop("parse_mode", None)
                 data["media"] = json.dumps(media_entries)
-            return await _bot_api_request("sendMediaGroup", data=data, files=files)
-        return
+            sent_ref = await _bot_api_request("sendMediaGroup", data=data, files=files)
+            await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
+            return sent_ref
+        await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
+        return sent_ref
 
     tg = _require_client()
-    safe_caption = (
-        _render_outbound_text(caption or "", allow_premium_tags=False)
-        if (caption and _is_html_formatting_enabled())
-        else caption
+    safe_caption, overflow_chunks = _prepare_media_caption_chunks(
+        caption,
+        allow_premium_tags=False,
     )
     media_items = [m.media for m in messages if m.media]
     if not media_items:
         if safe_caption:
-            return await _send_text_with_ref(safe_caption, reply_to=reply_to)
+            sent_ref = await _send_text_with_ref(safe_caption, reply_to=reply_to)
+            await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
+            return sent_ref
         return
 
     try:
-        return await _call_with_floodwait(
+        sent_ref = await _call_with_floodwait(
             tg.send_file,
             _require_destination_peer(),
             media_items,
@@ -4693,7 +5272,7 @@ async def _send_album(
                 downloaded.append(blob)
         if not downloaded:
             raise RuntimeError("Failed to download album media for restricted chat.")
-        return await _call_with_floodwait(
+        sent_ref = await _call_with_floodwait(
             tg.send_file,
             _require_destination_peer(),
             downloaded,
@@ -4701,6 +5280,8 @@ async def _send_album(
             parse_mode="html" if _is_html_formatting_enabled() else "md",
             reply_to=reply_to,
         )
+    await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
+    return sent_ref
 
 
 async def _process_single_message(msg: Message) -> None:
@@ -5605,6 +6186,12 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
         severity=severity,
         context_override=resolved_context,
     )
+    if not formatted_summary:
+        payload["final_action"] = "skip"
+        payload["skip_reason"] = "caption_redacted_empty"
+        payload["archive_text"] = candidate_text
+        await _advance_job_to_archive(job, payload)
+        return
     if has_media:
         if kind == "album":
             sent_ref = await _send_album(messages, formatted_summary, reply_to=reply_to)
@@ -6775,9 +7362,15 @@ async def setup_sources() -> List[int]:
             peer_id = await _resolve_entity_id(chat)
             if peer_id is not None and peer_id not in resolved_ids:
                 resolved_ids.append(peer_id)
+                _register_source_aliases(
+                    str(peer_id),
+                    getattr(chat, "title", None),
+                    getattr(chat, "username", None),
+                )
 
     # Additional manual sources (username/public/private links).
     for source in _manual_source_entries():
+        _register_source_aliases(source, source, _extract_public_username(source))
         peer_id = await _join_and_resolve_manual_source(source)
         if peer_id is not None and peer_id not in resolved_ids:
             resolved_ids.append(peer_id)

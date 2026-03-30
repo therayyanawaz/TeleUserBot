@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -97,6 +98,8 @@ def test_format_summary_text_normalizes_bad_feed_copy(monkeypatch):
     plain = ai_filter.strip_telegram_html(rendered)
 
     assert "〔" in rendered
+    assert rendered.count("<b>") == 1
+    assert "<u>" not in rendered
     assert "How the port reopening" not in plain
     assert "Officials confirmed the port will reopen Friday" in plain
     assert "NYT" not in plain
@@ -135,6 +138,189 @@ def test_format_summary_text_removes_duplicate_alert_prefixes(monkeypatch):
     assert "Flash Update Flash Update" not in plain
     assert "War & News Alert" not in plain
     assert "Why it matters" in plain
+
+
+def test_format_summary_text_strips_source_prefixes_and_promos(monkeypatch):
+    monkeypatch.setattr(main, "_include_source_tags", lambda: False)
+    monkeypatch.setattr(main, "_resolve_outbound_post_layout", lambda: "editorial_card")
+    main.source_title_cache.clear()
+    main.source_alias_cache.clear()
+    main._register_source_aliases("-1001", "Node of Time EN", "NewResistance")
+
+    rendered = main._format_summary_text(
+        "Node of Time EN",
+        "Bloomberg: Officials say the port reopened overnight after a three-day shutdown.<br>"
+        "Our channel: Node of Time EN<br>"
+        "Subscribe @NewResistance",
+        raw_text="Officials say the port reopened overnight after a three-day shutdown.",
+        severity="medium",
+    )
+    plain = ai_filter.strip_telegram_html(rendered)
+
+    assert rendered.count("<b>") == 1
+    assert "<u>" not in rendered
+    assert "Bloomberg:" not in plain
+    assert "Node of Time EN" not in plain
+    assert "@NewResistance" not in plain
+    assert "Subscribe" not in plain
+    assert "Officials say the port reopened overnight after a three-day shutdown" in plain
+
+
+def test_format_summary_text_returns_empty_for_promo_only_caption(monkeypatch):
+    monkeypatch.setattr(main, "_include_source_tags", lambda: False)
+    monkeypatch.setattr(main, "_resolve_outbound_post_layout", lambda: "editorial_card")
+    main.source_title_cache.clear()
+    main.source_alias_cache.clear()
+    main._register_source_aliases("-1001", "Node of Time EN", "NewResistance")
+
+    rendered = main._format_summary_text(
+        "Node of Time EN",
+        "Our channel: Node of Time EN<br>Subscribe @NewResistance",
+        raw_text="Our channel: Node of Time EN Subscribe @NewResistance",
+        severity="medium",
+    )
+
+    assert rendered == ""
+
+
+def test_validate_filter_decision_strips_source_prefixes_and_promo_from_model_output():
+    decision = ai_filter._validate_filter_decision(
+        {
+            "action": "deliver",
+            "severity": "medium",
+            "summary_html": "Bloomberg: Officials say the port reopened overnight.<br>Subscribe @NewResistance",
+            "headline_html": "",
+            "story_bridge_html": "",
+            "confidence": 0.8,
+            "reason_code": "delivery",
+            "topic_key": "port_reopen",
+            "needs_ocr_translation": False,
+        },
+        "Officials say the port reopened overnight after a three-day shutdown.",
+    )
+    plain = ai_filter.strip_telegram_html(decision.summary_html)
+
+    assert "Bloomberg:" not in plain
+    assert "@NewResistance" not in plain
+    assert "Subscribe" not in plain
+    assert "Officials say the port reopened overnight" in plain
+
+
+def test_prepare_media_caption_chunks_preserves_complete_sentences():
+    caption = (
+        "〔Breaking〕<br><br>"
+        "Officials say the port reopened overnight.<br><br>"
+        + " ".join(
+            f"Sentence {idx} closes cleanly."
+            for idx in range(1, 90)
+        )
+    )
+
+    first, overflow = main._prepare_media_caption_chunks(caption, allow_premium_tags=False)
+
+    assert first is not None
+    assert overflow
+    for chunk in [first, *overflow]:
+        plain = ai_filter.strip_telegram_html(chunk).strip()
+        assert len(plain) <= main._MEDIA_CAPTION_MAX_CHARS
+        assert plain.endswith((".", "!", "?", "〕"))
+
+
+@pytest.mark.asyncio
+async def test_send_album_single_item_preserves_original_caption(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def fake_send_single_media(msg, caption, *, reply_to=None):
+        captured["msg"] = msg
+        captured["caption"] = caption
+        captured["reply_to"] = reply_to
+        return {"message_id": 88}
+
+    monkeypatch.setattr(main, "_destination_uses_bot_api", lambda: True)
+    monkeypatch.setattr(main, "_send_single_media", fake_send_single_media)
+
+    message = SimpleNamespace()
+    caption = "〔Breaking〕<br><br>Headline.<br><br>" + " ".join(
+        f"Sentence {idx} remains complete."
+        for idx in range(1, 60)
+    )
+    sent_ref = await main._send_album([message], caption, reply_to=21)
+
+    assert sent_ref == {"message_id": 88}
+    assert captured["msg"] is message
+    assert captured["caption"] == caption
+    assert captured["reply_to"] == 21
+
+
+@pytest.mark.asyncio
+async def test_send_media_caption_overflow_replies_to_media(monkeypatch):
+    sent_calls: list[tuple[str, int | None]] = []
+
+    async def fake_send_text_with_ref(text, reply_to=None):
+        sent_calls.append((text, reply_to))
+        return {"message_id": 400 + len(sent_calls)}
+
+    monkeypatch.setattr(main, "_send_text_with_ref", fake_send_text_with_ref)
+
+    await main._send_media_caption_overflow(
+        ["Overflow one.", "Overflow two."],
+        sent_ref={"message_id": 321},
+    )
+
+    assert sent_calls == [("Overflow one.", 321), ("Overflow two.", 321)]
+
+
+@pytest.mark.asyncio
+async def test_handle_delivery_inbound_job_skips_when_caption_is_redacted_empty(monkeypatch):
+    archived: dict[str, object] = {}
+    main.source_title_cache.clear()
+    main.source_alias_cache.clear()
+    main._register_source_aliases("-1001", "Node of Time EN", "NewResistance")
+
+    monkeypatch.setattr(
+        main,
+        "_load_inbound_payload",
+        lambda _job: {
+            "channel_id": "-1001",
+            "source": "Node of Time EN",
+            "has_media": False,
+            "severity": "medium",
+            "candidate_text": "Our channel: Node of Time EN Subscribe @NewResistance",
+            "filter_decision": {
+                "action": "deliver",
+                "summary_html": "Our channel: Node of Time EN<br>Subscribe @NewResistance",
+                "topic_key": "promo_only",
+            },
+        },
+    )
+    async def fake_fetch_messages(_payload):
+        return [SimpleNamespace(id=7, chat_id=-1001, media=None)]
+
+    async def fake_resolve_source_reply_target(_msg):
+        return None
+
+    async def fake_resolve_dynamic_delivery_context(**_kwargs):
+        return ""
+
+    monkeypatch.setattr(main, "_fetch_messages_for_payload", fake_fetch_messages)
+    monkeypatch.setattr(main, "_resolve_source_reply_target", fake_resolve_source_reply_target)
+    monkeypatch.setattr(main, "_resolve_dynamic_delivery_context", fake_resolve_dynamic_delivery_context)
+    monkeypatch.setattr(main, "_is_digest_mode_enabled", lambda: False)
+
+    async def fake_advance_job_to_archive(_job, payload):
+        archived["payload"] = dict(payload)
+
+    async def fail_send(*_args, **_kwargs):
+        raise AssertionError("delivery should have been skipped")
+
+    monkeypatch.setattr(main, "_advance_job_to_archive", fake_advance_job_to_archive)
+    monkeypatch.setattr(main, "_send_text_with_ref", fail_send)
+
+    await main._handle_delivery_inbound_job({"id": 14})
+
+    payload = archived["payload"]
+    assert payload["final_action"] == "skip"
+    assert payload["skip_reason"] == "caption_redacted_empty"
 
 
 @pytest.mark.asyncio
