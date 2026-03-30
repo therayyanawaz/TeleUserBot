@@ -336,6 +336,7 @@ pipeline_sentence_transformer_warm_task: asyncio.Task | None = None
 pipeline_query_web_semaphore: asyncio.Semaphore | None = None
 pipeline_stage_latency_seconds: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=200))
 pipeline_stage_runs: Dict[str, int] = defaultdict(int)
+runtime_memory_warning_logged: bool = False
 
 INBOUND_STAGE_TRIAGE = "triage"
 INBOUND_STAGE_OCR = "ocr"
@@ -345,6 +346,78 @@ INBOUND_STAGE_ARCHIVE = "archive"
 
 ALBUM_WAIT_SECONDS = 1.5
 ENV_PATH = Path(__file__).with_name(".env")
+_UNKNOWN_MEMORY_BUDGET = object()
+runtime_memory_budget_bytes_cache: int | None | object = _UNKNOWN_MEMORY_BUDGET
+
+
+def _linux_memory_budget_bytes() -> int | None:
+    if not sys.platform.startswith("linux"):
+        return None
+
+    budget_candidates: List[int] = []
+
+    meminfo_path = Path("/proc/meminfo")
+    with contextlib.suppress(Exception):
+        for line in meminfo_path.read_text(encoding="utf-8").splitlines():
+            if not line.startswith("MemTotal:"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                budget_candidates.append(int(parts[1]) * 1024)
+            break
+
+    for raw_path in (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ):
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        with contextlib.suppress(Exception):
+            raw_value = path.read_text(encoding="utf-8").strip().lower()
+            if not raw_value or raw_value == "max":
+                continue
+            value = int(raw_value)
+            if value > 0 and value < (1 << 60):
+                budget_candidates.append(value)
+
+    if not budget_candidates:
+        return None
+    return max(0, min(budget_candidates))
+
+
+def _runtime_memory_budget_bytes() -> int | None:
+    global runtime_memory_budget_bytes_cache
+
+    if runtime_memory_budget_bytes_cache is _UNKNOWN_MEMORY_BUDGET:
+        runtime_memory_budget_bytes_cache = _linux_memory_budget_bytes()
+    if runtime_memory_budget_bytes_cache is None:
+        return None
+    if isinstance(runtime_memory_budget_bytes_cache, int):
+        return runtime_memory_budget_bytes_cache
+    return None
+
+
+def _is_low_memory_runtime() -> bool:
+    budget = _runtime_memory_budget_bytes()
+    if budget is None:
+        return False
+    return budget <= (1536 * 1024 * 1024)
+
+
+def _log_low_memory_runtime_once(reason: str) -> None:
+    global runtime_memory_warning_logged
+
+    if runtime_memory_warning_logged or not _is_low_memory_runtime():
+        return
+    runtime_memory_warning_logged = True
+    budget = _runtime_memory_budget_bytes()
+    mib = int((budget or 0) / (1024 * 1024))
+    LOGGER.warning(
+        "Low-memory runtime detected (%s MiB budget). Applying conservative memory guards: %s",
+        mib,
+        reason,
+    )
 
 
 def _is_missing_telegram_api_id() -> bool:
@@ -2538,7 +2611,11 @@ def _media_text_ocr_enabled() -> bool:
 
 
 def _media_text_ocr_video_enabled() -> bool:
-    return bool(getattr(config, "MEDIA_TEXT_OCR_VIDEO_ENABLED", True))
+    enabled = bool(getattr(config, "MEDIA_TEXT_OCR_VIDEO_ENABLED", True))
+    if enabled and _is_low_memory_runtime():
+        _log_low_memory_runtime_once("video OCR disabled to reduce peak memory use")
+        return False
+    return enabled
 
 
 def _media_text_ocr_min_chars() -> int:
@@ -3940,6 +4017,15 @@ def _cleanup_breaking_refs(now_ts: int | None = None) -> None:
         breaking_delivery_refs.pop(key, None)
 
 
+def _compact_sent_ref(ref: object) -> object | None:
+    serialized = _serialize_sent_ref(ref)
+    if serialized:
+        compact = _deserialize_sent_ref(serialized)
+        if compact is not None:
+            return compact
+    return _primary_message_ref(ref)
+
+
 def _register_breaking_delivery(
     *,
     text_hash: str,
@@ -3952,7 +4038,7 @@ def _register_breaking_delivery(
     now = int(time.time())
     _cleanup_breaking_refs(now)
     breaking_delivery_refs[text_hash] = {
-        "ref": ref,
+        "ref": _compact_sent_ref(ref),
         "base_text": base_text.strip(),
         "primary_source": primary_source.strip(),
         "sources": {primary_source.strip()},
@@ -3993,7 +4079,7 @@ async def _resolve_breaking_story_root_ref(cluster: Dict[str, object]) -> object
     has_media = bool(isinstance(stored_ref, dict) and stored_ref.get("has_media"))
     ref = await _load_destination_message_ref(root_message_id, has_media=has_media)
     if ref is not None:
-        breaking_story_ref_cache[cluster_id] = ref
+        breaking_story_ref_cache[cluster_id] = _compact_sent_ref(ref)
     return ref
 
 
@@ -4056,7 +4142,7 @@ def _persist_breaking_story_cluster(
         status="active",
     )
     if root_ref is not None and cluster_id:
-        breaking_story_ref_cache[cluster_id] = _primary_message_ref(root_ref) or root_ref
+        breaking_story_ref_cache[cluster_id] = _compact_sent_ref(root_ref)
 
 
 async def _apply_breaking_story_cluster_policy(
@@ -4704,6 +4790,7 @@ async def _merge_duplicate_breaking(
     entry["ref"] = updated_ref
     entry["sources"] = sources
     entry["ts"] = now
+    entry["ref"] = _compact_sent_ref(updated_ref)
     breaking_delivery_refs[result.matched_hash] = entry
     return True
 
@@ -5023,7 +5110,17 @@ async def _edit_sent_text(ref: object, text: str) -> object:
 
     target_ref = _primary_message_ref(ref)
     if not isinstance(target_ref, Message):
-        raise RuntimeError("Telethon edit requires Message reference.")
+        message_id = _message_ref_id(target_ref)
+        if not message_id:
+            raise RuntimeError("Telethon edit requires a message reference or message_id.")
+        fetched_ref = await _load_destination_message_ref(
+            message_id,
+            has_media=_message_ref_has_media(target_ref),
+        )
+        fetched_target = _primary_message_ref(fetched_ref)
+        if not isinstance(fetched_target, Message):
+            raise RuntimeError(f"Failed to reload destination message {message_id} for edit.")
+        target_ref = fetched_target
     payload_text = (
         _render_outbound_text(text, allow_premium_tags=False)
         if _is_html_formatting_enabled()
@@ -5699,13 +5796,23 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
 
 
 def _pipeline_worker_targets() -> Dict[str, int]:
-    return {
+    targets = {
         INBOUND_STAGE_TRIAGE: max(1, int(getattr(config, "PIPELINE_TRIAGE_WORKERS", 4) or 4)),
         INBOUND_STAGE_AI_DECISION: max(1, int(getattr(config, "PIPELINE_AI_WORKERS", 2) or 2)),
         INBOUND_STAGE_DELIVERY: max(1, int(getattr(config, "PIPELINE_DELIVERY_WORKERS", 2) or 2)),
         INBOUND_STAGE_OCR: max(1, int(getattr(config, "PIPELINE_OCR_WORKERS", 1) or 1)),
         "query_web": max(1, int(getattr(config, "PIPELINE_QUERY_WEB_WORKERS", 1) or 1)),
     }
+    if _is_low_memory_runtime():
+        budget = _runtime_memory_budget_bytes() or 0
+        triage_cap = 1 if budget <= (1024 * 1024 * 1024) else 2
+        targets[INBOUND_STAGE_TRIAGE] = min(targets[INBOUND_STAGE_TRIAGE], triage_cap)
+        targets[INBOUND_STAGE_AI_DECISION] = min(targets[INBOUND_STAGE_AI_DECISION], 1)
+        targets[INBOUND_STAGE_DELIVERY] = min(targets[INBOUND_STAGE_DELIVERY], 1)
+        targets[INBOUND_STAGE_OCR] = min(targets[INBOUND_STAGE_OCR], 1)
+        targets["query_web"] = min(targets["query_web"], 1)
+        _log_low_memory_runtime_once("pipeline worker fan-out reduced for constrained Linux host")
+    return targets
 
 
 def _pipeline_job_max_retries() -> int:
