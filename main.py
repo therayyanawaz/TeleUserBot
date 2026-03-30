@@ -404,17 +404,28 @@ def _is_low_memory_runtime() -> bool:
     budget = _runtime_memory_budget_bytes()
     if budget is None:
         return False
-    return budget <= (1536 * 1024 * 1024)
+    # If < 2.5GB RAM, we consider it low memory for a Python/FFmpeg app with no swap.
+    return budget <= (2560 * 1024 * 1024)
 
 
 def _log_low_memory_runtime_once(reason: str) -> None:
-    global runtime_memory_warning_logged
+    global runtime_memory_warning_logged, pipeline_media_semaphore
 
     if runtime_memory_warning_logged or not _is_low_memory_runtime():
         return
     runtime_memory_warning_logged = True
     budget = _runtime_memory_budget_bytes()
     mib = int((budget or 0) / (1024 * 1024))
+    
+    # Auto-throttle media concurrency if budget is tight.
+    if budget <= (1024 * 1024 * 1024):
+        concurrency = 1
+    else:
+        concurrency = 1
+    
+    if pipeline_media_semaphore and pipeline_media_semaphore._value > concurrency:
+        pipeline_media_semaphore = asyncio.Semaphore(concurrency)
+
     LOGGER.warning(
         "Low-memory runtime detected (%s MiB budget). Applying conservative memory guards: %s",
         mib,
