@@ -3675,10 +3675,10 @@ def _render_editorial_post(
     safe_category = sanitize_telegram_html(normalize_space(category_label))
     safe_headline = sanitize_telegram_html(normalize_space(headline))
     if not context:
-        return f"<b>〔{safe_category}〕</b><br><br>{safe_headline}"
+        return f"<b>{safe_category}</b><br><br>{safe_headline}"
     safe_context = sanitize_telegram_html(normalize_space(context))
     return (
-        f"<b>〔{safe_category}〕</b><br><br>{safe_headline}"
+        f"<b>{safe_category}</b><br><br>{safe_headline}"
         f"<br><br>Why it matters: {safe_context}"
     )
 
@@ -5190,6 +5190,16 @@ async def _send_single_media(
             caption,
             allow_premium_tags=True,
         )
+
+        file_size = getattr(msg.file, "size", 0) if msg.file else 0
+        # Bot API limit is 50MB. We use 48MB as a safe margin.
+        if file_size > 48 * 1024 * 1024:
+            LOGGER.warning(
+                "Media too large for Bot API (%s MiB). Falling back to text-only.",
+                int(file_size / (1024 * 1024)),
+            )
+            return await _send_text_with_ref(caption)
+
         raw = await msg.download_media(file=bytes)
         if raw is None:
             raise RuntimeError("Failed to download media for bot destination.")
@@ -5222,6 +5232,10 @@ async def _send_single_media(
         try:
             sent_ref = await _bot_api_request(method_map[media_type], data=data, files=files)
         except Exception as exc:
+            if "413" in str(exc) or "Request Entity Too Large" in str(exc):
+                LOGGER.warning("Bot API rejected large media (413). Falling back to text-only.")
+                return await _send_text_with_ref(caption)
+
             if reply_to and _is_reply_target_missing_error(exc):
                 LOGGER.debug("Reply target missing for media send; retrying without reply_to.")
                 retry_data = dict(data)

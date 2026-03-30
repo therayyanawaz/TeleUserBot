@@ -183,7 +183,6 @@ def test_format_breaking_text_unhinged_uses_editorial_card_without_context(monke
     rendered = main._format_breaking_text("NYT", "Two rockets landed near Haifa overnight.", None)
     plain = ai_filter.strip_telegram_html(rendered)
 
-    assert "〔" in rendered
     assert rendered.count("<b>") == 1
     assert "<u>" not in rendered
     assert "Why it matters" not in rendered
@@ -207,7 +206,6 @@ def test_format_breaking_text_unhinged_supports_context_line(monkeypatch):
     assert "Haifa" in plain
     assert "Acre" in plain
     assert "same thread into Acre" in plain
-    assert "〔" in rendered
     assert rendered.count("<b>") == 1
     assert "<u>" not in rendered
 
