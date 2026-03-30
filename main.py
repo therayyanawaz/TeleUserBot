@@ -334,6 +334,7 @@ startup_auth_repair_message: str = ""
 pipeline_worker_tasks: List[asyncio.Task] = []
 pipeline_sentence_transformer_warm_task: asyncio.Task | None = None
 pipeline_query_web_semaphore: asyncio.Semaphore | None = None
+pipeline_media_semaphore: asyncio.Semaphore | None = None
 pipeline_stage_latency_seconds: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=200))
 pipeline_stage_runs: Dict[str, int] = defaultdict(int)
 runtime_memory_warning_logged: bool = False
@@ -2724,47 +2725,48 @@ async def _message_media_signature(msg: Message) -> tuple[str, str]:
     if not getattr(msg, "media", None):
         return "", ""
 
-    media_kind = _message_media_kind(msg)
-    parts: list[str] = [media_kind]
-    media_blob = await _download_media_signature_bytes(msg)
+    async with (pipeline_media_semaphore or contextlib.nullcontext()):
+        media_kind = _message_media_kind(msg)
+        parts: list[str] = [media_kind]
+        media_blob = await _download_media_signature_bytes(msg)
 
-    visual_blob = b""
-    if media_kind == "image":
-        visual_blob = media_blob
-    elif media_kind == "video" and media_blob:
-        with contextlib.suppress(Exception):
-            visual_blob = await asyncio.to_thread(extract_first_video_frame_bytes, media_blob)
+        visual_blob = b""
+        if media_kind == "image":
+            visual_blob = media_blob
+        elif media_kind == "video" and media_blob:
+            with contextlib.suppress(Exception):
+                visual_blob = await asyncio.to_thread(extract_first_video_frame_bytes, media_blob)
 
-    visual_hash = ""
-    if visual_blob:
-        visual_hash = await asyncio.to_thread(compute_visual_media_hash, visual_blob)
-    if visual_hash:
-        return f"visual:{media_kind}:{visual_hash}", media_kind
+        visual_hash = ""
+        if visual_blob:
+            visual_hash = await asyncio.to_thread(compute_visual_media_hash, visual_blob)
+        if visual_hash:
+            return f"visual:{media_kind}:{visual_hash}", media_kind
 
-    file_obj = getattr(msg, "file", None)
-    for attr in ("id", "size", "mime_type", "name"):
-        value = getattr(file_obj, attr, None)
-        if value:
-            parts.append(f"{attr}:{value}")
-
-    photo = getattr(msg, "photo", None)
-    if photo is not None:
-        for attr in ("id", "access_hash"):
-            value = getattr(photo, attr, None)
+        file_obj = getattr(msg, "file", None)
+        for attr in ("id", "size", "mime_type", "name"):
+            value = getattr(file_obj, attr, None)
             if value:
-                parts.append(f"photo_{attr}:{value}")
+                parts.append(f"{attr}:{value}")
 
-    document = getattr(msg, "document", None)
-    if document is not None:
-        for attr in ("id", "access_hash", "mime_type", "size"):
-            value = getattr(document, attr, None)
-            if value:
-                parts.append(f"doc_{attr}:{value}")
+        photo = getattr(msg, "photo", None)
+        if photo is not None:
+            for attr in ("id", "access_hash"):
+                value = getattr(photo, attr, None)
+                if value:
+                    parts.append(f"photo_{attr}:{value}")
 
-    if media_blob:
-        parts.append(f"thumb_sha1:{hashlib.sha1(media_blob).hexdigest()}")
+        document = getattr(msg, "document", None)
+        if document is not None:
+            for attr in ("id", "access_hash", "mime_type", "size"):
+                value = getattr(document, attr, None)
+                if value:
+                    parts.append(f"doc_{attr}:{value}")
 
-    return build_media_signature_digest(parts), media_kind
+        if media_blob:
+            parts.append(f"thumb_sha1:{hashlib.sha1(media_blob).hexdigest()}")
+
+        return build_media_signature_digest(parts), media_kind
 
 
 async def _check_single_media_duplicate(msg: Message) -> bool:
@@ -6402,12 +6404,13 @@ async def _run_inbound_stage_worker(stage: str, worker_index: int) -> None:
 
 
 async def _start_pipeline_workers() -> None:
-    global pipeline_query_web_semaphore
+    global pipeline_query_web_semaphore, pipeline_media_semaphore
     if pipeline_worker_tasks:
         return
 
     targets = _pipeline_worker_targets()
     pipeline_query_web_semaphore = asyncio.Semaphore(max(1, int(targets.get("query_web", 1) or 1)))
+    pipeline_media_semaphore = asyncio.Semaphore(max(1, int(getattr(config, "PIPELINE_MEDIA_CONCURRENCY", 2) or 2)))
     reset_in_progress_inbound_jobs(older_than_seconds=0)
     purge_ai_decision_cache(
         older_than_ts=int(time.time()) - (max(1, int(getattr(config, "AI_DECISION_CACHE_HOURS", 72) or 72)) * 3600)
@@ -8667,9 +8670,11 @@ async def _on_new_message(event: events.NewMessage.Event) -> None:
             return
 
         if msg.media and not msg.grouped_id:
-            if await _check_single_media_duplicate(msg):
-                mark_seen(channel_id, msg.id)
-                return
+            # Limit concurrent media duplicate checks to prevent OOM on constrained hosts.
+            async with (pipeline_media_semaphore or contextlib.nullcontext()):
+                if await _check_single_media_duplicate(msg):
+                    mark_seen(channel_id, msg.id)
+                    return
 
         if _is_dupe_detection_enabled():
             dupe_result = await is_duplicate_and_handle(event)
