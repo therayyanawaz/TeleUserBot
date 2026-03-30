@@ -5311,27 +5311,37 @@ async def _send_album(
         media_entries: List[dict] = []
         files: Dict[str, tuple[str, bytes, str]] = {}
         downloaded_messages: List[Message] = []
-        for idx, msg in enumerate(messages):
-            raw = await msg.download_media(file=bytes)
-            if raw is None:
-                continue
+        total_size = 0
+        
+        async with (pipeline_media_semaphore or contextlib.nullcontext()):
+            for idx, msg in enumerate(messages):
+                msg_size = getattr(msg.file, "size", 0) if msg.file else 0
+                if total_size + msg_size > 48 * 1024 * 1024:
+                    LOGGER.warning("Album total size exceeds Bot API limit. Skipping further files.")
+                    break
 
-            media_type = _media_type_for_bot(msg)
-            field_name = f"file{idx}"
-            downloaded_messages.append(msg)
-            files[field_name] = (
-                _filename_for_bot_media(msg, idx),
-                raw,
-                "application/octet-stream",
-            )
-            item = {"type": media_type, "media": f"attach://{field_name}"}
-            if idx == 0 and safe_caption:
-                item["caption"] = _to_bot_text(safe_caption, max_len=1024) or ""
-                item["parse_mode"] = "HTML" if _is_html_formatting_enabled() else "Markdown"
-            media_entries.append(item)
+                raw = await msg.download_media(file=bytes)
+                if raw is None:
+                    continue
+
+                total_size += len(raw)
+                media_type = _media_type_for_bot(msg)
+                field_name = f"file{idx}"
+                downloaded_messages.append(msg)
+                files[field_name] = (
+                    _filename_for_bot_media(msg, idx),
+                    raw,
+                    "application/octet-stream",
+                )
+                item = {"type": media_type, "media": f"attach://{field_name}"}
+                if idx == 0 and safe_caption:
+                    item["caption"] = _to_bot_text(safe_caption, max_len=1024) or ""
+                    item["parse_mode"] = "HTML" if _is_html_formatting_enabled() else "Markdown"
+                media_entries.append(item)
 
         if not media_entries:
-            raise RuntimeError("Failed to download album media for bot destination.")
+            LOGGER.warning("No media could be downloaded for album. Falling back to text-only.")
+            return await _send_text_with_ref(caption)
 
         if len(media_entries) == 1:
             only_msg = downloaded_messages[0]
@@ -5346,6 +5356,10 @@ async def _send_album(
         try:
             sent_ref = await _bot_api_request("sendMediaGroup", data=data, files=files)
         except Exception as exc:
+            if "413" in str(exc) or "Request Entity Too Large" in str(exc):
+                LOGGER.warning("Bot API rejected media group (413). Falling back to text-only.")
+                return await _send_text_with_ref(caption)
+
             if reply_to and _is_reply_target_missing_error(exc):
                 LOGGER.debug("Reply target missing for media group send; retrying without reply_to.")
                 retry_data = dict(data)
