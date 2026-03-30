@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import base64
 import hashlib
 import json
@@ -21,7 +22,39 @@ from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
-from shared_http import get_auth_http_client
+from shared_http import get_auth_http_client, reset_shared_http_client
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
+
+
+def _load_dotenv_defaults(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if value and value[0] == value[-1] and value[0] in {'"', "'"}:
+            try:
+                value = str(ast.literal_eval(value))
+            except Exception:
+                value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+_load_dotenv_defaults(DEFAULT_ENV_PATH)
 
 
 # Public OAuth client constants (same family as Codex CLI OAuth flow).
@@ -409,6 +442,18 @@ def _prefer_newer_token_data(
     return best_source, best_payload
 
 
+def _select_env_only_token_data(
+    env_data: Optional[Dict[str, Any]],
+    env_cache_data: Optional[Dict[str, Any]],
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    if env_data is None:
+        return "none", None
+    return _prefer_newer_token_data(
+        ("env-cache", env_cache_data),
+        ("env", env_data),
+    )
+
+
 class AuthManager:
     """Handles token load, refresh, and full OAuth PKCE login."""
 
@@ -469,7 +514,7 @@ class AuthManager:
                 if self._is_env_only_mode():
                     raise OAuthError(
                         "Missing OAuth token in env. Set TG_USERBOT_AUTH_JSON "
-                        "or TG_USERBOT_AUTH_JSON_B64."
+                        "or TG_USERBOT_AUTH_JSON_B64, or run `python auth.py login --env-file .env`."
                     )
                 if not sys.stdin.isatty():
                     raise OAuthError(
@@ -488,7 +533,7 @@ class AuthManager:
                 if self._is_env_only_mode():
                     raise OAuthError(
                         "OAuth access token missing in env payload. "
-                        "Update TG_USERBOT_AUTH_JSON/B64."
+                        "Update TG_USERBOT_AUTH_JSON/B64 or run `python auth.py login --env-file .env`."
                     )
                 token_data = await self._run_full_oauth_flow()
                 access_token = token_data["access_token"]
@@ -568,10 +613,7 @@ class AuthManager:
             source = "memory"
             token_data = dict(self._runtime_token_data)
         elif self._is_env_only_mode():
-            source, selected = _prefer_newer_token_data(
-                ("env-cache", env_cache_data),
-                ("env", env_data),
-            )
+            source, selected = _select_env_only_token_data(env_data, env_cache_data)
             token_data = dict(selected or {})
         elif file_data is not None:
             source = "file"
@@ -616,10 +658,7 @@ class AuthManager:
         env_data = self._load_token_data_from_env()
         if self._is_env_only_mode():
             env_cache_data = _load_token_data_from_file(ENV_TOKEN_CACHE_PATH)
-            source, selected = _prefer_newer_token_data(
-                ("env-cache", env_cache_data),
-                ("env", env_data),
-            )
+            source, selected = _select_env_only_token_data(env_data, env_cache_data)
             if selected is not None:
                 if source == "env-cache":
                     self._logger.info("Loaded OAuth token state from %s.", ENV_TOKEN_CACHE_PATH)
@@ -730,7 +769,7 @@ class AuthManager:
                 if self._is_env_only_mode():
                     raise OAuthError(
                         "No refresh_token available in env payload. "
-                        "Update TG_USERBOT_AUTH_JSON/B64."
+                        "Update TG_USERBOT_AUTH_JSON/B64 or run `python auth.py login --env-file .env`."
                     )
                 self._logger.info("No refresh token found. Running full OAuth flow.")
                 return await self._run_full_oauth_flow()
@@ -758,7 +797,7 @@ class AuthManager:
                         if is_terminal
                         else (
                             "OAuth refresh failed in env-only mode. "
-                            "Update TG_USERBOT_AUTH_JSON/B64 and restart."
+                            "Update TG_USERBOT_AUTH_JSON/B64 and restart, or run `python auth.py login --env-file .env`."
                         )
                     )
                     self._set_auth_failure(
@@ -871,8 +910,28 @@ class AuthManager:
         return await self._post_token_payload(payload)
 
     async def _post_token_payload(self, payload: Dict[str, str]) -> Dict[str, Any]:
-        http = await get_auth_http_client()
-        response = await http.post(TOKEN_ENDPOINT, data=payload)
+        response: httpx.Response | None = None
+        for attempt in range(3):
+            http = await get_auth_http_client()
+            try:
+                response = await http.post(TOKEN_ENDPOINT, data=payload)
+                break
+            except httpx.TransportError as exc:
+                await reset_shared_http_client("auth")
+                if attempt < 2:
+                    self._logger.warning(
+                        "OpenAI OAuth transport error on attempt %s/3: %s",
+                        attempt + 1,
+                        exc,
+                    )
+                    await asyncio.sleep(0.35 * (attempt + 1))
+                    continue
+                raise OAuthError(
+                    f"OpenAI OAuth connection failed after retries: {exc}"
+                ) from exc
+
+        if response is None:
+            raise OAuthError("OpenAI OAuth connection failed before receiving a response.")
 
         if response.status_code >= 400:
             try:

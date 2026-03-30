@@ -29,7 +29,7 @@ from prompts import (
     build_query_system_prompt,
     quiet_period_message,
 )
-from shared_http import get_codex_http_client
+from shared_http import get_codex_http_client, reset_shared_http_client
 from utils import estimate_tokens_rough as _estimate_tokens_rough
 from utils import (
     expand_query_terms,
@@ -1379,8 +1379,25 @@ async def _call_codex_non_stream(
         stream=False,
         image_data_urls=image_data_urls,
     )
-    http = await get_codex_http_client()
-    response = await http.post(_resolve_codex_url(), headers=headers, json=payload)
+    response: httpx.Response | None = None
+    for attempt in range(3):
+        http = await get_codex_http_client()
+        try:
+            response = await http.post(_resolve_codex_url(), headers=headers, json=payload)
+            break
+        except httpx.TransportError as exc:
+            await reset_shared_http_client("codex")
+            if attempt < 2:
+                LOGGER.warning(
+                    "Codex non-stream transport error on attempt %s/3: %s",
+                    attempt + 1,
+                    exc,
+                )
+                await asyncio.sleep(0.35 * (attempt + 1))
+                continue
+            raise _CodexApiError(f"Codex request failed after retries: {exc}") from exc
+    if response is None:
+        raise _CodexApiError("Codex request failed before receiving a response.")
     if response.status_code >= 400:
         _raise_codex_http_error(response)
     try:

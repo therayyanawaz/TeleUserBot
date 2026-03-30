@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 
+import httpx
 import pytest
 
 import ai_filter
@@ -92,3 +93,55 @@ async def test_decide_filter_action_falls_back_on_invalid_json(isolated_db, monk
 
     assert decision.action in {"deliver", "digest"}
     assert decision.summary_html
+
+
+@pytest.mark.asyncio
+async def test_call_codex_non_stream_retries_transport_errors(monkeypatch):
+    attempts = {"count": 0}
+    reset_calls: list[str] = []
+
+    class _FakeClient:
+        async def post(self, _url, headers=None, json=None):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise httpx.TransportError(
+                    "Server closed the connection: [Errno 104] Connection reset by peer"
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Recovered response",
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )
+
+    async def fake_get_codex_http_client():
+        return _FakeClient()
+
+    async def fake_reset_shared_http_client(name: str):
+        reset_calls.append(name)
+
+    monkeypatch.setattr(ai_filter, "get_codex_http_client", fake_get_codex_http_client)
+    monkeypatch.setattr(ai_filter, "reset_shared_http_client", fake_reset_shared_http_client)
+
+    result = await ai_filter._call_codex_non_stream(
+        "headline",
+        {
+            "access_token": "token",
+            "account_id": "acct-123",
+        },
+        "instructions",
+    )
+
+    assert result == "Recovered response"
+    assert attempts["count"] == 2
+    assert reset_calls == ["codex"]

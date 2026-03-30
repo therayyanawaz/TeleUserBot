@@ -61,6 +61,13 @@ async def get_web_http_client() -> httpx.AsyncClient:
     )
 
 
+async def reset_shared_http_client(name: str) -> None:
+    async with _CLIENT_LOCK:
+        client = _CLIENTS.pop(name, None)
+    if client is not None:
+        await client.aclose()
+
+
 async def close_shared_http_clients() -> None:
     async with _CLIENT_LOCK:
         clients = list(_CLIENTS.values())
