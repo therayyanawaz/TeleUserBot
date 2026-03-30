@@ -1402,7 +1402,8 @@ async def _call_codex_non_stream(
         _raise_codex_http_error(response)
     try:
         data = response.json()
-    except Exception:
+    except (json.JSONDecodeError, ValueError) as exc:
+        LOGGER.debug("Failed to parse Codex JSON response: %s", exc)
         return ""
     return _extract_response_text_from_json(data).strip()
 

@@ -1217,7 +1217,7 @@ def get_last_digest_timestamp() -> int | None:
         return None
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         return None
     if value <= 0:
         return None

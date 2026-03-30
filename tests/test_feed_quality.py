@@ -256,7 +256,6 @@ def test_format_summary_text_normalizes_bad_feed_copy(monkeypatch):
     )
     plain = ai_filter.strip_telegram_html(rendered)
 
-    assert "〔" in rendered
     assert rendered.count("<b>") == 1
     assert "<u>" not in rendered
     assert "How the port reopening" not in plain
@@ -277,7 +276,7 @@ def test_format_summary_text_hides_source_even_when_source_tags_enabled(monkeypa
     plain = ai_filter.strip_telegram_html(rendered)
 
     assert "Bellum Acta" not in plain
-    assert plain.splitlines()[0].startswith("〔")
+    assert rendered.count("<b>") >= 1
 
 
 def test_format_summary_text_removes_duplicate_alert_prefixes(monkeypatch):

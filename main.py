@@ -7034,13 +7034,18 @@ async def _resolve_entity_id(chat_obj) -> int | None:
         try:
             entity = await _call_with_floodwait(tg.get_entity, chat_id)
             return utils.get_peer_id(entity)
-        except Exception:
+        except (ValueError, TypeError):
             pass
+        except Exception as exc:
+            LOGGER.debug("Failed resolving peer by chat id %s: %s", chat_id, exc, exc_info=True)
 
     try:
         entity = await _call_with_floodwait(tg.get_entity, chat_obj)
         return utils.get_peer_id(entity)
-    except Exception:
+    except (ValueError, TypeError):
+        return None
+    except Exception as exc:
+        LOGGER.debug("Failed resolving peer by entity: %s", exc, exc_info=True)
         return None
 
 

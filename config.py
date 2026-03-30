@@ -38,7 +38,7 @@ def _load_dotenv(path: Path) -> None:
             try:
                 parsed = ast.literal_eval(value)
                 value = str(parsed)
-            except Exception:
+            except (ValueError, SyntaxError):
                 value = value[1:-1]
 
         # Environment variables provided by shell/process take precedence.
@@ -104,7 +104,7 @@ def _env_list(key: str, default: list[str] | None = None) -> list[str]:
         parsed_json = json.loads(text)
         if isinstance(parsed_json, list):
             return _normalize_list(parsed_json)
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
         pass
 
     # Accept Python list representation.
@@ -112,7 +112,7 @@ def _env_list(key: str, default: list[str] | None = None) -> list[str]:
         parsed_py = ast.literal_eval(text)
         if isinstance(parsed_py, list):
             return _normalize_list(parsed_py)
-    except Exception:
+    except (ValueError, SyntaxError):
         pass
 
     # Fallback: comma-separated values.

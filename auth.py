@@ -390,7 +390,11 @@ def _load_token_data_from_file(path: Path = TOKEN_PATH) -> Optional[Dict[str, An
         return None
     try:
         payload = json.loads(token_path.read_text(encoding="utf-8"))
-    except Exception:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        logging.debug("Failed to load token file %s: %s", token_path, exc)
+        return None
+    except OSError as exc:
+        logging.debug("Failed to read token file %s: %s", token_path, exc)
         return None
     if not isinstance(payload, dict):
         return None
