@@ -261,6 +261,12 @@ Important behavior:
 
 This project uses a **Codex-style OAuth flow**, not a plain API key setup.
 
+Recommended low-usage model for ChatGPT-account Codex auth:
+
+```env
+CODEX_MODEL="gpt-5.1-codex-mini"
+```
+
 ### Hosted or headless mode
 
 Recommended for Replit, servers, and long-running deployments:

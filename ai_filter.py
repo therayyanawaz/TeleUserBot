@@ -43,7 +43,7 @@ from utils import (
 
 
 CACHE_MAX_ITEMS = 2048
-DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
+DEFAULT_CODEX_MODEL = "gpt-5.1-codex-mini"
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 DEFAULT_CODEX_ORIGINATOR = "pi"
 DEFAULT_DIGEST_MAX_POSTS = 80
