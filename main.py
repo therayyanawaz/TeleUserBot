@@ -129,6 +129,7 @@ from news_taxonomy import (
 )
 from news_signals import detect_story_signals, looks_like_live_event_update, should_downgrade_explainer_urgency
 from prompts import quiet_period_message
+from runtime_presenter import RuntimeActivityBufferHandler, RuntimeActivityFormatter
 from severity_classifier import classify_message_severity, severity_score_floor
 from utils import (
     apply_premium_emoji_html,
@@ -252,25 +253,6 @@ def _print_cli_status(symbol: str, text: str, *, level: str = "info") -> None:
     print(f"{_c(symbol, color, bold=True)} {text}")
 
 
-class _ColorConsoleFormatter(logging.Formatter):
-    _LEVEL_COLORS = {
-        "DEBUG": _C_DIM,
-        "INFO": _C_CYAN,
-        "WARNING": _C_YELLOW,
-        "ERROR": _C_RED,
-        "CRITICAL": _C_RED,
-    }
-
-    def format(self, record: logging.LogRecord) -> str:
-        text = super().format(record)
-        if not _COLOR_ON:
-            return text
-        color = self._LEVEL_COLORS.get(record.levelname, "")
-        if not color:
-            return text
-        return f"{color}{text}{_C_RESET}"
-
-
 ensure_runtime_dir()
 
 RUNTIME_LOG_PATH = ensure_runtime_dir() / "runtime.log"
@@ -287,6 +269,7 @@ _runtime_logger_previous_propagate: bool | None = None
 _runtime_file_handler: logging.Handler | None = None
 _error_handler: logging.Handler | None = None
 _console_handler: logging.Handler | None = None
+_runtime_activity_buffer_handler: RuntimeActivityBufferHandler | None = None
 
 _LOG_BOT_TOKEN_RE = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b")
 _LOG_CALLBACK_CODE_RE = re.compile(r"([?&]code=)[^&\s]+")
@@ -314,11 +297,6 @@ def _sanitize_log_text(text: str) -> str:
     return cleaned
 
 
-class _RedactingFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        return _sanitize_log_text(super().format(record))
-
-
 def _delete_runtime_log_files(*paths: Path) -> None:
     for path in paths:
         base_path = path.expanduser().resolve()
@@ -333,9 +311,10 @@ def _reset_runtime_logging() -> None:
     global _runtime_logging_configured, _runtime_root_previous_level
     global _runtime_logger_previous_level, _runtime_logger_previous_propagate
     global _runtime_file_handler, _error_handler, _console_handler
+    global _runtime_activity_buffer_handler
 
     root_logger = logging.getLogger()
-    for handler in (_runtime_file_handler, _error_handler):
+    for handler in (_runtime_file_handler, _error_handler, _runtime_activity_buffer_handler):
         if handler is None:
             continue
         if handler in root_logger.handlers:
@@ -358,16 +337,24 @@ def _reset_runtime_logging() -> None:
     _runtime_file_handler = None
     _error_handler = None
     _console_handler = None
+    _runtime_activity_buffer_handler = None
     _runtime_root_previous_level = None
     _runtime_logger_previous_level = None
     _runtime_logger_previous_propagate = None
     _runtime_logging_configured = False
 
 
+def _recent_runtime_activity(limit: int = 24):
+    if _runtime_activity_buffer_handler is None:
+        return []
+    return _runtime_activity_buffer_handler.snapshot(limit=limit)
+
+
 def _configure_runtime_logging() -> None:
     global _runtime_logging_configured, _runtime_root_previous_level
     global _runtime_logger_previous_level, _runtime_logger_previous_propagate
     global _runtime_file_handler, _error_handler, _console_handler
+    global _runtime_activity_buffer_handler
 
     if _runtime_logging_configured:
         return
@@ -375,7 +362,12 @@ def _configure_runtime_logging() -> None:
     ensure_runtime_dir()
     _delete_runtime_log_files(RUNTIME_LOG_PATH, ERROR_LOG_PATH)
 
-    file_formatter = _RedactingFormatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    file_formatter = RuntimeActivityFormatter(surface="file", sanitize=_sanitize_log_text)
+    console_formatter = RuntimeActivityFormatter(
+        surface="console",
+        sanitize=_sanitize_log_text,
+        color=_COLOR_ON,
+    )
     root_logger = logging.getLogger()
     _runtime_root_previous_level = root_logger.level
     _runtime_logger_previous_level = LOGGER.level
@@ -401,13 +393,18 @@ def _configure_runtime_logging() -> None:
 
     _console_handler = logging.StreamHandler()
     _console_handler.setLevel(logging.INFO)
-    _console_handler.setFormatter(
-        _ColorConsoleFormatter("%(asctime)s | %(levelname)s | %(message)s")
+    _console_handler.setFormatter(console_formatter)
+
+    _runtime_activity_buffer_handler = RuntimeActivityBufferHandler(
+        capacity=120,
+        sanitize=_sanitize_log_text,
     )
+    _runtime_activity_buffer_handler.setLevel(logging.INFO)
 
     root_logger.setLevel(logging.DEBUG)
     root_logger.addHandler(_runtime_file_handler)
     root_logger.addHandler(_error_handler)
+    root_logger.addHandler(_runtime_activity_buffer_handler)
 
     LOGGER.setLevel(logging.DEBUG)
     LOGGER.propagate = True
@@ -9409,6 +9406,7 @@ async def main() -> None:
                     host=_web_server_host(),
                     port=_web_server_port(),
                     get_status=_web_status_payload,
+                    get_recent_events=_recent_runtime_activity,
                     logger=LOGGER,
                 )
                 web_status_server.start()

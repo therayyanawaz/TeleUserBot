@@ -118,8 +118,8 @@ That directory stores runtime metadata such as:
 
 ### Runtime Logs
 
-- `~/.tg_userbot/runtime.log` captures full runtime activity at `DEBUG`, including third-party library logs.
-- `~/.tg_userbot/errors.log` keeps the error-only stream for faster triage.
+- `~/.tg_userbot/runtime.log` captures full runtime activity at `DEBUG` as a readable operator transcript, including third-party library logs.
+- `~/.tg_userbot/errors.log` keeps the error-only stream in the same readable format for faster triage.
 - Both log files are wiped on every fresh `python main.py` start.
 - During a single run, each file rotates at `10 MB` with up to `5` files kept.
 - Startup, shutdown, worker lifecycle, and low-memory transitions emit structured `memory_snapshot` log events with process memory usage fields.
@@ -499,9 +499,9 @@ TG_USERBOT_AUTH_JSON_B64="..."
 
 Health endpoints:
 
-- `/`
-- `/health`
-- `/status`
+- `/` renders the full operator dashboard
+- `/status` renders the same dashboard view for hosted status checks in a browser
+- `/health` renders a simplified health page and returns `200` when healthy or `503` when degraded
 
 Suggested hosted commands:
 

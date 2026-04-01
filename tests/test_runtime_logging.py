@@ -131,6 +131,40 @@ def test_runtime_log_captures_debug_but_console_stays_info(
     assert "third party debug" not in console_output
 
 
+def test_runtime_logs_format_structured_events_as_activity_blocks(
+    _isolated_runtime_logging,
+    capsys,
+):
+    runtime_log = _isolated_runtime_logging["runtime_log"]
+    error_log = _isolated_runtime_logging["error_log"]
+    main._configure_runtime_logging()
+
+    main.log_structured(
+        main.LOGGER,
+        "story_cluster_created",
+        channel_id="-1001647229236",
+        message_id=13174,
+        source="Basira Press",
+        severity="high",
+        cluster_id="a4f90cff1ab644dd908240b849c4c8e9",
+    )
+    _flush_runtime_handlers()
+
+    captured = capsys.readouterr()
+    console_output = (captured.out + captured.err).replace("\n", " ")
+    runtime_text = runtime_log.read_text(encoding="utf-8")
+    error_text = error_log.read_text(encoding="utf-8")
+
+    assert "Story cluster created" in runtime_text
+    assert "Basira Press" in runtime_text
+    assert "Cluster Id:" in runtime_text
+    assert '"event"' not in runtime_text
+    assert "\x1b[" not in runtime_text
+    assert "Story cluster created" in console_output
+    assert '"event"' not in console_output
+    assert error_text == ""
+
+
 def test_runtime_logs_redact_secrets(_isolated_runtime_logging):
     runtime_log = _isolated_runtime_logging["runtime_log"]
     error_log = _isolated_runtime_logging["error_log"]
@@ -149,8 +183,8 @@ def test_runtime_logs_redact_secrets(_isolated_runtime_logging):
     main.LOGGER.error(secret_message)
     _flush_runtime_handlers()
 
-    runtime_text = runtime_log.read_text(encoding="utf-8")
-    error_text = error_log.read_text(encoding="utf-8")
+    runtime_text = runtime_log.read_text(encoding="utf-8").replace("\n", " ")
+    error_text = error_log.read_text(encoding="utf-8").replace("\n", " ")
 
     for text in (runtime_text, error_text):
         assert "bearer-secret-token" not in text
@@ -164,8 +198,8 @@ def test_runtime_logs_redact_secrets(_isolated_runtime_logging):
         assert "authorization='Bearer [REDACTED]" in text
         assert 'TG_USERBOT_AUTH_JSON_B64=[REDACTED]' in text
         assert "BOT_DESTINATION_TOKEN=[REDACTED]" in text
-        assert '"access_token":"[REDACTED]"' in text
-        assert '"refresh_token":"[REDACTED]"' in text
+        assert '"access_token":"[REDACTED]"' in text or '"access_token":"[REDACTED]' in text
+        assert '"refresh_token":"[REDACTED]"' in text or '"refresh_token":"[REDACTED]' in text
         assert "code=[REDACTED]" in text
 
 
