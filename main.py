@@ -8,6 +8,7 @@ from difflib import SequenceMatcher
 import hashlib
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
@@ -175,6 +176,11 @@ try:
 except Exception:  # pragma: no cover - non-Unix fallback
     fcntl = None  # type: ignore[assignment]
 
+try:
+    import resource
+except Exception:  # pragma: no cover - non-Unix fallback
+    resource = None  # type: ignore[assignment]
+
 
 def _supports_color() -> bool:
     forced = str(os.getenv("CLI_COLOR", "") or "").strip().lower()
@@ -267,20 +273,147 @@ class _ColorConsoleFormatter(logging.Formatter):
 
 ensure_runtime_dir()
 
+RUNTIME_LOG_PATH = ensure_runtime_dir() / "runtime.log"
+_LOG_ROTATION_MAX_BYTES = 10 * 1024 * 1024
+_LOG_ROTATION_BACKUP_COUNT = 5
+
 LOGGER = logging.getLogger("tg_news_userbot")
 LOGGER.setLevel(logging.INFO)
 
-_error_handler = logging.FileHandler(ERROR_LOG_PATH)
-_error_handler.setLevel(logging.ERROR)
-_error_handler.setFormatter(
-    logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-)
-LOGGER.addHandler(_error_handler)
+_runtime_logging_configured = False
+_runtime_root_previous_level: int | None = None
+_runtime_logger_previous_level: int | None = None
+_runtime_logger_previous_propagate: bool | None = None
+_runtime_file_handler: logging.Handler | None = None
+_error_handler: logging.Handler | None = None
+_console_handler: logging.Handler | None = None
 
-_console_handler = logging.StreamHandler()
-_console_handler.setLevel(logging.INFO)
-_console_handler.setFormatter(_ColorConsoleFormatter("%(asctime)s | %(levelname)s | %(message)s"))
-LOGGER.addHandler(_console_handler)
+_LOG_BOT_TOKEN_RE = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b")
+_LOG_CALLBACK_CODE_RE = re.compile(r"([?&]code=)[^&\s]+")
+_LOG_BEARER_RE = re.compile(r"(?i)\b(Bearer)\s+[A-Za-z0-9._\-+/=]+")
+_LOG_AUTH_HEADER_RE = re.compile(
+    r"(?i)(authorization['\"]?\s*[:=]\s*['\"]?bearer\s+)[^\s'\",]+"
+)
+_LOG_ENV_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b((?:TG_USERBOT_AUTH_JSON(?:_B64)?|BOT_DESTINATION_TOKEN)\s*=\s*)(\"[^\"]*\"|'[^']*'|[^\s]+)"
+)
+_LOG_JSON_SECRET_RE = re.compile(
+    r'(?i)("?(?:access_token|refresh_token|id_token|TG_USERBOT_AUTH_JSON|'
+    r'TG_USERBOT_AUTH_JSON_B64|BOT_DESTINATION_TOKEN)"?\s*:\s*")[^"]*(")'
+)
+
+
+def _sanitize_log_text(text: str) -> str:
+    cleaned = str(text or "")
+    cleaned = _LOG_CALLBACK_CODE_RE.sub(r"\1[REDACTED]", cleaned)
+    cleaned = _LOG_AUTH_HEADER_RE.sub(r"\1[REDACTED]", cleaned)
+    cleaned = _LOG_BEARER_RE.sub(r"\1 [REDACTED]", cleaned)
+    cleaned = _LOG_ENV_ASSIGNMENT_RE.sub(r"\1[REDACTED]", cleaned)
+    cleaned = _LOG_JSON_SECRET_RE.sub(r"\1[REDACTED]\2", cleaned)
+    cleaned = _LOG_BOT_TOKEN_RE.sub("[REDACTED_BOT_TOKEN]", cleaned)
+    return cleaned
+
+
+class _RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return _sanitize_log_text(super().format(record))
+
+
+def _delete_runtime_log_files(*paths: Path) -> None:
+    for path in paths:
+        base_path = path.expanduser().resolve()
+        base_path.parent.mkdir(parents=True, exist_ok=True)
+        for candidate in base_path.parent.glob(f"{base_path.name}*"):
+            if candidate.name == base_path.name or candidate.name.startswith(f"{base_path.name}."):
+                with contextlib.suppress(Exception):
+                    candidate.unlink()
+
+
+def _reset_runtime_logging() -> None:
+    global _runtime_logging_configured, _runtime_root_previous_level
+    global _runtime_logger_previous_level, _runtime_logger_previous_propagate
+    global _runtime_file_handler, _error_handler, _console_handler
+
+    root_logger = logging.getLogger()
+    for handler in (_runtime_file_handler, _error_handler):
+        if handler is None:
+            continue
+        if handler in root_logger.handlers:
+            root_logger.removeHandler(handler)
+        with contextlib.suppress(Exception):
+            handler.close()
+
+    if _console_handler is not None and _console_handler in LOGGER.handlers:
+        LOGGER.removeHandler(_console_handler)
+        with contextlib.suppress(Exception):
+            _console_handler.close()
+
+    if _runtime_root_previous_level is not None:
+        root_logger.setLevel(_runtime_root_previous_level)
+    if _runtime_logger_previous_level is not None:
+        LOGGER.setLevel(_runtime_logger_previous_level)
+    if _runtime_logger_previous_propagate is not None:
+        LOGGER.propagate = _runtime_logger_previous_propagate
+
+    _runtime_file_handler = None
+    _error_handler = None
+    _console_handler = None
+    _runtime_root_previous_level = None
+    _runtime_logger_previous_level = None
+    _runtime_logger_previous_propagate = None
+    _runtime_logging_configured = False
+
+
+def _configure_runtime_logging() -> None:
+    global _runtime_logging_configured, _runtime_root_previous_level
+    global _runtime_logger_previous_level, _runtime_logger_previous_propagate
+    global _runtime_file_handler, _error_handler, _console_handler
+
+    if _runtime_logging_configured:
+        return
+
+    ensure_runtime_dir()
+    _delete_runtime_log_files(RUNTIME_LOG_PATH, ERROR_LOG_PATH)
+
+    file_formatter = _RedactingFormatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    root_logger = logging.getLogger()
+    _runtime_root_previous_level = root_logger.level
+    _runtime_logger_previous_level = LOGGER.level
+    _runtime_logger_previous_propagate = LOGGER.propagate
+
+    _runtime_file_handler = RotatingFileHandler(
+        RUNTIME_LOG_PATH,
+        maxBytes=_LOG_ROTATION_MAX_BYTES,
+        backupCount=_LOG_ROTATION_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    _runtime_file_handler.setLevel(logging.DEBUG)
+    _runtime_file_handler.setFormatter(file_formatter)
+
+    _error_handler = RotatingFileHandler(
+        ERROR_LOG_PATH,
+        maxBytes=_LOG_ROTATION_MAX_BYTES,
+        backupCount=_LOG_ROTATION_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    _error_handler.setLevel(logging.ERROR)
+    _error_handler.setFormatter(file_formatter)
+
+    _console_handler = logging.StreamHandler()
+    _console_handler.setLevel(logging.INFO)
+    _console_handler.setFormatter(
+        _ColorConsoleFormatter("%(asctime)s | %(levelname)s | %(message)s")
+    )
+
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.addHandler(_runtime_file_handler)
+    root_logger.addHandler(_error_handler)
+
+    LOGGER.setLevel(logging.DEBUG)
+    LOGGER.propagate = True
+    LOGGER.addHandler(_console_handler)
+    _runtime_logging_configured = True
+    _log_memory_snapshot("logger_bootstrap_complete", phase=startup_phase)
 
 
 client: TelegramClient | None = None
@@ -400,6 +533,88 @@ def _runtime_memory_budget_bytes() -> int | None:
     return None
 
 
+def _parse_linux_process_status_memory(status_text: str) -> Dict[str, int]:
+    metrics: Dict[str, int] = {}
+    for raw_line in str(status_text or "").splitlines():
+        if ":" not in raw_line:
+            continue
+        key, value = raw_line.split(":", 1)
+        parts = value.strip().split()
+        if not parts:
+            continue
+        try:
+            numeric = int(parts[0])
+        except Exception:
+            continue
+        unit = parts[1].lower() if len(parts) >= 2 else "bytes"
+        size_bytes = numeric * 1024 if unit == "kb" else numeric
+        normalized_key = key.strip().lower()
+        if normalized_key == "vmrss":
+            metrics["memory_current_bytes"] = size_bytes
+        elif normalized_key == "vmhwm":
+            metrics["memory_peak_bytes"] = size_bytes
+        elif normalized_key == "vmswap":
+            metrics["memory_swap_bytes"] = size_bytes
+    return metrics
+
+
+def _process_memory_snapshot() -> Dict[str, object]:
+    snapshot: Dict[str, object] = {
+        "memory_source": "unknown",
+        "memory_current_bytes": 0,
+        "memory_peak_bytes": 0,
+        "memory_swap_bytes": 0,
+    }
+
+    if sys.platform.startswith("linux"):
+        status_path = Path("/proc/self/status")
+        with contextlib.suppress(Exception):
+            parsed = _parse_linux_process_status_memory(status_path.read_text(encoding="utf-8"))
+            if parsed:
+                snapshot.update(parsed)
+                snapshot["memory_source"] = "proc_status"
+                snapshot["memory_budget_bytes"] = int(_runtime_memory_budget_bytes() or 0)
+                return snapshot
+
+    if resource is not None:
+        with contextlib.suppress(Exception):
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            peak_value = int(getattr(usage, "ru_maxrss", 0) or 0)
+            if peak_value > 0:
+                if sys.platform == "darwin":
+                    peak_bytes = peak_value
+                else:
+                    peak_bytes = peak_value * 1024
+                snapshot["memory_peak_bytes"] = peak_bytes
+                if not snapshot.get("memory_current_bytes"):
+                    snapshot["memory_current_bytes"] = peak_bytes
+                snapshot["memory_source"] = "resource_rusage"
+
+    snapshot["memory_budget_bytes"] = int(_runtime_memory_budget_bytes() or 0)
+    return snapshot
+
+
+def _log_memory_snapshot(reason: str, *, phase: str | None = None, **fields: object) -> None:
+    snapshot = _process_memory_snapshot()
+    payload = {
+        **snapshot,
+        "memory_reason": normalize_space(reason) or "unspecified",
+        "startup_phase": normalize_space(phase or startup_phase or "") or "unknown",
+        **fields,
+    }
+    log_structured(LOGGER, "memory_snapshot", level=logging.DEBUG, **payload)
+
+
+def _set_startup_phase(phase: str, *, reason: str = "") -> None:
+    global startup_phase
+    startup_phase = normalize_space(phase) or "unknown"
+    _log_memory_snapshot(
+        "startup_phase_changed",
+        phase=startup_phase,
+        phase_reason=normalize_space(reason) or startup_phase,
+    )
+
+
 def _is_low_memory_runtime() -> bool:
     budget = _runtime_memory_budget_bytes()
     if budget is None:
@@ -430,6 +645,11 @@ def _log_low_memory_runtime_once(reason: str) -> None:
         "Low-memory runtime detected (%s MiB budget). Applying conservative memory guards: %s",
         mib,
         reason,
+    )
+    _log_memory_snapshot(
+        "low_memory_guard_enabled",
+        low_memory_reason=normalize_space(reason),
+        memory_budget_bytes=int(budget or 0),
     )
 
 
@@ -6464,12 +6684,18 @@ async def _start_pipeline_workers() -> None:
         INBOUND_STAGE_ARCHIVE,
     ):
         for index in range(max(1, int(targets.get(stage, 1) or 1))):
-            pipeline_worker_tasks.append(
-                asyncio.create_task(
-                    _run_inbound_stage_worker(stage, index + 1),
-                    name=f"inbound-{stage}-{index + 1}",
+                pipeline_worker_tasks.append(
+                    asyncio.create_task(
+                        _run_inbound_stage_worker(stage, index + 1),
+                        name=f"inbound-{stage}-{index + 1}",
+                    )
                 )
-            )
+    _log_memory_snapshot(
+        "pipeline_workers_started",
+        pipeline_worker_count=len(pipeline_worker_tasks),
+        pipeline_worker_targets=targets,
+        pipeline_media_concurrency=int(getattr(config, "PIPELINE_MEDIA_CONCURRENCY", 2) or 2),
+    )
 
 
 async def _stop_pipeline_workers() -> None:
@@ -6482,6 +6708,11 @@ async def _stop_pipeline_workers() -> None:
     pipeline_worker_tasks.clear()
     pipeline_query_web_semaphore = None
     reset_in_progress_inbound_jobs(older_than_seconds=0)
+    _log_memory_snapshot(
+        "pipeline_workers_stopped",
+        pipeline_worker_count=0,
+        cancelled_worker_count=len(pending),
+    )
 
 
 def _format_digest_message(
@@ -9017,6 +9248,7 @@ async def _shutdown_client() -> None:
     global digest_scheduler_task, daily_digest_scheduler_task, queue_clear_scheduler_task
     global query_bot_poll_task
     global web_status_server, pipeline_sentence_transformer_warm_task
+    _log_memory_snapshot("shutdown_started", phase=startup_phase)
     configure_duplicate_runtime(None)
     breaking_delivery_refs.clear()
     breaking_story_ref_cache.clear()
@@ -9081,6 +9313,7 @@ async def _shutdown_client() -> None:
         LOGGER.exception("Failed during client shutdown.")
     finally:
         await close_shared_http_clients()
+        _log_memory_snapshot("shutdown_completed", phase=startup_phase)
 
 
 def _startup_health_check() -> None:
@@ -9165,6 +9398,10 @@ async def main() -> None:
     global startup_phase, startup_ready, startup_error
 
     try:
+        _configure_runtime_logging()
+        startup_ready = False
+        startup_error = ""
+        _set_startup_phase("booting", reason="startup_entered")
         _print_cli_banner()
         if _is_web_server_enabled():
             try:
@@ -9175,21 +9412,34 @@ async def main() -> None:
                     logger=LOGGER,
                 )
                 web_status_server.start()
+                _log_memory_snapshot(
+                    "web_status_server_started",
+                    phase=startup_phase,
+                    web_server_host=_web_server_host(),
+                    web_server_port=_web_server_port(),
+                )
             except Exception:
                 LOGGER.exception("Failed starting web status server.")
                 web_status_server = None
 
-        startup_phase = "config"
+        _set_startup_phase("config", reason="config_validation_started")
         _print_cli_status("•", "Validating configuration...", level="info")
         try:
             _prompt_for_missing_config()
             _validate_config()
             load_news_taxonomy(force_reload=True)
+            _log_memory_snapshot("config_validated", phase=startup_phase)
             _print_cli_status("✓", "Configuration validated", level="ok")
         except (RuntimeError, ValueError) as exc:
             startup_error = str(exc)
             startup_ready = False
-            startup_phase = "error"
+            _set_startup_phase("error", reason="config_validation_failed")
+            _log_memory_snapshot(
+                "startup_failure",
+                phase=startup_phase,
+                failure_reason=startup_error,
+                failure_stage="config",
+            )
             LOGGER.error("%s", exc)
             _print_cli_status("✗", "Configuration invalid. Fix values and re-run.", level="error")
             if _is_web_server_enabled() and _should_hold_on_startup_error():
@@ -9198,15 +9448,22 @@ async def main() -> None:
                     await asyncio.sleep(3600)
             return
 
-        startup_phase = "lock"
+        _set_startup_phase("lock", reason="instance_lock_started")
         _print_cli_status("•", "Checking single-instance lock...", level="info")
         try:
             instance_lock_handle = _acquire_instance_lock()
+            _log_memory_snapshot("instance_lock_acquired", phase=startup_phase)
             _print_cli_status("✓", "Instance lock acquired", level="ok")
         except RuntimeError as exc:
             startup_error = str(exc)
             startup_ready = False
-            startup_phase = "error"
+            _set_startup_phase("error", reason="instance_lock_failed")
+            _log_memory_snapshot(
+                "startup_failure",
+                phase=startup_phase,
+                failure_reason=startup_error,
+                failure_stage="lock",
+            )
             LOGGER.error("%s", exc)
             _print_cli_status("✗", "Another instance is already running", level="error")
             if _is_web_server_enabled() and _should_hold_on_startup_error():
@@ -9216,16 +9473,31 @@ async def main() -> None:
             return
 
         try:
-            startup_phase = "initializing"
+            _set_startup_phase("initializing", reason="runtime_initialization_started")
             _load_premium_emoji_map()
+            _log_memory_snapshot(
+                "premium_emoji_map_loaded",
+                phase=startup_phase,
+                premium_emoji_count=len(premium_emoji_map),
+            )
             init_db()
+            _log_memory_snapshot("database_initialized", phase=startup_phase)
             await _init_dupe_detector()
+            _log_memory_snapshot("dupe_detector_initialized", phase=startup_phase)
             _startup_health_check()
+            _log_memory_snapshot("runtime_state_ready", phase=startup_phase)
             _print_cli_status("✓", "Database and runtime state ready", level="ok")
 
-            startup_phase = "auth"
+            _set_startup_phase("auth", reason="auth_preparation_started")
             _print_cli_status("•", "Preparing OpenAI auth context...", level="info")
             await _prepare_auth_runtime_for_startup()
+            _log_memory_snapshot(
+                "auth_runtime_prepared",
+                phase=startup_phase,
+                auth_ready=auth_ready,
+                auth_degraded=auth_degraded,
+                auth_mode=auth_startup_mode_effective,
+            )
             log_structured(
                 LOGGER,
                 "auth_startup_state",
@@ -9248,17 +9520,19 @@ async def main() -> None:
                     level="warn",
                 )
 
-            startup_phase = "telegram_login"
+            _set_startup_phase("telegram_login", reason="telegram_session_connect_started")
             _print_cli_status("•", "Connecting Telegram user session...", level="info")
             client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
             await _ensure_user_account_session()
+            _log_memory_snapshot("telegram_session_ready", phase=startup_phase)
             _print_cli_status("✓", "Telegram session authorized", level="ok")
-            startup_phase = "destination_setup"
+            _set_startup_phase("destination_setup", reason="destination_validation_started")
             _print_cli_status("•", "Validating destination...", level="info")
             await _ensure_destination_peer()
+            _log_memory_snapshot("destination_ready", phase=startup_phase)
             _print_cli_status("✓", "Destination ready", level="ok")
 
-            startup_phase = "source_setup"
+            _set_startup_phase("source_setup", reason="source_resolution_started")
             _print_cli_status("•", "Resolving source channels...", level="info")
             resolved_sources = await setup_sources()
             while not resolved_sources:
@@ -9288,13 +9562,18 @@ async def main() -> None:
                 config.EXTRA_SOURCES = deduped
                 _persist_config_updates({"EXTRA_SOURCES": config.EXTRA_SOURCES})
                 resolved_sources = await setup_sources()
+            _log_memory_snapshot(
+                "source_resolution_completed",
+                phase=startup_phase,
+                resolved_source_count=len(resolved_sources),
+            )
             _print_cli_status("✓", f"Sources ready ({len(resolved_sources)} total)", level="ok")
 
-            startup_phase = "pipeline"
+            _set_startup_phase("pipeline", reason="pipeline_worker_start_started")
             await _start_pipeline_workers()
-            _print_cli_status("âœ“", "Inbound pipeline workers started", level="ok")
+            _print_cli_status("✓", "Inbound pipeline workers started", level="ok")
 
-            startup_phase = "handlers"
+            _set_startup_phase("handlers", reason="handler_registration_started")
             client.add_event_handler(_on_new_message, events.NewMessage(chats=resolved_sources))
             status_pattern = rf"^{re.escape(_digest_status_command())}(?:\\s+.*)?$"
             client.add_event_handler(
@@ -9306,6 +9585,12 @@ async def main() -> None:
                     _on_query_message,
                     events.NewMessage(outgoing=True),
                 )
+            _log_memory_snapshot(
+                "handlers_registered",
+                phase=startup_phase,
+                query_mode_enabled=_is_query_mode_enabled(),
+                resolved_source_count=len(resolved_sources),
+            )
 
             me = await client.get_me()
             started_as_username = str(getattr(me, "username", "") or "unknown")
@@ -9351,9 +9636,17 @@ async def main() -> None:
                         level="ok",
                     )
 
-            startup_phase = "running"
+            _set_startup_phase("running", reason="startup_runtime_ready")
             startup_ready = True
             startup_error = ""
+            _log_memory_snapshot(
+                "runtime_ready",
+                phase=startup_phase,
+                resolved_source_count=len(resolved_sources),
+                started_as_user_id=started_as_user_id,
+                digest_mode_enabled=_is_digest_mode_enabled(),
+                query_mode_enabled=_is_query_mode_enabled(),
+            )
             await _maybe_start_duplicate_backend_warmup()
             try:
                 await client.run_until_disconnected()
@@ -9363,7 +9656,13 @@ async def main() -> None:
         except (RuntimeError, ValueError) as exc:
             startup_error = str(exc)
             startup_ready = False
-            startup_phase = "error"
+            _set_startup_phase("error", reason="startup_runtime_failed")
+            _log_memory_snapshot(
+                "startup_failure",
+                phase=startup_phase,
+                failure_reason=startup_error,
+                failure_stage="runtime",
+            )
             LOGGER.error("%s", exc)
             _print_cli_status("✗", "Startup failed", level="error")
             if _is_web_server_enabled() and _should_hold_on_startup_error():
@@ -9373,7 +9672,13 @@ async def main() -> None:
         except Exception as exc:
             startup_error = str(exc)
             startup_ready = False
-            startup_phase = "error"
+            _set_startup_phase("error", reason="startup_runtime_unhandled_exception")
+            _log_memory_snapshot(
+                "startup_failure",
+                phase=startup_phase,
+                failure_reason=startup_error,
+                failure_stage="runtime_unhandled",
+            )
             LOGGER.exception("Unhandled startup error.")
             if _is_web_server_enabled() and _should_hold_on_startup_error():
                 LOGGER.warning("Holding process alive after unhandled startup error for health visibility.")
@@ -9383,7 +9688,7 @@ async def main() -> None:
         finally:
             await _shutdown_client()
     finally:
-        startup_phase = "stopped"
+        _set_startup_phase("stopped", reason="startup_runtime_stopped")
         startup_ready = False
         _release_instance_lock(instance_lock_handle)
         instance_lock_handle = None

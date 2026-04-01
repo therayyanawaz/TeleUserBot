@@ -116,6 +116,14 @@ That directory stores runtime metadata such as:
 - logs
 - delivery and pipeline metadata
 
+### Runtime Logs
+
+- `~/.tg_userbot/runtime.log` captures full runtime activity at `DEBUG`, including third-party library logs.
+- `~/.tg_userbot/errors.log` keeps the error-only stream for faster triage.
+- Both log files are wiped on every fresh `python main.py` start.
+- During a single run, each file rotates at `10 MB` with up to `5` files kept.
+- Startup, shutdown, worker lifecycle, and low-memory transitions emit structured `memory_snapshot` log events with process memory usage fields.
+
 ## 🧭 How It Works
 
 1. TeleUserBot connects to your Telegram account.
