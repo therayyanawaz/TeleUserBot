@@ -84,6 +84,25 @@ def test_choose_alert_label_keeps_thematic_label_for_concrete_event():
     )
 
     assert "Interception Alert" in label
+    assert label.startswith("🛡️ ")
+
+
+def test_choose_alert_label_upgrades_industrial_incident_emoji():
+    label = utils.choose_alert_label(
+        "Officials confirmed a factory explosion after a major blast at the plant overnight.",
+        severity="high",
+    )
+
+    assert label == "🏭💥 Industrial Incident"
+
+
+def test_choose_alert_label_upgrades_network_disruption_emoji():
+    label = utils.choose_alert_label(
+        "Authorities confirmed a telecom outage after the latest mobile network outage today.",
+        severity="medium",
+    )
+
+    assert label == "📡 Network Disruption"
 
 
 def test_severity_classifier_downgrades_explainer_with_shot_down_keyword():

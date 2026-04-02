@@ -250,6 +250,35 @@ _ALERT_LABEL_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 _GENERIC_BREAKING = "Breaking"
 _GENERIC_NEWS_UPDATE = "News Update"
+_ENHANCED_CATEGORY_EMOJI_PREFIXES = {
+    "air_defense": "🛡️",
+    "missile_strike": "🎯",
+    "rocket_fire": "🚀",
+    "drone_attack": "🛸",
+    "artillery_shelling": "💥",
+    "border_clash": "⚔️",
+    "maritime_security": "⚓",
+    "piracy_hijacking": "🏴‍☠️",
+    "sanctions_export_control": "⛓️",
+    "covert_intelligence": "🕵️",
+    "leadership_change": "🏛️",
+    "treaty_agreement": "✍️",
+    "corruption_probe": "🧾",
+    "policing_public_safety": "🚔",
+    "commodity_energy": "🛢️",
+    "labor_strike": "🪧",
+    "telecom_internet": "📡",
+    "aviation_incident": "🛬",
+    "shipping_port": "⚓",
+    "rail_transit": "🚆",
+    "industrial_fire_explosion": "🏭💥",
+    "water_sanitation": "🚰",
+    "earthquake": "🌍",
+    "storm_typhoon": "🌪️",
+    "heat_cold": "🌡️",
+    "hospital_health_emergency": "🚑",
+    "space_launch_incident": "🛰️",
+}
 
 
 def _generic_alert_label(severity: str) -> str:
@@ -257,6 +286,26 @@ def _generic_alert_label(severity: str) -> str:
     if normalized_severity == "high":
         return _GENERIC_BREAKING
     return _GENERIC_NEWS_UPDATE
+
+
+def _strip_label_prefix_icon(label: str) -> str:
+    cleaned = normalize_space(label)
+    if not cleaned:
+        return ""
+    parts = cleaned.split()
+    while parts and not re.search(r"[A-Za-z]", parts[0]):
+        parts.pop(0)
+    return normalize_space(" ".join(parts)) or cleaned
+
+
+def _enhance_taxonomy_label(category_key: str, label: str) -> str:
+    plain_label = _strip_label_prefix_icon(label)
+    if not plain_label:
+        return label
+    prefix = _ENHANCED_CATEGORY_EMOJI_PREFIXES.get(normalize_space(category_key).lower(), "")
+    if not prefix:
+        return label
+    return f"{prefix} {plain_label}"
 
 
 def _choose_alert_label_legacy(text: str, *, severity: str = "high") -> str:
@@ -287,7 +336,7 @@ def choose_alert_label(text: str, *, severity: str = "high") -> str:
         match = match_news_category(normalized)
         if match is not None:
             record_ontology_label_resolution(matched=True)
-            return match.label
+            return _enhance_taxonomy_label(match.category_key, match.label)
     record_ontology_label_resolution(matched=False)
     return _generic_alert_label(severity)
 
