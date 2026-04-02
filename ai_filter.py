@@ -2033,15 +2033,16 @@ def _json_digest_to_html(payload: Dict[str, Any], *, interval_minutes: int, max_
     if quiet:
         return quiet_period_message(interval_minutes)
 
-    items = payload.get("items")
-    if not isinstance(items, list) or not items:
+    blocks = payload.get("blocks")
+    if not isinstance(blocks, list) or not blocks:
+        blocks = payload.get("items")
+    if not isinstance(blocks, list) or not blocks:
         return quiet_period_message(interval_minutes)
 
-    # Sort by severity/importance descending if available.
-    def _score(item: Any) -> int:
-        if not isinstance(item, dict):
+    def _score(block: Any) -> int:
+        if not isinstance(block, dict):
             return 0
-        severity = str(item.get("severity") or "").lower()
+        severity = str(block.get("severity") or "").lower()
         if severity == "high":
             return 3
         if severity == "medium":
@@ -2049,38 +2050,48 @@ def _json_digest_to_html(payload: Dict[str, Any], *, interval_minutes: int, max_
         if severity == "low":
             return 1
         try:
-            return int(item.get("importance", 1))
+            return int(block.get("importance", 1))
         except Exception:
             return 1
 
-    ordered = sorted([it for it in items if isinstance(it, dict)], key=_score, reverse=True)
+    ordered = sorted([block for block in blocks if isinstance(block, dict)], key=_score, reverse=True)
 
-    lines: List[str] = []
-    for item in ordered:
-        emoji = normalize_space(str(item.get("emoji") or "")) or _severity_emoji(
-            item.get("severity", item.get("importance"))
-        )
-        if emoji not in {"🔥", "⚠️", "ℹ️"}:
-            emoji = _severity_emoji(item.get("severity", item.get("importance")))
-
+    rendered_blocks: List[str] = []
+    emitted_lines = 0
+    for block in ordered:
         headline = normalize_space(
-            str(item.get("headline") or item.get("title") or item.get("summary") or "")
+            str(block.get("headline") or block.get("title") or block.get("summary") or "")
         )
         if not headline:
             continue
-        if len(headline) > 140:
-            headline = f"{headline[:137].rsplit(' ', 1)[0]}..."
+        headline = _truncate_digest_fact(headline, max_chars=150)
+        facts_raw = block.get("facts")
+        if not isinstance(facts_raw, list):
+            facts_raw = []
+        facts = [
+            _truncate_digest_fact(str(fact), max_chars=240)
+            for fact in facts_raw
+            if normalize_space(str(fact))
+        ]
+        if not facts:
+            fallback_fact = normalize_space(str(block.get("detail") or block.get("context") or ""))
+            if fallback_fact and fallback_fact.lower() != headline.lower():
+                facts = [_truncate_digest_fact(fallback_fact, max_chars=240)]
 
-        line = f"{emoji} {headline}".strip()
-        lines.append(line)
-
-        if len(lines) >= max_lines:
+        block_lines = [f"<b>{headline}</b>"]
+        for fact in facts[:4]:
+            if emitted_lines >= max_lines:
+                break
+            block_lines.append(f"• {fact}")
+            emitted_lines += 1
+        rendered_blocks.append("<br>".join(block_lines))
+        if emitted_lines >= max_lines:
             break
 
-    if not lines:
+    if not rendered_blocks:
         return quiet_period_message(interval_minutes)
 
-    return sanitize_telegram_html("<br>".join(lines[:max_lines]))
+    return sanitize_telegram_html("<br><br>".join(rendered_blocks))
 
 
 def _strip_digest_citations(text: str) -> str:
@@ -2115,10 +2126,8 @@ def _digest_english_rewrite_prompt() -> str:
     return (
         "Rewrite this Telegram HTML digest into clean English only.\n"
         "Rules:\n"
-        "- Keep the same headline-only digest structure\n"
-        "- Preserve severity emojis and line breaks\n"
-        "- Make the English sound human, readable, and alive\n"
-        "- Avoid repetitive sentence shapes and stiff wording\n"
+        "- Keep the same story-block structure with bold headlines and bullet fact lines\n"
+        "- Make the English sound sharp, human, and slightly unhinged without inventing anything\n"
         "- Translate every non-English word or phrase into English\n"
         "- Remove citations, source names, bracket tags, outlet names, links, and any 'Read more' text\n"
         "- Do not add new facts\n"
@@ -2138,7 +2147,7 @@ async def _normalize_digest_output(
         interval_minutes=interval_minutes,
         max_lines=max_lines,
     )
-    if not _digest_needs_english_rewrite(cleaned, _resolve_output_language()):
+    if not _digest_needs_english_rewrite(cleaned, "English"):
         return cleaned
 
     try:
@@ -2183,34 +2192,48 @@ def _html_digest_cleanup(text: str, *, interval_minutes: int, max_lines: int) ->
     if normalize_space(cleaned) == quiet:
         return quiet
 
-    text_lines = re.sub(r"<br\s*/?>", "\n", cleaned, flags=re.IGNORECASE)
-    lines_raw = [line.rstrip() for line in text_lines.splitlines() if line.strip()]
-    lines: List[str] = []
-    for raw in lines_raw:
-        line = re.sub(r"</?[^>]+>", "", raw).strip()
-        line = re.sub(r"^[-*•]\s*", "", line)
-        line = line.strip()
-        if not line:
+    raw_blocks = re.split(r"(?:<br\s*/?>\s*){2,}|\n\s*\n", cleaned, flags=re.IGNORECASE)
+    rendered_blocks: List[str] = []
+    emitted_lines = 0
+
+    for raw_block in raw_blocks:
+        text_lines = re.sub(r"<br\s*/?>", "\n", raw_block, flags=re.IGNORECASE)
+        lines_raw = [line.rstrip() for line in text_lines.splitlines() if line.strip()]
+        if not lines_raw:
             continue
-        if not line.startswith(("🔥", "⚠️", "ℹ️")):
-            # Force compact headline line format when model drifts.
-            severity = _severity_from_text_heuristic(line)
-            emoji = "🔥" if severity == "high" else ("⚠️" if severity == "medium" else "ℹ️")
-            line = f"{emoji} {line}"
-        line = re.sub(
-            r"^(🔥|⚠️|ℹ️)\s+(?:breaking|alert|live update|update|situation update)\s*[:\-–—]+\s*",
-            r"\1 ",
-            line,
-            flags=re.IGNORECASE,
-        )
-        if len(line) > 220:
-            line = f"{line[:217].rsplit(' ', 1)[0]}..."
-        line = re.sub(r"\s\[[^\]]+\](?!\()", "", line).strip()
-        lines.append(line)
-    if not lines:
+
+        block_lines: List[str] = []
+        for idx, raw in enumerate(lines_raw):
+            line = re.sub(r"</?[^>]+>", "", raw).strip()
+            line = re.sub(r"^[-*•]\s*", "", line)
+            line = line.strip()
+            if not line:
+                continue
+            line = re.sub(r"\s\[[^\]]+\](?!\()", "", line).strip()
+            if idx == 0:
+                line = re.sub(
+                    r"^(?:breaking|alert|live update|update|situation update)\s*[:\-–—]+\s*",
+                    "",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+                line = _truncate_digest_fact(line, max_chars=150)
+                block_lines.append(f"<b>{line}</b>")
+            else:
+                fact = _truncate_digest_fact(line, max_chars=240)
+                block_lines.append(f"• {fact}")
+                emitted_lines += 1
+                if emitted_lines >= max_lines:
+                    break
+        if block_lines:
+            rendered_blocks.append("<br>".join(block_lines))
+        if emitted_lines >= max_lines:
+            break
+
+    if not rendered_blocks:
         return quiet_period_message(interval_minutes)
 
-    return sanitize_telegram_html("<br>".join(lines[:max_lines]))
+    return sanitize_telegram_html("<br><br>".join(rendered_blocks))
 
 
 def _post_source(post: Dict[str, object]) -> str:
@@ -2242,7 +2265,6 @@ def _build_digest_context(
     posts: Sequence[Dict[str, object]],
     *,
     token_budget: int,
-    max_posts: int,
 ) -> Tuple[List[str], int, int]:
     min_len = int(max(1, int(getattr(config, "DIGEST_MIN_POST_LENGTH", 12))))
 
@@ -2264,7 +2286,7 @@ def _build_digest_context(
     used_tokens = 0
     total_input = len(posts)
 
-    for idx, post in enumerate(deduped[:max_posts], start=1):
+    for idx, post in enumerate(deduped, start=1):
         source = _post_source(post)
         text = _post_text(post)
         if len(text) > 1200:
@@ -2296,15 +2318,21 @@ def _build_digest_context(
     return lines, len(lines), total_input
 
 
-def _rule_based_fallback_digest(
-    posts: Sequence[Dict[str, object]],
-    *,
-    max_items: int = 10,
-) -> str:
-    top: List[str] = []
+def _truncate_digest_fact(text: str, *, max_chars: int) -> str:
+    cleaned = normalize_space(text)
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return f"{cleaned[: max_chars - 3].rsplit(' ', 1)[0]}..."
+
+
+def _split_digest_sentences(text: str) -> List[str]:
+    pieces = re.split(r"(?:\r?\n)+|(?<=[.!?])\s+", normalize_space(text))
+    return [normalize_space(piece) for piece in pieces if normalize_space(piece)]
+
+
+def _story_block_fallback_digest(posts: Sequence[Dict[str, object]]) -> str:
+    blocks: List[str] = []
     seen = set()
-    include_links = False
-    include_sources = False
 
     for post in posts:
         text = _post_text(post)
@@ -2316,94 +2344,48 @@ def _rule_based_fallback_digest(
             continue
         seen.add(fingerprint)
 
-        source = _post_source(post)
-        title = text.split(". ")[0].strip()
-        title = re.sub(
+        sentences = _split_digest_sentences(text)
+        if not sentences:
+            continue
+        headline = re.sub(
             r"^(?:breaking|alert|live update|update|urgent)\s*[:\-–—]+\s*",
             "",
-            title,
+            sentences[0],
             flags=re.IGNORECASE,
-        )
-        if len(title) > 120:
-            title = f"{title[:117].rsplit(' ', 1)[0]}..."
+        ).strip()
+        if not headline:
+            headline = sentences[0]
+        headline = _truncate_digest_fact(headline, max_chars=150)
 
-        severity = _severity_from_text_heuristic(text)
-        emoji = "🔥" if severity == "high" else ("⚠️" if severity == "medium" else "ℹ️")
-        line = f"{emoji} {title}"
-        if include_sources:
-            line += f" <i>[{source}]</i>"
-        link = _post_link(post)
-        if include_links and link:
-            line += f' <a href="{link}">Read more</a>'
+        facts: List[str] = []
+        for sentence in sentences[1:]:
+            fact = _truncate_digest_fact(sentence, max_chars=240)
+            if not fact:
+                continue
+            if fact.lower() == headline.lower():
+                continue
+            facts.append(fact)
+            if len(facts) >= 3:
+                break
+        if not facts:
+            facts.append(_truncate_digest_fact(text, max_chars=240))
 
-        top.append(line)
-        if len(top) >= max_items:
-            break
+        block_lines = [f"<b>{headline}</b>"]
+        block_lines.extend(f"• {fact}" for fact in facts)
+        blocks.append("<br>".join(block_lines))
 
-    if not top:
+    if not blocks:
         return ""
-    return sanitize_telegram_html("<br>".join(top))
-
-
-def _tiny_local_digest(posts: Sequence[Dict[str, object]], *, max_items: int = 6) -> str:
-    """
-    Lightweight local second-stage fallback.
-    This is intentionally tiny/fast and purely deterministic.
-    """
-    lines: List[str] = []
-    include_sources = False
-    for post in posts:
-        text = _post_text(post)
-        if not text:
-            continue
-        source = _post_source(post)
-        short = text if len(text) <= 120 else f"{text[:117].rsplit(' ', 1)[0]}..."
-        severity = _severity_from_text_heuristic(text)
-        emoji = "🔥" if severity == "high" else ("⚠️" if severity == "medium" else "ℹ️")
-        line = f"{emoji} {short}"
-        if include_sources:
-            line += f" <i>[{source}]</i>"
-        lines.append(line)
-        if len(lines) >= max_items:
-            break
-    return sanitize_telegram_html("<br>".join(lines)) if lines else ""
-
-
-def _minimal_digest(posts: Sequence[Dict[str, object]], *, max_items: int = 4) -> str:
-    snippets: List[str] = []
-    for post in posts:
-        text = _post_text(post)
-        if not text:
-            continue
-        short = text if len(text) <= 110 else f"{text[:107].rsplit(' ', 1)[0]}..."
-        emoji = "🔥" if _severity_from_text_heuristic(text) == "high" else "ℹ️"
-        snippets.append(f"{emoji} {short}")
-        if len(snippets) >= max_items:
-            break
-    if not snippets:
-        return ""
-    return sanitize_telegram_html("<br>".join(snippets))
+    return sanitize_telegram_html("<br><br>".join(blocks))
 
 
 def local_fallback_digest(posts: Sequence[Dict[str, object]], *, interval_minutes: int) -> str:
     if not posts:
         return quiet_period_message(interval_minutes)
 
-    # Fallback chain:
-    # 1) rule-based editorial bullets
-    # 2) tiny local deterministic compression
-    # 3) minimal short bullet list
-    rule_based = _rule_based_fallback_digest(posts)
-    if rule_based:
-        return rule_based
-
-    tiny = _tiny_local_digest(posts)
-    if tiny:
-        return tiny
-
-    minimal = _minimal_digest(posts)
-    if minimal:
-        return minimal
+    story_blocks = _story_block_fallback_digest(posts)
+    if story_blocks:
+        return story_blocks
 
     return quiet_period_message(interval_minutes)
 
@@ -3995,7 +3977,12 @@ def _query_quality_issue(answer_html: str, question: str) -> str:
 
 
 def _digest_retry_prompt(prompt: str, issue: str) -> str:
-    return f"{prompt}\n\nRevision feedback:\n- {_filter_retry_feedback(issue)}\n- Keep the digest tight, concrete, and non-generic."
+    return (
+        f"{prompt}\n\nRevision feedback:\n- {_filter_retry_feedback(issue)}\n"
+        "- Rebuild the digest as sharp story blocks with concrete facts.\n"
+        "- Do not leave any meaningful update behind.\n"
+        "- Keep it English-only and remove all source branding."
+    )
 
 
 def _query_retry_prompt(prompt: str, issue: str) -> str:
@@ -4021,8 +4008,7 @@ async def create_digest_summary_result(
         return _make_generated_text_result(quiet_text, copy_origin="fallback")
 
     manager = auth_manager or AuthManager(logger=LOGGER)
-    max_posts = _resolve_digest_max_posts()
-    max_lines = _resolve_digest_max_lines()
+    max_lines = max(24, min(max(24, len(posts) * 6), 600))
 
     token_budget = _resolve_digest_token_budget()
     context_budget = max(1000, token_budget - 2200)
@@ -4030,7 +4016,6 @@ async def create_digest_summary_result(
     lines, included_count, total_input = _build_digest_context(
         posts,
         token_budget=context_budget,
-        max_posts=max_posts,
     )
     if not lines or included_count == 0:
         return _make_generated_text_result(quiet_text, copy_origin="fallback")
@@ -4040,7 +4025,7 @@ async def create_digest_summary_result(
         prefer_json = False
     importance_scoring = bool(getattr(config, "DIGEST_IMPORTANCE_SCORING", True))
     include_links = False
-    output_language = _resolve_output_language()
+    output_language = "English"
 
     user_payload = (
         "Batch metadata:\n"

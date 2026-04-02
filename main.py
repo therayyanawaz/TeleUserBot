@@ -44,6 +44,7 @@ from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInv
 import config
 from ai_filter import (
     create_digest_summary,
+    create_digest_summary_result,
     decide_filter_action,
     extract_feed_summary_parts,
     generate_answer_from_context,
@@ -81,11 +82,11 @@ from breaking_story import (
     serialize_breaking_story_facts,
 )
 from db import (
-    ack_digest_batch,
+    ack_digest_window,
     advance_inbound_job,
     count_active_breaking_story_clusters,
     claim_inbound_jobs,
-    claim_digest_batch,
+    claim_digest_window,
     clear_digest_queue_scoped,
     complete_inbound_job,
     count_ai_decision_cache_entries,
@@ -96,6 +97,9 @@ from db import (
     get_meta,
     init_db,
     is_seen,
+    load_active_digest_window_claim,
+    load_archive_window_page,
+    load_batch_rows_page,
     load_inbound_job_counts,
     load_recent_inbound_job_failures,
     load_breaking_story_decision_counts,
@@ -107,12 +111,13 @@ from db import (
     mark_seen,
     mark_seen_many,
     oldest_pending_inbound_job_age_seconds,
+    peek_oldest_pending_digest_timestamp,
     prune_archive_older_than,
     purge_ai_decision_cache,
     purge_source_delivery_refs,
     reset_in_progress_inbound_jobs,
     retry_or_dead_letter_inbound_job,
-    restore_digest_batch,
+    restore_digest_window,
     save_breaking_story_cluster,
     save_breaking_story_event,
     save_source_delivery_ref,
@@ -120,6 +125,7 @@ from db import (
     save_to_digest_queue,
     set_last_digest_timestamp,
     set_meta,
+    count_archive_window_rows,
     purge_breaking_story_history,
 )
 from news_taxonomy import (
@@ -433,6 +439,7 @@ source_alias_cache: Dict[str, set[str]] = defaultdict(set)
 digest_next_run_ts: float | None = None
 digest_retry_backoff_seconds: int = 0
 digest_loop_lock = asyncio.Lock()
+ROLLING_DIGEST_LAST_COMPLETED_META_KEY = "rolling_digest_last_completed_window_end_ts"
 dupe_detector: HybridDuplicateEngine | None = None
 monitored_source_chat_ids: List[int] = []
 query_last_request_ts: Dict[int, float] = {}
@@ -1113,11 +1120,11 @@ def _is_digest_mode_enabled() -> bool:
 
 
 def _digest_interval_seconds() -> int:
-    raw = getattr(config, "DIGEST_INTERVAL_MINUTES", 60)
+    raw = getattr(config, "DIGEST_INTERVAL_MINUTES", 30)
     try:
         minutes = int(raw)
     except Exception:
-        minutes = 60
+        minutes = 30
     minutes = max(1, min(minutes, 24 * 60))
     return minutes * 60
 
@@ -1132,7 +1139,7 @@ def _digest_daily_times() -> List[Tuple[int, int]]:
 
 def _digest_queue_clear_interval_seconds() -> int:
     # Queue clear scheduler is intentionally disabled to preserve full intake flow.
-    # Digest queue should only be drained by hourly digest claiming.
+    # Digest queue should only be drained by rolling digest window claiming.
     return 0
 
 
@@ -1287,6 +1294,8 @@ def _is_severity_routing_enabled() -> bool:
 
 
 def _is_immediate_high_enabled() -> bool:
+    if _is_digest_mode_enabled():
+        return False
     return _bool_flag(getattr(config, "IMMEDIATE_HIGH", True), True)
 
 
@@ -5655,25 +5664,34 @@ async def _process_single_message(msg: Message) -> None:
 
     if msg.media and not text:
         reply_message = await _load_reply_message(msg)
-        reply_to = await _resolve_source_reply_target(msg)
         media_caption = await _caption_for_media_without_text(msg)
         reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
         if not media_caption:
             media_caption = reply_caption
-        sent_ref = await _send_single_media(msg, media_caption, reply_to=reply_to)
-        _register_source_delivery_refs(
-            channel_id=channel_id,
-            source_message_ids=[msg.id],
-            sent_ref=sent_ref,
-        )
-        archive_text = strip_telegram_html(media_caption) if media_caption else reply_context_text
+        archive_text = normalize_space(strip_telegram_html(media_caption) if media_caption else reply_context_text)
         if archive_text:
+            _queue_for_digest(
+                channel_id,
+                msg.id,
+                archive_text,
+                source_name=source,
+                message_link=link,
+            )
             _archive_for_query_search(
                 channel_id,
                 msg.id,
                 archive_text,
                 source_name=source,
                 message_link=link,
+            )
+            log_structured(
+                LOGGER,
+                "digest_media_queued",
+                channel_id=channel_id,
+                message_id=msg.id,
+                source=source,
+                pending=count_pending(),
+                has_media=True,
             )
         mark_seen(channel_id, msg.id)
         return
@@ -5750,25 +5768,35 @@ async def _process_album(messages: List[Message]) -> None:
 
     if not combined_caption:
         reply_message = await _load_reply_message(messages[0])
-        reply_to = await _resolve_source_reply_target(messages[0])
         media_caption = await _caption_for_album_without_text(messages)
         reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
         if not media_caption:
             media_caption = reply_caption
-        sent_ref = await _send_album(messages, media_caption, reply_to=reply_to)
-        _register_source_delivery_refs(
-            channel_id=channel_id,
-            source_message_ids=message_ids,
-            sent_ref=sent_ref,
-        )
-        archive_text = strip_telegram_html(media_caption) if media_caption else reply_context_text
+        archive_text = normalize_space(strip_telegram_html(media_caption) if media_caption else reply_context_text)
         if archive_text:
+            _queue_for_digest(
+                channel_id,
+                messages[0].id,
+                archive_text,
+                source_name=source,
+                message_link=link,
+            )
             _archive_for_query_search(
                 channel_id,
                 messages[0].id,
                 archive_text,
                 source_name=source,
                 message_link=link,
+            )
+            log_structured(
+                LOGGER,
+                "digest_album_media_queued",
+                channel_id=channel_id,
+                first_message_id=messages[0].id,
+                album_size=len(messages),
+                source=source,
+                pending=count_pending(),
+                has_media=True,
             )
         mark_seen_many(channel_id, message_ids)
         return
@@ -6472,28 +6500,43 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
 
     if not candidate_text and has_media:
         reply_message = await _load_reply_message(primary)
-        reply_to = await _resolve_source_reply_target(primary)
         media_caption = str(payload.get("ocr_caption_html") or "")
         reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
         if not media_caption:
             media_caption = reply_caption or ""
-
-        if kind == "album":
-            sent_ref = await _send_album(messages, media_caption or None, reply_to=reply_to)
-        else:
-            sent_ref = await _send_single_media(primary, media_caption or None, reply_to=reply_to)
-        _register_source_delivery_refs(
-            channel_id=channel_id,
-            source_message_ids=message_ids,
-            sent_ref=sent_ref,
-        )
-        payload["delivery_message_id"] = int(_message_ref_id(sent_ref) or 0)
-        payload["archive_text"] = (
+        digest_text = (
             _plain_text_from_html_fragment(media_caption)
             or normalize_space(reply_context_text or "")
             or normalize_space(str(payload.get("archive_text") or ""))
         )
-        payload["final_action"] = "media_passthrough"
+        if digest_text:
+            _queue_for_digest(
+                channel_id,
+                int(primary.id or 0),
+                digest_text,
+                source_name=source,
+                message_link=link or None,
+            )
+            payload["archive_text"] = digest_text
+            payload["final_action"] = "digest_queued"
+            log_structured(
+                LOGGER,
+                "digest_pipeline_media_queued",
+                channel_id=channel_id,
+                message_id=int(primary.id or 0),
+                severity=severity,
+                source=source,
+                kind=kind,
+                pending=count_pending(),
+                copy_origin=str(decision.get("copy_origin") or ""),
+                routing_origin=str(decision.get("routing_origin") or ""),
+                fallback_reason=str(decision.get("fallback_reason") or ""),
+                ai_attempt_count=int(decision.get("ai_attempt_count") or 1),
+                ai_quality_retry_used=bool(decision.get("ai_quality_retry_used")),
+            )
+        else:
+            payload["final_action"] = "skip"
+            payload["skip_reason"] = "media_digest_text_missing"
         await _advance_job_to_archive(job, payload)
         return
 
@@ -6548,7 +6591,7 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
         await _advance_job_to_archive(job, payload)
         return
 
-    if (_is_digest_mode_enabled() or action == "digest") and candidate_text:
+    if _is_digest_mode_enabled() and candidate_text:
         _queue_for_digest(
             channel_id,
             int(primary.id or 0),
@@ -6567,6 +6610,36 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
             source=source,
             kind=kind,
             pending=count_pending(),
+            digest_mode=True,
+            copy_origin=str(decision.get("copy_origin") or ""),
+            routing_origin=str(decision.get("routing_origin") or ""),
+            fallback_reason=str(decision.get("fallback_reason") or ""),
+            ai_attempt_count=int(decision.get("ai_attempt_count") or 1),
+            ai_quality_retry_used=bool(decision.get("ai_quality_retry_used")),
+        )
+        await _advance_job_to_archive(job, payload)
+        return
+
+    if action == "digest" and candidate_text:
+        _queue_for_digest(
+            channel_id,
+            int(primary.id or 0),
+            candidate_text,
+            source_name=source,
+            message_link=link or None,
+        )
+        payload["final_action"] = "digest_queued"
+        payload["archive_text"] = candidate_text
+        log_structured(
+            LOGGER,
+            "digest_pipeline_queued",
+            channel_id=channel_id,
+            message_id=int(primary.id or 0),
+            severity=severity,
+            source=source,
+            kind=kind,
+            pending=count_pending(),
+            digest_mode=False,
             copy_origin=str(decision.get("copy_origin") or ""),
             routing_origin=str(decision.get("routing_origin") or ""),
             fallback_reason=str(decision.get("fallback_reason") or ""),
@@ -6771,16 +6844,15 @@ def _format_digest_message(
             return 0
 
         count = 0
-        for raw_line in body.replace("<br><br>", "\n").replace("<br>", "\n").splitlines():
-            line = normalize_space(strip_telegram_html(raw_line))
-            if not line:
-                continue
-            if re.match(r"^[•-]\s+", line):
+        raw_blocks = re.split(r"(?:<br\s*/?>\s*){2,}|\n\s*\n", body, flags=re.IGNORECASE)
+        for raw_block in raw_blocks:
+            block_lines = [
+                normalize_space(strip_telegram_html(line))
+                for line in re.split(r"\n+|<br\s*/?>", raw_block, flags=re.IGNORECASE)
+                if normalize_space(strip_telegram_html(line))
+            ]
+            if block_lines:
                 count += 1
-                continue
-            if re.match(r"^[\U0001F300-\U0001FAFF\u2600-\u27BF]", line):
-                count += 1
-                continue
         return count
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -6797,12 +6869,180 @@ def _format_digest_message(
     return sanitize_telegram_html(f"{header}<br><br>{digest_body.strip()}")
 
 
+def _get_last_completed_digest_window_end() -> int | None:
+    raw = normalize_space(str(get_meta(ROLLING_DIGEST_LAST_COMPLETED_META_KEY) or ""))
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except Exception:
+        return None
+    return value if value > 0 else None
+
+
+def _align_digest_window_end(timestamp: int, *, interval_seconds: int | None = None) -> int:
+    resolved_interval = max(60, int(interval_seconds or _digest_interval_seconds()))
+    ts = int(max(0, timestamp))
+    if ts <= 0:
+        return resolved_interval
+    return ((ts + resolved_interval - 1) // resolved_interval) * resolved_interval
+
+
+def _last_closed_digest_window_end(now_ts: int | None = None) -> int:
+    resolved_now = int(time.time() if now_ts is None else now_ts)
+    interval_seconds = max(60, _digest_interval_seconds())
+    return (resolved_now // interval_seconds) * interval_seconds
+
+
+def _next_digest_window_end_to_process(now_ts: int | None = None) -> int | None:
+    interval_seconds = max(60, _digest_interval_seconds())
+    last_closed_window_end = _last_closed_digest_window_end(now_ts)
+    last_completed_window_end = _get_last_completed_digest_window_end()
+    if last_completed_window_end is not None:
+        next_window_end = last_completed_window_end + interval_seconds
+        if next_window_end <= last_closed_window_end:
+            return next_window_end
+        return None
+
+    oldest_pending_ts = peek_oldest_pending_digest_timestamp()
+    if oldest_pending_ts is not None:
+        next_window_end = _align_digest_window_end(oldest_pending_ts, interval_seconds=interval_seconds)
+        if next_window_end <= last_closed_window_end:
+            return next_window_end
+
+    return last_closed_window_end if last_closed_window_end > 0 else None
+
+
+def _next_digest_boundary_timestamp(now_ts: int | None = None) -> int:
+    resolved_now = int(time.time() if now_ts is None else now_ts)
+    interval_seconds = max(60, _digest_interval_seconds())
+    current_boundary = (resolved_now // interval_seconds) * interval_seconds
+    return current_boundary + interval_seconds
+
+
+def _digest_input_token_budget() -> int:
+    raw_max = getattr(config, "DIGEST_MAX_TOKENS", 18000)
+    raw_context = getattr(config, "CODEX_MODEL_CONTEXT_TOKENS", 200000)
+    raw_fraction = getattr(config, "DIGEST_CONTEXT_FRACTION", 0.75)
+    try:
+        max_tokens = int(raw_max)
+    except Exception:
+        max_tokens = 18000
+    try:
+        context_tokens = int(raw_context)
+    except Exception:
+        context_tokens = 200000
+    try:
+        fraction = float(raw_fraction)
+    except Exception:
+        fraction = 0.75
+    fraction = min(max(fraction, 0.1), 0.9)
+    hard_cap = max(4000, int(context_tokens * fraction))
+    token_budget = max(2000, min(max_tokens, hard_cap))
+    return max(1200, token_budget - 2200)
+
+
+def _digest_window_page_size() -> int:
+    raw = getattr(config, "DIGEST_WINDOW_PAGE_SIZE", 200)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 200
+    return max(25, min(value, 1000))
+
+
+def _estimate_digest_row_tokens(row: Dict[str, object]) -> int:
+    text = normalize_space(str(row.get("raw_text") or ""))
+    if not text:
+        return 0
+    return max(48, estimate_tokens_rough(text) + 32)
+
+
+def _iter_digest_row_groups(
+    row_loader,
+    *,
+    token_budget: int,
+    page_size: int,
+):
+    after_id = 0
+    current_rows: List[Dict[str, object]] = []
+    current_tokens = 0
+    while True:
+        rows = row_loader(after_id=after_id, limit=page_size)
+        if not rows:
+            break
+        after_id = int(rows[-1].get("id") or after_id)
+        for row in rows:
+            row_tokens = _estimate_digest_row_tokens(row)
+            if row_tokens <= 0:
+                continue
+            if current_rows and current_tokens + row_tokens > token_budget:
+                yield current_rows
+                current_rows = []
+                current_tokens = 0
+            current_rows.append(row)
+            current_tokens += min(row_tokens, token_budget)
+        if after_id <= 0:
+            break
+    if current_rows:
+        yield current_rows
+
+
+async def _hydrate_digest_posts(rows: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+    posts: List[Dict[str, object]] = []
+    for row in rows:
+        channel_id = str(row.get("channel_id") or "")
+        source_name = normalize_space(str(row.get("source_name") or ""))
+        if not source_name and channel_id:
+            source_name = await _source_title_from_channel_id(channel_id)
+        posts.append(
+            {
+                "id": int(row.get("id") or 0),
+                "channel_id": channel_id,
+                "message_id": int(row.get("message_id") or 0),
+                "source_name": source_name,
+                "raw_text": str(row.get("raw_text") or ""),
+                "message_link": str(row.get("message_link") or ""),
+                "timestamp": int(row.get("timestamp") or 0),
+            }
+        )
+    return posts
+
+
+def _digest_window_label(window_start_ts: int, window_end_ts: int) -> str:
+    start_label = datetime.fromtimestamp(max(0, window_start_ts)).strftime("%H:%M")
+    end_label = datetime.fromtimestamp(max(0, window_end_ts)).strftime("%H:%M")
+    return f"{start_label}-{end_label}"
+
+
+def _rolling_digest_title(window_start_ts: int, window_end_ts: int, *, part_index: int, part_count: int) -> str:
+    base = f"30-Minute Digest ({_digest_window_label(window_start_ts, window_end_ts)})"
+    if part_count > 1:
+        return f"{base} • Part {part_index}/{part_count}"
+    return base
+
+
+def _daily_digest_title(window_hours: int, *, part_index: int, part_count: int) -> str:
+    base = f"24h Digest (last {window_hours}h)"
+    if part_count > 1:
+        return f"{base} • Part {part_index}/{part_count}"
+    return base
+
+
+async def _send_digest_message_sequence(messages: Sequence[str]) -> object | None:
+    first_ref = None
+    delay = _digest_send_delay_seconds()
+    for idx, message in enumerate(messages):
+        ref = await _send_digest_message(message)
+        if first_ref is None:
+            first_ref = ref
+        if idx < len(messages) - 1 and delay > 0:
+            await asyncio.sleep(delay)
+    return first_ref
+
+
 def _effective_interval_seconds() -> int:
-    base = _digest_interval_seconds()
-    health = get_quota_health()
-    threshold = _digest_429_threshold_per_hour()
-    multiplier = 2 if int(health.get("recent_429_count", 0)) > threshold else 1
-    return max(60, base * multiplier)
+    return _digest_interval_seconds()
 
 
 def _adaptive_batch_size() -> int:
@@ -6929,98 +7169,170 @@ async def _send_digest_message(text: str) -> object | None:
     return first_ref
 
 
-async def _flush_digest_queue_once() -> None:
+async def _build_window_digest_messages(
+    row_loader,
+    *,
+    total_updates: int,
+    interval_minutes: int,
+    title_builder,
+    context: Dict[str, object],
+) -> Tuple[List[str], Dict[str, object]]:
+    token_budget = _digest_input_token_budget()
+    page_size = _digest_window_page_size()
+    part_count = sum(
+        1
+        for _ in _iter_digest_row_groups(
+            row_loader,
+            token_budget=token_budget,
+            page_size=page_size,
+        )
+    )
+
+    if part_count <= 0:
+        quiet_body = quiet_period_message(interval_minutes)
+        quiet_body = await _run_post_processors(
+            quiet_body,
+            {
+                **context,
+                "posts": [],
+                "part_index": 1,
+                "part_count": 1,
+                "copy_origin": "fallback",
+                "fallback_reason": "",
+            },
+        )
+        return [
+            _format_digest_message(
+                digest_body=quiet_body,
+                total_updates=total_updates,
+                sources=[],
+                title=title_builder(1, 1),
+            )
+        ], {
+            "part_count": 1,
+            "quiet": True,
+            "response_chars": len(quiet_body),
+            "ai_parts": 0,
+            "fallback_parts": 1,
+        }
+
+    messages: List[str] = []
+    total_chars = 0
+    ai_parts = 0
+    fallback_parts = 0
+
+    for part_index, row_group in enumerate(
+        _iter_digest_row_groups(
+            row_loader,
+            token_budget=token_budget,
+            page_size=page_size,
+        ),
+        start=1,
+    ):
+        posts = await _hydrate_digest_posts(row_group)
+        result = await create_digest_summary_result(
+            posts,
+            _require_auth_manager(),
+            interval_minutes=interval_minutes,
+        )
+        digest_body = result.html.strip() or quiet_period_message(interval_minutes)
+        digest_body = await _run_post_processors(
+            digest_body,
+            {
+                **context,
+                "posts": posts,
+                "part_index": part_index,
+                "part_count": part_count,
+                "copy_origin": result.copy_origin,
+                "fallback_reason": result.fallback_reason,
+            },
+        )
+        messages.append(
+            _format_digest_message(
+                digest_body=digest_body,
+                total_updates=total_updates,
+                sources=[],
+                title=title_builder(part_index, part_count),
+            )
+        )
+        total_chars += len(digest_body)
+        if result.copy_origin == "ai":
+            ai_parts += 1
+        else:
+            fallback_parts += 1
+
+    return messages, {
+        "part_count": part_count,
+        "quiet": False,
+        "response_chars": total_chars,
+        "ai_parts": ai_parts,
+        "fallback_parts": fallback_parts,
+    }
+
+
+async def _flush_digest_queue_once() -> bool:
     global digest_retry_backoff_seconds
 
     async with digest_loop_lock:
-        batch_size = _adaptive_batch_size()
-        batch_id, rows = claim_digest_batch(batch_size)
-        if not rows:
-            return
+        active_batch_id, active_window_end_ts, active_rows = load_active_digest_window_claim()
+        batch_id = active_batch_id
+        window_end_ts = int(active_window_end_ts or 0)
+        claimed_rows = int(active_rows or 0)
 
-        pending_before = count_pending() + len(rows)
-        source_names: List[str] = []
-        posts: List[Dict[str, object]] = []
-        for row in rows:
-            source_name = str(row.get("source_name") or "").strip()
-            channel_id = str(row["channel_id"])
-            if not source_name:
-                source_name = await _source_title_from_channel_id(channel_id)
-            if source_name not in source_names:
-                source_names.append(source_name)
-            posts.append(
-                {
-                    "id": int(row["id"]),
-                    "channel_id": channel_id,
-                    "message_id": int(row["message_id"]),
-                    "source_name": source_name,
-                    "raw_text": str(row["raw_text"]),
-                    "message_link": str(row.get("message_link") or ""),
-                    "timestamp": int(row["timestamp"]),
-                }
-            )
+        if batch_id and window_end_ts <= 0:
+            restore_digest_window(batch_id)
+            batch_id = ""
+            claimed_rows = 0
 
-        input_token_est = sum(estimate_tokens_rough(str(p["raw_text"])) for p in posts)
+        if not batch_id:
+            due_window_end_ts = _next_digest_window_end_to_process()
+            if due_window_end_ts is None:
+                return False
+            window_end_ts = int(due_window_end_ts)
+            batch_id, claimed_rows = claim_digest_window(window_end_ts)
+
+        interval_minutes = max(1, _digest_interval_seconds() // 60)
+        window_start_ts = max(0, window_end_ts - _digest_interval_seconds())
+        pending_before = count_pending() + claimed_rows
         log_structured(
             LOGGER,
-            "digest_batch_claimed",
+            "digest_window_claimed",
+            batch_id=batch_id,
+            window_start_ts=window_start_ts,
+            window_end_ts=window_end_ts,
+            claimed=claimed_rows,
             pending_before=pending_before,
-            claimed=len(posts),
-            batch_size=batch_size,
-            estimated_tokens=input_token_est,
             quota_health=get_quota_health(),
         )
 
         try:
-            stream_stats = None
-            if _is_streaming_enabled():
-                streamer = LiveTelegramStreamer(
-                    send_message=lambda text, reply_to: _send_text_with_ref(text, reply_to=reply_to),
-                    edit_message=_edit_sent_text,
-                    get_message_id=lambda ref: _message_ref_id(ref) or 0,
-                    placeholder_text="Generating digest... ⏳",
-                    edit_interval_ms=_stream_edit_interval_ms(),
-                    max_chars_per_edit=_stream_max_chars_per_edit(),
-                    typing_enabled=False,
-                    html_mode=_is_html_formatting_enabled(),
-                )
-                await streamer.start()
-                digest_body = await create_digest_summary(
-                    posts,
-                    _require_auth_manager(),
-                    on_token=streamer.push,
-                )
-            else:
-                digest_body = await create_digest_summary(posts, _require_auth_manager())
-
-            if not digest_body.strip():
-                digest_body = quiet_period_message(max(1, _digest_interval_seconds() // 60))
-
-            digest_body = await _run_post_processors(
-                digest_body,
-                {
+            row_loader = lambda *, after_id=0, limit=200: load_batch_rows_page(
+                batch_id,
+                after_id=after_id,
+                limit=limit,
+            )
+            messages, stats = await _build_window_digest_messages(
+                row_loader,
+                total_updates=claimed_rows,
+                interval_minutes=interval_minutes,
+                title_builder=lambda part_index, part_count: _rolling_digest_title(
+                    window_start_ts,
+                    window_end_ts,
+                    part_index=part_index,
+                    part_count=part_count,
+                ),
+                context={
                     "batch_id": batch_id,
-                    "posts": posts,
+                    "window_start_ts": window_start_ts,
+                    "window_end_ts": window_end_ts,
                     "pending_before": pending_before,
+                    "surface": "rolling_digest",
                 },
             )
-
-            digest_message = _format_digest_message(
-                digest_body=digest_body,
-                total_updates=len(posts),
-                sources=source_names,
-                title=f"Hourly Digest (last {max(1, _digest_interval_seconds() // 60)}m)",
-            )
-            sent_ref = None
-            if _is_streaming_enabled():
-                stream_stats = await streamer.finalize(digest_message)
-                sent_ref = getattr(streamer, "_primary_ref", None)
-            else:
-                sent_ref = await _send_digest_message(digest_message)
-
+            sent_ref = await _send_digest_message_sequence(messages)
             await _pin_digest_message_ref(sent_ref, kind="hourly")
 
-            acked = ack_digest_batch(batch_id)
+            acked = ack_digest_window(batch_id, window_end_ts=window_end_ts)
             set_last_digest_timestamp(int(time.time()))
             digest_retry_backoff_seconds = 0
 
@@ -7028,21 +7340,24 @@ async def _flush_digest_queue_once() -> None:
                 LOGGER,
                 "digest_sent",
                 batch_id=batch_id,
-                rows=len(posts),
+                window_start_ts=window_start_ts,
+                window_end_ts=window_end_ts,
+                rows=claimed_rows,
                 acked=acked,
+                parts=int(stats.get("part_count") or 1),
+                quiet=bool(stats.get("quiet")),
                 pending_after=count_pending(),
-                response_chars=len(digest_body),
-                stream_enabled=_is_streaming_enabled(),
-                stream_edits=(stream_stats.edit_count if stream_stats else 0),
-                stream_tokens_per_second=(
-                    round(stream_stats.tokens_per_second, 3) if stream_stats else 0.0
-                ),
+                response_chars=int(stats.get("response_chars") or 0),
+                ai_parts=int(stats.get("ai_parts") or 0),
+                fallback_parts=int(stats.get("fallback_parts") or 0),
+                digest_mode="strict_digest_only",
             )
+            return True
         except asyncio.CancelledError:
-            restore_digest_batch(batch_id)
+            restore_digest_window(batch_id)
             raise
         except Exception as exc:
-            restored = restore_digest_batch(batch_id)
+            restored = restore_digest_window(batch_id)
             base = _digest_retry_base_seconds()
             max_backoff = _digest_retry_max_seconds()
             digest_retry_backoff_seconds = (
@@ -7055,11 +7370,13 @@ async def _flush_digest_queue_once() -> None:
                 "digest_failed_restored",
                 level=logging.ERROR,
                 batch_id=batch_id,
+                window_end_ts=window_end_ts,
                 restored=restored,
                 backoff_seconds=digest_retry_backoff_seconds,
                 error=str(exc),
             )
             LOGGER.exception("Digest generation/sending failed.")
+            return False
 
 
 async def _send_daily_archive_digest_once() -> None:
@@ -7068,82 +7385,39 @@ async def _send_daily_archive_digest_once() -> None:
         interval_minutes = max(1, window_hours * 60)
         now_ts = int(time.time())
         since_ts = max(0, now_ts - window_hours * 3600)
-        max_rows = _digest_daily_max_posts()
-        rows = load_archive_since(since_ts, max_rows)
-
-        source_names: List[str] = []
-        posts: List[Dict[str, object]] = []
-        for row in rows:
-            source_name = str(row.get("source_name") or "").strip()
-            channel_id = str(row["channel_id"])
-            if not source_name:
-                source_name = await _source_title_from_channel_id(channel_id)
-            if source_name not in source_names:
-                source_names.append(source_name)
-            posts.append(
-                {
-                    "id": int(row["id"]),
-                    "channel_id": channel_id,
-                    "message_id": int(row["message_id"]),
-                    "source_name": source_name,
-                    "raw_text": str(row["raw_text"]),
-                    "message_link": str(row.get("message_link") or ""),
-                    "timestamp": int(row["timestamp"]),
-                }
-            )
+        total_rows = count_archive_window_rows(since_ts, now_ts)
 
         log_structured(
             LOGGER,
             "daily_digest_batch_loaded",
             window_hours=window_hours,
-            selected=len(posts),
-            max_rows=max_rows,
+            selected=total_rows,
+            mode="full_window_archive",
         )
 
-        digest_body = ""
-        stream_stats = None
         try:
-            if _is_streaming_enabled():
-                streamer = LiveTelegramStreamer(
-                    send_message=lambda text, reply_to: _send_text_with_ref(text, reply_to=reply_to),
-                    edit_message=_edit_sent_text,
-                    get_message_id=lambda ref: _message_ref_id(ref) or 0,
-                    placeholder_text="Generating 24h digest... ⏳",
-                    edit_interval_ms=_stream_edit_interval_ms(),
-                    max_chars_per_edit=_stream_max_chars_per_edit(),
-                    typing_enabled=False,
-                    html_mode=_is_html_formatting_enabled(),
-                )
-                await streamer.start()
-                digest_body = await create_digest_summary(
-                    posts,
-                    _require_auth_manager(),
-                    interval_minutes=interval_minutes,
-                    on_token=streamer.push,
-                )
-            else:
-                digest_body = await create_digest_summary(
-                    posts,
-                    _require_auth_manager(),
-                    interval_minutes=interval_minutes,
-                )
-
-            if not digest_body.strip():
-                digest_body = quiet_period_message(interval_minutes)
-
-            digest_message = _format_digest_message(
-                digest_body=digest_body,
-                total_updates=len(posts),
-                sources=source_names,
-                title=f"24h Digest (last {window_hours}h)",
+            row_loader = lambda *, after_id=0, limit=200: load_archive_window_page(
+                since_ts,
+                now_ts,
+                after_id=after_id,
+                limit=limit,
             )
-            sent_ref = None
-            if _is_streaming_enabled():
-                stream_stats = await streamer.finalize(digest_message)
-                sent_ref = getattr(streamer, "_primary_ref", None)
-            else:
-                sent_ref = await _send_digest_message(digest_message)
-
+            messages, stats = await _build_window_digest_messages(
+                row_loader,
+                total_updates=total_rows,
+                interval_minutes=interval_minutes,
+                title_builder=lambda part_index, part_count: _daily_digest_title(
+                    window_hours,
+                    part_index=part_index,
+                    part_count=part_count,
+                ),
+                context={
+                    "window_start_ts": since_ts,
+                    "window_end_ts": now_ts,
+                    "surface": "daily_digest",
+                },
+            )
+            sent_ref = await _send_digest_message_sequence(messages)
             await _pin_digest_message_ref(sent_ref, kind="daily")
 
             set_last_digest_timestamp(int(time.time()))
@@ -7151,13 +7425,12 @@ async def _send_daily_archive_digest_once() -> None:
                 LOGGER,
                 "daily_digest_sent",
                 window_hours=window_hours,
-                rows=len(posts),
-                response_chars=len(digest_body),
-                stream_enabled=_is_streaming_enabled(),
-                stream_edits=(stream_stats.edit_count if stream_stats else 0),
-                stream_tokens_per_second=(
-                    round(stream_stats.tokens_per_second, 3) if stream_stats else 0.0
-                ),
+                rows=total_rows,
+                parts=int(stats.get("part_count") or 1),
+                quiet=bool(stats.get("quiet")),
+                response_chars=int(stats.get("response_chars") or 0),
+                ai_parts=int(stats.get("ai_parts") or 0),
+                fallback_parts=int(stats.get("fallback_parts") or 0),
             )
         except Exception:
             LOGGER.exception("Daily archive digest generation/sending failed.")
@@ -7177,7 +7450,11 @@ async def _send_daily_archive_digest_once() -> None:
 def _compute_next_scheduler_delay_seconds() -> int:
     if digest_retry_backoff_seconds > 0:
         return digest_retry_backoff_seconds
-    return _effective_interval_seconds()
+    due_window_end_ts = _next_digest_window_end_to_process()
+    if due_window_end_ts is not None:
+        return 0
+    next_boundary_ts = _next_digest_boundary_timestamp()
+    return max(1, next_boundary_ts - int(time.time()))
 
 
 async def run_digest_scheduler() -> None:
@@ -7186,7 +7463,7 @@ async def run_digest_scheduler() -> None:
     log_structured(
         LOGGER,
         "digest_scheduler_start",
-        mode="hourly_digest",
+        mode="strict_digest_only_30m",
         pending=count_pending(),
         inflight=count_inflight(),
         interval_seconds=_digest_interval_seconds(),
@@ -7198,8 +7475,11 @@ async def run_digest_scheduler() -> None:
         while True:
             delay = _compute_next_scheduler_delay_seconds()
             digest_next_run_ts = time.time() + delay
-            await asyncio.sleep(delay)
-            await _flush_digest_queue_once()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            processed = await _flush_digest_queue_once()
+            if delay <= 0 and not processed:
+                await asyncio.sleep(1)
     except asyncio.CancelledError:
         LOGGER.info("Digest scheduler stopped.")
         digest_next_run_ts = None
@@ -9666,14 +9946,14 @@ async def main() -> None:
                     )
                     _print_cli_status(
                         "✓",
-                        "Schedulers started (hourly + daily + queue clear)",
+                        "Schedulers started (30m rolling + daily + queue clear)",
                         level="ok",
                     )
                 else:
                     queue_clear_scheduler_task = None
                     _print_cli_status(
                         "✓",
-                        "Schedulers started (hourly + daily; queue clear disabled)",
+                        "Schedulers started (30m rolling + daily; queue clear disabled)",
                         level="ok",
                     )
 

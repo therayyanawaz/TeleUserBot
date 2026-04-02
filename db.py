@@ -12,6 +12,11 @@ from typing import Dict, Iterable, Iterator, List, Tuple
 from auth import DB_PATH, ensure_runtime_dir
 
 
+ROLLING_DIGEST_LAST_COMPLETED_KEY = "rolling_digest_last_completed_window_end_ts"
+ROLLING_DIGEST_ACTIVE_BATCH_KEY = "rolling_digest_active_batch_id"
+ROLLING_DIGEST_ACTIVE_WINDOW_END_KEY = "rolling_digest_active_window_end_ts"
+
+
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -965,6 +970,126 @@ def save_to_digest_archive(
         )
 
 
+def peek_oldest_pending_digest_timestamp() -> int | None:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT MIN(timestamp) AS min_ts
+            FROM digest_queue
+            WHERE processed = 0
+            """
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        value = int(row["min_ts"] or 0)
+    except Exception:
+        value = 0
+    return value if value > 0 else None
+
+
+def load_active_digest_window_claim() -> Tuple[str, int | None, int]:
+    batch_id = normalize_meta_value(get_meta(ROLLING_DIGEST_ACTIVE_BATCH_KEY))
+    if not batch_id:
+        return "", None, 0
+
+    raw_window_end = normalize_meta_value(get_meta(ROLLING_DIGEST_ACTIVE_WINDOW_END_KEY))
+    try:
+        window_end_ts = int(raw_window_end or 0)
+    except Exception:
+        window_end_ts = 0
+
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS claimed_rows
+            FROM digest_queue
+            WHERE batch_id = ? AND processed = 1
+            """,
+            (batch_id,),
+        ).fetchone()
+    claimed_rows = int(row["claimed_rows"] if row is not None else 0)
+    if claimed_rows <= 0:
+        delete_meta(ROLLING_DIGEST_ACTIVE_BATCH_KEY)
+        delete_meta(ROLLING_DIGEST_ACTIVE_WINDOW_END_KEY)
+        return "", None, 0
+    return batch_id, (window_end_ts if window_end_ts > 0 else None), claimed_rows
+
+
+def claim_digest_window(window_end_ts: int, *, batch_id: str | None = None) -> Tuple[str, int]:
+    cutoff_ts = int(max(0, window_end_ts))
+    if cutoff_ts <= 0:
+        return "", 0
+
+    resolved_batch_id = (batch_id or uuid.uuid4().hex).strip()
+    if not resolved_batch_id:
+        resolved_batch_id = uuid.uuid4().hex
+
+    with _transaction() as conn:
+        active_batch_row = conn.execute(
+            "SELECT value FROM digest_meta WHERE key = ? LIMIT 1",
+            (ROLLING_DIGEST_ACTIVE_BATCH_KEY,),
+        ).fetchone()
+        active_batch = normalize_meta_value(active_batch_row["value"] if active_batch_row is not None else None)
+        if active_batch:
+            active_rows = conn.execute(
+                """
+                SELECT COUNT(*) AS claimed_rows
+                FROM digest_queue
+                WHERE batch_id = ? AND processed = 1
+                """,
+                (active_batch,),
+            ).fetchone()
+            claimed_rows = int(active_rows["claimed_rows"] if active_rows is not None else 0)
+            if claimed_rows > 0:
+                return active_batch, claimed_rows
+
+        row_ids = conn.execute(
+            """
+            SELECT id
+            FROM digest_queue
+            WHERE processed = 0
+              AND timestamp <= ?
+            ORDER BY timestamp ASC, id ASC
+            """,
+            (cutoff_ts,),
+        ).fetchall()
+        ids = [int(row["id"]) for row in row_ids]
+        if ids:
+            conn.executemany(
+                """
+                UPDATE digest_queue
+                SET processed = 1,
+                    batch_id = ?
+                WHERE id = ?
+                """,
+                [(resolved_batch_id, row_id) for row_id in ids],
+            )
+
+        now_ts = int(time.time())
+        conn.execute(
+            """
+            INSERT INTO digest_meta (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (ROLLING_DIGEST_ACTIVE_BATCH_KEY, resolved_batch_id, now_ts),
+        )
+        conn.execute(
+            """
+            INSERT INTO digest_meta (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (ROLLING_DIGEST_ACTIVE_WINDOW_END_KEY, str(cutoff_ts), now_ts),
+        )
+    return resolved_batch_id, len(ids)
+
+
 def claim_digest_batch(limit: int, *, batch_id: str | None = None) -> Tuple[str, List[Dict[str, object]]]:
     if limit <= 0:
         return "", []
@@ -1026,6 +1151,38 @@ def ack_digest_batch(batch_id: str) -> int:
         return int(cur.rowcount or 0)
 
 
+def ack_digest_window(batch_id: str, *, window_end_ts: int) -> int:
+    cleaned_batch_id = (batch_id or "").strip()
+    if not cleaned_batch_id:
+        return 0
+    resolved_window_end = int(max(0, window_end_ts))
+    with _transaction() as conn:
+        cur = conn.execute(
+            """
+            DELETE FROM digest_queue
+            WHERE batch_id = ? AND processed = 1
+            """,
+            (cleaned_batch_id,),
+        )
+        now_ts = int(time.time())
+        if resolved_window_end > 0:
+            conn.execute(
+                """
+                INSERT INTO digest_meta (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (ROLLING_DIGEST_LAST_COMPLETED_KEY, str(resolved_window_end), now_ts),
+            )
+        conn.execute(
+            "DELETE FROM digest_meta WHERE key IN (?, ?)",
+            (ROLLING_DIGEST_ACTIVE_BATCH_KEY, ROLLING_DIGEST_ACTIVE_WINDOW_END_KEY),
+        )
+        return int(cur.rowcount or 0)
+
+
 def restore_digest_batch(batch_id: str) -> int:
     if not batch_id.strip():
         return 0
@@ -1042,6 +1199,27 @@ def restore_digest_batch(batch_id: str) -> int:
         return int(cur.rowcount or 0)
 
 
+def restore_digest_window(batch_id: str) -> int:
+    cleaned_batch_id = (batch_id or "").strip()
+    if not cleaned_batch_id:
+        return 0
+    with _transaction() as conn:
+        cur = conn.execute(
+            """
+            UPDATE digest_queue
+            SET processed = 0,
+                batch_id = NULL
+            WHERE batch_id = ?
+            """,
+            (cleaned_batch_id,),
+        )
+        conn.execute(
+            "DELETE FROM digest_meta WHERE key IN (?, ?)",
+            (ROLLING_DIGEST_ACTIVE_BATCH_KEY, ROLLING_DIGEST_ACTIVE_WINDOW_END_KEY),
+        )
+        return int(cur.rowcount or 0)
+
+
 def load_batch_rows(batch_id: str) -> List[Dict[str, object]]:
     if not batch_id.strip():
         return []
@@ -1054,6 +1232,27 @@ def load_batch_rows(batch_id: str) -> List[Dict[str, object]]:
             ORDER BY timestamp ASC, id ASC
             """,
             (batch_id,),
+        ).fetchall()
+    return _to_rows_dict(rows)
+
+
+def load_batch_rows_page(batch_id: str, *, after_id: int = 0, limit: int = 200) -> List[Dict[str, object]]:
+    cleaned_batch_id = (batch_id or "").strip()
+    if not cleaned_batch_id:
+        return []
+    resolved_limit = max(1, int(limit))
+    resolved_after_id = max(0, int(after_id))
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, channel_id, message_id, source_name, raw_text, message_link, timestamp, processed, batch_id
+            FROM digest_queue
+            WHERE batch_id = ?
+              AND id > ?
+            ORDER BY timestamp ASC, id ASC
+            LIMIT ?
+            """,
+            (cleaned_batch_id, resolved_after_id, resolved_limit),
         ).fetchall()
     return _to_rows_dict(rows)
 
@@ -1141,6 +1340,49 @@ def load_archive_since(since_ts: int, limit: int) -> List[Dict[str, object]]:
     return out
 
 
+def load_archive_window_page(
+    since_ts: int,
+    until_ts: int,
+    *,
+    after_id: int = 0,
+    limit: int = 200,
+) -> List[Dict[str, object]]:
+    resolved_limit = max(1, int(limit))
+    lower = int(max(0, since_ts))
+    upper = int(max(lower, until_ts))
+    resolved_after_id = max(0, int(after_id))
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, channel_id, message_id, source_name, raw_text, message_link, timestamp
+            FROM digest_archive
+            WHERE timestamp >= ?
+              AND timestamp < ?
+              AND id > ?
+            ORDER BY timestamp ASC, id ASC
+            LIMIT ?
+            """,
+            (lower, upper, resolved_after_id, resolved_limit),
+        ).fetchall()
+    return _to_archive_rows_dict(rows)
+
+
+def count_archive_window_rows(since_ts: int, until_ts: int) -> int:
+    lower = int(max(0, since_ts))
+    upper = int(max(lower, until_ts))
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS row_count
+            FROM digest_archive
+            WHERE timestamp >= ?
+              AND timestamp < ?
+            """,
+            (lower, upper),
+        ).fetchone()
+    return int(row["row_count"] if row is not None else 0)
+
+
 def prune_archive_older_than(cutoff_ts: int) -> int:
     cutoff = int(max(0, cutoff_ts))
     with _transaction() as conn:
@@ -1200,6 +1442,10 @@ def get_meta(key: str, default: str | None = None) -> str | None:
     if row is None:
         return default
     return str(row["value"])
+
+
+def normalize_meta_value(value: str | None) -> str:
+    return str(value or "").strip()
 
 
 def delete_meta(key: str) -> None:

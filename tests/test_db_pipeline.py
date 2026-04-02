@@ -168,3 +168,44 @@ def test_digest_writes_do_not_depend_on_created_at_default(tmp_path, monkeypatch
         (1700000000, 1700000000),
         (1700000100, 1700000100),
     ]
+
+
+def test_claim_digest_window_persists_active_window_and_pages_rows(isolated_db):
+    db.save_to_digest_queue("chan-1", 101, "Window item one", timestamp=1810, source_name="Desk")
+    db.save_to_digest_queue("chan-1", 102, "Window item two", timestamp=2500, source_name="Desk")
+    db.save_to_digest_queue("chan-1", 103, "Next window item", timestamp=3700, source_name="Desk")
+
+    batch_id, claimed = db.claim_digest_window(3600)
+
+    assert batch_id
+    assert claimed == 2
+
+    active_batch_id, active_window_end, active_rows = db.load_active_digest_window_claim()
+    assert active_batch_id == batch_id
+    assert active_window_end == 3600
+    assert active_rows == 2
+
+    first_page = db.load_batch_rows_page(batch_id, limit=1)
+    second_page = db.load_batch_rows_page(batch_id, after_id=first_page[-1]["id"], limit=10)
+
+    assert len(first_page) == 1
+    assert [row["message_id"] for row in first_page + second_page] == [101, 102]
+
+    acked = db.ack_digest_window(batch_id, window_end_ts=3600)
+
+    assert acked == 2
+    assert db.get_meta(db.ROLLING_DIGEST_LAST_COMPLETED_KEY) == "3600"
+    assert db.load_active_digest_window_claim() == ("", None, 0)
+    assert db.count_pending() == 1
+
+
+def test_restore_digest_window_resets_claim_and_keeps_rows_pending(isolated_db):
+    db.save_to_digest_queue("chan-1", 201, "Window item", timestamp=1810, source_name="Desk")
+
+    batch_id, claimed = db.claim_digest_window(3600)
+    restored = db.restore_digest_window(batch_id)
+
+    assert claimed == 1
+    assert restored == 1
+    assert db.load_active_digest_window_claim() == ("", None, 0)
+    assert db.count_pending() == 1

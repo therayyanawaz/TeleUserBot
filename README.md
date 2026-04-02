@@ -55,9 +55,10 @@ TeleUserBot fixes that by combining:
 
 ### 📰 Digest Publishing
 
-- Hourly digest mode
+- 30-minute rolling digest mode
 - Daily 24-hour digest mode
-- Configurable queue windows and size limits
+- SQLite-backed queue/archive storage with restart-safe window claiming
+- Multi-message digest delivery when one Telegram message is not enough
 - Optional pin rotation for latest digest posts
 
 ### 🔎 Private Query Assistant
@@ -327,10 +328,10 @@ Each incoming Telegram post is evaluated and can be:
 
 Instead of forwarding every post as-is, TeleUserBot can publish:
 
-- hourly digests
+- 30-minute rolling digests
 - daily digests
 
-Digest mode is designed for people who want signal density without raw-feed chaos.
+Digest mode is designed for people who want signal density without raw-feed chaos. When `DIGEST_MODE=true`, monitored updates are queued into persistent SQLite storage and delivered through digests only.
 
 ### 3. Query Mode
 
@@ -349,13 +350,20 @@ Recommended baseline:
 
 ```env
 DIGEST_MODE=true
-DIGEST_INTERVAL_MINUTES=60
+DIGEST_INTERVAL_MINUTES=30
 DIGEST_DAILY_TIMES=["00:00"]
 DIGEST_DAILY_WINDOW_HOURS=24
 DIGEST_MAX_POSTS=80
 DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES=0
 OUTPUT_LANGUAGE="English"
 ```
+
+Notes:
+
+- rolling digests are clock-aligned to `:00` and `:30`
+- digest windows are claimed from SQLite, not held only in memory
+- if a digest exceeds Telegram message limits, it is delivered as sequential `Part 1/N`, `Part 2/N`, ... messages
+- rolling and daily digests are forced to English output
 
 Optional digest pin rotation:
 

@@ -247,6 +247,52 @@ async def test_create_digest_summary_result_falls_back_after_weak_ai_retry(monke
     assert calls["count"] == 2
 
 
+def test_json_digest_to_html_renders_story_blocks():
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "blocks": [
+                {
+                    "headline": "Port reopens after a three-day shutdown",
+                    "severity": "medium",
+                    "facts": [
+                        "Officials said cargo traffic resumes at dawn.",
+                        "Security checks remain in place around the eastern gate.",
+                    ],
+                }
+            ],
+        },
+        interval_minutes=30,
+        max_lines=12,
+    )
+
+    assert "<b>Port reopens after a three-day shutdown</b>" in html
+    assert "• Officials said cargo traffic resumes at dawn." in html
+    assert "<br><br>" not in html or html.count("<br><br>") <= 1
+
+
+def test_local_fallback_digest_keeps_all_distinct_updates():
+    html = ai_filter.local_fallback_digest(
+        [
+            {
+                "text": "Officials reopened the port after three days of disruption. Cargo traffic resumes at dawn.",
+                "source_name": "Desk",
+            },
+            {
+                "text": "Air defenses fired over the northern district after a fresh barrage. Residents reported new blasts near the ridge.",
+                "source_name": "Desk",
+            },
+        ],
+        interval_minutes=30,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "Officials reopened the port after three days of disruption" in plain
+    assert "Cargo traffic resumes at dawn" in plain
+    assert "Air defenses fired over the northern district after a fresh barrage" in plain
+    assert "Residents reported new blasts near the ridge" in plain
+
+
 @pytest.mark.asyncio
 async def test_generate_answer_from_context_result_uses_ai_after_quality_retry(monkeypatch):
     calls = {"count": 0}

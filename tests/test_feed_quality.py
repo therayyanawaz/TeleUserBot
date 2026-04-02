@@ -614,6 +614,171 @@ async def test_handle_delivery_inbound_job_skips_when_caption_is_redacted_empty(
 
 
 @pytest.mark.asyncio
+async def test_queue_single_message_for_digest_queues_media_caption_instead_of_forwarding(monkeypatch):
+    queued: dict[str, object] = {}
+
+    monkeypatch.setattr(main, "is_seen", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(main, "mark_seen", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "count_pending", lambda: 1)
+    monkeypatch.setattr(main, "_archive_for_query_search", lambda *_args, **_kwargs: None)
+
+    async def fake_source_info(_msg):
+        return "Desk Wire", "https://t.me/example/11"
+
+    async def fake_load_reply_message(_msg):
+        return None
+
+    async def fake_caption_for_media_without_text(_msg):
+        return "<b>Warehouse fire tears through the port complex</b>"
+
+    async def fake_build_reply_context_caption(_source, _reply_message):
+        return "", ""
+
+    async def fail_send(*_args, **_kwargs):
+        raise AssertionError("media should not be forwarded in digest mode")
+
+    def fake_queue(channel_id, message_id, raw_text, **kwargs):
+        queued["channel_id"] = channel_id
+        queued["message_id"] = message_id
+        queued["raw_text"] = raw_text
+        queued["kwargs"] = kwargs
+
+    monkeypatch.setattr(main, "_source_info", fake_source_info)
+    monkeypatch.setattr(main, "_load_reply_message", fake_load_reply_message)
+    monkeypatch.setattr(main, "_caption_for_media_without_text", fake_caption_for_media_without_text)
+    monkeypatch.setattr(main, "_build_reply_context_caption", fake_build_reply_context_caption)
+    monkeypatch.setattr(main, "_send_single_media", fail_send)
+    monkeypatch.setattr(main, "_queue_for_digest", fake_queue)
+
+    await main._queue_single_message_for_digest(
+        SimpleNamespace(chat_id=-1001, id=11, media=True, message="")
+    )
+
+    assert queued["channel_id"] == "-1001"
+    assert queued["message_id"] == 11
+    assert "Warehouse fire tears through the port complex" in str(queued["raw_text"])
+
+
+@pytest.mark.asyncio
+async def test_handle_delivery_inbound_job_queues_deliver_action_when_digest_mode_enabled(monkeypatch):
+    archived: dict[str, object] = {}
+    queued: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        main,
+        "_load_inbound_payload",
+        lambda _job: {
+            "channel_id": "-1001",
+            "source": "Desk Wire",
+            "has_media": False,
+            "severity": "medium",
+            "candidate_text": "Officials reopened the port after three days of disruption.",
+            "filter_decision": {
+                "action": "deliver",
+                "summary_html": "<b>Officials reopened the port</b><br>The move follows three days of disruption.",
+                "copy_origin": "ai",
+                "routing_origin": "ai",
+                "fallback_reason": "",
+                "ai_attempt_count": 1,
+                "ai_quality_retry_used": False,
+            },
+        },
+    )
+
+    async def fake_fetch_messages(_payload):
+        return [SimpleNamespace(id=77, chat_id=-1001, media=None)]
+
+    async def fake_advance_job_to_archive(_job, payload):
+        archived["payload"] = dict(payload)
+
+    async def fail_send(*_args, **_kwargs):
+        raise AssertionError("digest mode should not send per-post delivery")
+
+    def fake_queue(channel_id, message_id, raw_text, **kwargs):
+        queued["channel_id"] = channel_id
+        queued["message_id"] = message_id
+        queued["raw_text"] = raw_text
+        queued["kwargs"] = kwargs
+
+    monkeypatch.setattr(main, "_fetch_messages_for_payload", fake_fetch_messages)
+    monkeypatch.setattr(main, "_advance_job_to_archive", fake_advance_job_to_archive)
+    monkeypatch.setattr(main, "_send_text_with_ref", fail_send)
+    monkeypatch.setattr(main, "_queue_for_digest", fake_queue)
+    monkeypatch.setattr(main, "_is_digest_mode_enabled", lambda: True)
+    monkeypatch.setattr(main, "count_pending", lambda: 1)
+
+    await main._handle_delivery_inbound_job({"id": 21})
+
+    assert queued["channel_id"] == "-1001"
+    assert queued["message_id"] == 77
+    assert "Officials reopened the port" in str(queued["raw_text"])
+    assert archived["payload"]["final_action"] == "digest_queued"
+
+
+@pytest.mark.asyncio
+async def test_handle_delivery_inbound_job_queues_media_passthrough_when_digest_mode_enabled(monkeypatch):
+    archived: dict[str, object] = {}
+    queued: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        main,
+        "_load_inbound_payload",
+        lambda _job: {
+            "channel_id": "-1001",
+            "source": "Desk Wire",
+            "has_media": True,
+            "severity": "medium",
+            "candidate_text": "",
+            "filter_decision": {
+                "action": "deliver",
+                "copy_origin": "ai",
+                "routing_origin": "ai",
+                "fallback_reason": "",
+                "ai_attempt_count": 1,
+                "ai_quality_retry_used": False,
+            },
+        },
+    )
+
+    async def fake_fetch_messages(_payload):
+        return [SimpleNamespace(id=88, chat_id=-1001, media=True)]
+
+    async def fake_load_reply_message(_msg):
+        return None
+
+    async def fake_build_reply_context_caption(_source, _reply_message):
+        return "", "Air defenses were activated over the northern district."
+
+    async def fake_advance_job_to_archive(_job, payload):
+        archived["payload"] = dict(payload)
+
+    async def fail_send(*_args, **_kwargs):
+        raise AssertionError("media passthrough should be queued, not forwarded")
+
+    def fake_queue(channel_id, message_id, raw_text, **kwargs):
+        queued["channel_id"] = channel_id
+        queued["message_id"] = message_id
+        queued["raw_text"] = raw_text
+        queued["kwargs"] = kwargs
+
+    monkeypatch.setattr(main, "_fetch_messages_for_payload", fake_fetch_messages)
+    monkeypatch.setattr(main, "_load_reply_message", fake_load_reply_message)
+    monkeypatch.setattr(main, "_build_reply_context_caption", fake_build_reply_context_caption)
+    monkeypatch.setattr(main, "_advance_job_to_archive", fake_advance_job_to_archive)
+    monkeypatch.setattr(main, "_send_single_media", fail_send)
+    monkeypatch.setattr(main, "_send_album", fail_send)
+    monkeypatch.setattr(main, "_queue_for_digest", fake_queue)
+    monkeypatch.setattr(main, "count_pending", lambda: 1)
+
+    await main._handle_delivery_inbound_job({"id": 22})
+
+    assert queued["channel_id"] == "-1001"
+    assert queued["message_id"] == 88
+    assert "Air defenses were activated over the northern district." in str(queued["raw_text"])
+    assert archived["payload"]["final_action"] == "digest_queued"
+
+
+@pytest.mark.asyncio
 async def test_handle_ai_inbound_job_uses_ai_decision_severity(monkeypatch):
     captured: dict[str, object] = {}
 

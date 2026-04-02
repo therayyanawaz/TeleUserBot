@@ -152,7 +152,7 @@ OPENAI_AUTH_STARTUP_MODE = _env_str("OPENAI_AUTH_STARTUP_MODE", "auto").lower() 
 # Digest Mode Core
 # -----------------------------------------------------------------------------
 DIGEST_MODE = _env_bool("DIGEST_MODE", True)  # type: bool
-DIGEST_INTERVAL_MINUTES = _env_int("DIGEST_INTERVAL_MINUTES", 60)  # type: int
+DIGEST_INTERVAL_MINUTES = _env_int("DIGEST_INTERVAL_MINUTES", 30)  # type: int
 DIGEST_DAILY_TIMES = _env_list("DIGEST_DAILY_TIMES", ["00:00"])  # type: list[str]
 # 0 disables automatic queue clearing (recommended to preserve full flow).
 DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES = _env_int("DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES", 0)  # type: int
