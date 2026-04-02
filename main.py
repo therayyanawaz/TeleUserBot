@@ -5842,27 +5842,54 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
 
     if msg.media and not text:
         reply_message = await _load_reply_message(msg)
-        reply_to = await _resolve_source_reply_target(msg)
         media_caption = await _caption_for_media_without_text(msg)
         reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
         if not media_caption:
             media_caption = reply_caption
-        sent_ref = await _send_single_media(msg, media_caption, reply_to=reply_to)
-        _register_source_delivery_refs(
-            channel_id=channel_id,
-            source_message_ids=[msg.id],
-            sent_ref=sent_ref,
+        digest_text = normalize_space(
+            _plain_text_from_html_fragment(media_caption) or reply_context_text or ""
         )
-        archive_text = strip_telegram_html(media_caption) if media_caption else reply_context_text
-        if archive_text:
-            _archive_for_query_search(
-                channel_id,
-                msg.id,
-                archive_text,
-                source_name=source,
-                message_link=link,
+        if not digest_text:
+            mark_seen(channel_id, msg.id)
+            return
+        severity = "medium"
+        severity_score = 0.0
+        severity_breakdown: dict = {}
+        if _is_severity_routing_enabled():
+            severity, severity_score, severity_breakdown = _classify_severity_with_breakdown(
+                text=digest_text,
+                source=source,
+                channel_id=channel_id,
+                message_id=msg.id,
+                has_media=True,
+                has_link=bool(link),
+                reply_to=_reply_to_message_id(msg),
             )
+        elif _contains_breaking_keyword(digest_text):
+            severity = "high"
+        _queue_for_digest(
+            channel_id,
+            msg.id,
+            digest_text,
+            source_name=source,
+            message_link=link,
+        )
         mark_seen(channel_id, msg.id)
+        log_structured(
+            LOGGER,
+            "digest_item_queued",
+            channel_id=channel_id,
+            message_id=msg.id,
+            source=source,
+            severity=severity,
+            severity_score=severity_score,
+            severity_emoji=_severity_emoji(severity),
+            has_link=bool(link),
+            has_media=True,
+            text_tokens=estimate_tokens_rough(digest_text),
+            pending=count_pending(),
+            severity_breakdown=severity_breakdown,
+        )
         return
 
     if not text:
@@ -5973,27 +6000,56 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
 
     if not combined_caption:
         reply_message = await _load_reply_message(messages[0])
-        reply_to = await _resolve_source_reply_target(messages[0])
         media_caption = await _caption_for_album_without_text(messages)
         reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
         if not media_caption:
             media_caption = reply_caption
-        sent_ref = await _send_album(messages, media_caption, reply_to=reply_to)
-        _register_source_delivery_refs(
-            channel_id=channel_id,
-            source_message_ids=message_ids,
-            sent_ref=sent_ref,
+        digest_text = normalize_space(
+            _plain_text_from_html_fragment(media_caption) or reply_context_text or ""
         )
-        archive_text = strip_telegram_html(media_caption) if media_caption else reply_context_text
-        if archive_text:
-            _archive_for_query_search(
-                channel_id,
-                messages[0].id,
-                archive_text,
-                source_name=source,
-                message_link=link,
+        if not digest_text:
+            mark_seen_many(channel_id, message_ids)
+            return
+        severity = "medium"
+        severity_score = 0.0
+        severity_breakdown: dict = {}
+        if _is_severity_routing_enabled():
+            severity, severity_score, severity_breakdown = _classify_severity_with_breakdown(
+                text=digest_text,
+                source=source,
+                channel_id=channel_id,
+                message_id=messages[0].id,
+                has_media=True,
+                has_link=bool(link),
+                reply_to=_reply_to_message_id(messages[0]),
+                album_size=len(messages),
             )
+        elif _contains_breaking_keyword(digest_text):
+            severity = "high"
+        _queue_for_digest(
+            channel_id,
+            messages[0].id,
+            digest_text,
+            source_name=source,
+            message_link=link,
+        )
         mark_seen_many(channel_id, message_ids)
+        log_structured(
+            LOGGER,
+            "digest_album_queued",
+            channel_id=channel_id,
+            first_message_id=messages[0].id,
+            album_size=len(messages),
+            source=source,
+            severity=severity,
+            severity_score=severity_score,
+            severity_emoji=_severity_emoji(severity),
+            has_link=bool(link),
+            has_media=True,
+            text_tokens=estimate_tokens_rough(digest_text),
+            pending=count_pending(),
+            severity_breakdown=severity_breakdown,
+        )
         return
 
     severity = "medium"
