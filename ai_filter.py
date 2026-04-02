@@ -309,6 +309,10 @@ class GeneratedTextResult:
     fallback_reason: str = ""
     ai_attempt_count: int = 1
     ai_quality_retry_used: bool = False
+    major_block_count: int = 0
+    timeline_item_count: int = 0
+    noise_stripped_count: int = 0
+    translation_applied_count: int = 0
 
 
 def estimate_tokens_rough(text: str) -> int:
@@ -507,11 +511,14 @@ def _clean_generated_delivery_segment(line: str) -> str:
     cleaned = _FEED_PROMO_TO_END_RE.sub("", cleaned)
     cleaned = re.sub(r"(?i)\b(?:channel|source)\s*[:\-–—|]+\s*$", "", cleaned)
     prefix_match = re.match(
-        r"^(?P<prefix>[A-Za-z][A-Za-z0-9&'._ /-]{1,50})\s*[:\-–—|]+\s*(?P<rest>.+)$",
+        r"^(?P<prefix>[A-Za-z][A-Za-z0-9&'._ /-]{1,50})(?P<sep>\s*[:\-–—|]+\s*)(?P<rest>.+)$",
         cleaned,
     )
     if prefix_match and _looks_like_generated_source_prefix(prefix_match.group("prefix")):
-        cleaned = normalize_space(prefix_match.group("rest"))
+        separator = normalize_space(prefix_match.group("sep"))
+        rest = normalize_space(prefix_match.group("rest"))
+        if not (separator == "-" and re.match(r"^[a-z][A-Za-z0-9-]{2,}", rest)):
+            cleaned = rest
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
     return normalize_space(cleaned.strip(" ,;:-|/[](){}"))
 
@@ -2028,70 +2035,275 @@ def _severity_emoji(value: Any) -> str:
     return "ℹ️"
 
 
-def _json_digest_to_html(payload: Dict[str, Any], *, interval_minutes: int, max_lines: int) -> str:
-    quiet = bool(payload.get("quiet"))
-    if quiet:
-        return quiet_period_message(interval_minutes)
+_DIGEST_PROMO_FRAGMENT_RE = re.compile(
+    r"(?i)\b(?:follow us|discussion|boost the channel|our channel|subscribe|join(?: us| our channel)?|"
+    r"watch here|watch live|livestream|live stream|share|smaylik|abon[eə]\s+olun|global eye)\b.*$"
+)
+_DIGEST_HASHTAG_RE = re.compile(r"(?<!\w)#[\w\-/]+")
+_DIGEST_PUNCT_ONLY_RE = re.compile(r"^[\W_]+$")
+_DIGEST_LEADING_NOISE_RE = re.compile(r"^[^0-9A-Za-z\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\u0400-\u04FF\"'“‘]+")
+_DIGEST_SOURCE_PREFIX_RE = re.compile(
+    r"(?i)^(?:enemy media|hebrew sources?|hebrew media|israeli media|news from the zionist enemy|"
+    r"follow-up from [^:]{1,80}|source|outlet|channel)\s*[:\-–—|]+\s*"
+)
+_DIGEST_ALSO_MOVING_RE = re.compile(r"(?i)^also moving$")
 
-    blocks = payload.get("blocks")
-    if not isinstance(blocks, list) or not blocks:
-        blocks = payload.get("items")
-    if not isinstance(blocks, list) or not blocks:
-        return quiet_period_message(interval_minutes)
 
-    def _score(block: Any) -> int:
-        if not isinstance(block, dict):
-            return 0
-        severity = str(block.get("severity") or "").lower()
-        if severity == "high":
-            return 3
-        if severity == "medium":
-            return 2
-        if severity == "low":
-            return 1
-        try:
-            return int(block.get("importance", 1))
-        except Exception:
-            return 1
+def _digest_clean_line(text: str, *, max_chars: int, allow_short: bool = False) -> str:
+    cleaned = normalize_space(strip_telegram_html(str(text or "")))
+    if not cleaned:
+        return ""
+    cleaned = _DIGEST_LEADING_NOISE_RE.sub("", cleaned).strip()
+    cleaned = _DIGEST_HASHTAG_RE.sub("", cleaned)
+    cleaned = _DIGEST_SOURCE_PREFIX_RE.sub("", cleaned)
+    cleaned = _clean_generated_delivery_segment(cleaned)
+    cleaned = _DIGEST_PROMO_FRAGMENT_RE.sub("", cleaned)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = normalize_space(cleaned.strip(" ,;:-|/[]{}()•"))
+    if not cleaned or _DIGEST_PUNCT_ONLY_RE.fullmatch(cleaned):
+        return ""
+    if not allow_short and not _digest_needs_english_rewrite(cleaned, "English") and _feed_segment_is_incomplete(cleaned):
+        return ""
+    return _truncate_digest_fact(cleaned, max_chars=max_chars)
 
-    ordered = sorted([block for block in blocks if isinstance(block, dict)], key=_score, reverse=True)
 
+def _digest_finalize_sentence(text: str, *, max_chars: int) -> str:
+    cleaned = _digest_clean_line(text, max_chars=max_chars, allow_short=True)
+    if not cleaned:
+        return ""
+    if cleaned.endswith((".", "!", "?", "…")):
+        return cleaned
+    if len(cleaned.split()) >= 4:
+        return f"{cleaned}."
+    return cleaned
+
+
+def _digest_priority_score(value: Any) -> int:
+    normalized = normalize_space(str(value or "")).lower()
+    if normalized in {"high", "critical", "3"}:
+        return 3
+    if normalized in {"medium", "2"}:
+        return 2
+    if normalized in {"low", "1"}:
+        return 1
+    try:
+        numeric = int(value)
+    except Exception:
+        numeric = 1
+    return max(1, min(numeric, 3))
+
+
+def _digest_priority_label(value: Any) -> str:
+    score = _digest_priority_score(value)
+    if score >= 3:
+        return "high"
+    if score == 2:
+        return "medium"
+    return "low"
+
+
+def _coerce_digest_major_block(block: Any) -> Dict[str, Any] | None:
+    if not isinstance(block, dict):
+        return None
+    headline = _digest_clean_line(
+        block.get("headline") or block.get("title") or block.get("summary") or "",
+        max_chars=120,
+    )
+    if not headline:
+        return None
+    lede = _digest_finalize_sentence(
+        block.get("lede") or block.get("detail") or block.get("context") or "",
+        max_chars=220,
+    )
+    facts_raw = block.get("facts")
+    if not isinstance(facts_raw, list):
+        facts_raw = []
+    facts: List[str] = []
+    seen: set[str] = set()
+    for fact in facts_raw:
+        cleaned = _digest_finalize_sentence(fact, max_chars=220)
+        key = cleaned.lower()
+        if not cleaned or key in seen or key == headline.lower() or key == lede.lower():
+            continue
+        seen.add(key)
+        facts.append(cleaned)
+        if len(facts) >= 4:
+            break
+    if not lede and facts:
+        lede = facts.pop(0)
+    return {
+        "headline": headline,
+        "lede": lede,
+        "facts": facts,
+        "priority": _digest_priority_label(
+            block.get("priority") or block.get("severity") or block.get("importance")
+        ),
+    }
+
+
+def _derive_digest_scene_setter(
+    major_blocks: Sequence[Dict[str, Any]],
+    timeline_items: Sequence[str],
+) -> str:
+    headlines = [
+        normalize_space(str(block.get("headline") or ""))
+        for block in major_blocks
+        if normalize_space(str(block.get("headline") or ""))
+    ]
+    if len(headlines) >= 2:
+        return _digest_finalize_sentence(
+            f"The half-hour was dominated by {headlines[0].lower()}, while {headlines[1].lower()} and follow-on reports kept moving.",
+            max_chars=260,
+        )
+    if len(headlines) == 1:
+        return _digest_finalize_sentence(
+            f"The main development in this window was {headlines[0].lower()}.",
+            max_chars=220,
+        )
+    if timeline_items:
+        return _digest_finalize_sentence(
+            "The window stayed active with several smaller developments moving at once.",
+            max_chars=180,
+        )
+    return ""
+
+
+def _render_digest_layout(
+    *,
+    scene_setter: str,
+    major_blocks: Sequence[Dict[str, Any]],
+    timeline_items: Sequence[str],
+    interval_minutes: int,
+    max_lines: int,
+) -> str:
+    quiet = quiet_period_message(interval_minutes)
     rendered_blocks: List[str] = []
     emitted_lines = 0
-    for block in ordered:
-        headline = normalize_space(
-            str(block.get("headline") or block.get("title") or block.get("summary") or "")
-        )
+
+    cleaned_scene = _digest_finalize_sentence(scene_setter, max_chars=280)
+    if cleaned_scene:
+        rendered_blocks.append(sanitize_telegram_html(cleaned_scene))
+
+    ordered_major_blocks = sorted(
+        [block for block in major_blocks if isinstance(block, dict)],
+        key=lambda block: _digest_priority_score(block.get("priority")),
+        reverse=True,
+    )
+
+    for block in ordered_major_blocks[:7]:
+        headline = _digest_clean_line(block.get("headline") or "", max_chars=120)
         if not headline:
             continue
-        headline = _truncate_digest_fact(headline, max_chars=150)
+        lede = _digest_finalize_sentence(block.get("lede") or "", max_chars=220)
         facts_raw = block.get("facts")
         if not isinstance(facts_raw, list):
             facts_raw = []
-        facts = [
-            _truncate_digest_fact(str(fact), max_chars=240)
-            for fact in facts_raw
-            if normalize_space(str(fact))
-        ]
-        if not facts:
-            fallback_fact = normalize_space(str(block.get("detail") or block.get("context") or ""))
-            if fallback_fact and fallback_fact.lower() != headline.lower():
-                facts = [_truncate_digest_fact(fallback_fact, max_chars=240)]
-
-        block_lines = [f"<b>{headline}</b>"]
-        for fact in facts[:4]:
+        facts: List[str] = []
+        seen: set[str] = set()
+        for fact in facts_raw:
+            cleaned = _digest_finalize_sentence(fact, max_chars=220)
+            key = cleaned.lower()
+            if not cleaned or key in seen or key == headline.lower() or key == lede.lower():
+                continue
+            seen.add(key)
+            facts.append(cleaned)
+            if len(facts) >= 4:
+                break
+        if not lede and facts:
+            lede = facts.pop(0)
+        if not lede and not facts:
+            continue
+        block_lines = [f"<b>{sanitize_telegram_html(headline)}</b>"]
+        if lede:
+            block_lines.append(sanitize_telegram_html(lede))
+        for fact in facts:
             if emitted_lines >= max_lines:
                 break
-            block_lines.append(f"• {fact}")
+            block_lines.append(f"• {sanitize_telegram_html(fact)}")
             emitted_lines += 1
         rendered_blocks.append("<br>".join(block_lines))
         if emitted_lines >= max_lines:
             break
 
+    cleaned_timeline: List[str] = []
+    seen_timeline: set[str] = set()
+    for item in timeline_items:
+        cleaned = _digest_finalize_sentence(item, max_chars=200)
+        key = cleaned.lower()
+        if not cleaned or key in seen_timeline:
+            continue
+        seen_timeline.add(key)
+        cleaned_timeline.append(cleaned)
+
+    if cleaned_timeline and emitted_lines < max_lines:
+        timeline_lines = ["<i>Also moving</i>"]
+        for item in cleaned_timeline:
+            if emitted_lines >= max_lines:
+                break
+            timeline_lines.append(f"• {sanitize_telegram_html(item)}")
+            emitted_lines += 1
+        if len(timeline_lines) > 1:
+            rendered_blocks.append("<br>".join(timeline_lines))
+
     if not rendered_blocks:
-        return quiet_period_message(interval_minutes)
+        return quiet
 
     return sanitize_telegram_html("<br><br>".join(rendered_blocks))
+
+
+def _digest_payload_to_layout(payload: Dict[str, Any]) -> tuple[str, List[Dict[str, Any]], List[str]]:
+    scene_setter = normalize_space(str(payload.get("scene_setter") or ""))
+    major_blocks_raw = payload.get("major_blocks")
+    timeline_raw = payload.get("timeline_items")
+
+    major_blocks: List[Dict[str, Any]] = []
+    timeline_items: List[str] = []
+
+    if isinstance(major_blocks_raw, list) and major_blocks_raw:
+        for block in major_blocks_raw:
+            coerced = _coerce_digest_major_block(block)
+            if coerced:
+                major_blocks.append(coerced)
+    else:
+        legacy_blocks = payload.get("blocks")
+        if not isinstance(legacy_blocks, list):
+            legacy_blocks = payload.get("items")
+        if isinstance(legacy_blocks, list):
+            ordered_legacy = sorted(
+                [block for block in legacy_blocks if isinstance(block, dict)],
+                key=lambda block: _digest_priority_score(
+                    block.get("priority") or block.get("severity") or block.get("importance")
+                ),
+                reverse=True,
+            )
+            for index, block in enumerate(ordered_legacy):
+                coerced = _coerce_digest_major_block(block)
+                if not coerced:
+                    continue
+                if index < 6:
+                    major_blocks.append(coerced)
+                else:
+                    timeline_items.extend([coerced.get("lede", ""), *coerced.get("facts", [])])
+
+    if isinstance(timeline_raw, list):
+        timeline_items.extend(str(item) for item in timeline_raw if normalize_space(str(item)))
+
+    if not scene_setter:
+        scene_setter = _derive_digest_scene_setter(major_blocks, timeline_items)
+    return scene_setter, major_blocks, timeline_items
+
+
+def _json_digest_to_html(payload: Dict[str, Any], *, interval_minutes: int, max_lines: int) -> str:
+    if bool(payload.get("quiet")):
+        return quiet_period_message(interval_minutes)
+    scene_setter, major_blocks, timeline_items = _digest_payload_to_layout(payload)
+    return _render_digest_layout(
+        scene_setter=scene_setter,
+        major_blocks=major_blocks,
+        timeline_items=timeline_items,
+        interval_minutes=interval_minutes,
+        max_lines=max_lines,
+    )
 
 
 def _strip_digest_citations(text: str) -> str:
@@ -2126,10 +2338,10 @@ def _digest_english_rewrite_prompt() -> str:
     return (
         "Rewrite this Telegram HTML digest into clean English only.\n"
         "Rules:\n"
-        "- Keep the same story-block structure with bold headlines and bullet fact lines\n"
+        "- Keep the same premium newsroom structure: scene setter, major blocks, and Also moving rail\n"
         "- Make the English sound sharp, human, and slightly unhinged without inventing anything\n"
         "- Translate every non-English word or phrase into English\n"
-        "- Remove citations, source names, bracket tags, outlet names, links, and any 'Read more' text\n"
+        "- Remove citations, source names, bracket tags, outlet names, links, handles, hashtags, and any 'Read more' text\n"
         "- Do not add new facts\n"
         "- Output Telegram HTML only"
     )
@@ -2193,47 +2405,60 @@ def _html_digest_cleanup(text: str, *, interval_minutes: int, max_lines: int) ->
         return quiet
 
     raw_blocks = re.split(r"(?:<br\s*/?>\s*){2,}|\n\s*\n", cleaned, flags=re.IGNORECASE)
-    rendered_blocks: List[str] = []
-    emitted_lines = 0
+    scene_setter = ""
+    major_blocks: List[Dict[str, Any]] = []
+    timeline_items: List[str] = []
+    timeline_mode = False
 
     for raw_block in raw_blocks:
+        block_has_bold = bool(re.search(r"<b>.*?</b>", raw_block, flags=re.IGNORECASE | re.DOTALL))
         text_lines = re.sub(r"<br\s*/?>", "\n", raw_block, flags=re.IGNORECASE)
         lines_raw = [line.rstrip() for line in text_lines.splitlines() if line.strip()]
         if not lines_raw:
             continue
 
-        block_lines: List[str] = []
-        for idx, raw in enumerate(lines_raw):
-            line = re.sub(r"</?[^>]+>", "", raw).strip()
-            line = re.sub(r"^[-*•]\s*", "", line)
-            line = line.strip()
-            if not line:
-                continue
-            line = re.sub(r"\s\[[^\]]+\](?!\()", "", line).strip()
-            if idx == 0:
-                line = re.sub(
-                    r"^(?:breaking|alert|live update|update|situation update)\s*[:\-–—]+\s*",
-                    "",
-                    line,
-                    flags=re.IGNORECASE,
-                )
-                line = _truncate_digest_fact(line, max_chars=150)
-                block_lines.append(f"<b>{line}</b>")
-            else:
-                fact = _truncate_digest_fact(line, max_chars=240)
-                block_lines.append(f"• {fact}")
-                emitted_lines += 1
-                if emitted_lines >= max_lines:
-                    break
-        if block_lines:
-            rendered_blocks.append("<br>".join(block_lines))
-        if emitted_lines >= max_lines:
-            break
+        plain_lines: List[str] = []
+        for raw in lines_raw:
+            cleaned_line = _digest_finalize_sentence(raw, max_chars=240)
+            if cleaned_line:
+                plain_lines.append(cleaned_line)
+        if not plain_lines:
+            continue
 
-    if not rendered_blocks:
-        return quiet_period_message(interval_minutes)
+        if _DIGEST_ALSO_MOVING_RE.fullmatch(normalize_space(plain_lines[0])):
+            timeline_mode = True
+            timeline_items.extend(plain_lines[1:])
+            continue
 
-    return sanitize_telegram_html("<br><br>".join(rendered_blocks))
+        if timeline_mode:
+            timeline_items.extend(plain_lines)
+            continue
+
+        if not scene_setter and not block_has_bold and len(plain_lines) == 1:
+            scene_setter = plain_lines[0]
+            continue
+
+        headline = _digest_clean_line(plain_lines[0], max_chars=120)
+        if not headline:
+            continue
+        lede = plain_lines[1] if len(plain_lines) > 1 else ""
+        facts = plain_lines[2:] if len(plain_lines) > 2 else []
+        major_blocks.append(
+            {
+                "headline": headline,
+                "lede": lede,
+                "facts": facts,
+                "priority": "medium",
+            }
+        )
+
+    return _render_digest_layout(
+        scene_setter=scene_setter,
+        major_blocks=major_blocks,
+        timeline_items=timeline_items,
+        interval_minutes=interval_minutes,
+        max_lines=max_lines,
+    )
 
 
 def _post_source(post: Dict[str, object]) -> str:
@@ -2287,7 +2512,6 @@ def _build_digest_context(
     total_input = len(posts)
 
     for idx, post in enumerate(deduped, start=1):
-        source = _post_source(post)
         text = _post_text(post)
         if len(text) > 1200:
             text = f"{text[:1197].rsplit(' ', 1)[0]}..."
@@ -2301,7 +2525,7 @@ def _build_digest_context(
 
         link = _post_link(post)
         link_part = f" | link={link}" if link else ""
-        line = f"{idx}. [{source}] ({ts_label}) {text}{link_part}"
+        line = f"{idx}. ({ts_label}) {text}{link_part}"
 
         line_tokens = estimate_tokens_rough(line) + 8
         if lines and (used_tokens + line_tokens > token_budget):
@@ -2330,64 +2554,171 @@ def _split_digest_sentences(text: str) -> List[str]:
     return [normalize_space(piece) for piece in pieces if normalize_space(piece)]
 
 
-def _story_block_fallback_digest(posts: Sequence[Dict[str, object]]) -> str:
-    blocks: List[str] = []
-    seen = set()
+def _clean_digest_source_text(text: str) -> tuple[str, int]:
+    raw = re.sub(r"(?i)<br\s*/?>", "\n", _strip_digest_citations(strip_telegram_html(str(text or ""))))
+    removed = 0
+    cleaned_lines: List[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"\n+|(?<=[.!?])\s+", raw):
+        candidate = _digest_finalize_sentence(part, max_chars=280)
+        if not candidate:
+            removed += 1
+            continue
+        key = candidate.lower()
+        if key in seen:
+            removed += 1
+            continue
+        seen.add(key)
+        cleaned_lines.append(candidate)
+    return normalize_space(" ".join(cleaned_lines)), removed
+
+
+async def _translate_digest_posts_to_english(
+    posts: Sequence[Dict[str, object]],
+    auth_manager: AuthManager,
+) -> tuple[List[Dict[str, object]], int]:
+    targets = [
+        (idx, _post_text(post))
+        for idx, post in enumerate(posts, start=1)
+        if _digest_needs_english_rewrite(_post_text(post), "English")
+    ]
+    if not targets:
+        return [dict(post) for post in posts], 0
+
+    payload = "\n".join(f"{idx}. {text}" for idx, text in targets)
+    instructions = (
+        "Translate each numbered digest evidence line into sharp English plain text.\n"
+        'Return ONLY one JSON object with this schema: {"items":[{"id": number, "text": string}]}.\n'
+        "Rules:\n"
+        "- Keep the factual meaning and uncertainty markers.\n"
+        "- Remove usernames, channel names, outlet labels, links, hashtags, and promo text.\n"
+        "- Do not add any new facts.\n"
+        "- Keep each item as one clean English evidence line."
+    )
+    try:
+        raw = await _call_codex_with_auth_repair(payload, auth_manager, instructions, verbosity="low")
+        parsed = _try_parse_digest_json(raw) or {}
+    except Exception:
+        return [dict(post) for post in posts], 0
+
+    translated_items = parsed.get("items")
+    if not isinstance(translated_items, list):
+        return [dict(post) for post in posts], 0
+
+    translated_map: Dict[int, str] = {}
+    for item in translated_items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            item_id = int(item.get("id") or 0)
+        except Exception:
+            item_id = 0
+        cleaned = _digest_finalize_sentence(item.get("text") or "", max_chars=280)
+        if item_id > 0 and cleaned:
+            translated_map[item_id] = cleaned
+
+    translated_count = 0
+    updated_posts: List[Dict[str, object]] = []
+    for idx, post in enumerate(posts, start=1):
+        updated = dict(post)
+        translated = translated_map.get(idx)
+        if translated:
+            updated["raw_text"] = translated
+            translated_count += 1
+        updated_posts.append(updated)
+    return updated_posts, translated_count
+
+
+async def _prepare_digest_posts(
+    posts: Sequence[Dict[str, object]],
+    auth_manager: AuthManager,
+) -> tuple[List[Dict[str, object]], Dict[str, int]]:
+    prepared: List[Dict[str, object]] = []
+    noise_stripped_count = 0
+    for post in posts:
+        cleaned_text, removed = _clean_digest_source_text(_post_text(post))
+        noise_stripped_count += removed
+        if not cleaned_text or _likely_noise(cleaned_text):
+            noise_stripped_count += 1
+            continue
+        updated = dict(post)
+        updated["raw_text"] = cleaned_text
+        prepared.append(updated)
+
+    translated_posts, translation_applied_count = await _translate_digest_posts_to_english(prepared, auth_manager)
+    return translated_posts, {
+        "noise_stripped_count": noise_stripped_count,
+        "translation_applied_count": translation_applied_count,
+    }
+
+
+def _fallback_digest_layout(posts: Sequence[Dict[str, object]]) -> tuple[str, List[Dict[str, Any]], List[str]]:
+    major_blocks: List[Dict[str, Any]] = []
+    timeline_items: List[str] = []
+    seen: set[str] = set()
 
     for post in posts:
         text = _post_text(post)
         if not text or _likely_noise(text):
             continue
-
         fingerprint = _cache_key(text.lower())
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
 
-        sentences = _split_digest_sentences(text)
+        sentences = [_digest_finalize_sentence(part, max_chars=220) for part in _split_digest_sentences(text)]
+        sentences = [sentence for sentence in sentences if sentence]
         if not sentences:
             continue
-        headline = re.sub(
-            r"^(?:breaking|alert|live update|update|urgent)\s*[:\-–—]+\s*",
-            "",
-            sentences[0],
-            flags=re.IGNORECASE,
-        ).strip()
-        if not headline:
-            headline = sentences[0]
-        headline = _truncate_digest_fact(headline, max_chars=150)
 
+        headline = _digest_clean_line(_fallback_headline(text) or sentences[0], max_chars=120)
+        if not headline:
+            continue
+
+        lede = ""
         facts: List[str] = []
-        for sentence in sentences[1:]:
-            fact = _truncate_digest_fact(sentence, max_chars=240)
-            if not fact:
+        for sentence in sentences:
+            if sentence.lower() == headline.lower():
                 continue
-            if fact.lower() == headline.lower():
+            if not lede:
+                lede = sentence
                 continue
-            facts.append(fact)
+            if sentence.lower() == lede.lower():
+                continue
+            facts.append(sentence)
             if len(facts) >= 3:
                 break
-        if not facts:
-            facts.append(_truncate_digest_fact(text, max_chars=240))
 
-        block_lines = [f"<b>{headline}</b>"]
-        block_lines.extend(f"• {fact}" for fact in facts)
-        blocks.append("<br>".join(block_lines))
+        if len(major_blocks) < 5:
+            major_blocks.append(
+                {
+                    "headline": headline,
+                    "lede": lede,
+                    "facts": facts,
+                    "priority": "high" if len(major_blocks) < 2 else "medium",
+                }
+            )
+        else:
+            if lede:
+                timeline_items.append(lede)
+            timeline_items.extend(facts)
 
-    if not blocks:
-        return ""
-    return sanitize_telegram_html("<br><br>".join(blocks))
+    scene_setter = _derive_digest_scene_setter(major_blocks, timeline_items)
+    return scene_setter, major_blocks, timeline_items
 
 
 def local_fallback_digest(posts: Sequence[Dict[str, object]], *, interval_minutes: int) -> str:
     if not posts:
         return quiet_period_message(interval_minutes)
 
-    story_blocks = _story_block_fallback_digest(posts)
-    if story_blocks:
-        return story_blocks
-
-    return quiet_period_message(interval_minutes)
+    scene_setter, major_blocks, timeline_items = _fallback_digest_layout(posts)
+    return _render_digest_layout(
+        scene_setter=scene_setter,
+        major_blocks=major_blocks,
+        timeline_items=timeline_items,
+        interval_minutes=interval_minutes,
+        max_lines=max(24, min(max(24, len(posts) * 6), 600)),
+    )
 
 
 def _query_requests_detail(query: str) -> bool:
@@ -3926,6 +4257,10 @@ def _make_generated_text_result(
     fallback_reason: str = "",
     ai_attempt_count: int = 1,
     ai_quality_retry_used: bool = False,
+    major_block_count: int = 0,
+    timeline_item_count: int = 0,
+    noise_stripped_count: int = 0,
+    translation_applied_count: int = 0,
 ) -> GeneratedTextResult:
     return GeneratedTextResult(
         html=html,
@@ -3933,7 +4268,31 @@ def _make_generated_text_result(
         fallback_reason=_normalize_filter_fallback_reason(fallback_reason),
         ai_attempt_count=max(1, ai_attempt_count),
         ai_quality_retry_used=ai_quality_retry_used,
+        major_block_count=max(0, int(major_block_count)),
+        timeline_item_count=max(0, int(timeline_item_count)),
+        noise_stripped_count=max(0, int(noise_stripped_count)),
+        translation_applied_count=max(0, int(translation_applied_count)),
     )
+
+
+def _digest_render_counts(text: str) -> tuple[int, int]:
+    major_block_count = 0
+    timeline_item_count = 0
+    raw_blocks = re.split(r"(?:<br\s*/?>\s*){2,}|\n\s*\n", str(text or ""), flags=re.IGNORECASE)
+    for raw_block in raw_blocks:
+        lines = [
+            normalize_space(strip_telegram_html(line))
+            for line in re.split(r"\n+|<br\s*/?>", raw_block, flags=re.IGNORECASE)
+            if normalize_space(strip_telegram_html(line))
+        ]
+        if not lines:
+            continue
+        if _DIGEST_ALSO_MOVING_RE.fullmatch(lines[0]):
+            timeline_item_count += max(0, len(lines) - 1)
+            continue
+        if "<b>" in raw_block.lower():
+            major_block_count += 1
+    return major_block_count, timeline_item_count
 
 
 def _digest_quality_issue(text: str, quiet_text: str) -> str:
@@ -3942,19 +4301,54 @@ def _digest_quality_issue(text: str, quiet_text: str) -> str:
         return "empty_output"
     if cleaned == normalize_space(strip_telegram_html(quiet_text)):
         return ""
-    lines = [
-        normalize_space(strip_telegram_html(line))
-        for line in re.split(r"\n+|<br\s*/?>", str(text or ""), flags=re.IGNORECASE)
-        if normalize_space(strip_telegram_html(line))
-    ]
-    if not lines:
+    if _digest_needs_english_rewrite(text, "English"):
+        return "non_english_leftovers"
+    lowered = cleaned.lower()
+    if "t.me/" in lowered or "telegram.me/" in lowered or _FEED_HANDLE_RE.search(cleaned):
+        return "source_leak"
+    if _DIGEST_HASHTAG_RE.search(cleaned) or _DIGEST_PROMO_FRAGMENT_RE.search(cleaned):
+        return "source_leak"
+
+    raw_blocks = re.split(r"(?:<br\s*/?>\s*){2,}|\n\s*\n", str(text or ""), flags=re.IGNORECASE)
+    if not raw_blocks:
         return "empty_output"
-    for line in lines:
-        if line.startswith("🟢 No major developments"):
+
+    block_count = 0
+    for raw_block in raw_blocks:
+        lines = [
+            normalize_space(strip_telegram_html(line))
+            for line in re.split(r"\n+|<br\s*/?>", raw_block, flags=re.IGNORECASE)
+            if normalize_space(strip_telegram_html(line))
+        ]
+        if not lines:
             continue
-        issue = _news_copy_quality_issue(line, line, allow_short=True)
-        if issue in {"vague_copy", "incomplete_copy"}:
-            return issue
+        if any(len(line) <= 1 or _DIGEST_PUNCT_ONLY_RE.fullmatch(line) for line in lines):
+            return "messy_layout"
+        if _DIGEST_ALSO_MOVING_RE.fullmatch(lines[0]):
+            if len(lines) == 1:
+                return "messy_layout"
+            for line in lines[1:]:
+                issue = _news_copy_quality_issue(line, line, allow_short=True)
+                if issue in {"vague_copy", "incomplete_copy"}:
+                    return issue
+            continue
+
+        bold_count = len(re.findall(r"<b>.*?</b>", raw_block, flags=re.IGNORECASE | re.DOTALL))
+        if bold_count > 1:
+            return "messy_layout"
+        if bold_count == 0 and len(lines) > 1:
+            return "messy_layout"
+
+        if len(lines) >= 2 and lines[0].lower() == lines[1].lower():
+            return "messy_layout"
+        for line in lines:
+            issue = _news_copy_quality_issue(line, line, allow_short=True)
+            if issue in {"vague_copy", "incomplete_copy"}:
+                return issue
+        block_count += 1
+
+    if block_count > 9 and "also moving" not in lowered:
+        return "messy_layout"
     return ""
 
 
@@ -3979,9 +4373,9 @@ def _query_quality_issue(answer_html: str, question: str) -> str:
 def _digest_retry_prompt(prompt: str, issue: str) -> str:
     return (
         f"{prompt}\n\nRevision feedback:\n- {_filter_retry_feedback(issue)}\n"
-        "- Rebuild the digest as sharp story blocks with concrete facts.\n"
+        "- Rebuild the digest as a premium newsroom brief with a scene setter, major grouped stories, and an Also moving rail.\n"
         "- Do not leave any meaningful update behind.\n"
-        "- Keep it English-only and remove all source branding."
+        "- Keep it English-only and remove all source branding, handles, hashtags, and promo junk."
     )
 
 
@@ -4009,16 +4403,29 @@ async def create_digest_summary_result(
 
     manager = auth_manager or AuthManager(logger=LOGGER)
     max_lines = max(24, min(max(24, len(posts) * 6), 600))
+    prepared_posts, prep_stats = await _prepare_digest_posts(posts, manager)
+    if not prepared_posts:
+        return _make_generated_text_result(
+            quiet_text,
+            copy_origin="fallback",
+            noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
+            translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
+        )
 
     token_budget = _resolve_digest_token_budget()
     context_budget = max(1000, token_budget - 2200)
 
     lines, included_count, total_input = _build_digest_context(
-        posts,
+        prepared_posts,
         token_budget=context_budget,
     )
     if not lines or included_count == 0:
-        return _make_generated_text_result(quiet_text, copy_origin="fallback")
+        return _make_generated_text_result(
+            quiet_text,
+            copy_origin="fallback",
+            noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
+            translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
+        )
 
     prefer_json = bool(getattr(config, "DIGEST_PREFER_JSON_OUTPUT", True))
     if on_token is not None:
@@ -4029,8 +4436,11 @@ async def create_digest_summary_result(
 
     user_payload = (
         "Batch metadata:\n"
-        f"- Total queued posts: {total_input}\n"
+        f"- Total queued posts: {len(posts)}\n"
+        f"- Posts after cleanup: {len(prepared_posts)}\n"
         f"- Included after dedupe/noise/token budget: {included_count}\n"
+        f"- Noise fragments stripped: {int(prep_stats.get('noise_stripped_count') or 0)}\n"
+        f"- Pre-translation lines rewritten to English: {int(prep_stats.get('translation_applied_count') or 0)}\n"
         f"- Estimated input tokens: {sum(estimate_tokens_rough(x) for x in lines)}\n\n"
         + build_digest_input_block(lines)
     )
@@ -4058,12 +4468,18 @@ async def create_digest_summary_result(
                 on_token=on_token,
             )
         except Exception as exc:
+            fallback_html = local_fallback_digest(prepared_posts, interval_minutes=interval_minutes)
+            major_block_count, timeline_item_count = _digest_render_counts(fallback_html)
             result = _make_generated_text_result(
-                local_fallback_digest(posts, interval_minutes=interval_minutes),
+                fallback_html,
                 copy_origin="fallback",
                 fallback_reason=_fallback_reason_from_exc(exc),
                 ai_attempt_count=round_number,
                 ai_quality_retry_used=(round_number == 2),
+                major_block_count=major_block_count,
+                timeline_item_count=timeline_item_count,
+                noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
+                translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
             )
             log_structured(
                 LOGGER,
@@ -4073,18 +4489,28 @@ async def create_digest_summary_result(
                 ai_attempt_count=result.ai_attempt_count,
                 ai_quality_retry_used=result.ai_quality_retry_used,
                 output_chars=len(result.html),
+                major_block_count=result.major_block_count,
+                timeline_item_count=result.timeline_item_count,
+                noise_stripped_count=result.noise_stripped_count,
+                translation_applied_count=result.translation_applied_count,
             )
             return result
 
         if not content.strip():
             retry_issue = "empty_output"
             if round_number == 2:
+                fallback_html = local_fallback_digest(prepared_posts, interval_minutes=interval_minutes)
+                major_block_count, timeline_item_count = _digest_render_counts(fallback_html)
                 result = _make_generated_text_result(
-                    local_fallback_digest(posts, interval_minutes=interval_minutes),
+                    fallback_html,
                     copy_origin="fallback",
                     fallback_reason="empty_output",
                     ai_attempt_count=2,
                     ai_quality_retry_used=True,
+                    major_block_count=major_block_count,
+                    timeline_item_count=timeline_item_count,
+                    noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
+                    translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
                 )
                 log_structured(
                     LOGGER,
@@ -4094,6 +4520,10 @@ async def create_digest_summary_result(
                     ai_attempt_count=result.ai_attempt_count,
                     ai_quality_retry_used=result.ai_quality_retry_used,
                     output_chars=len(result.html),
+                    major_block_count=result.major_block_count,
+                    timeline_item_count=result.timeline_item_count,
+                    noise_stripped_count=result.noise_stripped_count,
+                    translation_applied_count=result.translation_applied_count,
                 )
                 return result
             continue
@@ -4103,12 +4533,18 @@ async def create_digest_summary_result(
             if parsed is None:
                 retry_issue = "invalid_payload"
                 if round_number == 2:
+                    fallback_html = local_fallback_digest(prepared_posts, interval_minutes=interval_minutes)
+                    major_block_count, timeline_item_count = _digest_render_counts(fallback_html)
                     result = _make_generated_text_result(
-                        local_fallback_digest(posts, interval_minutes=interval_minutes),
+                        fallback_html,
                         copy_origin="fallback",
                         fallback_reason="invalid_payload",
                         ai_attempt_count=2,
                         ai_quality_retry_used=True,
+                        major_block_count=major_block_count,
+                        timeline_item_count=timeline_item_count,
+                        noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
+                        translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
                     )
                     log_structured(
                         LOGGER,
@@ -4118,6 +4554,10 @@ async def create_digest_summary_result(
                         ai_attempt_count=result.ai_attempt_count,
                         ai_quality_retry_used=result.ai_quality_retry_used,
                         output_chars=len(result.html),
+                        major_block_count=result.major_block_count,
+                        timeline_item_count=result.timeline_item_count,
+                        noise_stripped_count=result.noise_stripped_count,
+                        translation_applied_count=result.translation_applied_count,
                     )
                     return result
                 continue
@@ -4139,12 +4579,18 @@ async def create_digest_summary_result(
         if quality_issue:
             retry_issue = quality_issue
             if round_number == 2:
+                fallback_html = local_fallback_digest(prepared_posts, interval_minutes=interval_minutes)
+                major_block_count, timeline_item_count = _digest_render_counts(fallback_html)
                 result = _make_generated_text_result(
-                    local_fallback_digest(posts, interval_minutes=interval_minutes),
+                    fallback_html,
                     copy_origin="fallback",
                     fallback_reason="quality_rejected_after_retry",
                     ai_attempt_count=2,
                     ai_quality_retry_used=True,
+                    major_block_count=major_block_count,
+                    timeline_item_count=timeline_item_count,
+                    noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
+                    translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
                 )
                 log_structured(
                     LOGGER,
@@ -4154,15 +4600,24 @@ async def create_digest_summary_result(
                     ai_attempt_count=result.ai_attempt_count,
                     ai_quality_retry_used=result.ai_quality_retry_used,
                     output_chars=len(result.html),
+                    major_block_count=result.major_block_count,
+                    timeline_item_count=result.timeline_item_count,
+                    noise_stripped_count=result.noise_stripped_count,
+                    translation_applied_count=result.translation_applied_count,
                 )
                 return result
             continue
 
+        major_block_count, timeline_item_count = _digest_render_counts(normalized)
         result = _make_generated_text_result(
             normalized,
             copy_origin="ai",
             ai_attempt_count=round_number,
             ai_quality_retry_used=(round_number == 2),
+            major_block_count=major_block_count,
+            timeline_item_count=timeline_item_count,
+            noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
+            translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
         )
         log_structured(
             LOGGER,
@@ -4172,15 +4627,25 @@ async def create_digest_summary_result(
             ai_attempt_count=result.ai_attempt_count,
             ai_quality_retry_used=result.ai_quality_retry_used,
             output_chars=len(result.html),
+            major_block_count=result.major_block_count,
+            timeline_item_count=result.timeline_item_count,
+            noise_stripped_count=result.noise_stripped_count,
+            translation_applied_count=result.translation_applied_count,
         )
         return result
 
+    fallback_html = local_fallback_digest(prepared_posts, interval_minutes=interval_minutes)
+    major_block_count, timeline_item_count = _digest_render_counts(fallback_html)
     result = _make_generated_text_result(
-        local_fallback_digest(posts, interval_minutes=interval_minutes),
+        fallback_html,
         copy_origin="fallback",
         fallback_reason="quality_rejected_after_retry",
         ai_attempt_count=2,
         ai_quality_retry_used=True,
+        major_block_count=major_block_count,
+        timeline_item_count=timeline_item_count,
+        noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
+        translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
     )
     log_structured(
         LOGGER,
@@ -4190,6 +4655,10 @@ async def create_digest_summary_result(
         ai_attempt_count=result.ai_attempt_count,
         ai_quality_retry_used=result.ai_quality_retry_used,
         output_chars=len(result.html),
+        major_block_count=result.major_block_count,
+        timeline_item_count=result.timeline_item_count,
+        noise_stripped_count=result.noise_stripped_count,
+        translation_applied_count=result.translation_applied_count,
     )
     return result
 

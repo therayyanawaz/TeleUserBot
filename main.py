@@ -6891,38 +6891,38 @@ def _format_digest_message(
     *,
     title: str = "Digest",
 ) -> str:
-    def _count_digest_headlines(body: str) -> int:
-        plain = normalize_space(strip_telegram_html(body))
-        if not plain:
-            return 0
-        lowered = plain.lower()
-        if "no major developments" in lowered or "quiet period" in lowered:
-            return 0
-
-        count = 0
-        raw_blocks = re.split(r"(?:<br\s*/?>\s*){2,}|\n\s*\n", body, flags=re.IGNORECASE)
-        for raw_block in raw_blocks:
-            block_lines = [
-                normalize_space(strip_telegram_html(line))
-                for line in re.split(r"\n+|<br\s*/?>", raw_block, flags=re.IGNORECASE)
-                if normalize_space(strip_telegram_html(line))
-            ]
-            if block_lines:
-                count += 1
-        return count
-
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    timestamp = datetime.now().astimezone().strftime("%H:%M %Z").strip()
     label = sanitize_telegram_html(title.strip() or "Digest")
-    headline_count = _count_digest_headlines(digest_body)
-    if headline_count > 0:
-        header = (
-            f"<b>📰 {label} • {timestamp} • "
-            f"{headline_count} headlines from {total_updates} updates</b>"
-        )
-    else:
-        header = f"<b>📰 {label} • {timestamp} • {total_updates} updates reviewed</b>"
+    header = f"<b>{label}</b>"
+    metadata = sanitize_telegram_html(f"{timestamp} • {total_updates} updates reviewed")
     _ = sources
-    return sanitize_telegram_html(f"{header}<br><br>{digest_body.strip()}")
+    return sanitize_telegram_html(f"{header}<br>{metadata}<br><br>{digest_body.strip()}")
+
+
+def _split_digest_body_blocks(digest_body: str, *, max_chars: int) -> List[str]:
+    cleaned = normalize_space(str(digest_body or ""))
+    if not cleaned:
+        return []
+    raw_blocks = [
+        block.strip()
+        for block in re.split(r"(?:<br\s*/?>\s*){2,}|\n\s*\n", str(digest_body or ""), flags=re.IGNORECASE)
+        if normalize_space(strip_telegram_html(block))
+    ]
+    if not raw_blocks:
+        return [sanitize_telegram_html(cleaned)]
+
+    chunks: List[str] = []
+    current_blocks: List[str] = []
+    for block in raw_blocks:
+        candidate = "<br><br>".join(current_blocks + [block])
+        if current_blocks and len(candidate) > max_chars:
+            chunks.append(sanitize_telegram_html("<br><br>".join(current_blocks)))
+            current_blocks = [block]
+        else:
+            current_blocks.append(block)
+    if current_blocks:
+        chunks.append(sanitize_telegram_html("<br><br>".join(current_blocks)))
+    return [chunk for chunk in chunks if normalize_space(strip_telegram_html(chunk))]
 
 
 def _get_last_completed_digest_window_end() -> int | None:
@@ -7235,7 +7235,7 @@ async def _build_window_digest_messages(
 ) -> Tuple[List[str], Dict[str, object]]:
     token_budget = _digest_input_token_budget()
     page_size = _digest_window_page_size()
-    part_count = sum(
+    logical_part_count = sum(
         1
         for _ in _iter_digest_row_groups(
             row_loader,
@@ -7244,7 +7244,7 @@ async def _build_window_digest_messages(
         )
     )
 
-    if part_count <= 0:
+    if logical_part_count <= 0:
         quiet_body = quiet_period_message(interval_minutes)
         quiet_body = await _run_post_processors(
             quiet_body,
@@ -7270,12 +7270,21 @@ async def _build_window_digest_messages(
             "response_chars": len(quiet_body),
             "ai_parts": 0,
             "fallback_parts": 1,
+            "major_block_count": 0,
+            "timeline_item_count": 0,
+            "noise_stripped_count": 0,
+            "translation_applied_count": 0,
         }
 
-    messages: List[str] = []
+    rendered_bodies: List[str] = []
     total_chars = 0
     ai_parts = 0
     fallback_parts = 0
+    major_block_count = 0
+    timeline_item_count = 0
+    noise_stripped_count = 0
+    translation_applied_count = 0
+    max_body_chars = max(1200, _digest_send_chunk_size() - 220)
 
     for part_index, row_group in enumerate(
         _iter_digest_row_groups(
@@ -7298,11 +7307,33 @@ async def _build_window_digest_messages(
                 **context,
                 "posts": posts,
                 "part_index": part_index,
-                "part_count": part_count,
+                "part_count": logical_part_count,
                 "copy_origin": result.copy_origin,
                 "fallback_reason": result.fallback_reason,
             },
         )
+        rendered_bodies.extend(
+            _split_digest_body_blocks(
+                digest_body,
+                max_chars=max_body_chars,
+            )
+        )
+        total_chars += len(digest_body)
+        if result.copy_origin == "ai":
+            ai_parts += 1
+        else:
+            fallback_parts += 1
+        major_block_count += int(result.major_block_count or 0)
+        timeline_item_count += int(result.timeline_item_count or 0)
+        noise_stripped_count += int(result.noise_stripped_count or 0)
+        translation_applied_count += int(result.translation_applied_count or 0)
+
+    if not rendered_bodies:
+        rendered_bodies = [quiet_period_message(interval_minutes)]
+
+    part_count = len(rendered_bodies)
+    messages: List[str] = []
+    for part_index, digest_body in enumerate(rendered_bodies, start=1):
         messages.append(
             _format_digest_message(
                 digest_body=digest_body,
@@ -7311,11 +7342,6 @@ async def _build_window_digest_messages(
                 title=title_builder(part_index, part_count),
             )
         )
-        total_chars += len(digest_body)
-        if result.copy_origin == "ai":
-            ai_parts += 1
-        else:
-            fallback_parts += 1
 
     return messages, {
         "part_count": part_count,
@@ -7323,6 +7349,10 @@ async def _build_window_digest_messages(
         "response_chars": total_chars,
         "ai_parts": ai_parts,
         "fallback_parts": fallback_parts,
+        "major_block_count": major_block_count,
+        "timeline_item_count": timeline_item_count,
+        "noise_stripped_count": noise_stripped_count,
+        "translation_applied_count": translation_applied_count,
     }
 
 
@@ -7406,6 +7436,10 @@ async def _flush_digest_queue_once() -> bool:
                 response_chars=int(stats.get("response_chars") or 0),
                 ai_parts=int(stats.get("ai_parts") or 0),
                 fallback_parts=int(stats.get("fallback_parts") or 0),
+                major_block_count=int(stats.get("major_block_count") or 0),
+                timeline_item_count=int(stats.get("timeline_item_count") or 0),
+                noise_stripped_count=int(stats.get("noise_stripped_count") or 0),
+                translation_applied_count=int(stats.get("translation_applied_count") or 0),
                 digest_mode="strict_digest_only",
             )
             return True
@@ -7487,6 +7521,10 @@ async def _send_daily_archive_digest_once() -> None:
                 response_chars=int(stats.get("response_chars") or 0),
                 ai_parts=int(stats.get("ai_parts") or 0),
                 fallback_parts=int(stats.get("fallback_parts") or 0),
+                major_block_count=int(stats.get("major_block_count") or 0),
+                timeline_item_count=int(stats.get("timeline_item_count") or 0),
+                noise_stripped_count=int(stats.get("noise_stripped_count") or 0),
+                translation_applied_count=int(stats.get("translation_applied_count") or 0),
             )
         except Exception:
             LOGGER.exception("Daily archive digest generation/sending failed.")

@@ -251,24 +251,31 @@ def test_json_digest_to_html_renders_story_blocks():
     html = ai_filter._json_digest_to_html(
         {
             "quiet": False,
-            "blocks": [
+            "scene_setter": "Port operations and nearby security activity drove the window.",
+            "major_blocks": [
                 {
                     "headline": "Port reopens after a three-day shutdown",
-                    "severity": "medium",
+                    "lede": "Officials said cargo traffic resumes at dawn.",
+                    "priority": "medium",
                     "facts": [
-                        "Officials said cargo traffic resumes at dawn.",
                         "Security checks remain in place around the eastern gate.",
                     ],
                 }
+            ],
+            "timeline_items": [
+                "Air defenses were activated over the northern district after a fresh barrage."
             ],
         },
         interval_minutes=30,
         max_lines=12,
     )
 
+    assert "Port operations and nearby security activity drove the window." in html
     assert "<b>Port reopens after a three-day shutdown</b>" in html
-    assert "• Officials said cargo traffic resumes at dawn." in html
-    assert "<br><br>" not in html or html.count("<br><br>") <= 1
+    assert "Officials said cargo traffic resumes at dawn." in html
+    assert "• Security checks remain in place around the eastern gate." in html
+    assert "<i>Also moving</i>" in html
+    assert "• Air defenses were activated over the northern district after a fresh barrage." in html
 
 
 def test_local_fallback_digest_keeps_all_distinct_updates():
@@ -291,6 +298,80 @@ def test_local_fallback_digest_keeps_all_distinct_updates():
     assert "Cargo traffic resumes at dawn" in plain
     assert "Air defenses fired over the northern district after a fresh barrage" in plain
     assert "Residents reported new blasts near the ridge" in plain
+    assert plain.count("Officials reopened the port after three days of disruption") == 1
+    assert plain.count("Air defenses fired over the northern district after a fresh barrage") == 1
+
+
+def test_html_digest_cleanup_strips_promo_handles_and_duplicate_blocks():
+    raw = """
+There is a confirmed fall of fission fragments in a number of locations in the middle of the entity.
+• 🌟🌟Follow Us | Discussion | 🤔 Boost the Channel 💚
+
+🇮🇷🇮🇷⚔️🏴‍☠️🇺🇸 Enemy media: Preliminary reports of a direct hit in Petah Tikva.
+• @stayfreeworld
+
+A fall in Beit She'an 🌟🌟Follow Us | Discussion | 🤔 Boost the Channel 💚
+• A fall in Beit She'an 🌟🌟Follow Us | Discussion | 🤔 Boost the Channel 💚
+
+<i>Also moving</i>
+• Report of more launches towards Israel @AlHaqNews
+• #Paylaş
+""".strip()
+
+    html = ai_filter._html_digest_cleanup(raw, interval_minutes=30, max_lines=12)
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "Follow Us" not in plain
+    assert "Boost the Channel" not in plain
+    assert "@stayfreeworld" not in plain
+    assert "@AlHaqNews" not in plain
+    assert "#Paylaş" not in plain
+    assert "Enemy media:" not in plain
+    assert plain.count("A fall in Beit She'an") == 1
+    assert "Also moving" in plain
+
+
+@pytest.mark.asyncio
+async def test_prepare_digest_posts_translates_non_english_lines(monkeypatch):
+    async def fake_call_codex_with_auth_repair(_payload, _auth_manager, _instructions, **_kwargs):
+        return json.dumps(
+            {
+                "items": [
+                    {
+                        "id": 1,
+                        "text": "Hebrew-language sources reported continuous unusual explosions in Tel Aviv.",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex_with_auth_repair)
+
+    prepared, stats = await ai_filter._prepare_digest_posts(
+        [
+            {
+                "text": "☄️ İvrit mənbələri: Tel-Əvivdə fasiləsiz qeyri-adi partlayış səsləri eşidilir #Şərh_yaz.",
+                "source_name": "Desk",
+            }
+        ],
+        _FakeAuthManager(),
+    )
+
+    assert prepared[0]["raw_text"] == "Hebrew-language sources reported continuous unusual explosions in Tel Aviv."
+    assert stats["translation_applied_count"] == 1
+
+
+def test_digest_quality_issue_rejects_source_leaks_and_messy_layout():
+    html = (
+        "<b>Central Israel Impact Reports</b><br>"
+        "Central Israel Impact Reports<br>"
+        "• @stayfreeworld"
+    )
+
+    assert ai_filter._digest_quality_issue(html, ai_filter.quiet_period_message(30)) in {
+        "source_leak",
+        "messy_layout",
+    }
 
 
 @pytest.mark.asyncio
