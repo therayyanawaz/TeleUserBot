@@ -31,24 +31,31 @@ async def test_decide_filter_action_uses_persistent_cache(isolated_db, monkeypat
         return json.dumps(
             {
                 "action": "deliver",
-                "severity": "medium",
-                "summary_html": "<b>Summary</b> text",
-                "headline_html": "Headline",
+                "severity": "high",
+                "summary_html": (
+                    "<b>Officials confirmed new power-grid restrictions across three districts</b><br>"
+                    "Authorities said the order takes effect tonight after the latest outage."
+                ),
+                "headline_html": "Officials confirmed new power-grid restrictions across three districts",
                 "story_bridge_html": "Why it matters: context",
                 "confidence": 0.92,
                 "reason_code": "newsworthy_update",
-                "topic_key": "headline",
+                "topic_key": "power_grid",
                 "needs_ocr_translation": False,
             }
         )
 
     monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
 
-    text = "Officials confirmed a significant infrastructure update affecting multiple districts."
+    text = (
+        "Officials confirmed new power-grid restrictions across three districts, "
+        "and authorities said the order takes effect tonight after the latest outage."
+    )
     first = await ai_filter.decide_filter_action(text, _FakeAuthManager())
     second = await ai_filter.decide_filter_action(text, _FakeAuthManager())
 
     assert first.action == "deliver"
+    assert first.copy_origin == "ai"
     assert second.cached is True
     assert calls["count"] == 1
 
@@ -82,8 +89,10 @@ def test_validate_filter_decision_sanitizes_and_clamps():
 @pytest.mark.asyncio
 async def test_decide_filter_action_falls_back_on_invalid_json(isolated_db, monkeypatch):
     importlib.reload(ai_filter)
+    calls = {"count": 0}
 
     async def fake_call_codex(*args, **kwargs):
+        calls["count"] += 1
         return "this is not valid json"
 
     monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
@@ -93,6 +102,64 @@ async def test_decide_filter_action_falls_back_on_invalid_json(isolated_db, monk
 
     assert decision.action in {"deliver", "digest"}
     assert decision.summary_html
+    assert decision.copy_origin == "fallback"
+    assert decision.fallback_reason == "invalid_payload"
+    assert decision.ai_attempt_count == 2
+    assert decision.ai_quality_retry_used is True
+    assert calls["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_decide_filter_action_retries_weak_ai_copy_before_accepting(isolated_db, monkeypatch):
+    importlib.reload(ai_filter)
+    calls = {"count": 0}
+
+    async def fake_call_codex(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return json.dumps(
+                {
+                    "action": "deliver",
+                    "severity": "high",
+                    "summary_html": "<b>Situation update in Tehran</b>",
+                    "headline_html": "Situation update in Tehran",
+                    "story_bridge_html": "",
+                    "confidence": 0.88,
+                    "reason_code": "breaking_update",
+                    "topic_key": "tehran_update",
+                    "needs_ocr_translation": False,
+                }
+            )
+        return json.dumps(
+            {
+                "action": "deliver",
+                "severity": "high",
+                "summary_html": (
+                    "<b>Iranian officials ordered a new airspace restriction over Tehran</b><br>"
+                    "Authorities said the measure takes effect immediately after the latest warning."
+                ),
+                "headline_html": "Iranian officials ordered a new airspace restriction over Tehran",
+                "story_bridge_html": "",
+                "confidence": 0.91,
+                "reason_code": "breaking_update",
+                "topic_key": "tehran_airspace",
+                "needs_ocr_translation": False,
+            }
+        )
+
+    monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
+
+    text = (
+        "Iranian officials ordered a new airspace restriction over Tehran, "
+        "and authorities said the measure takes effect immediately after the latest warning."
+    )
+    decision = await ai_filter.decide_filter_action(text, _FakeAuthManager())
+
+    assert decision.copy_origin == "ai"
+    assert decision.ai_attempt_count == 2
+    assert decision.ai_quality_retry_used is True
+    assert "airspace restriction over Tehran" in decision.summary_html
+    assert calls["count"] == 2
 
 
 @pytest.mark.asyncio
@@ -145,3 +212,66 @@ async def test_call_codex_non_stream_retries_transport_errors(monkeypatch):
     assert result == "Recovered response"
     assert attempts["count"] == 2
     assert reset_calls == ["codex"]
+
+
+@pytest.mark.asyncio
+async def test_create_digest_summary_result_falls_back_after_weak_ai_retry(monkeypatch):
+    calls = {"count": 0}
+
+    async def fake_call_codex(*args, **kwargs):
+        calls["count"] += 1
+        return "⚠️ Situation update in Tehran"
+
+    async def fake_normalize_digest_output(content, *_args, **_kwargs):
+        return content
+
+    monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "_normalize_digest_output", fake_normalize_digest_output)
+    monkeypatch.setattr(ai_filter.config, "DIGEST_PREFER_JSON_OUTPUT", False, raising=False)
+
+    result = await ai_filter.create_digest_summary_result(
+        [
+            {
+                "text": "Iranian officials ordered a new airspace restriction over Tehran.",
+                "source_name": "Desk",
+            }
+        ],
+        auth_manager=_FakeAuthManager(),
+        interval_minutes=60,
+    )
+
+    assert result.copy_origin == "fallback"
+    assert result.fallback_reason == "quality_rejected_after_retry"
+    assert result.ai_attempt_count == 2
+    assert result.ai_quality_retry_used is True
+    assert calls["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_from_context_result_uses_ai_after_quality_retry(monkeypatch):
+    calls = {"count": 0}
+
+    async def fake_call_codex(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return "<b>There are developments</b><br>• ⚠️ Situation update in Tehran"
+        return (
+            "<b>Tehran Airspace Restriction</b><br>"
+            "• ⚠️ Iranian officials ordered a new airspace restriction over Tehran.<br>"
+            "• ⚠️ Authorities said it takes effect immediately after the latest warning."
+        )
+
+    monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "_query_confidence_allows_answer", lambda *_args, **_kwargs: True)
+
+    result = await ai_filter.generate_answer_from_context_result(
+        "What's the latest out of Tehran?",
+        [{"text": "Iranian officials ordered a new airspace restriction over Tehran."}],
+        auth_manager=_FakeAuthManager(),
+    )
+
+    assert result.copy_origin == "ai"
+    assert result.ai_attempt_count == 2
+    assert result.ai_quality_retry_used is True
+    assert "airspace restriction over Tehran" in result.html
+    assert calls["count"] == 2

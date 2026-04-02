@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 import json
@@ -36,6 +36,7 @@ from utils import (
     extract_query_keywords,
     extract_query_numbers,
     is_broad_news_query,
+    log_structured,
     normalize_space,
     sanitize_telegram_html,
     strip_telegram_html,
@@ -48,7 +49,7 @@ DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 DEFAULT_CODEX_ORIGINATOR = "pi"
 DEFAULT_DIGEST_MAX_POSTS = 80
 DEFAULT_DIGEST_MAX_TOKENS = 18000
-FILTER_DECISION_PROMPT_VERSION = "v5"
+FILTER_DECISION_PROMPT_VERSION = "v6"
 VITAL_VIEW_PROMPT_VERSION = "v3"
 
 _DIGIT_TOKEN_RE = re.compile(r"\b\d+(?:[.,:/-]\d+)*\b")
@@ -293,7 +294,21 @@ class FilterDecision:
     reason_code: str
     topic_key: str
     needs_ocr_translation: bool
+    copy_origin: Literal["ai", "fallback"] = "ai"
+    routing_origin: Literal["ai", "system_override", "fallback"] = "ai"
+    fallback_reason: str = ""
+    ai_attempt_count: int = 1
+    ai_quality_retry_used: bool = False
     cached: bool = False
+
+
+@dataclass
+class GeneratedTextResult:
+    html: str
+    copy_origin: Literal["ai", "fallback"]
+    fallback_reason: str = ""
+    ai_attempt_count: int = 1
+    ai_quality_retry_used: bool = False
 
 
 def estimate_tokens_rough(text: str) -> int:
@@ -656,6 +671,37 @@ def _build_feed_summary_html(raw_text: str, summary_seed: str = "") -> str:
     return f"{headline_html}<br>{sanitize_telegram_html(context)}"
 
 
+def _normalize_generated_feed_summary_html(summary_html: str, raw_text: str) -> str:
+    signals = detect_story_signals(raw_text)
+    segments = _feed_summary_segments(summary_html)
+    if not segments:
+        return ""
+
+    acceptable = [segment for segment in segments if not _is_bad_feed_headline(segment)]
+    preferred = [segment for segment in acceptable if looks_like_live_event_update(segment)]
+    headline = preferred[0] if preferred else (acceptable[0] if acceptable else "")
+    if not headline:
+        return ""
+    if bool(signals.get("downgrade_explainer")) and not looks_like_live_event_update(headline):
+        return ""
+
+    headline = _truncate_feed_line(headline.rstrip(".!?"), limit=150)
+    headline_html = f"<b>{sanitize_telegram_html(headline)}</b>"
+
+    context = ""
+    for segment in acceptable:
+        if segment == headline:
+            continue
+        if _is_weak_feed_context(segment, headline):
+            continue
+        context = _truncate_feed_line(segment.rstrip(".!?"), limit=170)
+        break
+
+    if not context:
+        return headline_html
+    return f"{headline_html}<br>{sanitize_telegram_html(context)}"
+
+
 def normalize_feed_summary_html(summary_html: str, raw_text: str) -> str:
     normalized = _build_feed_summary_html(raw_text, summary_html)
     if normalized:
@@ -683,6 +729,36 @@ def _fallback_summary(text: str) -> Optional[str]:
         return None
     summary = _build_feed_summary_html(text)
     return summary or None
+
+
+def _filter_decision_quality_issue(decision: FilterDecision, raw_text: str) -> str:
+    if decision.action == "skip":
+        return ""
+
+    summary_lines = _summary_plain_lines(decision.summary_html)
+    if not summary_lines:
+        return "empty_output"
+
+    headline_issue = _news_copy_quality_issue(summary_lines[0], raw_text)
+    if headline_issue:
+        return headline_issue
+
+    if len(summary_lines) > 1:
+        context_issue = _news_copy_quality_issue(summary_lines[1], raw_text, allow_short=True)
+        if context_issue and context_issue not in {"headline_too_thin"}:
+            return context_issue
+        if SequenceMatcher(None, summary_lines[0].lower(), summary_lines[1].lower()).ratio() >= 0.78:
+            return "repetitive_copy"
+
+    if decision.severity == "high":
+        headline = normalize_space(strip_telegram_html(decision.headline_html))
+        headline_issue = _news_copy_quality_issue(headline, raw_text)
+        if headline_issue:
+            return headline_issue
+        if not resolve_breaking_headline_for_delivery(raw_text, headline, allow_fallback=False):
+            return "ungrounded_copy"
+
+    return ""
 
 
 def _severity_from_text_heuristic(text: str) -> Literal["high", "medium", "low"]:
@@ -875,16 +951,21 @@ def _breaking_headline_is_grounded(source_text: str, candidate: str) -> bool:
     return True
 
 
-def resolve_breaking_headline_for_delivery(source_text: str, candidate: str | None) -> str:
+def resolve_breaking_headline_for_delivery(
+    source_text: str,
+    candidate: str | None,
+    *,
+    allow_fallback: bool = True,
+) -> str:
     fallback = _safe_breaking_headline_fallback(source_text)
     cleaned_candidate = _cleanup_headline(str(candidate or ""))
     if not cleaned_candidate:
-        return fallback
+        return fallback if allow_fallback else ""
     if not _breaking_style_is_unhinged():
         return cleaned_candidate
     if _breaking_headline_is_grounded(source_text, cleaned_candidate):
         return cleaned_candidate
-    return fallback
+    return fallback if allow_fallback else ""
 
 
 def _include_source_tags() -> bool:
@@ -923,7 +1004,9 @@ def _summary_system_prompt() -> str:
         "Output must be Telegram HTML only.\n"
         "Allowed tags: <b>, <i>, <u>, <s>, <tg-spoiler>, <code>, <pre>, <blockquote>, <a href>, <br>.\n"
         "If this message is real news or useful info, return a compact feed card: line 1 is a rewritten factual headline, line 2 is optional and must be one short contextual sentence.\n"
+        "When the source contains a clear actor, action, location, object, number, or official attribution, carry those specifics into the rewrite.\n"
         "Do not copy article titles, teaser paragraphs, rhetorical questions, or explainer framing.\n"
+        "Reject vague leads like situation update, incident reported, developments continue, or tensions rise unless the source itself contains nothing more specific.\n"
         "Lead with the actual development, not with why/how framing.\n"
         "If the second line would be obvious, generic, or padded, omit it.\n"
         "If it is spam, ads, promotional, or noise, reply only: SKIP"
@@ -954,7 +1037,10 @@ def _filter_decision_system_prompt() -> str:
         "Use digest for meaningful non-breaking items worth keeping.\n"
         "If the text is mainly an analysis, explainer, opinion, recap, thread, or question-led piece without a concrete new event or official development, use digest or skip, not deliver.\n"
         "For delivered non-breaking items, summary_html must be a compact feed card: line 1 is a rewritten factual headline and line 2 is optional one short contextual sentence.\n"
+        "If the source contains a clear actor, action, location, object, number, or official body, include those specifics in the rewrite.\n"
         "Do not copy article titles, teaser paragraphs, rhetorical questions, or why/how/what explains framing into summary_html.\n"
+        "Reject vague leads like situation update, incident reported, developments continue, explosions shake [country], or tensions rise unless the source itself is equally vague.\n"
+        "Do not let line 2 merely restate line 1 in different words.\n"
         "The first line must lead with the actual development, not the source framing.\n"
         "Omit the second line if it would be fluff, generic stakes, or obvious common sense.\n"
         "Do not include markdown fences, comments, or extra text."
@@ -1561,7 +1647,217 @@ def _sanitize_topic_key(value: Any, fallback_text: str) -> str:
     return "_".join(tokens[:6])[:80] or "general_update"
 
 
-def _fallback_filter_decision(text: str) -> FilterDecision:
+_ALLOWED_FILTER_FALLBACK_REASONS = {
+    "auth_error",
+    "rate_limited",
+    "timeout",
+    "transport_error",
+    "api_error",
+    "invalid_payload",
+    "empty_output",
+    "quality_rejected_after_retry",
+}
+_WEAK_COPY_PATTERNS = (
+    "situation update",
+    "incident reported",
+    "incident in",
+    "latest developments",
+    "major developments",
+    "reports say",
+    "report says",
+    "according to reports",
+    "there are reports",
+    "there appears to be",
+    "appears to be",
+    "heightened tension",
+    "heightened tensions",
+    "ongoing developments",
+)
+_COPY_SPECIFICITY_STOPWORDS = {
+    "about",
+    "after",
+    "amid",
+    "another",
+    "around",
+    "being",
+    "between",
+    "confirmed",
+    "continues",
+    "earlier",
+    "from",
+    "have",
+    "into",
+    "latest",
+    "major",
+    "more",
+    "near",
+    "news",
+    "north",
+    "officials",
+    "over",
+    "reported",
+    "reports",
+    "said",
+    "several",
+    "situation",
+    "south",
+    "their",
+    "there",
+    "this",
+    "update",
+    "warned",
+    "with",
+}
+
+
+def _normalize_filter_fallback_reason(value: Any) -> str:
+    cleaned = normalize_space(str(value or "")).lower()
+    cleaned = re.sub(r"[^a-z0-9_]+", "_", cleaned)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    if cleaned in _ALLOWED_FILTER_FALLBACK_REASONS:
+        return cleaned
+    return ""
+
+
+def _fallback_reason_from_exc(exc: BaseException) -> str:
+    if isinstance(exc, _CodexAuthError):
+        return "auth_error"
+    if isinstance(exc, _CodexRateLimitError):
+        return "rate_limited"
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.TransportError):
+        return "transport_error"
+    if isinstance(exc, _CodexApiError):
+        return "api_error"
+    if isinstance(exc, (json.JSONDecodeError, ValueError, TypeError)):
+        return "invalid_payload"
+    return "api_error"
+
+
+def _copy_specificity_tokens(text: str) -> set[str]:
+    return {
+        token.lower()
+        for token in _LATIN_TOKEN_RE.findall(normalize_space(str(text or "")))
+        if len(token) >= 3 and token.lower() not in _COPY_SPECIFICITY_STOPWORDS
+    }
+
+
+def _summary_plain_lines(summary_html: str) -> list[str]:
+    plain = re.sub(r"(?i)<br\s*/?>", "\n", str(summary_html or ""))
+    return [
+        normalize_space(strip_telegram_html(line))
+        for line in re.split(r"\n+", plain)
+        if normalize_space(strip_telegram_html(line))
+    ]
+
+
+def _generated_copy_has_grounding(candidate: str, source_text: str) -> bool:
+    candidate_clean = normalize_space(strip_telegram_html(candidate))
+    source_clean = normalize_space(strip_telegram_html(source_text))
+    if not candidate_clean or not source_clean:
+        return False
+
+    source_named = _extract_candidate_named_tokens(source_clean)
+    candidate_named = _extract_candidate_named_tokens(candidate_clean)
+    if source_named and candidate_named and not (candidate_named & source_named):
+        return False
+
+    source_numbers = _extract_numeric_tokens(source_clean)
+    candidate_numbers = _extract_numeric_tokens(candidate_clean)
+    if source_numbers and candidate_numbers and not (candidate_numbers & source_numbers):
+        return False
+
+    source_tokens = _copy_specificity_tokens(source_clean)
+    candidate_tokens = _copy_specificity_tokens(candidate_clean)
+    if len(source_tokens) >= 6 and len(source_tokens & candidate_tokens) < 2:
+        return False
+    return True
+
+
+def _news_copy_quality_issue(candidate: str, source_text: str, *, allow_short: bool = False) -> str:
+    cleaned = normalize_space(strip_telegram_html(candidate))
+    lowered = cleaned.lower()
+    if not cleaned:
+        return "empty_output"
+    if _feed_segment_is_incomplete(cleaned):
+        return "incomplete_copy"
+    if any(pattern in lowered for pattern in _WEAK_COPY_PATTERNS):
+        return "vague_copy"
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9.'/-]*", cleaned)
+    if not allow_short and len(words) < 4:
+        return "headline_too_thin"
+    if cleaned.endswith(("...", "…")):
+        return "incomplete_copy"
+    if not _generated_copy_has_grounding(cleaned, source_text):
+        return "ungrounded_copy"
+    return ""
+
+
+def _filter_retry_feedback(issue: str) -> str:
+    issue = normalize_space(issue).lower()
+    if issue in {"invalid_payload", "empty_output"}:
+        return (
+            "Your last answer was unusable. Return exactly one valid JSON object with every required key, "
+            "and make every output field complete."
+        )
+    if issue == "headline_too_thin":
+        return (
+            "Your last copy was too thin. Rewrite it with a concrete actor, action, and location when present in the source."
+        )
+    if issue == "ungrounded_copy":
+        return (
+            "Your last copy drifted away from the source. Keep the wording sharp, but preserve the concrete names, locations, "
+            "numbers, and actors that appear in the source."
+        )
+    return (
+        "Your last copy was too vague or incomplete. Rewrite it in a sharper newsroom voice with concrete facts, "
+        "complete sentences, and no generic filler."
+    )
+
+
+def _decision_retry_prompt(base_prompt: str, issue: str) -> str:
+    return f"{base_prompt}\n\nRevision feedback:\n- {_filter_retry_feedback(issue)}"
+
+
+async def _call_codex_with_auth_repair(
+    cleaned: str,
+    auth_manager: AuthManager,
+    instructions: str,
+    *,
+    verbosity: str = "medium",
+    on_token: Callable[[str], Awaitable[None]] | None = None,
+) -> str:
+    try:
+        auth_context = await auth_manager.get_auth_context()
+        return await _call_codex(
+            cleaned,
+            auth_context,
+            instructions=instructions,
+            verbosity=verbosity,
+            on_token=on_token,
+        )
+    except _CodexAuthError as exc:
+        auth_context = await auth_manager.refresh_auth_context()
+        try:
+            return await _call_codex(
+                cleaned,
+                auth_context,
+                instructions=instructions,
+                verbosity=verbosity,
+                on_token=on_token,
+            )
+        except Exception as refresh_exc:
+            raise refresh_exc from exc
+
+
+def _fallback_filter_decision(
+    text: str,
+    *,
+    fallback_reason: str = "",
+    ai_attempt_count: int = 1,
+    ai_quality_retry_used: bool = False,
+) -> FilterDecision:
     cleaned = normalize_space(text)
     if not cleaned or _likely_noise(cleaned):
         return FilterDecision(
@@ -1574,6 +1870,11 @@ def _fallback_filter_decision(text: str) -> FilterDecision:
             reason_code="likely_noise",
             topic_key=_sanitize_topic_key("", cleaned),
             needs_ocr_translation=False,
+            copy_origin="fallback",
+            routing_origin="fallback",
+            fallback_reason=_normalize_filter_fallback_reason(fallback_reason),
+            ai_attempt_count=max(1, ai_attempt_count),
+            ai_quality_retry_used=ai_quality_retry_used,
         )
 
     summary = _fallback_summary(cleaned) or ""
@@ -1594,6 +1895,11 @@ def _fallback_filter_decision(text: str) -> FilterDecision:
         reason_code="local_fallback",
         topic_key=_sanitize_topic_key("", cleaned),
         needs_ocr_translation=False,
+        copy_origin="fallback",
+        routing_origin="fallback",
+        fallback_reason=_normalize_filter_fallback_reason(fallback_reason),
+        ai_attempt_count=max(1, ai_attempt_count),
+        ai_quality_retry_used=ai_quality_retry_used,
     )
 
 
@@ -1614,6 +1920,11 @@ def _validate_filter_decision(
     *,
     recent_context: Sequence[str] | None = None,
     context_evidence: ContextEvidence | None = None,
+    copy_origin: Literal["ai", "fallback"] = "ai",
+    routing_origin: Literal["ai", "system_override", "fallback"] = "ai",
+    fallback_reason: str = "",
+    ai_attempt_count: int = 1,
+    ai_quality_retry_used: bool = False,
 ) -> FilterDecision:
     fallback = _fallback_filter_decision(raw_text)
     story_signals = detect_story_signals(raw_text)
@@ -1633,20 +1944,20 @@ def _validate_filter_decision(
     raw_summary_html = _clean_generated_delivery_html(raw_summary_html, max_lines=2)
     headline_html = _clean_generated_delivery_html(headline_html, max_lines=1)
     story_bridge_html = _clean_generated_delivery_html(story_bridge_html, max_lines=2)
-    summary_html = normalize_feed_summary_html(raw_summary_html, raw_text)
+    summary_html = _normalize_generated_feed_summary_html(raw_summary_html, raw_text)
 
-    if action != "skip" and not summary_html:
-        summary_html = fallback.summary_html
     if bool(story_signals.get("downgrade_explainer")) and (
         action == "deliver" or severity == "high"
     ):
         severity = "medium" if summary_html else "low"
         action = "digest" if summary_html else "skip"
         confidence = min(confidence, 0.75)
+        routing_origin = "system_override"
     if severity == "high":
         headline_html = resolve_breaking_headline_for_delivery(
             raw_text,
-            headline_html or fallback.headline_html,
+            headline_html,
+            allow_fallback=False,
         )
         if _breaking_style_is_unhinged():
             story_bridge_html = resolve_vital_rational_view_for_delivery(
@@ -1677,6 +1988,11 @@ def _validate_filter_decision(
         reason_code=reason_code,
         topic_key=topic_key,
         needs_ocr_translation=needs_ocr_translation,
+        copy_origin=copy_origin,
+        routing_origin=routing_origin,
+        fallback_reason=_normalize_filter_fallback_reason(fallback_reason),
+        ai_attempt_count=max(1, ai_attempt_count),
+        ai_quality_retry_used=ai_quality_retry_used,
     )
 
 
@@ -2673,40 +2989,171 @@ async def decide_filter_action(text: str, auth_manager: AuthManager) -> FilterDe
         return decision
 
     compact = cleaned if len(cleaned) <= 2400 else f"{cleaned[:2397].rsplit(' ', 1)[0]}..."
+    base_prompt = _filter_decision_system_prompt()
+    retry_issue = ""
 
-    try:
-        auth_context = await auth_manager.get_auth_context()
-        raw = await _call_codex(
-            compact,
-            auth_context,
-            instructions=_filter_decision_system_prompt(),
-            verbosity="low",
+    for round_number in (1, 2):
+        instructions = (
+            _decision_retry_prompt(base_prompt, retry_issue)
+            if round_number == 2 and retry_issue
+            else base_prompt
         )
-    except _CodexAuthError:
         try:
-            auth_context = await auth_manager.refresh_auth_context()
-            raw = await _call_codex(
+            raw = await _call_codex_with_auth_repair(
                 compact,
-                auth_context,
-                instructions=_filter_decision_system_prompt(),
+                auth_manager,
+                instructions,
                 verbosity="low",
             )
-        except Exception:
-            return _fallback_filter_decision(cleaned)
-    except (_CodexRateLimitError, httpx.HTTPError, _CodexApiError, ValueError):
-        return _fallback_filter_decision(cleaned)
-    except Exception:
-        return _fallback_filter_decision(cleaned)
+        except Exception as exc:
+            fallback = _fallback_filter_decision(
+                cleaned,
+                fallback_reason=_fallback_reason_from_exc(exc),
+                ai_attempt_count=round_number,
+                ai_quality_retry_used=(round_number == 2),
+            )
+            log_structured(
+                LOGGER,
+                "filter_decision_finalized",
+                surface="feed",
+                action=fallback.action,
+                severity=fallback.severity,
+                copy_origin=fallback.copy_origin,
+                routing_origin=fallback.routing_origin,
+                fallback_reason=fallback.fallback_reason,
+                ai_attempt_count=fallback.ai_attempt_count,
+                ai_quality_retry_used=fallback.ai_quality_retry_used,
+                cached=fallback.cached,
+            )
+            return fallback
 
-    payload = _try_parse_digest_json(raw)
-    decision = _validate_filter_decision(payload or {}, cleaned)
-    ai_decision_cache_set(
-        normalized_hash=normalized_hash,
-        prompt_version=FILTER_DECISION_PROMPT_VERSION,
-        model=model,
-        decision_json=json.dumps(decision.__dict__, separators=(",", ":")),
+        raw = normalize_space(raw)
+        if not raw:
+            retry_issue = "empty_output"
+            if round_number == 2:
+                fallback = _fallback_filter_decision(
+                    cleaned,
+                    fallback_reason="empty_output",
+                    ai_attempt_count=2,
+                    ai_quality_retry_used=True,
+                )
+                log_structured(
+                    LOGGER,
+                    "filter_decision_finalized",
+                    surface="feed",
+                    action=fallback.action,
+                    severity=fallback.severity,
+                    copy_origin=fallback.copy_origin,
+                    routing_origin=fallback.routing_origin,
+                    fallback_reason=fallback.fallback_reason,
+                    ai_attempt_count=fallback.ai_attempt_count,
+                    ai_quality_retry_used=fallback.ai_quality_retry_used,
+                    cached=fallback.cached,
+                )
+                return fallback
+            continue
+
+        payload = _try_parse_digest_json(raw)
+        if payload is None:
+            retry_issue = "invalid_payload"
+            if round_number == 2:
+                fallback = _fallback_filter_decision(
+                    cleaned,
+                    fallback_reason="invalid_payload",
+                    ai_attempt_count=2,
+                    ai_quality_retry_used=True,
+                )
+                log_structured(
+                    LOGGER,
+                    "filter_decision_finalized",
+                    surface="feed",
+                    action=fallback.action,
+                    severity=fallback.severity,
+                    copy_origin=fallback.copy_origin,
+                    routing_origin=fallback.routing_origin,
+                    fallback_reason=fallback.fallback_reason,
+                    ai_attempt_count=fallback.ai_attempt_count,
+                    ai_quality_retry_used=fallback.ai_quality_retry_used,
+                    cached=fallback.cached,
+                )
+                return fallback
+            continue
+
+        decision = _validate_filter_decision(
+            payload,
+            cleaned,
+            copy_origin="ai",
+            routing_origin="ai",
+            ai_attempt_count=round_number,
+            ai_quality_retry_used=(round_number == 2),
+        )
+        quality_issue = _filter_decision_quality_issue(decision, cleaned)
+        if quality_issue:
+            retry_issue = quality_issue
+            if round_number == 2:
+                decision = _fallback_filter_decision(
+                    cleaned,
+                    fallback_reason="quality_rejected_after_retry",
+                    ai_attempt_count=2,
+                    ai_quality_retry_used=True,
+                )
+                log_structured(
+                    LOGGER,
+                    "filter_decision_finalized",
+                    surface="feed",
+                    action=decision.action,
+                    severity=decision.severity,
+                    copy_origin=decision.copy_origin,
+                    routing_origin=decision.routing_origin,
+                    fallback_reason=decision.fallback_reason,
+                    ai_attempt_count=decision.ai_attempt_count,
+                    ai_quality_retry_used=decision.ai_quality_retry_used,
+                    cached=decision.cached,
+                )
+                return decision
+            continue
+
+        ai_decision_cache_set(
+            normalized_hash=normalized_hash,
+            prompt_version=FILTER_DECISION_PROMPT_VERSION,
+            model=model,
+            decision_json=json.dumps(decision.__dict__, separators=(",", ":")),
+        )
+        log_structured(
+            LOGGER,
+            "filter_decision_finalized",
+            surface="feed",
+            action=decision.action,
+            severity=decision.severity,
+            copy_origin=decision.copy_origin,
+            routing_origin=decision.routing_origin,
+            fallback_reason=decision.fallback_reason,
+            ai_attempt_count=decision.ai_attempt_count,
+            ai_quality_retry_used=decision.ai_quality_retry_used,
+            cached=decision.cached,
+        )
+        return decision
+
+    fallback = _fallback_filter_decision(
+        cleaned,
+        fallback_reason="quality_rejected_after_retry",
+        ai_attempt_count=2,
+        ai_quality_retry_used=True,
     )
-    return decision
+    log_structured(
+        LOGGER,
+        "filter_decision_finalized",
+        surface="feed",
+        action=fallback.action,
+        severity=fallback.severity,
+        copy_origin=fallback.copy_origin,
+        routing_origin=fallback.routing_origin,
+        fallback_reason=fallback.fallback_reason,
+        ai_attempt_count=fallback.ai_attempt_count,
+        ai_quality_retry_used=fallback.ai_quality_retry_used,
+        cached=fallback.cached,
+    )
+    return fallback
 
 
 async def summarize_or_skip(text: str, auth_manager: AuthManager) -> Optional[str]:
@@ -2727,14 +3174,14 @@ async def summarize_or_skip(text: str, auth_manager: AuthManager) -> Optional[st
         decision = await decide_filter_action(cleaned, auth_manager)
     except Exception:
         fallback = _fallback_summary(cleaned)
-        _cache_set(key, fallback)
         return fallback
 
     if decision.action == "skip" or not decision.summary_html:
         _cache_set(key, None)
         return None
 
-    _cache_set(key, decision.summary_html)
+    if decision.copy_origin == "ai":
+        _cache_set(key, decision.summary_html)
     return decision.summary_html
 
 
@@ -3337,45 +3784,35 @@ async def summarize_breaking_headline(
         return cached
 
     compact = cleaned if len(cleaned) <= 1800 else f"{cleaned[:1797].rsplit(' ', 1)[0]}..."
+    base_prompt = _breaking_headline_prompt()
+    retry_issue = ""
 
-    try:
-        auth_context = await auth_manager.get_auth_context()
-        raw = await _call_codex(
-            compact,
-            auth_context,
-            instructions=_breaking_headline_prompt(),
-            verbosity="low",
+    for round_number in (1, 2):
+        prompt = (
+            _query_retry_prompt(base_prompt, retry_issue)
+            if round_number == 2 and retry_issue
+            else base_prompt
         )
-    except _CodexAuthError:
         try:
-            auth_context = await auth_manager.refresh_auth_context()
-            raw = await _call_codex(
+            raw = await _call_codex_with_auth_repair(
                 compact,
-                auth_context,
-                instructions=_breaking_headline_prompt(),
+                auth_manager,
+                prompt,
                 verbosity="low",
             )
         except Exception:
-            fallback = resolve_breaking_headline_for_delivery(cleaned, None)
-            _headline_cache_set(key, fallback)
-            return fallback
-    except (_CodexRateLimitError, httpx.HTTPError, _CodexApiError, ValueError):
-        fallback = resolve_breaking_headline_for_delivery(cleaned, None)
-        _headline_cache_set(key, fallback)
-        return fallback
-    except Exception:
-        fallback = resolve_breaking_headline_for_delivery(cleaned, None)
-        _headline_cache_set(key, fallback)
-        return fallback
+            return resolve_breaking_headline_for_delivery(cleaned, None)
 
-    headline = resolve_breaking_headline_for_delivery(cleaned, raw)
-    if headline:
-        _headline_cache_set(key, headline)
-        return headline
+        headline = resolve_breaking_headline_for_delivery(cleaned, raw, allow_fallback=False)
+        issue = _news_copy_quality_issue(headline, cleaned) if headline else "empty_output"
+        if not issue and headline:
+            _headline_cache_set(key, headline)
+            return headline
+        retry_issue = issue or "vague_copy"
+        if round_number == 2:
+            return resolve_breaking_headline_for_delivery(cleaned, None)
 
-    fallback = resolve_breaking_headline_for_delivery(cleaned, None)
-    _headline_cache_set(key, fallback)
-    return fallback
+    return resolve_breaking_headline_for_delivery(cleaned, None)
 
 
 async def summarize_vital_rational_view(
@@ -3500,17 +3937,80 @@ async def translate_ocr_text_to_english(
     return safe or None
 
 
-async def create_digest_summary(
+def _make_generated_text_result(
+    html: str,
+    *,
+    copy_origin: Literal["ai", "fallback"],
+    fallback_reason: str = "",
+    ai_attempt_count: int = 1,
+    ai_quality_retry_used: bool = False,
+) -> GeneratedTextResult:
+    return GeneratedTextResult(
+        html=html,
+        copy_origin=copy_origin,
+        fallback_reason=_normalize_filter_fallback_reason(fallback_reason),
+        ai_attempt_count=max(1, ai_attempt_count),
+        ai_quality_retry_used=ai_quality_retry_used,
+    )
+
+
+def _digest_quality_issue(text: str, quiet_text: str) -> str:
+    cleaned = normalize_space(strip_telegram_html(text))
+    if not cleaned:
+        return "empty_output"
+    if cleaned == normalize_space(strip_telegram_html(quiet_text)):
+        return ""
+    lines = [
+        normalize_space(strip_telegram_html(line))
+        for line in re.split(r"\n+|<br\s*/?>", str(text or ""), flags=re.IGNORECASE)
+        if normalize_space(strip_telegram_html(line))
+    ]
+    if not lines:
+        return "empty_output"
+    for line in lines:
+        if line.startswith("🟢 No major developments"):
+            continue
+        issue = _news_copy_quality_issue(line, line, allow_short=True)
+        if issue in {"vague_copy", "incomplete_copy"}:
+            return issue
+    return ""
+
+
+def _query_quality_issue(answer_html: str, question: str) -> str:
+    cleaned = normalize_space(strip_telegram_html(answer_html))
+    if not cleaned:
+        return "empty_output"
+    lowered = cleaned.lower()
+    if QUERY_NO_MATCH_TEXT.lower() in lowered:
+        return ""
+    if "based on the provided evidence" in lowered or "provided evidence" in lowered:
+        return "vague_copy"
+    if any(pattern in lowered for pattern in _WEAK_COPY_PATTERNS):
+        return "vague_copy"
+    if cleaned.endswith(("...", "…", ":", "-", "–", "—", "/")):
+        return "incomplete_copy"
+    if len(cleaned) < max(28, min(64, len(normalize_space(question)))):
+        return "headline_too_thin"
+    return ""
+
+
+def _digest_retry_prompt(prompt: str, issue: str) -> str:
+    return f"{prompt}\n\nRevision feedback:\n- {_filter_retry_feedback(issue)}\n- Keep the digest tight, concrete, and non-generic."
+
+
+def _query_retry_prompt(prompt: str, issue: str) -> str:
+    return f"{prompt}\n\nRevision feedback:\n- {_filter_retry_feedback(issue)}\n- Answer the exact question directly in the first line with concrete facts."
+
+
+async def create_digest_summary_result(
     posts: List[Dict[str, object]],
     auth_manager: AuthManager | None = None,
     *,
     interval_minutes: int | None = None,
     on_token: Callable[[str], Awaitable[None]] | None = None,
-) -> str:
+) -> GeneratedTextResult:
     """
-    Build one editorial digest from queued posts.
-
-    Returns Telegram-HTML digest body or the exact quiet-period sentence.
+    Build one editorial digest from queued posts and keep provenance metadata.
     """
     if interval_minutes is None:
         interval_minutes = int(max(1, int(getattr(config, "DIGEST_INTERVAL_MINUTES", 30))))
@@ -3518,14 +4018,13 @@ async def create_digest_summary(
         interval_minutes = int(max(1, interval_minutes))
     quiet_text = quiet_period_message(interval_minutes)
     if not posts:
-        return quiet_text
+        return _make_generated_text_result(quiet_text, copy_origin="fallback")
 
     manager = auth_manager or AuthManager(logger=LOGGER)
     max_posts = _resolve_digest_max_posts()
     max_lines = _resolve_digest_max_lines()
 
     token_budget = _resolve_digest_token_budget()
-    # Reserve room for instructions + response generation.
     context_budget = max(1000, token_budget - 2200)
 
     lines, included_count, total_input = _build_digest_context(
@@ -3534,10 +4033,9 @@ async def create_digest_summary(
         max_posts=max_posts,
     )
     if not lines or included_count == 0:
-        return quiet_text
+        return _make_generated_text_result(quiet_text, copy_origin="fallback")
 
     prefer_json = bool(getattr(config, "DIGEST_PREFER_JSON_OUTPUT", True))
-    # JSON mode streams poorly for live UX; force markdown when streaming edits are enabled.
     if on_token is not None:
         prefer_json = False
     importance_scoring = bool(getattr(config, "DIGEST_IMPORTANCE_SCORING", True))
@@ -3551,13 +4049,7 @@ async def create_digest_summary(
         f"- Estimated input tokens: {sum(estimate_tokens_rough(x) for x in lines)}\n\n"
         + build_digest_input_block(lines)
     )
-
-    try:
-        auth_context = await manager.get_auth_context()
-    except Exception:
-        return local_fallback_digest(posts, interval_minutes=interval_minutes)
-
-    prompt = build_digest_system_prompt(
+    base_prompt = build_digest_system_prompt(
         interval_minutes=interval_minutes,
         json_mode=prefer_json,
         importance_scoring=importance_scoring,
@@ -3565,101 +4057,196 @@ async def create_digest_summary(
         output_language=output_language,
         include_source_tags=False,
     )
+    retry_issue = ""
 
-    try:
-        content = await _call_codex(
-            user_payload,
-            auth_context,
-            instructions=prompt,
-            on_token=on_token,
+    for round_number in (1, 2):
+        prompt = (
+            _digest_retry_prompt(base_prompt, retry_issue)
+            if round_number == 2 and retry_issue
+            else base_prompt
         )
-    except _CodexAuthError:
         try:
-            auth_context = await manager.refresh_auth_context()
-            content = await _call_codex(
+            content = await _call_codex_with_auth_repair(
                 user_payload,
-                auth_context,
-                instructions=prompt,
+                manager,
+                prompt,
                 on_token=on_token,
             )
-        except Exception:
-            return local_fallback_digest(posts, interval_minutes=interval_minutes)
-    except _CodexRateLimitError as exc:
-        global _QUOTA_WARNING_LOGGED
-        if not _QUOTA_WARNING_LOGGED:
-            LOGGER.error(
-                "Codex subscription limit reached (429) during digest generation. "
-                "Using local fallback digest. %s",
-                exc,
+        except Exception as exc:
+            result = _make_generated_text_result(
+                local_fallback_digest(posts, interval_minutes=interval_minutes),
+                copy_origin="fallback",
+                fallback_reason=_fallback_reason_from_exc(exc),
+                ai_attempt_count=round_number,
+                ai_quality_retry_used=(round_number == 2),
             )
-            _QUOTA_WARNING_LOGGED = True
-        return local_fallback_digest(posts, interval_minutes=interval_minutes)
-    except (httpx.HTTPError, _CodexApiError, ValueError) as exc:
-        LOGGER.error("Codex digest call failed, using local fallback digest: %s", exc)
-        return local_fallback_digest(posts, interval_minutes=interval_minutes)
-    except Exception:
-        return local_fallback_digest(posts, interval_minutes=interval_minutes)
+            log_structured(
+                LOGGER,
+                "digest_generation_result",
+                copy_origin=result.copy_origin,
+                fallback_reason=result.fallback_reason,
+                ai_attempt_count=result.ai_attempt_count,
+                ai_quality_retry_used=result.ai_quality_retry_used,
+                output_chars=len(result.html),
+            )
+            return result
 
-    if not content.strip():
-        return local_fallback_digest(posts, interval_minutes=interval_minutes)
+        if not content.strip():
+            retry_issue = "empty_output"
+            if round_number == 2:
+                result = _make_generated_text_result(
+                    local_fallback_digest(posts, interval_minutes=interval_minutes),
+                    copy_origin="fallback",
+                    fallback_reason="empty_output",
+                    ai_attempt_count=2,
+                    ai_quality_retry_used=True,
+                )
+                log_structured(
+                    LOGGER,
+                    "digest_generation_result",
+                    copy_origin=result.copy_origin,
+                    fallback_reason=result.fallback_reason,
+                    ai_attempt_count=result.ai_attempt_count,
+                    ai_quality_retry_used=result.ai_quality_retry_used,
+                    output_chars=len(result.html),
+                )
+                return result
+            continue
 
-    if prefer_json:
-        parsed = _try_parse_digest_json(content)
-        if parsed is not None:
-            return await _normalize_digest_output(
-                _json_digest_to_html(
-                    parsed,
-                    interval_minutes=interval_minutes,
-                    max_lines=max_lines,
-                ),
-                manager,
+        if prefer_json:
+            parsed = _try_parse_digest_json(content)
+            if parsed is None:
+                retry_issue = "invalid_payload"
+                if round_number == 2:
+                    result = _make_generated_text_result(
+                        local_fallback_digest(posts, interval_minutes=interval_minutes),
+                        copy_origin="fallback",
+                        fallback_reason="invalid_payload",
+                        ai_attempt_count=2,
+                        ai_quality_retry_used=True,
+                    )
+                    log_structured(
+                        LOGGER,
+                        "digest_generation_result",
+                        copy_origin=result.copy_origin,
+                        fallback_reason=result.fallback_reason,
+                        ai_attempt_count=result.ai_attempt_count,
+                        ai_quality_retry_used=result.ai_quality_retry_used,
+                        output_chars=len(result.html),
+                    )
+                    return result
+                continue
+            candidate = _json_digest_to_html(
+                parsed,
                 interval_minutes=interval_minutes,
                 max_lines=max_lines,
             )
-        # Fallback to explicit markdown retry if JSON parse failed.
-        markdown_prompt = build_digest_system_prompt(
+        else:
+            candidate = content
+
+        normalized = await _normalize_digest_output(
+            candidate,
+            manager,
             interval_minutes=interval_minutes,
-            json_mode=False,
-            importance_scoring=importance_scoring,
-            include_links=include_links,
-            output_language=output_language,
-            include_source_tags=False,
+            max_lines=max_lines,
         )
-        try:
-            content = await _call_codex(
-                user_payload,
-                auth_context,
-                instructions=markdown_prompt,
-                on_token=on_token,
-            )
-        except Exception:
-            return local_fallback_digest(posts, interval_minutes=interval_minutes)
+        quality_issue = _digest_quality_issue(normalized, quiet_text)
+        if quality_issue:
+            retry_issue = quality_issue
+            if round_number == 2:
+                result = _make_generated_text_result(
+                    local_fallback_digest(posts, interval_minutes=interval_minutes),
+                    copy_origin="fallback",
+                    fallback_reason="quality_rejected_after_retry",
+                    ai_attempt_count=2,
+                    ai_quality_retry_used=True,
+                )
+                log_structured(
+                    LOGGER,
+                    "digest_generation_result",
+                    copy_origin=result.copy_origin,
+                    fallback_reason=result.fallback_reason,
+                    ai_attempt_count=result.ai_attempt_count,
+                    ai_quality_retry_used=result.ai_quality_retry_used,
+                    output_chars=len(result.html),
+                )
+                return result
+            continue
 
-    return await _normalize_digest_output(
-        content,
-        manager,
-        interval_minutes=interval_minutes,
-        max_lines=max_lines,
+        result = _make_generated_text_result(
+            normalized,
+            copy_origin="ai",
+            ai_attempt_count=round_number,
+            ai_quality_retry_used=(round_number == 2),
+        )
+        log_structured(
+            LOGGER,
+            "digest_generation_result",
+            copy_origin=result.copy_origin,
+            fallback_reason=result.fallback_reason,
+            ai_attempt_count=result.ai_attempt_count,
+            ai_quality_retry_used=result.ai_quality_retry_used,
+            output_chars=len(result.html),
+        )
+        return result
+
+    result = _make_generated_text_result(
+        local_fallback_digest(posts, interval_minutes=interval_minutes),
+        copy_origin="fallback",
+        fallback_reason="quality_rejected_after_retry",
+        ai_attempt_count=2,
+        ai_quality_retry_used=True,
     )
+    log_structured(
+        LOGGER,
+        "digest_generation_result",
+        copy_origin=result.copy_origin,
+        fallback_reason=result.fallback_reason,
+        ai_attempt_count=result.ai_attempt_count,
+        ai_quality_retry_used=result.ai_quality_retry_used,
+        output_chars=len(result.html),
+    )
+    return result
 
 
-async def generate_answer_from_context(
+async def create_digest_summary(
+    posts: List[Dict[str, object]],
+    auth_manager: AuthManager | None = None,
+    *,
+    interval_minutes: int | None = None,
+    on_token: Callable[[str], Awaitable[None]] | None = None,
+) -> str:
+    """
+    Build one editorial digest from queued posts.
+
+    Returns Telegram-HTML digest body or the exact quiet-period sentence.
+    """
+    result = await create_digest_summary_result(
+        posts,
+        auth_manager=auth_manager,
+        interval_minutes=interval_minutes,
+        on_token=on_token,
+    )
+    return result.html
+
+
+async def generate_answer_from_context_result(
     query: str,
     context_messages: Sequence[Dict[str, object]],
     auth_manager: AuthManager | None = None,
     *,
     conversation_history: Sequence[Dict[str, str]] | None = None,
     on_token: Callable[[str], Awaitable[None]] | None = None,
-) -> str:
+) -> GeneratedTextResult:
     """
     Generate a conversational query answer from recent Telegram context messages.
     """
     question = normalize_space(query)
     if not question:
-        return QUERY_NO_MATCH_TEXT
+        return _make_generated_text_result(QUERY_NO_MATCH_TEXT, copy_origin="fallback")
 
     if not context_messages:
-        return QUERY_NO_MATCH_TEXT
+        return _make_generated_text_result(QUERY_NO_MATCH_TEXT, copy_origin="fallback")
 
     manager = auth_manager or AuthManager(logger=LOGGER)
     detailed = _query_requests_detail(question)
@@ -3673,9 +4260,9 @@ async def generate_answer_from_context(
     # Strict guardrail for high-risk queries (leadership/death/succession):
     # if evidence diversity is weak, do not produce potentially false claims.
     if strict_confirmation_query and distinct_sources < 2:
-        return QUERY_NO_MATCH_TEXT
+        return _make_generated_text_result(QUERY_NO_MATCH_TEXT, copy_origin="fallback")
     if not _query_confidence_allows_answer(question, scored_context[:12]):
-        return QUERY_NO_MATCH_TEXT
+        return _make_generated_text_result(QUERY_NO_MATCH_TEXT, copy_origin="fallback")
 
     # Reserve room for prompt + answer generation.
     context_budget = max(2000, _query_context_token_budget() - 2600)
@@ -3685,7 +4272,7 @@ async def generate_answer_from_context(
         token_budget=context_budget,
     )
     if not context_lines:
-        return QUERY_NO_MATCH_TEXT
+        return _make_generated_text_result(QUERY_NO_MATCH_TEXT, copy_origin="fallback")
 
     history_lines: list[str] = []
     if conversation_history:
@@ -3716,51 +4303,170 @@ async def generate_answer_from_context(
     payload_parts.extend(["", "Evidence messages:", *context_lines])
     user_payload = "\n".join(payload_parts)
 
-    prompt = build_query_system_prompt(
+    base_prompt = build_query_system_prompt(
         output_language=output_language,
         detailed=detailed,
     )
+    retry_issue = ""
 
-    try:
-        auth_context = await manager.get_auth_context()
-        content = await _call_codex(
-            user_payload,
-            auth_context,
-            instructions=prompt,
-            verbosity="low" if not detailed else "medium",
-            on_token=on_token,
+    for round_number in (1, 2):
+        prompt = (
+            _query_retry_prompt(base_prompt, retry_issue)
+            if round_number == 2 and retry_issue
+            else base_prompt
         )
-    except _CodexAuthError:
         try:
-            auth_context = await manager.refresh_auth_context()
-            content = await _call_codex(
+            content = await _call_codex_with_auth_repair(
                 user_payload,
-                auth_context,
-                instructions=prompt,
+                manager,
+                prompt,
                 verbosity="low" if not detailed else "medium",
                 on_token=on_token,
             )
-        except Exception:
-            return _fallback_query_answer(question, ranked_context, detailed=detailed)
-    except _CodexRateLimitError:
-        return _fallback_query_answer(question, ranked_context, detailed=detailed)
-    except (httpx.HTTPError, _CodexApiError, ValueError):
-        return _fallback_query_answer(question, ranked_context, detailed=detailed)
-    except Exception:
-        return _fallback_query_answer(question, ranked_context, detailed=detailed)
+        except Exception as exc:
+            result = _make_generated_text_result(
+                _fallback_query_answer(question, ranked_context, detailed=detailed),
+                copy_origin="fallback",
+                fallback_reason=_fallback_reason_from_exc(exc),
+                ai_attempt_count=round_number,
+                ai_quality_retry_used=(round_number == 2),
+            )
+            log_structured(
+                LOGGER,
+                "query_generation_result",
+                copy_origin=result.copy_origin,
+                fallback_reason=result.fallback_reason,
+                ai_attempt_count=result.ai_attempt_count,
+                ai_quality_retry_used=result.ai_quality_retry_used,
+                output_chars=len(result.html),
+            )
+            return result
 
-    cleaned = normalize_space(content)
-    if not cleaned:
-        return _fallback_query_answer(question, ranked_context, detailed=detailed)
+        cleaned = normalize_space(content)
+        if not cleaned:
+            retry_issue = "empty_output"
+            if round_number == 2:
+                result = _make_generated_text_result(
+                    _fallback_query_answer(question, ranked_context, detailed=detailed),
+                    copy_origin="fallback",
+                    fallback_reason="empty_output",
+                    ai_attempt_count=2,
+                    ai_quality_retry_used=True,
+                )
+                log_structured(
+                    LOGGER,
+                    "query_generation_result",
+                    copy_origin=result.copy_origin,
+                    fallback_reason=result.fallback_reason,
+                    ai_attempt_count=result.ai_attempt_count,
+                    ai_quality_retry_used=result.ai_quality_retry_used,
+                    output_chars=len(result.html),
+                )
+                return result
+            continue
 
-    plain_cleaned = re.sub(r"</?[^>]+>", "", cleaned).lower()
-    if QUERY_NO_MATCH_TEXT.lower() in cleaned.lower() or "no relevant information found" in plain_cleaned:
-        return QUERY_NO_MATCH_TEXT
+        plain_cleaned = re.sub(r"</?[^>]+>", "", cleaned).lower()
+        if QUERY_NO_MATCH_TEXT.lower() in cleaned.lower() or "no relevant information found" in plain_cleaned:
+            result = _make_generated_text_result(QUERY_NO_MATCH_TEXT, copy_origin="ai")
+            log_structured(
+                LOGGER,
+                "query_generation_result",
+                copy_origin=result.copy_origin,
+                fallback_reason=result.fallback_reason,
+                ai_attempt_count=result.ai_attempt_count,
+                ai_quality_retry_used=result.ai_quality_retry_used,
+                output_chars=len(result.html),
+            )
+            return result
 
-    if strict_confirmation_query and distinct_sources < 2 and _answer_has_definitive_high_risk_claim(cleaned):
-        return QUERY_NO_MATCH_TEXT
+        if strict_confirmation_query and distinct_sources < 2 and _answer_has_definitive_high_risk_claim(cleaned):
+            result = _make_generated_text_result(QUERY_NO_MATCH_TEXT, copy_origin="fallback")
+            log_structured(
+                LOGGER,
+                "query_generation_result",
+                copy_origin=result.copy_origin,
+                fallback_reason=result.fallback_reason,
+                ai_attempt_count=result.ai_attempt_count,
+                ai_quality_retry_used=result.ai_quality_retry_used,
+                output_chars=len(result.html),
+            )
+            return result
 
-    safe = sanitize_telegram_html(content.strip())
-    if not safe:
-        return QUERY_NO_MATCH_TEXT
-    return safe
+        safe = sanitize_telegram_html(content.strip())
+        quality_issue = _query_quality_issue(safe, question)
+        if not safe:
+            quality_issue = "empty_output"
+        if quality_issue:
+            retry_issue = quality_issue
+            if round_number == 2:
+                result = _make_generated_text_result(
+                    _fallback_query_answer(question, ranked_context, detailed=detailed),
+                    copy_origin="fallback",
+                    fallback_reason="quality_rejected_after_retry",
+                    ai_attempt_count=2,
+                    ai_quality_retry_used=True,
+                )
+                log_structured(
+                    LOGGER,
+                    "query_generation_result",
+                    copy_origin=result.copy_origin,
+                    fallback_reason=result.fallback_reason,
+                    ai_attempt_count=result.ai_attempt_count,
+                    ai_quality_retry_used=result.ai_quality_retry_used,
+                    output_chars=len(result.html),
+                )
+                return result
+            continue
+
+        result = _make_generated_text_result(
+            safe,
+            copy_origin="ai",
+            ai_attempt_count=round_number,
+            ai_quality_retry_used=(round_number == 2),
+        )
+        log_structured(
+            LOGGER,
+            "query_generation_result",
+            copy_origin=result.copy_origin,
+            fallback_reason=result.fallback_reason,
+            ai_attempt_count=result.ai_attempt_count,
+            ai_quality_retry_used=result.ai_quality_retry_used,
+            output_chars=len(result.html),
+        )
+        return result
+
+    result = _make_generated_text_result(
+        _fallback_query_answer(question, ranked_context, detailed=detailed),
+        copy_origin="fallback",
+        fallback_reason="quality_rejected_after_retry",
+        ai_attempt_count=2,
+        ai_quality_retry_used=True,
+    )
+    log_structured(
+        LOGGER,
+        "query_generation_result",
+        copy_origin=result.copy_origin,
+        fallback_reason=result.fallback_reason,
+        ai_attempt_count=result.ai_attempt_count,
+        ai_quality_retry_used=result.ai_quality_retry_used,
+        output_chars=len(result.html),
+    )
+    return result
+
+
+async def generate_answer_from_context(
+    query: str,
+    context_messages: Sequence[Dict[str, object]],
+    auth_manager: AuthManager | None = None,
+    *,
+    conversation_history: Sequence[Dict[str, str]] | None = None,
+    on_token: Callable[[str], Awaitable[None]] | None = None,
+) -> str:
+    result = await generate_answer_from_context_result(
+        query,
+        context_messages,
+        auth_manager=auth_manager,
+        conversation_history=conversation_history,
+        on_token=on_token,
+    )
+    return result.html

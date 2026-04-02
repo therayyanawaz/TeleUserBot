@@ -637,6 +637,9 @@ async def test_handle_ai_inbound_job_uses_ai_decision_severity(monkeypatch):
     assert payload["triage_severity"] == "high"
     assert payload["severity"] == "medium"
     assert payload["filter_decision"]["action"] == "digest"
+    assert payload["filter_decision"]["copy_origin"] == "ai"
+    assert payload["filter_decision"]["routing_origin"] == "ai"
+    assert payload["filter_decision"]["fallback_reason"] == ""
     assert captured["priority"] == "medium"
 
 

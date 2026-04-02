@@ -57,6 +57,7 @@ from ai_filter import (
     summarize_or_skip,
     translate_ocr_text_to_english,
 )
+from prompts import QUERY_NO_MATCH_TEXT
 from auth import (
     ENV_AUTH_ENV_ONLY,
     ENV_AUTH_JSON,
@@ -5871,9 +5872,8 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
         _normalized, text_hash = build_dupe_fingerprint(text)
         headline = await summarize_breaking_headline(text, _require_auth_manager())
         if not headline:
-            headline = normalize_space(text)
-            if len(headline) > 420:
-                headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
+            mark_seen(channel_id, msg.id)
+            return
         cluster_result = await _apply_breaking_story_cluster_policy(
             messages=[msg],
             source=source,
@@ -5999,9 +5999,8 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
     if severity == "high" and _is_immediate_high_enabled():
         headline = await summarize_breaking_headline(combined_caption, _require_auth_manager())
         if not headline:
-            headline = normalize_space(combined_caption)
-            if len(headline) > 420:
-                headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
+            mark_seen_many(channel_id, message_ids)
+            return
         cluster_result = await _apply_breaking_story_cluster_policy(
             messages=messages,
             source=source,
@@ -6414,8 +6413,26 @@ async def _handle_ai_inbound_job(job: Dict[str, object]) -> None:
         "reason_code": decision.reason_code,
         "topic_key": decision.topic_key,
         "needs_ocr_translation": decision.needs_ocr_translation,
+        "copy_origin": decision.copy_origin,
+        "routing_origin": decision.routing_origin,
+        "fallback_reason": decision.fallback_reason,
+        "ai_attempt_count": decision.ai_attempt_count,
+        "ai_quality_retry_used": decision.ai_quality_retry_used,
         "cached": decision.cached,
     }
+    log_structured(
+        LOGGER,
+        "ai_filter_decision_ready",
+        message_id=_pipeline_job_primary_message_id(payload),
+        severity=decision.severity,
+        action=decision.action,
+        copy_origin=decision.copy_origin,
+        routing_origin=decision.routing_origin,
+        fallback_reason=decision.fallback_reason,
+        ai_attempt_count=decision.ai_attempt_count,
+        ai_quality_retry_used=decision.ai_quality_retry_used,
+        cached=decision.cached,
+    )
     advance_inbound_job(
         int(job["id"]),
         next_stage=INBOUND_STAGE_DELIVERY,
@@ -6481,7 +6498,19 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
         return
 
     if severity == "high" and action == "deliver" and _is_immediate_high_enabled() and candidate_text:
-        headline = _plain_text_from_html_fragment(str(decision.get("headline_html") or "")) or candidate_text
+        headline = _plain_text_from_html_fragment(str(decision.get("headline_html") or ""))
+        if not headline:
+            summary_headline, _ = extract_feed_summary_parts(
+                str(decision.get("summary_html") or ""),
+                candidate_text,
+            )
+            headline = normalize_space(summary_headline)
+        if not headline:
+            payload["final_action"] = "skip"
+            payload["skip_reason"] = "missing_breaking_headline"
+            payload["archive_text"] = candidate_text
+            await _advance_job_to_archive(job, payload)
+            return
         if len(headline) > 420:
             headline = f"{headline[:417].rsplit(' ', 1)[0]}..."
         story_bridge = _plain_text_from_html_fragment(str(decision.get("story_bridge_html") or ""))
@@ -6510,6 +6539,11 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
             kind=kind,
             final_action=str(cluster_result.get("final_action") or ""),
             cluster_decision=str(cluster_result.get("cluster_decision") or ""),
+            copy_origin=str(decision.get("copy_origin") or ""),
+            routing_origin=str(decision.get("routing_origin") or ""),
+            fallback_reason=str(decision.get("fallback_reason") or ""),
+            ai_attempt_count=int(decision.get("ai_attempt_count") or 1),
+            ai_quality_retry_used=bool(decision.get("ai_quality_retry_used")),
         )
         await _advance_job_to_archive(job, payload)
         return
@@ -6533,13 +6567,22 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
             source=source,
             kind=kind,
             pending=count_pending(),
+            copy_origin=str(decision.get("copy_origin") or ""),
+            routing_origin=str(decision.get("routing_origin") or ""),
+            fallback_reason=str(decision.get("fallback_reason") or ""),
+            ai_attempt_count=int(decision.get("ai_attempt_count") or 1),
+            ai_quality_retry_used=bool(decision.get("ai_quality_retry_used")),
         )
         await _advance_job_to_archive(job, payload)
         return
 
     summary_html = str(decision.get("summary_html") or "").strip()
     if not summary_html:
-        summary_html = sanitize_telegram_html(_truncate_context_line(candidate_text, limit=700))
+        payload["final_action"] = "skip"
+        payload["skip_reason"] = "decision_missing_summary"
+        payload["archive_text"] = candidate_text
+        await _advance_job_to_archive(job, payload)
+        return
     reply_to = await _resolve_source_reply_target(primary)
     summary_headline, summary_context = extract_feed_summary_parts(summary_html, candidate_text)
     resolved_context = await _resolve_dynamic_delivery_context(
@@ -8673,7 +8716,7 @@ async def _stream_query_answer(
             on_token=streamer.push,
         )
     if not answer.strip():
-        answer = "No matching information found in recent updates."
+        answer = QUERY_NO_MATCH_TEXT
     answer = _strip_query_answer_citations(answer)
     if final_suffix_html.strip() and "no relevant information found" not in strip_telegram_html(answer).lower():
         answer = f"{answer.strip()}<br><br>{final_suffix_html.strip()}"
@@ -8928,7 +8971,7 @@ async def _handle_query_request(
                     conversation_history=history,
                 )
             if not answer.strip():
-                answer = "No matching information found in recent updates."
+                answer = QUERY_NO_MATCH_TEXT
             answer = _strip_query_answer_citations(answer)
             if (
                 evidence_split_section
@@ -8972,7 +9015,7 @@ async def _handle_query_request(
         LOGGER.exception("Query handling failed.")
         await _safe_reply_markdown(
             event_ref,  # type: ignore[arg-type]
-            "No matching information found in recent updates.",
+            QUERY_NO_MATCH_TEXT,
             edit_message=progress,
             prefer_bot_identity=prefer_bot_identity,
             bot_chat_id=bot_chat_id,

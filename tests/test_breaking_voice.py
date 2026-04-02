@@ -73,9 +73,7 @@ def test_validate_filter_decision_clears_breaking_bridge_in_unhinged_mode(monkey
     )
 
     assert decision.story_bridge_html == ""
-    assert decision.headline_html == ai_filter._safe_breaking_headline_fallback(
-        "Officials say two rockets landed near Haifa overnight."
-    )
+    assert decision.headline_html == ""
 
 
 def test_validate_filter_decision_accepts_contextual_bridge_in_unhinged_mode(monkeypatch):
