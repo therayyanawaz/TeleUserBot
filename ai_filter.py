@@ -313,6 +313,8 @@ class GeneratedTextResult:
     timeline_item_count: int = 0
     noise_stripped_count: int = 0
     translation_applied_count: int = 0
+    citation_stripped_count: int = 0
+    duplicate_collapsed_count: int = 0
 
 
 def estimate_tokens_rough(text: str) -> int:
@@ -1808,6 +1810,19 @@ def _filter_retry_feedback(issue: str) -> str:
             "Your last answer was unusable. Return exactly one valid JSON object with every required key, "
             "and make every output field complete."
         )
+    if issue == "citation_leak":
+        return (
+            "Your last answer still named a source. Remove every outlet, channel, username, handle, or source-style phrase "
+            "and rewrite any needed uncertainty as generic wording such as 'initial reports indicate'."
+        )
+    if issue == "duplication":
+        return (
+            "Your last answer repeated the same fact. Collapse duplicates and make each line add a distinct factual update."
+        )
+    if issue == "weak_scene_setter":
+        return (
+            "Your opening line was too generic. Rewrite the scene setter as one sharp, concrete sentence that frames the window."
+        )
     if issue == "headline_too_thin":
         return (
             "Your last copy was too thin. Rewrite it with a concrete actor, action, and location when present in the source."
@@ -2037,16 +2052,132 @@ def _severity_emoji(value: Any) -> str:
 
 _DIGEST_PROMO_FRAGMENT_RE = re.compile(
     r"(?i)\b(?:follow us|discussion|boost the channel|our channel|subscribe|join(?: us| our channel)?|"
-    r"watch here|watch live|livestream|live stream|share|smaylik|abon[eə]\s+olun|global eye)\b.*$"
+    r"watch here|watch live|livestream|live stream|share|paylas|paylaş|smaylik|abon[eə]\s+olun|global eye|şərh[_\s-]*yaz)\b.*$"
 )
 _DIGEST_HASHTAG_RE = re.compile(r"(?<!\w)#[\w\-/]+")
 _DIGEST_PUNCT_ONLY_RE = re.compile(r"^[\W_]+$")
 _DIGEST_LEADING_NOISE_RE = re.compile(r"^[^0-9A-Za-z\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\u0400-\u04FF\"'“‘]+")
+_DIGEST_GENERIC_UNCERTAINTY_RE = re.compile(
+    r"(?i)^(?:initial|preliminary|early|unconfirmed)\s+reports?\s+(?:indicate|suggest|point to)\b"
+)
 _DIGEST_SOURCE_PREFIX_RE = re.compile(
     r"(?i)^(?:enemy media|hebrew sources?|hebrew media|israeli media|news from the zionist enemy|"
     r"follow-up from [^:]{1,80}|source|outlet|channel)\s*[:\-–—|]+\s*"
 )
 _DIGEST_ALSO_MOVING_RE = re.compile(r"(?i)^also moving$")
+_DIGEST_CITATION_WORD_RE = re.compile(
+    r"(?i)\b(?:enemy(?:'s)? media|hebrew(?:-language)? sources?|hebrew media|israeli media|"
+    r"local media|foreign media|follow-up from|news agency|media reports?)\b"
+)
+_DIGEST_ACCORDING_TO_CITATION_RE = re.compile(
+    r"(?i)\baccording to\s+[^.,;:]{0,80}\b(?:media|sources?|outlet|channel|network|agency|press|radio|tv)\b[:,]?\s*"
+)
+_DIGEST_SOURCE_REPORT_RE = re.compile(
+    r"(?i)^(?P<prefix>(?:enemy(?:'s)? media|hebrew(?:-language)? sources?|hebrew media|israeli media|"
+    r"local media|foreign media|news from the zionist enemy|follow-up from [^:]{1,80}|reports? in [^:]{1,80}|"
+    r"[^:]{1,80}\b(?:media|sources?|outlet|channel|network|agency|press|radio|tv)\b))"
+    r"(?:\s*[:\-–—|,]\s*|\s+)"
+    r"(?:(?:reported|reports|say|says|said|claim|claims|claimed|indicate|indicates|indicated|warned|warning)\s+(?:that\s+)?)?"
+    r"(?P<rest>.+)$"
+)
+_DIGEST_REPORTS_OF_RE = re.compile(
+    r"(?i)^(?P<label>(?:preliminary|initial|early|unconfirmed)(?:\s+[a-z-]+)?\s+reports?|there\s+(?:are|were)\s+reports?|reports?)\s+of\s+(?P<rest>.+)$"
+)
+_DIGEST_WEAK_SCENE_SETTER_RE = re.compile(
+    r"(?i)^(?:the window stayed active|the main development in this window was|the half-hour was dominated by)\b"
+)
+
+
+def _digest_line_key(text: str) -> str:
+    cleaned = normalize_space(strip_telegram_html(str(text or ""))).lower()
+    cleaned = re.sub(r"(?i)\b(?:initial|preliminary|early|unconfirmed)\s+reports?\s+(?:indicate|suggest|point to)\b", "", cleaned)
+    cleaned = re.sub(r"(?i)\b(?:reports?|indicate|indicates|indicated|suggest|suggests|suggested)\b", "", cleaned)
+    cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned)
+    return _cache_key(cleaned)
+
+
+def _looks_like_digest_citation_prefix(prefix: str) -> bool:
+    cleaned = normalize_space(prefix).strip(" .").lower()
+    if not cleaned:
+        return False
+    if _looks_like_generated_source_prefix(prefix):
+        return True
+    return bool(_DIGEST_CITATION_WORD_RE.search(cleaned))
+
+
+def _digest_apply_generic_uncertainty(text: str) -> str:
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return ""
+    if _DIGEST_GENERIC_UNCERTAINTY_RE.match(cleaned) or _text_has_hedge_markers(cleaned):
+        return cleaned
+    return f"Initial reports indicate {cleaned}"
+
+
+def _rewrite_reports_of_phrase(text: str) -> str:
+    match = _DIGEST_REPORTS_OF_RE.match(normalize_space(text))
+    if not match:
+        return normalize_space(text)
+    label = normalize_space(match.group("label"))
+    rest = normalize_space(match.group("rest"))
+    if not rest:
+        return ""
+    if label.lower().startswith(("preliminary", "initial", "early", "unconfirmed")):
+        qualifier = label.split()[0].capitalize()
+        return f"{qualifier} reports indicate {rest}"
+    return f"Reports indicate {rest}"
+
+
+def _digest_rewrite_source_attribution(text: str) -> tuple[str, int]:
+    cleaned = normalize_space(strip_telegram_html(str(text or "")))
+    if not cleaned:
+        return "", 0
+
+    removed = 0
+    prefix_removed = False
+
+    prefix_match = re.match(
+        r"^(?P<prefix>[A-Za-z][A-Za-z0-9&'._ /-]{1,60})(?P<sep>\s*[:\-–—|]+\s*)(?P<rest>.+)$",
+        cleaned,
+    )
+    if prefix_match and _looks_like_digest_citation_prefix(prefix_match.group("prefix")):
+        separator = normalize_space(prefix_match.group("sep"))
+        rest = normalize_space(prefix_match.group("rest"))
+        if not (separator == "-" and re.match(r"^[a-z][A-Za-z0-9-]{2,}", rest)):
+            cleaned = rest
+            removed += 1
+            prefix_removed = True
+
+    citation_match = _DIGEST_SOURCE_REPORT_RE.match(cleaned)
+    if citation_match:
+        cleaned = normalize_space(citation_match.group("rest"))
+        removed += 1
+        prefix_removed = True
+
+    cleaned, inline_removed = _DIGEST_ACCORDING_TO_CITATION_RE.subn("", cleaned)
+    if inline_removed:
+        removed += inline_removed
+        prefix_removed = True
+
+    cleaned = normalize_space(cleaned)
+    cleaned = _rewrite_reports_of_phrase(cleaned)
+    if prefix_removed:
+        cleaned = _digest_apply_generic_uncertainty(cleaned)
+    return normalize_space(cleaned), removed
+
+
+def _digest_has_citation_language(text: str) -> bool:
+    cleaned = normalize_space(strip_telegram_html(str(text or "")))
+    lowered = cleaned.lower()
+    if not cleaned:
+        return False
+    if "t.me/" in lowered or "telegram.me/" in lowered or _FEED_HANDLE_RE.search(cleaned):
+        return True
+    if _DIGEST_ACCORDING_TO_CITATION_RE.search(cleaned):
+        return True
+    if _DIGEST_CITATION_WORD_RE.search(cleaned):
+        return True
+    return False
 
 
 def _digest_clean_line(text: str, *, max_chars: int, allow_short: bool = False) -> str:
@@ -2055,12 +2186,18 @@ def _digest_clean_line(text: str, *, max_chars: int, allow_short: bool = False) 
         return ""
     cleaned = _DIGEST_LEADING_NOISE_RE.sub("", cleaned).strip()
     cleaned = _DIGEST_HASHTAG_RE.sub("", cleaned)
+    cleaned = _DIGEST_PROMO_FRAGMENT_RE.sub("", cleaned)
+    cleaned, _ = _digest_rewrite_source_attribution(cleaned)
     cleaned = _DIGEST_SOURCE_PREFIX_RE.sub("", cleaned)
     cleaned = _clean_generated_delivery_segment(cleaned)
+    cleaned, _ = _digest_rewrite_source_attribution(cleaned)
     cleaned = _DIGEST_PROMO_FRAGMENT_RE.sub("", cleaned)
+    cleaned = _rewrite_reports_of_phrase(cleaned)
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
     cleaned = normalize_space(cleaned.strip(" ,;:-|/[]{}()•"))
     if not cleaned or _DIGEST_PUNCT_ONLY_RE.fullmatch(cleaned):
+        return ""
+    if _digest_has_citation_language(cleaned):
         return ""
     if not allow_short and not _digest_needs_english_rewrite(cleaned, "English") and _feed_segment_is_incomplete(cleaned):
         return ""
@@ -2120,10 +2257,12 @@ def _coerce_digest_major_block(block: Any) -> Dict[str, Any] | None:
         facts_raw = []
     facts: List[str] = []
     seen: set[str] = set()
+    headline_key = _digest_line_key(headline)
+    lede_key = _digest_line_key(lede)
     for fact in facts_raw:
         cleaned = _digest_finalize_sentence(fact, max_chars=220)
-        key = cleaned.lower()
-        if not cleaned or key in seen or key == headline.lower() or key == lede.lower():
+        key = _digest_line_key(cleaned)
+        if not cleaned or not key or key in seen or key == headline_key or key == lede_key:
             continue
         seen.add(key)
         facts.append(cleaned)
@@ -2152,18 +2291,18 @@ def _derive_digest_scene_setter(
     ]
     if len(headlines) >= 2:
         return _digest_finalize_sentence(
-            f"The half-hour was dominated by {headlines[0].lower()}, while {headlines[1].lower()} and follow-on reports kept moving.",
+            f"{headlines[0]} set the pace in this half-hour, while {headlines[1].lower()} and follow-on developments kept the pressure on.",
             max_chars=260,
         )
     if len(headlines) == 1:
         return _digest_finalize_sentence(
-            f"The main development in this window was {headlines[0].lower()}.",
-            max_chars=220,
+            f"{headlines[0]} defined this half-hour.",
+            max_chars=200,
         )
     if timeline_items:
         return _digest_finalize_sentence(
-            "The window stayed active with several smaller developments moving at once.",
-            max_chars=180,
+            "Smaller developments kept stacking up across the window.",
+            max_chars=160,
         )
     return ""
 
@@ -2179,10 +2318,12 @@ def _render_digest_layout(
     quiet = quiet_period_message(interval_minutes)
     rendered_blocks: List[str] = []
     emitted_lines = 0
+    seen_rendered: set[str] = set()
 
     cleaned_scene = _digest_finalize_sentence(scene_setter, max_chars=280)
-    if cleaned_scene:
+    if cleaned_scene and not _DIGEST_WEAK_SCENE_SETTER_RE.search(cleaned_scene):
         rendered_blocks.append(sanitize_telegram_html(cleaned_scene))
+        seen_rendered.add(_digest_line_key(cleaned_scene))
 
     ordered_major_blocks = sorted(
         [block for block in major_blocks if isinstance(block, dict)],
@@ -2200,10 +2341,12 @@ def _render_digest_layout(
             facts_raw = []
         facts: List[str] = []
         seen: set[str] = set()
+        headline_key = _digest_line_key(headline)
+        lede_key = _digest_line_key(lede)
         for fact in facts_raw:
             cleaned = _digest_finalize_sentence(fact, max_chars=220)
-            key = cleaned.lower()
-            if not cleaned or key in seen or key == headline.lower() or key == lede.lower():
+            key = _digest_line_key(cleaned)
+            if not cleaned or not key or key in seen or key == headline_key or key == lede_key:
                 continue
             seen.add(key)
             facts.append(cleaned)
@@ -2213,15 +2356,26 @@ def _render_digest_layout(
             lede = facts.pop(0)
         if not lede and not facts:
             continue
+        if not headline_key or headline_key in seen_rendered:
+            continue
         block_lines = [f"<b>{sanitize_telegram_html(headline)}</b>"]
+        seen_rendered.add(headline_key)
         if lede:
-            block_lines.append(sanitize_telegram_html(lede))
+            lede_key = _digest_line_key(lede)
+            if lede_key and lede_key not in seen_rendered:
+                block_lines.append(sanitize_telegram_html(lede))
+                seen_rendered.add(lede_key)
         for fact in facts:
             if emitted_lines >= max_lines:
                 break
+            fact_key = _digest_line_key(fact)
+            if not fact_key or fact_key in seen_rendered:
+                continue
             block_lines.append(f"• {sanitize_telegram_html(fact)}")
+            seen_rendered.add(fact_key)
             emitted_lines += 1
-        rendered_blocks.append("<br>".join(block_lines))
+        if len(block_lines) >= 2:
+            rendered_blocks.append("<br>".join(block_lines))
         if emitted_lines >= max_lines:
             break
 
@@ -2229,8 +2383,8 @@ def _render_digest_layout(
     seen_timeline: set[str] = set()
     for item in timeline_items:
         cleaned = _digest_finalize_sentence(item, max_chars=200)
-        key = cleaned.lower()
-        if not cleaned or key in seen_timeline:
+        key = _digest_line_key(cleaned)
+        if not cleaned or not key or key in seen_timeline or key in seen_rendered:
             continue
         seen_timeline.add(key)
         cleaned_timeline.append(cleaned)
@@ -2313,10 +2467,13 @@ def _strip_digest_citations(text: str) -> str:
     cleaned = re.sub(r'<a\s+href="[^"]*">\s*Read more\s*</a>', "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'<a\s+href="[^"]*">.*?</a>', "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\bRead more\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = _FEED_HANDLE_RE.sub("", cleaned)
+    cleaned = _FEED_TELEGRAM_LINK_RE.sub("", cleaned)
     cleaned = re.sub(r"https?://\S+", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*\[[^\]]+\]", "", cleaned)
+    cleaned = re.sub(r"(?i)\b(?:source|outlet|channel)\s*[:\-–—|]+\s*", "", cleaned)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
-    cleaned = re.sub(r"\s+\n", "\n", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
     cleaned = re.sub(r"(?:<br>\s*){3,}", "<br><br>", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
 
@@ -2342,6 +2499,8 @@ def _digest_english_rewrite_prompt() -> str:
         "- Make the English sound sharp, human, and slightly unhinged without inventing anything\n"
         "- Translate every non-English word or phrase into English\n"
         "- Remove citations, source names, bracket tags, outlet names, links, handles, hashtags, and any 'Read more' text\n"
+        "- When attribution is necessary, use generic uncertainty only, such as 'initial reports indicate' or 'preliminary reports suggest'\n"
+        "- Never name a channel, outlet, username, or source label\n"
         "- Do not add new facts\n"
         "- Output Telegram HTML only"
     )
@@ -2437,12 +2596,18 @@ def _html_digest_cleanup(text: str, *, interval_minutes: int, max_lines: int) ->
         if not scene_setter and not block_has_bold and len(plain_lines) == 1:
             scene_setter = plain_lines[0]
             continue
+        if not block_has_bold and len(plain_lines) == 1:
+            timeline_items.append(plain_lines[0])
+            continue
 
         headline = _digest_clean_line(plain_lines[0], max_chars=120)
         if not headline:
             continue
         lede = plain_lines[1] if len(plain_lines) > 1 else ""
         facts = plain_lines[2:] if len(plain_lines) > 2 else []
+        if len(plain_lines) >= 2 and _digest_line_key(plain_lines[0]) == _digest_line_key(plain_lines[1]):
+            timeline_items.append(plain_lines[0])
+            continue
         major_blocks.append(
             {
                 "headline": headline,
@@ -2493,25 +2658,20 @@ def _build_digest_context(
 ) -> Tuple[List[str], int, int]:
     min_len = int(max(1, int(getattr(config, "DIGEST_MIN_POST_LENGTH", 12))))
 
-    deduped: List[Dict[str, object]] = []
-    seen = set()
+    eligible_posts: List[Dict[str, object]] = []
     for post in posts:
         text = _post_text(post)
         if len(text) < min_len:
             continue
         if _likely_noise(text):
             continue
-        fingerprint = _cache_key(text.lower())
-        if fingerprint in seen:
-            continue
-        seen.add(fingerprint)
-        deduped.append(post)
+        eligible_posts.append(post)
 
     lines: List[str] = []
     used_tokens = 0
     total_input = len(posts)
 
-    for idx, post in enumerate(deduped, start=1):
+    for idx, post in enumerate(eligible_posts, start=1):
         text = _post_text(post)
         if len(text) > 1200:
             text = f"{text[:1197].rsplit(' ', 1)[0]}..."
@@ -2523,9 +2683,7 @@ def _build_digest_context(
             else "unknown-time"
         )
 
-        link = _post_link(post)
-        link_part = f" | link={link}" if link else ""
-        line = f"{idx}. ({ts_label}) {text}{link_part}"
+        line = f"{idx}. ({ts_label}) {text}"
 
         line_tokens = estimate_tokens_rough(line) + 8
         if lines and (used_tokens + line_tokens > token_budget):
@@ -2533,7 +2691,7 @@ def _build_digest_context(
         if not lines and line_tokens > token_budget:
             # Guarantee at least one line by truncating aggressively.
             short = text[: max(120, token_budget * 4)]
-            line = f"{idx}. [{source}] ({ts_label}) {short}..."
+            line = f"{idx}. ({ts_label}) {short}..."
             line_tokens = estimate_tokens_rough(line)
 
         lines.append(line)
@@ -2554,13 +2712,43 @@ def _split_digest_sentences(text: str) -> List[str]:
     return [normalize_space(piece) for piece in pieces if normalize_space(piece)]
 
 
-def _clean_digest_source_text(text: str) -> tuple[str, int]:
+def _digest_posts_are_near_duplicates(left: str, right: str) -> bool:
+    left_key = _digest_line_key(left)
+    right_key = _digest_line_key(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    shorter, longer = sorted((left_key, right_key), key=len)
+    if len(shorter.split()) >= 8 and shorter in longer:
+        return True
+    return SequenceMatcher(None, left_key, right_key).ratio() >= 0.94
+
+
+def _dedupe_prepared_digest_posts(posts: Sequence[Dict[str, object]]) -> tuple[List[Dict[str, object]], int]:
+    unique_posts: List[Dict[str, object]] = []
+    removed = 0
+    for post in posts:
+        text = _post_text(post)
+        if not text:
+            continue
+        if any(_digest_posts_are_near_duplicates(text, _post_text(existing)) for existing in unique_posts):
+            removed += 1
+            continue
+        unique_posts.append(dict(post))
+    return unique_posts, removed
+
+
+def _clean_digest_source_text(text: str) -> tuple[str, int, int]:
     raw = re.sub(r"(?i)<br\s*/?>", "\n", _strip_digest_citations(strip_telegram_html(str(text or ""))))
     removed = 0
+    citation_removed = 0
     cleaned_lines: List[str] = []
     seen: set[str] = set()
     for part in re.split(r"\n+|(?<=[.!?])\s+", raw):
-        candidate = _digest_finalize_sentence(part, max_chars=280)
+        rewritten, rewritten_count = _digest_rewrite_source_attribution(part)
+        citation_removed += rewritten_count
+        candidate = _digest_finalize_sentence(rewritten, max_chars=280)
         if not candidate:
             removed += 1
             continue
@@ -2570,20 +2758,20 @@ def _clean_digest_source_text(text: str) -> tuple[str, int]:
             continue
         seen.add(key)
         cleaned_lines.append(candidate)
-    return normalize_space(" ".join(cleaned_lines)), removed
+    return normalize_space(" ".join(cleaned_lines)), removed, citation_removed
 
 
 async def _translate_digest_posts_to_english(
     posts: Sequence[Dict[str, object]],
     auth_manager: AuthManager,
-) -> tuple[List[Dict[str, object]], int]:
+) -> tuple[List[Dict[str, object]], int, int]:
     targets = [
         (idx, _post_text(post))
         for idx, post in enumerate(posts, start=1)
         if _digest_needs_english_rewrite(_post_text(post), "English")
     ]
     if not targets:
-        return [dict(post) for post in posts], 0
+        return [dict(post) for post in posts], 0, 0
 
     payload = "\n".join(f"{idx}. {text}" for idx, text in targets)
     instructions = (
@@ -2592,6 +2780,8 @@ async def _translate_digest_posts_to_english(
         "Rules:\n"
         "- Keep the factual meaning and uncertainty markers.\n"
         "- Remove usernames, channel names, outlet labels, links, hashtags, and promo text.\n"
+        "- Never write source-style attribution such as 'Hebrew sources report' or 'Channel X said'.\n"
+        "- If the original line depends on unattributed media or source wording, rewrite it with generic uncertainty such as 'initial reports indicate'.\n"
         "- Do not add any new facts.\n"
         "- Keep each item as one clean English evidence line."
     )
@@ -2599,13 +2789,14 @@ async def _translate_digest_posts_to_english(
         raw = await _call_codex_with_auth_repair(payload, auth_manager, instructions, verbosity="low")
         parsed = _try_parse_digest_json(raw) or {}
     except Exception:
-        return [dict(post) for post in posts], 0
+        return [dict(post) for post in posts], 0, 0
 
     translated_items = parsed.get("items")
     if not isinstance(translated_items, list):
-        return [dict(post) for post in posts], 0
+        return [dict(post) for post in posts], 0, 0
 
     translated_map: Dict[int, str] = {}
+    citation_removed_total = 0
     for item in translated_items:
         if not isinstance(item, dict):
             continue
@@ -2613,7 +2804,9 @@ async def _translate_digest_posts_to_english(
             item_id = int(item.get("id") or 0)
         except Exception:
             item_id = 0
-        cleaned = _digest_finalize_sentence(item.get("text") or "", max_chars=280)
+        rewritten, rewritten_count = _digest_rewrite_source_attribution(item.get("text") or "")
+        citation_removed_total += rewritten_count
+        cleaned = _digest_finalize_sentence(rewritten, max_chars=280)
         if item_id > 0 and cleaned:
             translated_map[item_id] = cleaned
 
@@ -2626,7 +2819,7 @@ async def _translate_digest_posts_to_english(
             updated["raw_text"] = translated
             translated_count += 1
         updated_posts.append(updated)
-    return updated_posts, translated_count
+    return updated_posts, translated_count, citation_removed_total
 
 
 async def _prepare_digest_posts(
@@ -2635,9 +2828,11 @@ async def _prepare_digest_posts(
 ) -> tuple[List[Dict[str, object]], Dict[str, int]]:
     prepared: List[Dict[str, object]] = []
     noise_stripped_count = 0
+    citation_stripped_count = 0
     for post in posts:
-        cleaned_text, removed = _clean_digest_source_text(_post_text(post))
+        cleaned_text, removed, citation_removed = _clean_digest_source_text(_post_text(post))
         noise_stripped_count += removed
+        citation_stripped_count += citation_removed
         if not cleaned_text or _likely_noise(cleaned_text):
             noise_stripped_count += 1
             continue
@@ -2645,10 +2840,14 @@ async def _prepare_digest_posts(
         updated["raw_text"] = cleaned_text
         prepared.append(updated)
 
-    translated_posts, translation_applied_count = await _translate_digest_posts_to_english(prepared, auth_manager)
-    return translated_posts, {
+    translated_posts, translation_applied_count, translated_citation_strips = await _translate_digest_posts_to_english(prepared, auth_manager)
+    citation_stripped_count += translated_citation_strips
+    deduped_posts, duplicate_collapsed_count = _dedupe_prepared_digest_posts(translated_posts)
+    return deduped_posts, {
         "noise_stripped_count": noise_stripped_count,
         "translation_applied_count": translation_applied_count,
+        "citation_stripped_count": citation_stripped_count,
+        "duplicate_collapsed_count": duplicate_collapsed_count,
     }
 
 
@@ -4261,6 +4460,8 @@ def _make_generated_text_result(
     timeline_item_count: int = 0,
     noise_stripped_count: int = 0,
     translation_applied_count: int = 0,
+    citation_stripped_count: int = 0,
+    duplicate_collapsed_count: int = 0,
 ) -> GeneratedTextResult:
     return GeneratedTextResult(
         html=html,
@@ -4272,6 +4473,8 @@ def _make_generated_text_result(
         timeline_item_count=max(0, int(timeline_item_count)),
         noise_stripped_count=max(0, int(noise_stripped_count)),
         translation_applied_count=max(0, int(translation_applied_count)),
+        citation_stripped_count=max(0, int(citation_stripped_count)),
+        duplicate_collapsed_count=max(0, int(duplicate_collapsed_count)),
     )
 
 
@@ -4304,8 +4507,8 @@ def _digest_quality_issue(text: str, quiet_text: str) -> str:
     if _digest_needs_english_rewrite(text, "English"):
         return "non_english_leftovers"
     lowered = cleaned.lower()
-    if "t.me/" in lowered or "telegram.me/" in lowered or _FEED_HANDLE_RE.search(cleaned):
-        return "source_leak"
+    if _digest_has_citation_language(cleaned):
+        return "citation_leak"
     if _DIGEST_HASHTAG_RE.search(cleaned) or _DIGEST_PROMO_FRAGMENT_RE.search(cleaned):
         return "source_leak"
 
@@ -4314,6 +4517,7 @@ def _digest_quality_issue(text: str, quiet_text: str) -> str:
         return "empty_output"
 
     block_count = 0
+    seen_digest_lines: set[str] = set()
     for raw_block in raw_blocks:
         lines = [
             normalize_space(strip_telegram_html(line))
@@ -4328,6 +4532,10 @@ def _digest_quality_issue(text: str, quiet_text: str) -> str:
             if len(lines) == 1:
                 return "messy_layout"
             for line in lines[1:]:
+                key = _digest_line_key(line)
+                if not key or key in seen_digest_lines:
+                    return "duplication"
+                seen_digest_lines.add(key)
                 issue = _news_copy_quality_issue(line, line, allow_short=True)
                 if issue in {"vague_copy", "incomplete_copy"}:
                     return issue
@@ -4338,10 +4546,18 @@ def _digest_quality_issue(text: str, quiet_text: str) -> str:
             return "messy_layout"
         if bold_count == 0 and len(lines) > 1:
             return "messy_layout"
+        if bold_count == 0 and _DIGEST_WEAK_SCENE_SETTER_RE.search(lines[0]):
+            return "weak_scene_setter"
 
-        if len(lines) >= 2 and lines[0].lower() == lines[1].lower():
-            return "messy_layout"
+        if len(lines) >= 2 and SequenceMatcher(None, lines[0].lower(), lines[1].lower()).ratio() >= 0.86:
+            return "duplication"
         for line in lines:
+            key = _digest_line_key(line)
+            if not key:
+                return "messy_layout"
+            if key in seen_digest_lines:
+                return "duplication"
+            seen_digest_lines.add(key)
             issue = _news_copy_quality_issue(line, line, allow_short=True)
             if issue in {"vague_copy", "incomplete_copy"}:
                 return issue
@@ -4375,7 +4591,8 @@ def _digest_retry_prompt(prompt: str, issue: str) -> str:
         f"{prompt}\n\nRevision feedback:\n- {_filter_retry_feedback(issue)}\n"
         "- Rebuild the digest as a premium newsroom brief with a scene setter, major grouped stories, and an Also moving rail.\n"
         "- Do not leave any meaningful update behind.\n"
-        "- Keep it English-only and remove all source branding, handles, hashtags, and promo junk."
+        "- Keep it English-only and remove all source branding, handles, hashtags, promo junk, and citation-style phrasing.\n"
+        "- If uncertainty is needed, use generic wording only, such as 'initial reports indicate' or 'preliminary reports suggest'."
     )
 
 
@@ -4404,12 +4621,18 @@ async def create_digest_summary_result(
     manager = auth_manager or AuthManager(logger=LOGGER)
     max_lines = max(24, min(max(24, len(posts) * 6), 600))
     prepared_posts, prep_stats = await _prepare_digest_posts(posts, manager)
+    noise_stripped_count = int(prep_stats.get("noise_stripped_count") or 0)
+    translation_applied_count = int(prep_stats.get("translation_applied_count") or 0)
+    citation_stripped_count = int(prep_stats.get("citation_stripped_count") or 0)
+    duplicate_collapsed_count = int(prep_stats.get("duplicate_collapsed_count") or 0)
     if not prepared_posts:
         return _make_generated_text_result(
             quiet_text,
             copy_origin="fallback",
-            noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
-            translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
+            noise_stripped_count=noise_stripped_count,
+            translation_applied_count=translation_applied_count,
+            citation_stripped_count=citation_stripped_count,
+            duplicate_collapsed_count=duplicate_collapsed_count,
         )
 
     token_budget = _resolve_digest_token_budget()
@@ -4423,8 +4646,10 @@ async def create_digest_summary_result(
         return _make_generated_text_result(
             quiet_text,
             copy_origin="fallback",
-            noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
-            translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
+            noise_stripped_count=noise_stripped_count,
+            translation_applied_count=translation_applied_count,
+            citation_stripped_count=citation_stripped_count,
+            duplicate_collapsed_count=duplicate_collapsed_count,
         )
 
     prefer_json = bool(getattr(config, "DIGEST_PREFER_JSON_OUTPUT", True))
@@ -4439,8 +4664,10 @@ async def create_digest_summary_result(
         f"- Total queued posts: {len(posts)}\n"
         f"- Posts after cleanup: {len(prepared_posts)}\n"
         f"- Included after dedupe/noise/token budget: {included_count}\n"
-        f"- Noise fragments stripped: {int(prep_stats.get('noise_stripped_count') or 0)}\n"
-        f"- Pre-translation lines rewritten to English: {int(prep_stats.get('translation_applied_count') or 0)}\n"
+        f"- Noise fragments stripped: {noise_stripped_count}\n"
+        f"- Source/citation fragments stripped: {citation_stripped_count}\n"
+        f"- Duplicate posts collapsed before writing: {duplicate_collapsed_count}\n"
+        f"- Pre-translation lines rewritten to English: {translation_applied_count}\n"
         f"- Estimated input tokens: {sum(estimate_tokens_rough(x) for x in lines)}\n\n"
         + build_digest_input_block(lines)
     )
@@ -4478,8 +4705,10 @@ async def create_digest_summary_result(
                 ai_quality_retry_used=(round_number == 2),
                 major_block_count=major_block_count,
                 timeline_item_count=timeline_item_count,
-                noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
-                translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
+                noise_stripped_count=noise_stripped_count,
+                translation_applied_count=translation_applied_count,
+                citation_stripped_count=citation_stripped_count,
+                duplicate_collapsed_count=duplicate_collapsed_count,
             )
             log_structured(
                 LOGGER,
@@ -4493,6 +4722,9 @@ async def create_digest_summary_result(
                 timeline_item_count=result.timeline_item_count,
                 noise_stripped_count=result.noise_stripped_count,
                 translation_applied_count=result.translation_applied_count,
+                citation_stripped_count=result.citation_stripped_count,
+                duplicate_collapsed_count=result.duplicate_collapsed_count,
+                quality_issue="",
             )
             return result
 
@@ -4509,8 +4741,10 @@ async def create_digest_summary_result(
                     ai_quality_retry_used=True,
                     major_block_count=major_block_count,
                     timeline_item_count=timeline_item_count,
-                    noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
-                    translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
+                    noise_stripped_count=noise_stripped_count,
+                    translation_applied_count=translation_applied_count,
+                    citation_stripped_count=citation_stripped_count,
+                    duplicate_collapsed_count=duplicate_collapsed_count,
                 )
                 log_structured(
                     LOGGER,
@@ -4524,6 +4758,9 @@ async def create_digest_summary_result(
                     timeline_item_count=result.timeline_item_count,
                     noise_stripped_count=result.noise_stripped_count,
                     translation_applied_count=result.translation_applied_count,
+                    citation_stripped_count=result.citation_stripped_count,
+                    duplicate_collapsed_count=result.duplicate_collapsed_count,
+                    quality_issue=retry_issue,
                 )
                 return result
             continue
@@ -4543,8 +4780,10 @@ async def create_digest_summary_result(
                         ai_quality_retry_used=True,
                         major_block_count=major_block_count,
                         timeline_item_count=timeline_item_count,
-                        noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
-                        translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
+                        noise_stripped_count=noise_stripped_count,
+                        translation_applied_count=translation_applied_count,
+                        citation_stripped_count=citation_stripped_count,
+                        duplicate_collapsed_count=duplicate_collapsed_count,
                     )
                     log_structured(
                         LOGGER,
@@ -4558,6 +4797,9 @@ async def create_digest_summary_result(
                         timeline_item_count=result.timeline_item_count,
                         noise_stripped_count=result.noise_stripped_count,
                         translation_applied_count=result.translation_applied_count,
+                        citation_stripped_count=result.citation_stripped_count,
+                        duplicate_collapsed_count=result.duplicate_collapsed_count,
+                        quality_issue=retry_issue,
                     )
                     return result
                 continue
@@ -4589,8 +4831,10 @@ async def create_digest_summary_result(
                     ai_quality_retry_used=True,
                     major_block_count=major_block_count,
                     timeline_item_count=timeline_item_count,
-                    noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
-                    translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
+                    noise_stripped_count=noise_stripped_count,
+                    translation_applied_count=translation_applied_count,
+                    citation_stripped_count=citation_stripped_count,
+                    duplicate_collapsed_count=duplicate_collapsed_count,
                 )
                 log_structured(
                     LOGGER,
@@ -4604,6 +4848,9 @@ async def create_digest_summary_result(
                     timeline_item_count=result.timeline_item_count,
                     noise_stripped_count=result.noise_stripped_count,
                     translation_applied_count=result.translation_applied_count,
+                    citation_stripped_count=result.citation_stripped_count,
+                    duplicate_collapsed_count=result.duplicate_collapsed_count,
+                    quality_issue=quality_issue,
                 )
                 return result
             continue
@@ -4616,8 +4863,10 @@ async def create_digest_summary_result(
             ai_quality_retry_used=(round_number == 2),
             major_block_count=major_block_count,
             timeline_item_count=timeline_item_count,
-            noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
-            translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
+            noise_stripped_count=noise_stripped_count,
+            translation_applied_count=translation_applied_count,
+            citation_stripped_count=citation_stripped_count,
+            duplicate_collapsed_count=duplicate_collapsed_count,
         )
         log_structured(
             LOGGER,
@@ -4631,6 +4880,9 @@ async def create_digest_summary_result(
             timeline_item_count=result.timeline_item_count,
             noise_stripped_count=result.noise_stripped_count,
             translation_applied_count=result.translation_applied_count,
+            citation_stripped_count=result.citation_stripped_count,
+            duplicate_collapsed_count=result.duplicate_collapsed_count,
+            quality_issue="",
         )
         return result
 
@@ -4644,8 +4896,10 @@ async def create_digest_summary_result(
         ai_quality_retry_used=True,
         major_block_count=major_block_count,
         timeline_item_count=timeline_item_count,
-        noise_stripped_count=int(prep_stats.get("noise_stripped_count") or 0),
-        translation_applied_count=int(prep_stats.get("translation_applied_count") or 0),
+        noise_stripped_count=noise_stripped_count,
+        translation_applied_count=translation_applied_count,
+        citation_stripped_count=citation_stripped_count,
+        duplicate_collapsed_count=duplicate_collapsed_count,
     )
     log_structured(
         LOGGER,
@@ -4659,6 +4913,9 @@ async def create_digest_summary_result(
         timeline_item_count=result.timeline_item_count,
         noise_stripped_count=result.noise_stripped_count,
         translation_applied_count=result.translation_applied_count,
+        citation_stripped_count=result.citation_stripped_count,
+        duplicate_collapsed_count=result.duplicate_collapsed_count,
+        quality_issue=retry_issue or "quality_rejected_after_retry",
     )
     return result
 

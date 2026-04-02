@@ -7274,6 +7274,8 @@ async def _build_window_digest_messages(
             "timeline_item_count": 0,
             "noise_stripped_count": 0,
             "translation_applied_count": 0,
+            "citation_stripped_count": 0,
+            "duplicate_collapsed_count": 0,
         }
 
     rendered_bodies: List[str] = []
@@ -7284,6 +7286,8 @@ async def _build_window_digest_messages(
     timeline_item_count = 0
     noise_stripped_count = 0
     translation_applied_count = 0
+    citation_stripped_count = 0
+    duplicate_collapsed_count = 0
     max_body_chars = max(1200, _digest_send_chunk_size() - 220)
 
     for part_index, row_group in enumerate(
@@ -7327,6 +7331,8 @@ async def _build_window_digest_messages(
         timeline_item_count += int(result.timeline_item_count or 0)
         noise_stripped_count += int(result.noise_stripped_count or 0)
         translation_applied_count += int(result.translation_applied_count or 0)
+        citation_stripped_count += int(result.citation_stripped_count or 0)
+        duplicate_collapsed_count += int(result.duplicate_collapsed_count or 0)
 
     if not rendered_bodies:
         rendered_bodies = [quiet_period_message(interval_minutes)]
@@ -7353,6 +7359,8 @@ async def _build_window_digest_messages(
         "timeline_item_count": timeline_item_count,
         "noise_stripped_count": noise_stripped_count,
         "translation_applied_count": translation_applied_count,
+        "citation_stripped_count": citation_stripped_count,
+        "duplicate_collapsed_count": duplicate_collapsed_count,
     }
 
 
@@ -7440,6 +7448,8 @@ async def _flush_digest_queue_once() -> bool:
                 timeline_item_count=int(stats.get("timeline_item_count") or 0),
                 noise_stripped_count=int(stats.get("noise_stripped_count") or 0),
                 translation_applied_count=int(stats.get("translation_applied_count") or 0),
+                citation_stripped_count=int(stats.get("citation_stripped_count") or 0),
+                duplicate_collapsed_count=int(stats.get("duplicate_collapsed_count") or 0),
                 digest_mode="strict_digest_only",
             )
             return True
@@ -7525,6 +7535,8 @@ async def _send_daily_archive_digest_once() -> None:
                 timeline_item_count=int(stats.get("timeline_item_count") or 0),
                 noise_stripped_count=int(stats.get("noise_stripped_count") or 0),
                 translation_applied_count=int(stats.get("translation_applied_count") or 0),
+                citation_stripped_count=int(stats.get("citation_stripped_count") or 0),
+                duplicate_collapsed_count=int(stats.get("duplicate_collapsed_count") or 0),
             )
         except Exception:
             LOGGER.exception("Daily archive digest generation/sending failed.")

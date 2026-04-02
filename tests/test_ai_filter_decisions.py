@@ -357,8 +357,50 @@ async def test_prepare_digest_posts_translates_non_english_lines(monkeypatch):
         _FakeAuthManager(),
     )
 
-    assert prepared[0]["raw_text"] == "Hebrew-language sources reported continuous unusual explosions in Tel Aviv."
+    assert prepared[0]["raw_text"] == "Initial reports indicate continuous unusual explosions in Tel Aviv."
     assert stats["translation_applied_count"] == 1
+    assert stats["citation_stripped_count"] >= 1
+
+
+def test_digest_clean_line_rewrites_citation_style_attribution_to_generic_uncertainty():
+    cleaned = ai_filter._digest_clean_line(
+        "Hebrew-language sources reported continuous unusual explosions in Tel Aviv.",
+        max_chars=220,
+        allow_short=True,
+    )
+
+    assert cleaned == "Initial reports indicate continuous unusual explosions in Tel Aviv."
+
+
+@pytest.mark.asyncio
+async def test_prepare_digest_posts_collapses_duplicate_citation_variants():
+    prepared, stats = await ai_filter._prepare_digest_posts(
+        [
+            {
+                "text": "Enemy media: Preliminary reports of a direct hit in Petah Tikva.",
+                "source_name": "Desk",
+            },
+            {
+                "text": "Fox: Preliminary reports of a direct hit in Petah Tikva.",
+                "source_name": "Desk",
+            },
+        ],
+        _FakeAuthManager(),
+    )
+
+    assert len(prepared) == 1
+    assert prepared[0]["raw_text"] == "Preliminary reports indicate a direct hit in Petah Tikva."
+    assert stats["citation_stripped_count"] >= 2
+    assert stats["duplicate_collapsed_count"] == 1
+
+
+def test_digest_quality_issue_rejects_direct_citation_language():
+    html = (
+        "<b>Central Israel Impact Reports</b><br>"
+        "Hebrew-language sources reported continuous unusual explosions in Tel Aviv."
+    )
+
+    assert ai_filter._digest_quality_issue(html, ai_filter.quiet_period_message(30)) == "citation_leak"
 
 
 def test_digest_quality_issue_rejects_source_leaks_and_messy_layout():
@@ -369,6 +411,7 @@ def test_digest_quality_issue_rejects_source_leaks_and_messy_layout():
     )
 
     assert ai_filter._digest_quality_issue(html, ai_filter.quiet_period_message(30)) in {
+        "citation_leak",
         "source_leak",
         "messy_layout",
     }

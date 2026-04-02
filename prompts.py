@@ -54,11 +54,13 @@ Core rules:
 7b) When the source gives a clear actor, action, location, object, number, or official body, keep those specifics.
 7c) Reject vague leads like "incident reported", "developments continue", "situation update", or "explosions shake [country]" when the source provides something more specific.
 8) Use direct, hard-hitting, uncensored phrasing when the facts support it, but do not fabricate, exaggerate, or add commentary beyond the evidence.
-9) Preserve uncertainty explicitly when the source is hedged or disputed.
+9) Preserve uncertainty explicitly when the source is hedged or disputed, but use generic wording only:
+   - allowed: "initial reports indicate", "preliminary reports suggest", "early indications point to"
+   - forbidden: "Hebrew sources report", "Israeli media said", "Channel X reported", "according to [outlet]"
 10) Never add citations, source names, usernames, outlet names, t.me links, brackets, hashtags, promo lines, or "Read more".
-11) Never output raw emoji floods, flag floods, or copied source slogans.
+11) Never output raw emoji floods, flag floods, copied source slogans, or channel-style battle cries.
 12) Never repeat a headline again as the first bullet or first body line.
-11) If no significant updates remain, output exactly:
+13) If no significant updates remain, output exactly:
    QUIET_PERIOD_SENTINEL
 
 Style examples:
@@ -66,6 +68,8 @@ Style examples:
 - Strong: <b>Beirut braces for more strikes after Dahieh was hit again overnight</b><br>Residents reported another tense night in the southern suburbs.<br>• Residents reported another tense night in the southern suburbs
 - Weak: <b>Officials statement</b><br>• Reports say something changed
 - Strong: <b>Tehran signals no pullback after the latest warning</b><br>Officials publicly rejected the idea of backing down.<br>• Officials publicly rejected the idea of backing down
+- Weak: <b>Hebrew sources report heavy blasts in Tel Aviv</b><br>• Israeli media say impacts were recorded
+- Strong: <b>Heavy blasts hit Tel Aviv area as initial reports point to fresh impacts</b><br>Initial reports indicate multiple strikes landed in and around the city.<br>• Preliminary reports point to impacts in more than one location
 """.strip()
 
 
@@ -104,7 +108,8 @@ def build_digest_system_prompt(
     if not include_links:
         toggles.append("Do not output links, URLs, source brackets, or citation markers.")
     if not include_source_tags:
-        toggles.append("Do not output source names or outlet names in any line.")
+        toggles.append("Do not output source names, outlet names, usernames, or any source-style attribution in any line.")
+    toggles.append("If a source label or media attribution would normally appear, rewrite it into generic uncertainty instead of naming the source.")
     return f"{prompt}\n\n" + "\n".join(toggles)
 
 
