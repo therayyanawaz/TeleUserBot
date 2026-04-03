@@ -45,6 +45,7 @@ import config
 from ai_filter import (
     create_digest_summary,
     create_digest_summary_result,
+    extract_digest_narrative_parts,
     decide_filter_action,
     extract_feed_summary_parts,
     generate_answer_from_context,
@@ -6893,36 +6894,166 @@ def _format_digest_message(
 ) -> str:
     timestamp = datetime.now().astimezone().strftime("%H:%M %Z").strip()
     label = sanitize_telegram_html(title.strip() or "Digest")
-    header = f"<b>{label}</b>"
+    header = f"<b>📰 {label}</b>"
     metadata = sanitize_telegram_html(f"{timestamp} • {total_updates} updates reviewed")
     _ = sources
     return sanitize_telegram_html(f"{header}<br>{metadata}<br><br>{digest_body.strip()}")
+
+
+def _digest_support_line_limit() -> int:
+    raw = getattr(config, "DIGEST_MAX_LINES", 12)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 12
+    return max(3, min(value, 12))
+
+
+def _render_digest_body_sections(
+    headline: str,
+    story: str,
+    highlights: Sequence[str],
+    also_moving: Sequence[str],
+) -> str:
+    clean_headline = normalize_space(strip_telegram_html(headline))
+    clean_story = normalize_space(strip_telegram_html(story))
+    if not clean_headline or not clean_story:
+        return sanitize_telegram_html(normalize_space(strip_telegram_html(story or headline)))
+
+    blocks = [
+        "<br>".join(
+            [
+                f"<b>{sanitize_telegram_html(clean_headline)}</b>",
+                sanitize_telegram_html(clean_story),
+                *[
+                    f"• {sanitize_telegram_html(normalize_space(strip_telegram_html(item)))}"
+                    for item in highlights
+                    if normalize_space(strip_telegram_html(item))
+                ],
+            ]
+        )
+    ]
+    if any(normalize_space(strip_telegram_html(item)) for item in also_moving):
+        blocks.append(
+            "<br>".join(
+                [
+                    "<i>Also moving</i>",
+                    *[
+                        f"• {sanitize_telegram_html(normalize_space(strip_telegram_html(item)))}"
+                        for item in also_moving
+                        if normalize_space(strip_telegram_html(item))
+                    ],
+                ]
+            )
+        )
+    return sanitize_telegram_html("<br><br>".join(blocks))
+
+
+def _split_digest_story_sentences(text: str, *, limit: int) -> List[str]:
+    cleaned = normalize_space(strip_telegram_html(text))
+    if not cleaned:
+        return []
+    if len(cleaned) <= limit:
+        return [cleaned]
+
+    sentences = [
+        normalize_space(part)
+        for part in re.split(r"(?<=[.!?])\s+", cleaned)
+        if normalize_space(part)
+    ]
+    if not sentences:
+        return [cleaned]
+
+    chunks: List[str] = []
+    current = ""
+    for sentence in sentences:
+        candidate = f"{current} {sentence}".strip() if current else sentence
+        if current and len(candidate) > limit:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks or [cleaned]
 
 
 def _split_digest_body_blocks(digest_body: str, *, max_chars: int) -> List[str]:
     cleaned = normalize_space(str(digest_body or ""))
     if not cleaned:
         return []
-    raw_blocks = [
-        block.strip()
-        for block in re.split(r"(?:<br\s*/?>\s*){2,}|\n\s*\n", str(digest_body or ""), flags=re.IGNORECASE)
-        if normalize_space(strip_telegram_html(block))
-    ]
-    if not raw_blocks:
+    headline, story, highlights, also_moving = extract_digest_narrative_parts(
+        digest_body,
+        max_lines=_digest_support_line_limit(),
+    )
+    if not headline or not story:
         return [sanitize_telegram_html(cleaned)]
 
+    story_chunks = _split_digest_story_sentences(
+        story,
+        limit=max(140, max_chars - len(normalize_space(headline)) - 60),
+    )
+    if not story_chunks:
+        story_chunks = [story]
+
     chunks: List[str] = []
-    current_blocks: List[str] = []
-    for block in raw_blocks:
-        candidate = "<br><br>".join(current_blocks + [block])
-        if current_blocks and len(candidate) > max_chars:
-            chunks.append(sanitize_telegram_html("<br><br>".join(current_blocks)))
-            current_blocks = [block]
-        else:
-            current_blocks.append(block)
-    if current_blocks:
-        chunks.append(sanitize_telegram_html("<br><br>".join(current_blocks)))
-    return [chunk for chunk in chunks if normalize_space(strip_telegram_html(chunk))]
+    for story_chunk in story_chunks[:-1]:
+        rendered = _render_digest_body_sections(headline, story_chunk, [], [])
+        if normalize_space(strip_telegram_html(rendered)):
+            chunks.append(rendered)
+
+    active_story = story_chunks[-1]
+    remaining_highlights = list(highlights)
+    remaining_also = list(also_moving)
+    support_limit = _digest_support_line_limit()
+    base_body_len = len(_render_digest_body_sections(headline, active_story, [], []))
+
+    if not remaining_highlights and not remaining_also:
+        rendered = _render_digest_body_sections(headline, active_story, [], [])
+        return [rendered] if normalize_space(strip_telegram_html(rendered)) else []
+
+    while remaining_highlights or remaining_also:
+        part_highlights: List[str] = []
+        part_also: List[str] = []
+
+        while remaining_highlights and len(part_highlights) + len(part_also) < support_limit:
+            candidate = _render_digest_body_sections(
+                headline,
+                active_story,
+                [*part_highlights, remaining_highlights[0]],
+                part_also,
+            )
+            if len(candidate) > max_chars and (part_highlights or base_body_len <= max_chars):
+                break
+            part_highlights.append(remaining_highlights.pop(0))
+
+        while remaining_also and len(part_highlights) + len(part_also) < support_limit:
+            candidate = _render_digest_body_sections(
+                headline,
+                active_story,
+                part_highlights,
+                [*part_also, remaining_also[0]],
+            )
+            if len(candidate) > max_chars and (part_also or part_highlights or base_body_len <= max_chars):
+                break
+            part_also.append(remaining_also.pop(0))
+
+        if not part_highlights and not part_also:
+            if remaining_highlights:
+                part_highlights.append(remaining_highlights.pop(0))
+            elif remaining_also:
+                part_also.append(remaining_also.pop(0))
+
+        rendered = _render_digest_body_sections(
+            headline,
+            active_story,
+            part_highlights,
+            part_also,
+        )
+        if normalize_space(strip_telegram_html(rendered)):
+            chunks.append(rendered)
+
+    return chunks or [_render_digest_body_sections(headline, active_story, [], [])]
 
 
 def _get_last_completed_digest_window_end() -> int | None:
@@ -7073,14 +7204,14 @@ def _digest_window_label(window_start_ts: int, window_end_ts: int) -> str:
 
 def _rolling_digest_title(window_start_ts: int, window_end_ts: int, *, part_index: int, part_count: int) -> str:
     base = f"30-Minute Digest ({_digest_window_label(window_start_ts, window_end_ts)})"
-    if part_count > 1:
+    if part_count > 1 and part_index > 1:
         return f"{base} • Part {part_index}/{part_count}"
     return base
 
 
 def _daily_digest_title(window_hours: int, *, part_index: int, part_count: int) -> str:
     base = f"24h Digest (last {window_hours}h)"
-    if part_count > 1:
+    if part_count > 1 and part_index > 1:
         return f"{base} • Part {part_index}/{part_count}"
     return base
 

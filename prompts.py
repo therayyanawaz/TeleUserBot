@@ -41,16 +41,13 @@ Core rules:
 2) Remove promo/spam/noise/polls/meme chatter/source branding before writing.
 3) Merge duplicates and paraphrased echoes, but do not lose any distinct factual update.
 4) Every meaningful post in the provided batch must be represented somewhere in the digest, either directly or inside a merged story block.
-5) Use a hybrid flow:
-   - scene setter: one sharp sentence if useful
-   - major grouped stories first
-   - a short "Also moving" rail for smaller but relevant developments
-6) Major story blocks must look like:
-   <b>Sharp story headline</b><br>
-   One clean lede sentence.<br>
-   • fact line 1<br>
-   • fact line 2
-7) Story headlines, ledes, and fact lines must be concrete, complete, and newsroom-sharp.
+5) Default to one narrative-first digest brief, not a pile of separate micro-blocks.
+6) The digest must contain:
+   - one sharp headline
+   - one short story paragraph that covers the whole window
+   - a small highlights list for the most important specifics
+   - an optional short "Also moving" rail for overflow only
+7) The story paragraph must summarize the full window, not merely introduce it.
 7b) When the source gives a clear actor, action, location, object, number, or official body, keep those specifics.
 7c) Reject vague leads like "incident reported", "developments continue", "situation update", or "explosions shake [country]" when the source provides something more specific.
 8) Use direct, hard-hitting, uncensored phrasing when the facts support it, but do not fabricate, exaggerate, or add commentary beyond the evidence.
@@ -59,17 +56,17 @@ Core rules:
    - forbidden: "Hebrew sources report", "Israeli media said", "Channel X reported", "according to [outlet]"
 10) Never add citations, source names, usernames, outlet names, t.me links, brackets, hashtags, promo lines, or "Read more".
 11) Never output raw emoji floods, flag floods, copied source slogans, or channel-style battle cries.
-12) Never repeat a headline again as the first bullet or first body line.
+12) Never repeat the headline as the first sentence of the story or as the first bullet.
 13) If no significant updates remain, output exactly:
    QUIET_PERIOD_SENTINEL
 
 Style examples:
-- Weak: <b>Situation update</b><br>• Activity continues
-- Strong: <b>Beirut braces for more strikes after Dahieh was hit again overnight</b><br>Residents reported another tense night in the southern suburbs.<br>• Residents reported another tense night in the southern suburbs
-- Weak: <b>Officials statement</b><br>• Reports say something changed
-- Strong: <b>Tehran signals no pullback after the latest warning</b><br>Officials publicly rejected the idea of backing down.<br>• Officials publicly rejected the idea of backing down
-- Weak: <b>Hebrew sources report heavy blasts in Tel Aviv</b><br>• Israeli media say impacts were recorded
-- Strong: <b>Heavy blasts hit Tel Aviv area as initial reports point to fresh impacts</b><br>Initial reports indicate multiple strikes landed in and around the city.<br>• Preliminary reports point to impacts in more than one location
+- Weak: <b>Situation update</b><br>Activity continues.
+- Strong: <b>Beirut braces for more strikes after Dahieh was hit again overnight</b><br>Another wave of overnight strikes and warnings kept the southern suburbs under pressure while follow-on reports pointed to more damage and fresh movement around the area.<br>• Residents reported another tense night in the southern suburbs.
+- Weak: <b>Officials statement</b><br>Reports say something changed.
+- Strong: <b>Tehran signals no pullback after the latest warning</b><br>Officials publicly rejected the idea of backing down, and the broader batch showed no sign that military pressure or public messaging is easing.<br>• Officials publicly rejected the idea of backing down.
+- Weak: <b>Hebrew sources report heavy blasts in Tel Aviv</b><br>Israeli media say impacts were recorded.
+- Strong: <b>Heavy blasts hit the Tel Aviv area as fresh impacts were reported</b><br>Initial reports indicate multiple strikes landed in and around the city while follow-on updates pointed to damage, interceptions, and additional alerts across the wider area.<br>• Preliminary reports point to impacts in more than one location.
 """.strip()
 
 
@@ -96,15 +93,15 @@ def build_digest_system_prompt(
     ]
     if json_mode:
         toggles.append(
-            'Return ONLY one JSON object with this schema: {"quiet": boolean, "scene_setter": string, "major_blocks": [{"headline": string, "lede": string, "facts": [string, ...], "priority": "high|medium|low"}], "timeline_items": [string, ...]}.'
+            'Return ONLY one JSON object with this schema: {"quiet": boolean, "headline": string, "story": string, "highlights": [string, ...], "also_moving": [string, ...]}.'
         )
-        toggles.append("Use 3-7 major blocks when the evidence supports it, then move smaller updates into timeline_items.")
-        toggles.append("Every major block must have a concrete headline, one lede sentence, and 1-4 fact lines in plain text.")
-        toggles.append("timeline_items must be short standalone English sentences.")
+        toggles.append("The story must be one compact paragraph that covers the whole digest window.")
+        toggles.append("highlights must hold the key specifics that support the story.")
+        toggles.append("also_moving is optional and should contain only a few smaller overflow updates.")
         toggles.append("Do not include HTML inside JSON values.")
     else:
-        toggles.append("Return Telegram HTML only using this order: optional scene-setter paragraph, major story blocks, then an italic Also moving rail.")
-        toggles.append("Each major block must have one bold headline, one plain-text lede sentence, then 1-4 bullet fact lines.")
+        toggles.append("Return Telegram HTML only using this order: one bold headline, one short story paragraph, bullet highlights, then an italic Also moving rail only if needed.")
+        toggles.append("Keep the digest narrative-first and easy to read like a mini brief, not a stack of unrelated blocks.")
     if not include_links:
         toggles.append("Do not output links, URLs, source brackets, or citation markers.")
     if not include_source_tags:

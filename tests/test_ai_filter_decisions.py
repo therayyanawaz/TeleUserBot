@@ -247,7 +247,37 @@ async def test_create_digest_summary_result_falls_back_after_weak_ai_retry(monke
     assert calls["count"] == 2
 
 
-def test_json_digest_to_html_renders_story_blocks():
+def test_json_digest_to_html_renders_narrative_digest():
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "headline": "Port reopens after a three-day shutdown",
+            "story": (
+                "Officials said cargo traffic resumes at dawn while security checks remain in place "
+                "around the eastern gate and nearby movement stayed under watch."
+            ),
+            "highlights": [
+                "Truck traffic resumed before sunrise.",
+                "Security checks remain in place around the eastern gate.",
+            ],
+            "also_moving": [
+                "Air defenses were activated over the northern district after a fresh barrage."
+            ],
+        },
+        interval_minutes=30,
+        max_lines=12,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "<b>Port reopens after a three-day shutdown</b>" in html
+    assert "Officials said cargo traffic resumes at dawn" in plain
+    assert "Truck traffic resumed before sunrise." in plain
+    assert "• Security checks remain in place around the eastern gate." in html
+    assert "<i>Also moving</i>" in html
+    assert "• Air defenses were activated over the northern district after a fresh barrage." in html
+
+
+def test_json_digest_to_html_normalizes_legacy_payload_to_narrative_shape():
     html = ai_filter._json_digest_to_html(
         {
             "quiet": False,
@@ -269,13 +299,40 @@ def test_json_digest_to_html_renders_story_blocks():
         interval_minutes=30,
         max_lines=12,
     )
+    plain = ai_filter.strip_telegram_html(html)
 
-    assert "Port operations and nearby security activity drove the window." in html
     assert "<b>Port reopens after a three-day shutdown</b>" in html
-    assert "Officials said cargo traffic resumes at dawn." in html
-    assert "• Security checks remain in place around the eastern gate." in html
-    assert "<i>Also moving</i>" in html
-    assert "• Air defenses were activated over the northern district after a fresh barrage." in html
+    assert "Port operations and nearby security activity drove the window." in plain
+    assert "Officials said cargo traffic resumes at dawn." in plain
+    assert "Security checks remain in place around the eastern gate." in plain
+    assert "Also moving" in plain
+
+
+def test_json_digest_to_html_dedupes_story_highlights_and_also_moving():
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "headline": "Port reopens after a three-day shutdown",
+            "story": (
+                "Port reopens after a three-day shutdown. Officials said cargo traffic resumes at dawn."
+            ),
+            "highlights": [
+                "Officials said cargo traffic resumes at dawn.",
+                "Security checks remain in place around the eastern gate.",
+            ],
+            "also_moving": [
+                "Security checks remain in place around the eastern gate.",
+                "Air defenses were activated over the northern district after a fresh barrage.",
+            ],
+        },
+        interval_minutes=30,
+        max_lines=12,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert plain.count("Port reopens after a three-day shutdown") == 1
+    assert plain.count("Officials said cargo traffic resumes at dawn") == 1
+    assert plain.count("Security checks remain in place around the eastern gate") == 1
 
 
 def test_local_fallback_digest_keeps_all_distinct_updates():
@@ -360,6 +417,27 @@ async def test_prepare_digest_posts_translates_non_english_lines(monkeypatch):
     assert prepared[0]["raw_text"] == "Initial reports indicate continuous unusual explosions in Tel Aviv."
     assert stats["translation_applied_count"] == 1
     assert stats["citation_stripped_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_prepare_digest_posts_drops_non_english_lines_when_translation_fails(monkeypatch):
+    async def fake_call_codex_with_auth_repair(*_args, **_kwargs):
+        raise RuntimeError("translation unavailable")
+
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex_with_auth_repair)
+
+    prepared, stats = await ai_filter._prepare_digest_posts(
+        [
+            {
+                "text": "إطلاق صواريخ باتجاه حيفا وتضرر منشأة قريبة.",
+                "source_name": "Desk",
+            }
+        ],
+        _FakeAuthManager(),
+    )
+
+    assert prepared == []
+    assert stats["translation_applied_count"] == 0
 
 
 def test_digest_clean_line_rewrites_citation_style_attribution_to_generic_uncertainty():

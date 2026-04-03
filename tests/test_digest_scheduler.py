@@ -32,33 +32,48 @@ def test_format_digest_message_uses_clean_two_line_header():
         "<b>Central Israel Impact Reports</b><br>Initial impact reports concentrated around Petah Tikva.",
         total_updates=41,
         sources=[],
-        title="30-Minute Digest • 22:00-22:30 • Part 1/2",
+        title="30-Minute Digest (22:00-22:30)",
     )
 
     lines = formatted.splitlines()
-    assert lines[0] == "<b>30-Minute Digest • 22:00-22:30 • Part 1/2</b>"
+    assert lines[0] == "<b>📰 30-Minute Digest (22:00-22:30)</b>"
     assert "41 updates reviewed" in lines[1]
     assert "41 updates reviewed" in formatted
     assert "headlines from" not in formatted
 
 
-def test_split_digest_body_blocks_preserves_block_boundaries():
-    first_block = (
-        "<b>Central Israel Impact Reports</b><br>"
-        "Initial impact reports concentrated around Petah Tikva.<br>"
-        "• Preliminary reports pointed to direct hits in Petah Tikva."
+def test_rolling_digest_title_omits_part_label_for_first_message(monkeypatch):
+    monkeypatch.setattr(main, "_digest_window_label", lambda *_args, **_kwargs: "22:00-22:30")
+
+    assert (
+        main._rolling_digest_title(79200, 81000, part_index=1, part_count=2)
+        == "30-Minute Digest (22:00-22:30)"
     )
-    second_block = (
-        "<b>Baghdad Under Fire</b><br>"
-        "Explosions and strike reports built around Victoria Base.<br>"
+    assert (
+        main._rolling_digest_title(79200, 81000, part_index=2, part_count=2)
+        == "30-Minute Digest (22:00-22:30) • Part 2/2"
+    )
+
+
+def test_split_digest_body_blocks_repeats_story_context_across_parts():
+    digest_body = (
+        "<b>Central Israel Impact Reports</b><br>"
+        "Initial impact reports concentrated around Petah Tikva across the window. "
+        "Emergency crews and air-defense activity spread across central Israel through the morning.<br>"
+        "• Preliminary reports pointed to direct hits in Petah Tikva.<br>"
+        "• Damage assessments moved across multiple neighborhoods.<br>"
+        "• Emergency crews were dispatched to several sites.<br>"
+        "• Follow-on alerts stayed active across the district.<br>"
+        "<br><i>Also moving</i><br>"
         "• Iraqi drone strike claims targeted the US base in Baghdad."
     )
     chunks = main._split_digest_body_blocks(
-        f"{first_block}<br><br>{second_block}",
-        max_chars=len(first_block) + 20,
+        digest_body,
+        max_chars=300,
     )
 
-    assert len(chunks) == 2
-    assert "<b>Central Israel Impact Reports</b>" in chunks[0]
-    assert "<b>Baghdad Under Fire</b>" not in chunks[0]
-    assert "<b>Baghdad Under Fire</b>" in chunks[1]
+    assert len(chunks) >= 2
+    assert all(len(chunk) <= 300 for chunk in chunks)
+    assert all("<b>Central Israel Impact Reports</b>" in chunk for chunk in chunks)
+    assert all("Initial impact reports concentrated around Petah Tikva" in chunk for chunk in chunks)
+    assert "Also moving" in chunks[-1]

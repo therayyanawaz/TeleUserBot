@@ -11,7 +11,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 import httpx
 
@@ -315,6 +315,10 @@ class GeneratedTextResult:
     translation_applied_count: int = 0
     citation_stripped_count: int = 0
     duplicate_collapsed_count: int = 0
+    narrative_headline: str = ""
+    narrative_story: str = ""
+    narrative_highlights: Tuple[str, ...] = ()
+    narrative_also_moving: Tuple[str, ...] = ()
 
 
 def estimate_tokens_rough(text: str) -> int:
@@ -1571,6 +1575,14 @@ def _resolve_digest_max_lines() -> int:
     return max(3, min(value, 12))
 
 
+_DIGEST_STORY_MAX_CHARS = 420
+
+
+def _digest_also_moving_cap(max_lines: int | None = None) -> int:
+    resolved = _resolve_digest_max_lines() if max_lines is None else max(1, int(max_lines))
+    return max(1, min(3, max(1, resolved // 3)))
+
+
 def _resolve_digest_token_budget() -> int:
     raw_max = getattr(config, "DIGEST_MAX_TOKENS", DEFAULT_DIGEST_MAX_TOKENS)
     raw_context = getattr(config, "CODEX_MODEL_CONTEXT_TOKENS", 200000)
@@ -1822,6 +1834,14 @@ def _filter_retry_feedback(issue: str) -> str:
     if issue == "weak_scene_setter":
         return (
             "Your opening line was too generic. Rewrite the scene setter as one sharp, concrete sentence that frames the window."
+        )
+    if issue == "missing_story":
+        return (
+            "Your digest is missing the short story paragraph. Add one compact paragraph that covers the whole window before any bullets."
+        )
+    if issue == "oversized_also_moving":
+        return (
+            "Your Also moving rail is too long. Keep it to only a few overflow items and move the main facts into the story or highlights."
         )
     if issue == "headline_too_thin":
         return (
@@ -2192,6 +2212,7 @@ def _digest_clean_line(text: str, *, max_chars: int, allow_short: bool = False) 
     cleaned = _clean_generated_delivery_segment(cleaned)
     cleaned, _ = _digest_rewrite_source_attribution(cleaned)
     cleaned = _DIGEST_PROMO_FRAGMENT_RE.sub("", cleaned)
+    cleaned = re.sub(r"(?:[\U0001F300-\U0001FAFF\u2600-\u26FF\u2700-\u27BF\uFE0F]+\s*)+$", "", cleaned)
     cleaned = _rewrite_reports_of_phrase(cleaned)
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
     cleaned = normalize_space(cleaned.strip(" ,;:-|/[]{}()•"))
@@ -2280,132 +2301,194 @@ def _coerce_digest_major_block(block: Any) -> Dict[str, Any] | None:
     }
 
 
-def _derive_digest_scene_setter(
-    major_blocks: Sequence[Dict[str, Any]],
-    timeline_items: Sequence[str],
+def _collect_digest_story_sentences(
+    values: Iterable[Any],
+    *,
+    total_max_chars: int = _DIGEST_STORY_MAX_CHARS,
+    max_sentences: int = 3,
+    sentence_max_chars: int = 220,
+    seen: set[str] | None = None,
+) -> List[str]:
+    out: List[str] = []
+    local_seen = seen if seen is not None else set()
+    total_chars = 0
+    for value in values:
+        raw = normalize_space(strip_telegram_html(str(value or "")))
+        if not raw:
+            continue
+        for part in _split_digest_sentences(raw):
+            cleaned = _digest_finalize_sentence(part, max_chars=sentence_max_chars)
+            key = _digest_line_key(cleaned)
+            if not cleaned or not key or key in local_seen:
+                continue
+            projected = total_chars + len(cleaned) + (1 if out else 0)
+            if out and projected > total_max_chars:
+                return out
+            local_seen.add(key)
+            out.append(cleaned)
+            total_chars = projected
+            if len(out) >= max_sentences:
+                return out
+    return out
+
+
+def _build_digest_story_from_fragments(
+    values: Iterable[Any],
+    *,
+    total_max_chars: int = _DIGEST_STORY_MAX_CHARS,
+    max_sentences: int = 3,
+    seen: set[str] | None = None,
 ) -> str:
-    headlines = [
-        normalize_space(str(block.get("headline") or ""))
-        for block in major_blocks
-        if normalize_space(str(block.get("headline") or ""))
-    ]
-    if len(headlines) >= 2:
-        return _digest_finalize_sentence(
-            f"{headlines[0]} set the pace in this half-hour, while {headlines[1].lower()} and follow-on developments kept the pressure on.",
-            max_chars=260,
-        )
-    if len(headlines) == 1:
-        return _digest_finalize_sentence(
-            f"{headlines[0]} defined this half-hour.",
-            max_chars=200,
-        )
-    if timeline_items:
-        return _digest_finalize_sentence(
-            "Smaller developments kept stacking up across the window.",
-            max_chars=160,
-        )
-    return ""
+    sentences = _collect_digest_story_sentences(
+        values,
+        total_max_chars=total_max_chars,
+        max_sentences=max_sentences,
+        seen=seen,
+    )
+    return " ".join(sentences).strip()
 
 
-def _render_digest_layout(
+def _clean_digest_support_items(
+    values: Iterable[Any],
+    *,
+    max_chars: int = 220,
+    seen: set[str] | None = None,
+) -> List[str]:
+    out: List[str] = []
+    local_seen = seen if seen is not None else set()
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            nested = _clean_digest_support_items(value, max_chars=max_chars, seen=local_seen)
+            out.extend(nested)
+            continue
+        raw = normalize_space(strip_telegram_html(str(value or "")))
+        if not raw:
+            continue
+        for part in re.split(r"\n+", raw):
+            cleaned = _digest_finalize_sentence(part, max_chars=max_chars)
+            key = _digest_line_key(cleaned)
+            if not cleaned or not key or key in local_seen:
+                continue
+            local_seen.add(key)
+            out.append(cleaned)
+    return out
+
+
+def _legacy_digest_to_narrative(
     *,
     scene_setter: str,
     major_blocks: Sequence[Dict[str, Any]],
     timeline_items: Sequence[str],
-    interval_minutes: int,
     max_lines: int,
-) -> str:
-    quiet = quiet_period_message(interval_minutes)
-    rendered_blocks: List[str] = []
-    emitted_lines = 0
-    seen_rendered: set[str] = set()
+) -> tuple[str, str, List[str], List[str]]:
+    headline = ""
+    if major_blocks:
+        headline = _digest_clean_line(major_blocks[0].get("headline") or "", max_chars=120)
+    headline_key = _digest_line_key(headline)
 
-    cleaned_scene = _digest_finalize_sentence(scene_setter, max_chars=280)
-    if cleaned_scene and not _DIGEST_WEAK_SCENE_SETTER_RE.search(cleaned_scene):
-        rendered_blocks.append(sanitize_telegram_html(cleaned_scene))
-        seen_rendered.add(_digest_line_key(cleaned_scene))
-
-    ordered_major_blocks = sorted(
-        [block for block in major_blocks if isinstance(block, dict)],
-        key=lambda block: _digest_priority_score(block.get("priority")),
-        reverse=True,
+    story_fragments: List[str] = []
+    if scene_setter:
+        story_fragments.append(scene_setter)
+    for block in list(major_blocks)[:3]:
+        if block.get("lede"):
+            story_fragments.append(str(block.get("lede") or ""))
+        elif block.get("facts"):
+            story_fragments.append(str((block.get("facts") or [""])[0]))
+    story = _build_digest_story_from_fragments(
+        story_fragments,
+        total_max_chars=_DIGEST_STORY_MAX_CHARS,
+        max_sentences=3,
+        seen={headline_key} if headline_key else None,
     )
 
-    for block in ordered_major_blocks[:7]:
-        headline = _digest_clean_line(block.get("headline") or "", max_chars=120)
-        if not headline:
+    highlight_candidates: List[str] = []
+    also_candidates: List[str] = [str(item) for item in timeline_items if normalize_space(str(item))]
+    for index, block in enumerate(major_blocks):
+        facts = [str(item) for item in (block.get("facts") or []) if normalize_space(str(item))]
+        if index == 0:
+            highlight_candidates.extend(facts)
             continue
-        lede = _digest_finalize_sentence(block.get("lede") or "", max_chars=220)
-        facts_raw = block.get("facts")
-        if not isinstance(facts_raw, list):
-            facts_raw = []
-        facts: List[str] = []
-        seen: set[str] = set()
-        headline_key = _digest_line_key(headline)
-        lede_key = _digest_line_key(lede)
-        for fact in facts_raw:
-            cleaned = _digest_finalize_sentence(fact, max_chars=220)
-            key = _digest_line_key(cleaned)
-            if not cleaned or not key or key in seen or key == headline_key or key == lede_key:
-                continue
-            seen.add(key)
-            facts.append(cleaned)
-            if len(facts) >= 4:
-                break
-        if not lede and facts:
-            lede = facts.pop(0)
-        if not lede and not facts:
-            continue
-        if not headline_key or headline_key in seen_rendered:
-            continue
-        block_lines = [f"<b>{sanitize_telegram_html(headline)}</b>"]
-        seen_rendered.add(headline_key)
+        lede = normalize_space(str(block.get("lede") or ""))
         if lede:
-            lede_key = _digest_line_key(lede)
-            if lede_key and lede_key not in seen_rendered:
-                block_lines.append(sanitize_telegram_html(lede))
-                seen_rendered.add(lede_key)
-        for fact in facts:
-            if emitted_lines >= max_lines:
-                break
-            fact_key = _digest_line_key(fact)
-            if not fact_key or fact_key in seen_rendered:
-                continue
-            block_lines.append(f"• {sanitize_telegram_html(fact)}")
-            seen_rendered.add(fact_key)
-            emitted_lines += 1
-        if len(block_lines) >= 2:
-            rendered_blocks.append("<br>".join(block_lines))
-        if emitted_lines >= max_lines:
-            break
+            highlight_candidates.append(lede)
+        highlight_candidates.extend(facts)
 
-    cleaned_timeline: List[str] = []
-    seen_timeline: set[str] = set()
-    for item in timeline_items:
-        cleaned = _digest_finalize_sentence(item, max_chars=200)
-        key = _digest_line_key(cleaned)
-        if not cleaned or not key or key in seen_timeline or key in seen_rendered:
-            continue
-        seen_timeline.add(key)
-        cleaned_timeline.append(cleaned)
+    if len(also_candidates) > _digest_also_moving_cap(max_lines):
+        highlight_candidates.extend(also_candidates[_digest_also_moving_cap(max_lines) :])
+        also_candidates = also_candidates[: _digest_also_moving_cap(max_lines)]
 
-    if cleaned_timeline and emitted_lines < max_lines:
-        timeline_lines = ["<i>Also moving</i>"]
-        for item in cleaned_timeline:
-            if emitted_lines >= max_lines:
-                break
-            timeline_lines.append(f"• {sanitize_telegram_html(item)}")
-            emitted_lines += 1
-        if len(timeline_lines) > 1:
-            rendered_blocks.append("<br>".join(timeline_lines))
+    seen: set[str] = set()
+    if headline_key:
+        seen.add(headline_key)
+    for sentence in _collect_digest_story_sentences([story], max_sentences=8):
+        sentence_key = _digest_line_key(sentence)
+        if sentence_key:
+            seen.add(sentence_key)
 
-    if not rendered_blocks:
-        return quiet
+    highlights = _clean_digest_support_items(highlight_candidates, seen=seen)
+    also_moving = _clean_digest_support_items(also_candidates, max_chars=200, seen=seen)
 
-    return sanitize_telegram_html("<br><br>".join(rendered_blocks))
+    if not story and highlights:
+        story = highlights.pop(0)
+        story_key = _digest_line_key(story)
+        if story_key:
+            seen.add(story_key)
+    if not headline:
+        headline = _fallback_headline(story or " ".join(highlights[:2])) or ""
+        headline = _digest_clean_line(headline, max_chars=120, allow_short=True)
+
+    return headline, story, highlights, also_moving
 
 
-def _digest_payload_to_layout(payload: Dict[str, Any]) -> tuple[str, List[Dict[str, Any]], List[str]]:
+def _digest_payload_to_narrative(
+    payload: Dict[str, Any],
+    *,
+    max_lines: int,
+) -> tuple[str, str, List[str], List[str]]:
+    headline = _digest_clean_line(payload.get("headline") or "", max_chars=120, allow_short=True)
+    headline_key = _digest_line_key(headline)
+    story = _build_digest_story_from_fragments(
+        [payload.get("story") or payload.get("summary") or ""],
+        total_max_chars=_DIGEST_STORY_MAX_CHARS,
+        max_sentences=4,
+        seen={headline_key} if headline_key else None,
+    )
+
+    highlights_raw = payload.get("highlights")
+    if not isinstance(highlights_raw, list):
+        highlights_raw = payload.get("facts")
+    if not isinstance(highlights_raw, list):
+        highlights_raw = []
+
+    also_raw = payload.get("also_moving")
+    if not isinstance(also_raw, list):
+        also_raw = []
+
+    seen: set[str] = set()
+    if headline_key:
+        seen.add(headline_key)
+    for sentence in _collect_digest_story_sentences([story], max_sentences=8):
+        sentence_key = _digest_line_key(sentence)
+        if sentence_key:
+            seen.add(sentence_key)
+
+    highlights = _clean_digest_support_items(highlights_raw, seen=seen)
+    also_moving = _clean_digest_support_items(also_raw, max_chars=200, seen=seen)
+
+    if headline or story or highlights or also_moving:
+        if len(also_moving) > _digest_also_moving_cap(max_lines):
+            highlights.extend(also_moving[_digest_also_moving_cap(max_lines) :])
+            also_moving = also_moving[: _digest_also_moving_cap(max_lines)]
+        if not story and highlights:
+            story = highlights.pop(0)
+        if not headline:
+            headline = _digest_clean_line(
+                _fallback_headline(story or " ".join(highlights[:2])) or "",
+                max_chars=120,
+                allow_short=True,
+            )
+        return headline, story, highlights, also_moving
+
     scene_setter = normalize_space(str(payload.get("scene_setter") or ""))
     major_blocks_raw = payload.get("major_blocks")
     timeline_raw = payload.get("timeline_items")
@@ -2430,33 +2513,179 @@ def _digest_payload_to_layout(payload: Dict[str, Any]) -> tuple[str, List[Dict[s
                 ),
                 reverse=True,
             )
-            for index, block in enumerate(ordered_legacy):
+            for block in ordered_legacy:
                 coerced = _coerce_digest_major_block(block)
-                if not coerced:
-                    continue
-                if index < 6:
+                if coerced:
                     major_blocks.append(coerced)
-                else:
-                    timeline_items.extend([coerced.get("lede", ""), *coerced.get("facts", [])])
 
     if isinstance(timeline_raw, list):
         timeline_items.extend(str(item) for item in timeline_raw if normalize_space(str(item)))
 
-    if not scene_setter:
-        scene_setter = _derive_digest_scene_setter(major_blocks, timeline_items)
-    return scene_setter, major_blocks, timeline_items
+    return _legacy_digest_to_narrative(
+        scene_setter=scene_setter,
+        major_blocks=major_blocks,
+        timeline_items=timeline_items,
+        max_lines=max_lines,
+    )
+
+
+def extract_digest_narrative_parts(
+    text: str,
+    *,
+    max_lines: int,
+) -> tuple[str, str, List[str], List[str]]:
+    cleaned = _strip_digest_citations((text or "").strip())
+    if not cleaned:
+        return "", "", [], []
+
+    quiet = quiet_period_message(30)
+    if normalize_space(strip_telegram_html(cleaned)) == normalize_space(strip_telegram_html(quiet)):
+        return "", "", [], []
+
+    raw_blocks = re.split(r"(?:<br\s*/?>\s*){2,}|\n\s*\n", cleaned, flags=re.IGNORECASE)
+    headline = ""
+    story_fragments: List[str] = []
+    highlight_candidates: List[str] = []
+    also_candidates: List[str] = []
+
+    for raw_block in raw_blocks:
+        block_has_bold = bool(re.search(r"<b>.*?</b>", raw_block, flags=re.IGNORECASE | re.DOTALL))
+        text_lines = re.sub(r"<br\s*/?>", "\n", raw_block, flags=re.IGNORECASE)
+        lines_raw = [line.rstrip() for line in text_lines.splitlines() if line.strip()]
+        if not lines_raw:
+            continue
+
+        parsed_lines: List[tuple[str, bool]] = []
+        for raw_line in lines_raw:
+            plain = normalize_space(strip_telegram_html(raw_line))
+            is_bullet = plain.startswith(("•", "-", "*"))
+            cleaned_line = _digest_finalize_sentence(raw_line, max_chars=240)
+            if cleaned_line:
+                parsed_lines.append((cleaned_line, is_bullet))
+        if not parsed_lines:
+            continue
+
+        if _DIGEST_ALSO_MOVING_RE.fullmatch(normalize_space(parsed_lines[0][0])):
+            also_candidates.extend(line for line, _is_bullet in parsed_lines[1:])
+            continue
+
+        start_index = 0
+        if block_has_bold:
+            candidate_headline = _digest_clean_line(lines_raw[0], max_chars=120, allow_short=True)
+            if candidate_headline and not headline:
+                headline = candidate_headline
+            start_index = 1
+
+        for line, is_bullet in parsed_lines[start_index:]:
+            if is_bullet:
+                highlight_candidates.append(line)
+            else:
+                story_fragments.append(line)
+
+    story = _build_digest_story_from_fragments(
+        story_fragments,
+        total_max_chars=_DIGEST_STORY_MAX_CHARS,
+        max_sentences=4,
+        seen={_digest_line_key(headline)} if _digest_line_key(headline) else None,
+    )
+    if not headline:
+        headline = _digest_clean_line(
+            _fallback_headline(story or " ".join(highlight_candidates[:2])) or "",
+            max_chars=120,
+            allow_short=True,
+        )
+
+    if len(also_candidates) > _digest_also_moving_cap(max_lines):
+        highlight_candidates.extend(also_candidates[_digest_also_moving_cap(max_lines) :])
+        also_candidates = also_candidates[: _digest_also_moving_cap(max_lines)]
+
+    seen: set[str] = set()
+    headline_key = _digest_line_key(headline)
+    if headline_key:
+        seen.add(headline_key)
+    for sentence in _collect_digest_story_sentences([story], max_sentences=8):
+        sentence_key = _digest_line_key(sentence)
+        if sentence_key:
+            seen.add(sentence_key)
+    highlights = _clean_digest_support_items(highlight_candidates, seen=seen)
+    also_moving = _clean_digest_support_items(also_candidates, max_chars=200, seen=seen)
+
+    if not story and highlights:
+        story = highlights.pop(0)
+
+    return headline, story, highlights, also_moving
+
+
+def _render_digest_layout(
+    *,
+    headline: str,
+    story: str,
+    highlights: Sequence[str],
+    also_moving: Sequence[str],
+    interval_minutes: int,
+) -> str:
+    quiet = quiet_period_message(interval_minutes)
+
+    clean_headline = _digest_clean_line(headline, max_chars=120, allow_short=True)
+    clean_story = _build_digest_story_from_fragments([story], total_max_chars=_DIGEST_STORY_MAX_CHARS, max_sentences=4)
+    if not clean_headline or not clean_story:
+        return quiet
+
+    seen: set[str] = set()
+    headline_key = _digest_line_key(clean_headline)
+    story_key = _digest_line_key(clean_story)
+    if headline_key:
+        seen.add(headline_key)
+    if story_key:
+        seen.add(story_key)
+
+    clean_highlights = _clean_digest_support_items(highlights, seen=seen)
+    clean_also = _clean_digest_support_items(also_moving, max_chars=200, seen=seen)
+    if len(clean_also) > _digest_also_moving_cap():
+        clean_highlights.extend(clean_also[_digest_also_moving_cap() :])
+        clean_also = clean_also[: _digest_also_moving_cap()]
+
+    story_sentences = _collect_digest_story_sentences([clean_story], max_sentences=4)
+    if story_sentences and SequenceMatcher(None, story_sentences[0].lower(), clean_headline.lower()).ratio() >= 0.86:
+        trimmed_story = " ".join(story_sentences[1:]).strip()
+        if trimmed_story:
+            clean_story = trimmed_story
+    if _digest_line_key(clean_story) == _digest_line_key(clean_headline):
+        if clean_highlights:
+            clean_story = clean_highlights.pop(0)
+        elif clean_also:
+            clean_story = clean_also.pop(0)
+        else:
+            return quiet
+
+    main_lines = [
+        f"<b>{sanitize_telegram_html(clean_headline)}</b>",
+        sanitize_telegram_html(clean_story),
+    ]
+    main_lines.extend(f"• {sanitize_telegram_html(item)}" for item in clean_highlights)
+    rendered_blocks = ["<br>".join(main_lines)]
+
+    if clean_also:
+        also_lines = ["<i>Also moving</i>"]
+        also_lines.extend(f"• {sanitize_telegram_html(item)}" for item in clean_also)
+        rendered_blocks.append("<br>".join(also_lines))
+
+    return sanitize_telegram_html("<br><br>".join(rendered_blocks))
 
 
 def _json_digest_to_html(payload: Dict[str, Any], *, interval_minutes: int, max_lines: int) -> str:
     if bool(payload.get("quiet")):
         return quiet_period_message(interval_minutes)
-    scene_setter, major_blocks, timeline_items = _digest_payload_to_layout(payload)
-    return _render_digest_layout(
-        scene_setter=scene_setter,
-        major_blocks=major_blocks,
-        timeline_items=timeline_items,
-        interval_minutes=interval_minutes,
+    headline, story, highlights, also_moving = _digest_payload_to_narrative(
+        payload,
         max_lines=max_lines,
+    )
+    return _render_digest_layout(
+        headline=headline,
+        story=story,
+        highlights=highlights,
+        also_moving=also_moving,
+        interval_minutes=interval_minutes,
     )
 
 
@@ -2495,7 +2724,7 @@ def _digest_english_rewrite_prompt() -> str:
     return (
         "Rewrite this Telegram HTML digest into clean English only.\n"
         "Rules:\n"
-        "- Keep the same premium newsroom structure: scene setter, major blocks, and Also moving rail\n"
+        "- Keep the same narrative-first structure: one headline, one short story paragraph, support bullets, and a short Also moving rail only when needed\n"
         "- Make the English sound sharp, human, and slightly unhinged without inventing anything\n"
         "- Translate every non-English word or phrase into English\n"
         "- Remove citations, source names, bracket tags, outlet names, links, handles, hashtags, and any 'Read more' text\n"
@@ -2562,67 +2791,16 @@ def _html_digest_cleanup(text: str, *, interval_minutes: int, max_lines: int) ->
     quiet = quiet_period_message(interval_minutes)
     if normalize_space(cleaned) == quiet:
         return quiet
-
-    raw_blocks = re.split(r"(?:<br\s*/?>\s*){2,}|\n\s*\n", cleaned, flags=re.IGNORECASE)
-    scene_setter = ""
-    major_blocks: List[Dict[str, Any]] = []
-    timeline_items: List[str] = []
-    timeline_mode = False
-
-    for raw_block in raw_blocks:
-        block_has_bold = bool(re.search(r"<b>.*?</b>", raw_block, flags=re.IGNORECASE | re.DOTALL))
-        text_lines = re.sub(r"<br\s*/?>", "\n", raw_block, flags=re.IGNORECASE)
-        lines_raw = [line.rstrip() for line in text_lines.splitlines() if line.strip()]
-        if not lines_raw:
-            continue
-
-        plain_lines: List[str] = []
-        for raw in lines_raw:
-            cleaned_line = _digest_finalize_sentence(raw, max_chars=240)
-            if cleaned_line:
-                plain_lines.append(cleaned_line)
-        if not plain_lines:
-            continue
-
-        if _DIGEST_ALSO_MOVING_RE.fullmatch(normalize_space(plain_lines[0])):
-            timeline_mode = True
-            timeline_items.extend(plain_lines[1:])
-            continue
-
-        if timeline_mode:
-            timeline_items.extend(plain_lines)
-            continue
-
-        if not scene_setter and not block_has_bold and len(plain_lines) == 1:
-            scene_setter = plain_lines[0]
-            continue
-        if not block_has_bold and len(plain_lines) == 1:
-            timeline_items.append(plain_lines[0])
-            continue
-
-        headline = _digest_clean_line(plain_lines[0], max_chars=120)
-        if not headline:
-            continue
-        lede = plain_lines[1] if len(plain_lines) > 1 else ""
-        facts = plain_lines[2:] if len(plain_lines) > 2 else []
-        if len(plain_lines) >= 2 and _digest_line_key(plain_lines[0]) == _digest_line_key(plain_lines[1]):
-            timeline_items.append(plain_lines[0])
-            continue
-        major_blocks.append(
-            {
-                "headline": headline,
-                "lede": lede,
-                "facts": facts,
-                "priority": "medium",
-            }
-        )
-
-    return _render_digest_layout(
-        scene_setter=scene_setter,
-        major_blocks=major_blocks,
-        timeline_items=timeline_items,
-        interval_minutes=interval_minutes,
+    headline, story, highlights, also_moving = extract_digest_narrative_parts(
+        cleaned,
         max_lines=max_lines,
+    )
+    return _render_digest_layout(
+        headline=headline,
+        story=story,
+        highlights=highlights,
+        also_moving=also_moving,
+        interval_minutes=interval_minutes,
     )
 
 
@@ -2843,7 +3021,13 @@ async def _prepare_digest_posts(
     translated_posts, translation_applied_count, translated_citation_strips = await _translate_digest_posts_to_english(prepared, auth_manager)
     citation_stripped_count += translated_citation_strips
     deduped_posts, duplicate_collapsed_count = _dedupe_prepared_digest_posts(translated_posts)
-    return deduped_posts, {
+    english_ready_posts = [
+        post
+        for post in deduped_posts
+        if not _digest_needs_english_rewrite(_post_text(post), "English")
+    ]
+    noise_stripped_count += max(0, len(deduped_posts) - len(english_ready_posts))
+    return english_ready_posts, {
         "noise_stripped_count": noise_stripped_count,
         "translation_applied_count": translation_applied_count,
         "citation_stripped_count": citation_stripped_count,
@@ -2851,72 +3035,80 @@ async def _prepare_digest_posts(
     }
 
 
-def _fallback_digest_layout(posts: Sequence[Dict[str, object]]) -> tuple[str, List[Dict[str, Any]], List[str]]:
-    major_blocks: List[Dict[str, Any]] = []
-    timeline_items: List[str] = []
+def _fallback_digest_layout(posts: Sequence[Dict[str, object]]) -> tuple[str, str, List[str], List[str]]:
+    unique_posts: List[str] = []
     seen: set[str] = set()
-
     for post in posts:
         text = _post_text(post)
-        if not text or _likely_noise(text):
+        if not text or _likely_noise(text) or _digest_needs_english_rewrite(text, "English"):
             continue
         fingerprint = _cache_key(text.lower())
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
+        unique_posts.append(text)
 
+    if not unique_posts:
+        return "", "", [], []
+
+    headline = _digest_clean_line(_fallback_headline(unique_posts[0]) or unique_posts[0], max_chars=120)
+    headline_key = _digest_line_key(headline)
+
+    story_fragments: List[str] = []
+    highlight_candidates: List[str] = []
+    also_candidates: List[str] = []
+    for index, text in enumerate(unique_posts):
         sentences = [_digest_finalize_sentence(part, max_chars=220) for part in _split_digest_sentences(text)]
         sentences = [sentence for sentence in sentences if sentence]
         if not sentences:
             continue
-
-        headline = _digest_clean_line(_fallback_headline(text) or sentences[0], max_chars=120)
-        if not headline:
-            continue
-
-        lede = ""
-        facts: List[str] = []
-        for sentence in sentences:
-            if sentence.lower() == headline.lower():
-                continue
-            if not lede:
-                lede = sentence
-                continue
-            if sentence.lower() == lede.lower():
-                continue
-            facts.append(sentence)
-            if len(facts) >= 3:
-                break
-
-        if len(major_blocks) < 5:
-            major_blocks.append(
-                {
-                    "headline": headline,
-                    "lede": lede,
-                    "facts": facts,
-                    "priority": "high" if len(major_blocks) < 2 else "medium",
-                }
-            )
+        if index < 3:
+            story_fragments.append(sentences[0])
+            highlight_candidates.extend(sentences[1:3])
         else:
-            if lede:
-                timeline_items.append(lede)
-            timeline_items.extend(facts)
+            also_candidates.append(sentences[0])
+            highlight_candidates.extend(sentences[1:2])
 
-    scene_setter = _derive_digest_scene_setter(major_blocks, timeline_items)
-    return scene_setter, major_blocks, timeline_items
+    story = _build_digest_story_from_fragments(
+        story_fragments,
+        total_max_chars=_DIGEST_STORY_MAX_CHARS,
+        max_sentences=3,
+        seen={headline_key} if headline_key else None,
+    )
+
+    seen_lines: set[str] = set()
+    if headline_key:
+        seen_lines.add(headline_key)
+    for sentence in _collect_digest_story_sentences([story], max_sentences=8):
+        sentence_key = _digest_line_key(sentence)
+        if sentence_key:
+            seen_lines.add(sentence_key)
+    highlights = _clean_digest_support_items(highlight_candidates, seen=seen_lines)
+    also_moving = _clean_digest_support_items(also_candidates, max_chars=200, seen=seen_lines)
+
+    if len(also_moving) > _digest_also_moving_cap():
+        highlights.extend(also_moving[_digest_also_moving_cap() :])
+        also_moving = also_moving[: _digest_also_moving_cap()]
+
+    if not story and highlights:
+        story = highlights.pop(0)
+    if not headline:
+        headline = _digest_clean_line(_fallback_headline(story or " ".join(highlights[:2])) or "", max_chars=120)
+
+    return headline, story, highlights, also_moving
 
 
 def local_fallback_digest(posts: Sequence[Dict[str, object]], *, interval_minutes: int) -> str:
     if not posts:
         return quiet_period_message(interval_minutes)
 
-    scene_setter, major_blocks, timeline_items = _fallback_digest_layout(posts)
+    headline, story, highlights, also_moving = _fallback_digest_layout(posts)
     return _render_digest_layout(
-        scene_setter=scene_setter,
-        major_blocks=major_blocks,
-        timeline_items=timeline_items,
+        headline=headline,
+        story=story,
+        highlights=highlights,
+        also_moving=also_moving,
         interval_minutes=interval_minutes,
-        max_lines=max(24, min(max(24, len(posts) * 6), 600)),
     )
 
 
@@ -4462,7 +4654,28 @@ def _make_generated_text_result(
     translation_applied_count: int = 0,
     citation_stripped_count: int = 0,
     duplicate_collapsed_count: int = 0,
+    narrative_headline: str = "",
+    narrative_story: str = "",
+    narrative_highlights: Sequence[str] = (),
+    narrative_also_moving: Sequence[str] = (),
 ) -> GeneratedTextResult:
+    resolved_headline = normalize_space(narrative_headline)
+    resolved_story = normalize_space(narrative_story)
+    resolved_highlights = [
+        normalize_space(str(item)) for item in narrative_highlights if normalize_space(str(item))
+    ]
+    resolved_also_moving = [
+        normalize_space(str(item)) for item in narrative_also_moving if normalize_space(str(item))
+    ]
+    if html and not resolved_headline and not resolved_story and not resolved_highlights and not resolved_also_moving:
+        parsed_headline, parsed_story, parsed_highlights, parsed_also_moving = extract_digest_narrative_parts(
+            html,
+            max_lines=max(_resolve_digest_max_lines(), 6),
+        )
+        resolved_headline = parsed_headline
+        resolved_story = parsed_story
+        resolved_highlights = parsed_highlights
+        resolved_also_moving = parsed_also_moving
     return GeneratedTextResult(
         html=html,
         copy_origin=copy_origin,
@@ -4475,27 +4688,19 @@ def _make_generated_text_result(
         translation_applied_count=max(0, int(translation_applied_count)),
         citation_stripped_count=max(0, int(citation_stripped_count)),
         duplicate_collapsed_count=max(0, int(duplicate_collapsed_count)),
+        narrative_headline=resolved_headline,
+        narrative_story=resolved_story,
+        narrative_highlights=tuple(resolved_highlights),
+        narrative_also_moving=tuple(resolved_also_moving),
     )
 
 
 def _digest_render_counts(text: str) -> tuple[int, int]:
-    major_block_count = 0
-    timeline_item_count = 0
-    raw_blocks = re.split(r"(?:<br\s*/?>\s*){2,}|\n\s*\n", str(text or ""), flags=re.IGNORECASE)
-    for raw_block in raw_blocks:
-        lines = [
-            normalize_space(strip_telegram_html(line))
-            for line in re.split(r"\n+|<br\s*/?>", raw_block, flags=re.IGNORECASE)
-            if normalize_space(strip_telegram_html(line))
-        ]
-        if not lines:
-            continue
-        if _DIGEST_ALSO_MOVING_RE.fullmatch(lines[0]):
-            timeline_item_count += max(0, len(lines) - 1)
-            continue
-        if "<b>" in raw_block.lower():
-            major_block_count += 1
-    return major_block_count, timeline_item_count
+    headline, story, _highlights, also_moving = extract_digest_narrative_parts(
+        text,
+        max_lines=max(_resolve_digest_max_lines(), 6),
+    )
+    return (1 if headline and story else 0, len(also_moving))
 
 
 def _digest_quality_issue(text: str, quiet_text: str) -> str:
@@ -4511,60 +4716,41 @@ def _digest_quality_issue(text: str, quiet_text: str) -> str:
         return "citation_leak"
     if _DIGEST_HASHTAG_RE.search(cleaned) or _DIGEST_PROMO_FRAGMENT_RE.search(cleaned):
         return "source_leak"
+    headline, story, highlights, also_moving = extract_digest_narrative_parts(
+        text,
+        max_lines=max(_resolve_digest_max_lines(), 6),
+    )
+    if not headline:
+        return "headline_too_thin"
+    if not story:
+        return "missing_story"
 
-    raw_blocks = re.split(r"(?:<br\s*/?>\s*){2,}|\n\s*\n", str(text or ""), flags=re.IGNORECASE)
-    if not raw_blocks:
-        return "empty_output"
+    story_issue = _news_copy_quality_issue(story, story, allow_short=True)
+    if story_issue in {"vague_copy", "incomplete_copy"}:
+        return story_issue
 
-    block_count = 0
+    if _digest_line_key(story) == _digest_line_key(headline):
+        return "duplication"
+    story_sentences = _collect_digest_story_sentences([story], max_sentences=1)
+    if story_sentences and SequenceMatcher(None, story_sentences[0].lower(), headline.lower()).ratio() >= 0.86:
+        return "duplication"
+    if len(also_moving) > _digest_also_moving_cap():
+        return "oversized_also_moving"
+
     seen_digest_lines: set[str] = set()
-    for raw_block in raw_blocks:
-        lines = [
-            normalize_space(strip_telegram_html(line))
-            for line in re.split(r"\n+|<br\s*/?>", raw_block, flags=re.IGNORECASE)
-            if normalize_space(strip_telegram_html(line))
-        ]
-        if not lines:
-            continue
-        if any(len(line) <= 1 or _DIGEST_PUNCT_ONLY_RE.fullmatch(line) for line in lines):
+    for line in [headline, story, *highlights, *also_moving]:
+        key = _digest_line_key(line)
+        if not key:
             return "messy_layout"
-        if _DIGEST_ALSO_MOVING_RE.fullmatch(lines[0]):
-            if len(lines) == 1:
-                return "messy_layout"
-            for line in lines[1:]:
-                key = _digest_line_key(line)
-                if not key or key in seen_digest_lines:
-                    return "duplication"
-                seen_digest_lines.add(key)
-                issue = _news_copy_quality_issue(line, line, allow_short=True)
-                if issue in {"vague_copy", "incomplete_copy"}:
-                    return issue
-            continue
-
-        bold_count = len(re.findall(r"<b>.*?</b>", raw_block, flags=re.IGNORECASE | re.DOTALL))
-        if bold_count > 1:
-            return "messy_layout"
-        if bold_count == 0 and len(lines) > 1:
-            return "messy_layout"
-        if bold_count == 0 and _DIGEST_WEAK_SCENE_SETTER_RE.search(lines[0]):
-            return "weak_scene_setter"
-
-        if len(lines) >= 2 and SequenceMatcher(None, lines[0].lower(), lines[1].lower()).ratio() >= 0.86:
+        if key in seen_digest_lines:
             return "duplication"
-        for line in lines:
-            key = _digest_line_key(line)
-            if not key:
-                return "messy_layout"
-            if key in seen_digest_lines:
-                return "duplication"
-            seen_digest_lines.add(key)
-            issue = _news_copy_quality_issue(line, line, allow_short=True)
-            if issue in {"vague_copy", "incomplete_copy"}:
-                return issue
-        block_count += 1
+        seen_digest_lines.add(key)
+        issue = _news_copy_quality_issue(line, line, allow_short=True)
+        if issue in {"vague_copy", "incomplete_copy"}:
+            return issue
 
-    if block_count > 9 and "also moving" not in lowered:
-        return "messy_layout"
+    if not highlights and not also_moving and len(story.split()) < 8:
+        return "headline_too_thin"
     return ""
 
 
@@ -4589,7 +4775,7 @@ def _query_quality_issue(answer_html: str, question: str) -> str:
 def _digest_retry_prompt(prompt: str, issue: str) -> str:
     return (
         f"{prompt}\n\nRevision feedback:\n- {_filter_retry_feedback(issue)}\n"
-        "- Rebuild the digest as a premium newsroom brief with a scene setter, major grouped stories, and an Also moving rail.\n"
+        "- Rebuild the digest as one narrative-first newsroom brief with one headline, one short story paragraph, support bullets, and a very short Also moving rail only if needed.\n"
         "- Do not leave any meaningful update behind.\n"
         "- Keep it English-only and remove all source branding, handles, hashtags, promo junk, and citation-style phrasing.\n"
         "- If uncertainty is needed, use generic wording only, such as 'initial reports indicate' or 'preliminary reports suggest'."
@@ -4619,7 +4805,7 @@ async def create_digest_summary_result(
         return _make_generated_text_result(quiet_text, copy_origin="fallback")
 
     manager = auth_manager or AuthManager(logger=LOGGER)
-    max_lines = max(24, min(max(24, len(posts) * 6), 600))
+    max_lines = _resolve_digest_max_lines()
     prepared_posts, prep_stats = await _prepare_digest_posts(posts, manager)
     noise_stripped_count = int(prep_stats.get("noise_stripped_count") or 0)
     translation_applied_count = int(prep_stats.get("translation_applied_count") or 0)
