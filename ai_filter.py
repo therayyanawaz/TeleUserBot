@@ -3237,16 +3237,19 @@ def local_fallback_digest(posts: Sequence[Dict[str, object]], *, interval_minute
                 continue
             sentences = [_digest_finalize_sentence(part, max_chars=180) for part in _split_digest_sentences(text)]
             sentences = [sentence for sentence in sentences if sentence]
-            candidate = _digest_clean_line(
-                sentences[0] if sentences else (_fallback_headline(text) or text),
-                max_chars=180,
-                allow_short=True,
-            )
-            key = _digest_line_key(candidate)
-            if not candidate or not key or key in seen:
-                continue
-            seen.add(key)
-            headlines.append(candidate)
+            candidates = sentences or [
+                _digest_clean_line(
+                    _fallback_headline(text) or text,
+                    max_chars=180,
+                    allow_short=True,
+                )
+            ]
+            for candidate in candidates:
+                key = _digest_line_key(candidate)
+                if not candidate or not key or key in seen:
+                    continue
+                seen.add(key)
+                headlines.append(candidate)
         return _render_digest_layout(
             headline=_headline_rail_title(interval_minutes),
             story="",

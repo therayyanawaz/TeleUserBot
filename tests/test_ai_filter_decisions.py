@@ -400,8 +400,26 @@ def test_local_fallback_digest_uses_headline_rail_for_short_window():
 
     assert "Top headlines from the last 30 minutes" in plain
     assert "Officials reopened the port after three days of disruption" in plain
+    assert "Cargo traffic resumes at dawn" in plain
     assert "Air defenses fired over the northern district after a fresh barrage" in plain
-    assert "Cargo traffic resumes at dawn" not in plain
+    assert "Residents reported new blasts near the ridge" in plain
+
+
+def test_local_fallback_digest_headline_rail_keeps_distinct_updates_from_one_post():
+    html = ai_filter.local_fallback_digest(
+        [
+            {
+                "text": "First site was hit in Dubai. Second site was hit in Bahrain.",
+                "source_name": "Desk",
+            }
+        ],
+        interval_minutes=30,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "Top headlines from the last 30 minutes" in plain
+    assert "First site was hit in Dubai" in plain
+    assert "Second site was hit in Bahrain" in plain
 
 
 def test_html_digest_cleanup_strips_promo_handles_and_duplicate_blocks():
