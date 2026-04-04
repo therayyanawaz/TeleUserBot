@@ -3609,10 +3609,27 @@ def _rewrite_known_source_alias_attribution(text: str, *, source_title: str = ""
             cleaned,
         )
         cleaned = re.sub(
+            rf"(?i)(?:\s*,\s*|\s+)according to\s+@?{escaped}\b\s*,\s*",
+            " ",
+            cleaned,
+        )
+        cleaned = re.sub(
             rf"(?i)(?P<prefix>^|[.;:!?]\s*)according to\s+@?{escaped}\b[:,]?\s*",
             lambda match: match.group("prefix"),
             cleaned,
         )
+        cleaned = re.sub(
+            rf"(?i)\s*,\s*according to\s+@?{escaped}\b(?=\s*[.?!]|$)",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            rf"(?i)\s+according to\s+@?{escaped}\b(?=\s*[.?!]|$)",
+            "",
+            cleaned,
+        )
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = normalize_space(cleaned)
     return cleaned
 
 
