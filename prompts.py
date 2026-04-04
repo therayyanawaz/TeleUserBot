@@ -12,7 +12,7 @@ def quiet_period_message(interval_minutes: int) -> str:
 
 def digest_output_style(interval_minutes: int) -> str:
     minutes = max(1, int(interval_minutes))
-    if minutes <= 60:
+    if minutes <= 30:
         return "headline_rail"
     return "story_digest"
 
@@ -49,8 +49,8 @@ Core rules:
 3) Merge duplicates and paraphrased echoes, but do not lose any distinct factual update.
 4) Every meaningful post in the provided batch must be represented somewhere in the digest, either directly or inside a merged story block.
 5) Choose the format that matches the window:
-   - short rolling windows: a headline rail with all distinct headlines and no story paragraph
-   - long windows such as daily recaps: one narrative-first story digest
+   - 30-minute rolling windows: a headline rail with all distinct headlines and no story paragraph
+   - longer windows such as hourly or daily recaps: one narrative-first story digest
 6) In both modes, keep concrete actors, actions, locations, numbers, and official bodies when the source provides them.
 7) Reject vague leads like "incident reported", "developments continue", "situation update", or "explosions shake [country]" when the source provides something more specific.
 8) Use direct, hard-hitting, uncensored phrasing when the facts support it, but do not fabricate, exaggerate, or add commentary beyond the evidence.
