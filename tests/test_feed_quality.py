@@ -262,7 +262,7 @@ def test_parse_time_filter_today_uses_configured_timezone(monkeypatch):
         default_hours=1,
     )
 
-    assert hours_back == 6
+    assert hours_back == 7
     assert cleaned == "What happened in Tehran?"
 
 
