@@ -1395,12 +1395,9 @@ def _query_web_max_results() -> int:
 
 
 def _query_web_max_hours_back() -> int:
-    raw = getattr(config, "QUERY_WEB_MAX_HOURS_BACK", 24 * 7)
-    try:
-        value = int(raw)
-    except Exception:
-        value = 24 * 7
-    return max(1, min(value, 24 * 7))
+    # Query verification is contractually capped at 7 days to match the
+    # Telegram expansion window used before the mandatory web cross-check.
+    return 24 * 7
 
 
 def _query_web_require_recent() -> bool:
@@ -9679,6 +9676,7 @@ async def _handle_query_request(
 
         if should_run_web_search:
             ran_web_search = True
+            web_hours = min(active_hours, _query_web_max_hours_back())
             await _safe_reply_markdown(
                 event_ref,  # type: ignore[arg-type]
                 _query_crosscheck_status(high_risk=high_risk_query),
@@ -9688,7 +9686,7 @@ async def _handle_query_request(
             )
             web_results = await _search_recent_news_web_bounded(
                 cleaned_query,
-                hours_back=active_hours,
+                hours_back=web_hours,
                 max_results=_query_web_max_results(),
                 allowed_domains=_query_web_allowed_domains(),
                 require_recent=_query_web_require_recent(),
