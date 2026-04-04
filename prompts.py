@@ -53,6 +53,8 @@ Core rules:
    - longer windows such as hourly or daily recaps: one narrative-first story digest
 6) In both modes, keep concrete actors, actions, locations, numbers, and official bodies when the source provides them.
 7) Reject vague leads like "incident reported", "developments continue", "situation update", or "explosions shake [country]" when the source provides something more specific.
+7b) Headline reasoning rule: prefer the line with the clearest actor + action + location/result, not the first line by default.
+7c) If one line names who acted, what happened, and where or with what result, use that line over a softer framing line.
 8) Use direct, hard-hitting, uncensored phrasing when the facts support it, but do not fabricate, exaggerate, or add commentary beyond the evidence.
 9) Preserve uncertainty explicitly when the source is hedged or disputed, but use generic wording only:
    - allowed: "initial reports indicate", "preliminary reports suggest", "early indications point to"
@@ -103,6 +105,7 @@ def build_digest_system_prompt(
             toggles.append("This is a short rolling digest. Output a headline rail, not a story digest.")
             toggles.append("headline should be a short rail label, not a narrative sentence.")
             toggles.append("headlines must contain only the main distinct developments as short standalone headline lines.")
+            toggles.append("For each headline line, pick the strongest concrete fact, not the softest setup line.")
             toggles.append("Keep the rail tight enough to fit one clean Telegram message whenever possible.")
             toggles.append("Do not include a story paragraph in this mode.")
             toggles.append("also_moving is optional and should contain at most a few overflow headline lines.")
@@ -111,6 +114,7 @@ def build_digest_system_prompt(
                 'Return ONLY one JSON object with this schema: {"quiet": boolean, "headline": string, "story": string, "highlights": [string, ...], "also_moving": [string, ...]}.'
             )
             toggles.append("This is a long-window digest. Build one story digest, not a headline rail.")
+            toggles.append("The main headline must be the strongest concrete development in the window, not a generic umbrella label.")
             toggles.append("The story must be one compact paragraph that covers the whole digest window.")
             toggles.append("highlights must hold the key specifics that support the story.")
             toggles.append("also_moving is optional and should contain only a few smaller overflow updates.")

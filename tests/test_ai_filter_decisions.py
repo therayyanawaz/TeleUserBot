@@ -457,6 +457,14 @@ def test_local_fallback_digest_headline_rail_caps_to_main_lines(monkeypatch):
     assert "Headline 5 remains specific and concrete." not in plain
 
 
+def test_fallback_headline_prefers_concrete_sentence_over_soft_setup():
+    headline = ai_filter._fallback_headline(
+        "Situation update after overnight military activity. Iran launched missiles at Haifa and air defenses intercepted several over the city."
+    )
+
+    assert headline == "Iran launched missiles at Haifa and air defenses intercepted several over the city."
+
+
 def test_html_digest_cleanup_strips_promo_handles_and_duplicate_blocks():
     raw = """
 There is a confirmed fall of fission fragments in a number of locations in the middle of the entity.

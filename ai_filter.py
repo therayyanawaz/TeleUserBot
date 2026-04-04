@@ -821,20 +821,34 @@ def _fallback_headline(text: str) -> Optional[str]:
     cleaned = normalize_space(text)
     if not cleaned:
         return None
+
+    def _headline_strength_score(value: str) -> tuple[int, int, int, int]:
+        lowered = value.lower()
+        actor_hits = len(re.findall(r"\b(?:iran|israel|idf|irgc|hezbollah|hamas|us|u\.s\.|ukraine|russia|army|government|ministry|officials?)\b", lowered))
+        action_hits = len(re.findall(r"\b(?:hit|hits|struck|strike|strikes|launched|launches|killed|kills|destroyed|destroys|suspended|halts|intercepted|downed|fired|fires|attacked|attack|captured|ordered|announced|confirmed)\b", lowered))
+        specificity_hits = len(re.findall(r"\b[A-Z][a-z]{2,}\b|\b\d+\b", value))
+        penalty = 1 if any(pattern in lowered for pattern in _WEAK_COPY_PATTERNS) else 0
+        return (actor_hits + action_hits + specificity_hits - penalty, action_hits, specificity_hits, -penalty)
+
+    candidates = [
+        normalize_space(part)
+        for part in re.split(r"(?<=[.!?])\s+", cleaned)
+        if normalize_space(part)
+    ]
+    if not candidates:
+        candidates = [cleaned]
+
     summary_html = _build_feed_summary_html(cleaned)
     if summary_html:
         plain_summary = re.sub(r"(?i)<br\s*/?>.*$", "", summary_html)
         headline = normalize_space(strip_telegram_html(plain_summary))
-        if headline:
+        if headline and _headline_strength_score(headline) >= _headline_strength_score(max(candidates[:4], key=_headline_strength_score)):
             return headline
-    sentence_match = re.search(r"(.{24,700}?[.!?])(?:\s|$)", cleaned)
-    if sentence_match:
-        first = normalize_space(sentence_match.group(1))
-    else:
-        first = cleaned
-    if len(first) > 420:
-        first = f"{first[:417].rsplit(' ', 1)[0]}..."
-    return first
+
+    best = max(candidates[:4], key=_headline_strength_score)
+    if len(best) > 420:
+        best = f"{best[:417].rsplit(' ', 1)[0]}..."
+    return best
 
 
 def _resolve_codex_model() -> str:
