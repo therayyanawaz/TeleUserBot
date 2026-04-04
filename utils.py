@@ -1752,7 +1752,7 @@ async def search_recent_news_web(
     logger: logging.Logger | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Strict web-news fallback search (RSS based).
+    Strict web-news cross-check search (RSS based).
 
     Uses multiple RSS-backed news search endpoints and returns normalized context
     rows compatible with query answer generation.
@@ -1814,7 +1814,7 @@ async def search_recent_news_web(
                     if response.status_code != 200:
                         if logger:
                             logger.debug(
-                                "Web fallback RSS status=%s provider=%s variant=%s",
+                                "Web cross-check RSS status=%s provider=%s variant=%s",
                                 response.status_code,
                                 provider_name,
                                 variant,
@@ -1826,7 +1826,7 @@ async def search_recent_news_web(
                     except Exception:
                         if logger:
                             logger.debug(
-                                "Web fallback RSS parse failure provider=%s variant=%s.",
+                                "Web cross-check RSS parse failure provider=%s variant=%s.",
                                 provider_name,
                                 variant,
                                 exc_info=True,
@@ -1899,7 +1899,7 @@ async def search_recent_news_web(
             http.headers.update(original_headers)
     except Exception:
         if logger:
-            logger.debug("Web fallback search failed.", exc_info=True)
+            logger.debug("Web cross-check search failed.", exc_info=True)
         return []
 
     rows.sort(key=lambda row: int(row.get("timestamp", 0)), reverse=True)
