@@ -9595,7 +9595,11 @@ async def _stream_query_answer(
             interval_minutes=max(1, int((digest_hours_back or 1) * 60)),
             on_token=streamer.push,
         )
-        answer = _wrap_query_digest_answer(answer, hours_back=digest_hours_back or 1)
+        answer = _wrap_query_digest_answer(
+            answer,
+            hours_back=digest_hours_back or 1,
+            query_text=query_text,
+        )
     else:
         answer = await generate_answer_from_context(
             query=query_text,
@@ -9851,7 +9855,11 @@ async def _handle_query_request(
                     auth_manager=_require_auth_manager(),
                     interval_minutes=max(1, active_hours * 60),
                 )
-                answer = _wrap_query_digest_answer(answer, hours_back=active_hours)
+                answer = _wrap_query_digest_answer(
+                    answer,
+                    hours_back=active_hours,
+                    query_text=plan.original_query,
+                )
             else:
                 answer = await generate_answer_from_context(
                     query=effective_query,
