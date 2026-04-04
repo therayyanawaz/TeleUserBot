@@ -1369,10 +1369,9 @@ def _query_default_hours_back() -> int:
     return max(1, min(value, 24 * 30))
 
 
-def _is_query_web_fallback_enabled() -> bool:
-    # Query answers always require a web cross-check. The legacy config flag is
-    # kept for backward compatibility in settings, but it no longer disables the
-    # verification step.
+def _is_query_web_crosscheck_required() -> bool:
+    # Query answers always require a trusted web cross-check after Telegram
+    # evidence gathering.
     return True
 
 
@@ -9608,7 +9607,7 @@ async def _handle_query_request(
 
     progress = await _safe_reply_markdown(
         event_ref,  # type: ignore[arg-type]
-        _query_search_status(_is_query_web_fallback_enabled()),
+        _query_search_status(_is_query_web_crosscheck_required()),
         reply_to=reply_to,
         prefer_bot_identity=prefer_bot_identity,
         bot_chat_id=bot_chat_id,
@@ -9705,7 +9704,7 @@ async def _handle_query_request(
         web_fallback_used = False
         ran_web_search = False
 
-        should_run_web_search = bool(_is_query_web_fallback_enabled())
+        should_run_web_search = bool(_is_query_web_crosscheck_required())
 
         if should_run_web_search:
             ran_web_search = True
@@ -9736,7 +9735,7 @@ async def _handle_query_request(
                 }
                 if len(source_hosts) < required_sources:
                     LOGGER.info(
-                        "Web fallback rejected for query due to low source diversity (%s < %s).",
+                        "Web cross-check evidence rejected for query due to low source diversity (%s < %s).",
                         len(source_hosts),
                         required_sources,
                     )
@@ -10198,7 +10197,8 @@ def _startup_health_check() -> None:
         dupe_use_sentence_transformers=_dupe_use_sentence_transformers(),
         severity_routing=_is_severity_routing_enabled(),
         query_mode=_is_query_mode_enabled(),
-        query_web_fallback=_is_query_web_fallback_enabled(),
+        query_web_crosscheck_required=_is_query_web_crosscheck_required(),
+        query_web_max_hours_back=_query_web_max_hours_back(),
         html_formatting=_is_html_formatting_enabled(),
         premium_emoji=_is_premium_emoji_enabled(),
         premium_emoji_count=len(premium_emoji_map),
@@ -10225,7 +10225,7 @@ def _startup_health_check() -> None:
         quota_health=get_quota_health(),
     )
     LOGGER.info(
-        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s query_web=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%s scope=%s pin_hourly=%s pin_daily=%s web=%s@%s:%s",
+        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s query_web_crosscheck=%s query_web_hours=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%s scope=%s pin_hourly=%s pin_daily=%s web=%s@%s:%s",
         mode,
         pending,
         inflight,
@@ -10233,7 +10233,8 @@ def _startup_health_check() -> None:
         _is_dupe_detection_enabled(),
         _is_severity_routing_enabled(),
         _is_query_mode_enabled(),
-        _is_query_web_fallback_enabled(),
+        _is_query_web_crosscheck_required(),
+        _query_web_max_hours_back(),
         _is_html_formatting_enabled(),
         _is_premium_emoji_enabled(),
         len(premium_emoji_map),
