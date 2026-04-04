@@ -257,13 +257,38 @@ def test_parse_time_filter_today_uses_configured_timezone(monkeypatch):
     monkeypatch.setattr(utils.config, "TIMEZONE", "Asia/Kolkata", raising=False)
     monkeypatch.setattr(utils, "datetime", _FakeDateTime)
 
-    hours_back, cleaned = utils.parse_time_filter_from_query(
+    hours_back, cleaned, start_ts, end_ts = utils.parse_time_filter_from_query(
         "What happened today in Tehran?",
         default_hours=1,
     )
 
-    assert hours_back == 7
+    assert hours_back == 6
     assert cleaned == "What happened in Tehran?"
+    assert start_ts == int(datetime(2026, 4, 3, 18, 30, tzinfo=timezone.utc).timestamp())
+    assert end_ts == int(datetime(2026, 4, 4, 0, 30, tzinfo=timezone.utc).timestamp())
+
+
+def test_parse_time_filter_yesterday_uses_calendar_day_boundaries(monkeypatch):
+    class _FakeDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            base = datetime(2026, 4, 4, 20, 0, tzinfo=timezone.utc)
+            if tz is None:
+                return base.replace(tzinfo=None)
+            return base.astimezone(tz)
+
+    monkeypatch.setattr(utils.config, "TIMEZONE", "Asia/Kolkata", raising=False)
+    monkeypatch.setattr(utils, "datetime", _FakeDateTime)
+
+    hours_back, cleaned, start_ts, end_ts = utils.parse_time_filter_from_query(
+        "What happened yesterday in Tehran?",
+        default_hours=1,
+    )
+
+    assert hours_back == 26
+    assert cleaned == "What happened in Tehran?"
+    assert start_ts == int(datetime(2026, 4, 3, 18, 30, tzinfo=timezone.utc).timestamp())
+    assert end_ts == int(datetime(2026, 4, 4, 18, 30, tzinfo=timezone.utc).timestamp())
 
 
 def test_runtime_timezone_accepts_ist_alias(monkeypatch):
@@ -311,6 +336,37 @@ def test_load_archive_query_context_uses_runtime_timezone_for_date_labels(monkey
 
     assert rows
     assert rows[0]["date"].endswith("+05:30")
+
+
+def test_filter_stored_query_rows_respects_end_bound_for_yesterday_window():
+    rows = [
+        {
+            "timestamp": int(datetime(2026, 4, 4, 17, 0, tzinfo=timezone.utc).timestamp()),
+            "channel_id": "-1001",
+            "message_id": 10,
+            "source_name": "Archive Source",
+            "message_link": "",
+            "raw_text": "Strike reports continued yesterday evening.",
+        },
+        {
+            "timestamp": int(datetime(2026, 4, 4, 19, 0, tzinfo=timezone.utc).timestamp()),
+            "channel_id": "-1001",
+            "message_id": 11,
+            "source_name": "Archive Source",
+            "message_link": "",
+            "raw_text": "Strike reports continued after midnight local time.",
+        },
+    ]
+
+    filtered = main._filter_stored_query_rows(
+        rows,
+        query_text="strike",
+        broad_query=False,
+        start_ts=int(datetime(2026, 4, 3, 18, 30, tzinfo=timezone.utc).timestamp()),
+        end_ts=int(datetime(2026, 4, 4, 18, 30, tzinfo=timezone.utc).timestamp()),
+    )
+
+    assert [item["message_id"] for item in filtered] == [10]
 
 
 @pytest.mark.asyncio

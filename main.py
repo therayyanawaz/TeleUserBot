@@ -8858,6 +8858,8 @@ def _filter_stored_query_rows(
     *,
     query_text: str,
     broad_query: bool,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
 ) -> list[Dict[str, object]]:
     expanded_terms = {
         normalize_space(term).lower()
@@ -8883,6 +8885,10 @@ def _filter_stored_query_rows(
                 continue
 
         timestamp = int(row.get("timestamp") or 0)
+        if start_ts is not None and timestamp > 0 and timestamp < int(start_ts):
+            continue
+        if end_ts is not None and timestamp > 0 and timestamp >= int(end_ts):
+            continue
         date_label = (
             datetime.fromtimestamp(timestamp, tz=runtime_timezone()).isoformat()
             if timestamp > 0
@@ -8908,12 +8914,20 @@ def _load_queue_query_context(
     hours_back: int,
     limit: int,
     broad_query: bool,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
 ) -> list[Dict[str, object]]:
     since_ts = max(0, int(time.time()) - max(1, int(hours_back)) * 3600)
     rows = load_queue_since(since_ts, max(1, int(limit)))
     if not rows:
         return []
-    return _filter_stored_query_rows(rows, query_text=query_text, broad_query=broad_query)
+    return _filter_stored_query_rows(
+        rows,
+        query_text=query_text,
+        broad_query=broad_query,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
 
 
 def _load_archive_query_context(
@@ -8922,6 +8936,8 @@ def _load_archive_query_context(
     hours_back: int,
     limit: int,
     broad_query: bool,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
 ) -> list[Dict[str, object]]:
     """
     Pull recent archived updates into query context.
@@ -8934,7 +8950,13 @@ def _load_archive_query_context(
     rows = load_archive_since(since_ts, max(1, int(limit)))
     if not rows:
         return []
-    return _filter_stored_query_rows(rows, query_text=query_text, broad_query=broad_query)
+    return _filter_stored_query_rows(
+        rows,
+        query_text=query_text,
+        broad_query=broad_query,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
 
 
 def _wrap_query_digest_answer(answer: str, *, hours_back: int) -> str:
@@ -9699,6 +9721,8 @@ async def _handle_query_request(
                 hours_back=active_hours,
                 limit=max(context_limit * 3, 80),
                 broad_query=broad_query,
+                start_ts=getattr(plan, "start_ts", None),
+                end_ts=getattr(plan, "end_ts", None),
             )
             if queue_results:
                 telegram_results = _merge_query_context(
@@ -9713,6 +9737,8 @@ async def _handle_query_request(
                 hours_back=active_hours,
                 limit=max(context_limit * 3, 80),
                 broad_query=broad_query,
+                start_ts=getattr(plan, "start_ts", None),
+                end_ts=getattr(plan, "end_ts", None),
             )
             if archive_results:
                 telegram_results = _merge_query_context(
