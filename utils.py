@@ -360,6 +360,7 @@ class QueryPlan:
     original_query: str
     cleaned_query: str
     hours_back: int
+    explicit_time_filter: bool
     broad_query: bool
     keywords: tuple[str, ...]
     expanded_terms: tuple[str, ...]
@@ -371,6 +372,7 @@ def build_query_plan(query: str, *, default_hours: int = 24) -> QueryPlan:
     original = normalize_space(query)
     hours_back, cleaned = parse_time_filter_from_query(original, default_hours)
     effective = cleaned or original
+    explicit_time_filter = hours_back != max(1, int(default_hours)) or effective != original
     broad = is_broad_news_query(original)
     keywords = tuple(extract_query_keywords(effective))
     expanded_terms = tuple(expand_query_terms(effective))
@@ -380,6 +382,7 @@ def build_query_plan(query: str, *, default_hours: int = 24) -> QueryPlan:
         original_query=original,
         cleaned_query=effective,
         hours_back=hours_back,
+        explicit_time_filter=explicit_time_filter,
         broad_query=broad,
         keywords=keywords,
         expanded_terms=expanded_terms,

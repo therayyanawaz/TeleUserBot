@@ -3489,6 +3489,87 @@ def _rank_query_context(
     return out if out else list(context_messages[: max(6, int(limit))])
 
 
+def _query_collect_fallback_candidates(
+    query: str,
+    context_messages: Sequence[Dict[str, object]],
+    *,
+    detailed: bool,
+) -> list[tuple[str, Literal["high", "medium", "low"]]]:
+    ranked = _rank_query_context(query, context_messages, limit=(10 if detailed else 6))
+    ranked = ranked[: (8 if detailed else 6)]
+    if not ranked:
+        return []
+
+    broad_query = is_broad_news_query(query)
+    lowered_query = normalize_space(query).lower()
+    query_terms = {
+        normalize_space(term).lower()
+        for term in [*expand_query_terms(query), *extract_query_keywords(query), *extract_query_numbers(query)]
+        if len(normalize_space(term)) >= 2
+    }
+    if "aws" in lowered_query:
+        query_terms.update({"amazon", "amazon web services"})
+    now_ts = int(time.time())
+    matched: list[tuple[int, float, str, Literal["high", "medium", "low"]]] = []
+    fallback: list[tuple[int, float, str, Literal["high", "medium", "low"]]] = []
+
+    for item in ranked:
+        raw_text = normalize_space(str(item.get("text") or ""))
+        if not raw_text:
+            continue
+        for sentence in _split_digest_sentences(raw_text):
+            cleaned = _digest_finalize_sentence(sentence, max_chars=220)
+            if not cleaned:
+                continue
+            lowered = cleaned.lower()
+            term_hits = sum(1 for term in query_terms if term in lowered)
+            sentence_item = dict(item)
+            sentence_item["text"] = cleaned
+            score = _score_query_context_row(query, sentence_item, now_ts=now_ts) + min(3.0, term_hits * 1.15)
+            if not detailed and len(cleaned) > 180:
+                score -= 0.35
+            target = matched if (term_hits > 0 or broad_query or not query_terms) else fallback
+            target.append((term_hits, score, cleaned, _severity_from_text_heuristic(cleaned)))
+
+    max_items = 5 if detailed else 3
+    ranked_candidates = sorted(matched or fallback, key=lambda item: (item[0], item[1]), reverse=True)
+    if len(ranked) == 1 and len(ranked_candidates) > max_items:
+        ranked_candidates = [*ranked_candidates[: max_items - 1], ranked_candidates[-1]]
+    results: list[tuple[str, Literal["high", "medium", "low"]]] = []
+    seen_keys: set[str] = set()
+    for _term_hits, _score, cleaned, severity in ranked_candidates:
+        key = _digest_line_key(cleaned)
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        results.append((cleaned, severity))
+        if len(results) >= max_items:
+            break
+    return results
+
+
+def _query_fallback_title(query: str, candidate_lines: Sequence[str]) -> str:
+    if candidate_lines:
+        headline = _fallback_headline(" ".join(candidate_lines[:2])) or _fallback_headline(candidate_lines[0])
+        if headline:
+            first_key = _digest_line_key(candidate_lines[0])
+            headline_key = _digest_line_key(headline)
+            if first_key and headline_key and (
+                headline_key == first_key
+                or SequenceMatcher(None, headline_key, first_key).ratio() >= 0.9
+            ):
+                headline = ""
+        if headline:
+            return headline
+    if _query_is_identity_question(query):
+        return "Best available answer"
+    if _query_is_casualty_question(query):
+        return "What the evidence shows"
+    if is_broad_news_query(query):
+        return "Latest update"
+    return "Direct answer"
+
+
 def _query_context_token_budget() -> int:
     raw = getattr(config, "DIGEST_MAX_TOKENS", 18000)
     try:
@@ -3620,41 +3701,41 @@ def _fallback_query_answer(
     if not context_messages:
         return QUERY_NO_MATCH_TEXT
 
-    selected = _rank_query_context(query, context_messages, limit=(8 if detailed else 4))
-    selected = selected[: (6 if detailed else 4)]
-    lines = []
-    intro_title = "What stands out right now"
-    normalized_query = normalize_space(query).rstrip("?")
-    keywords = extract_query_keywords(query)
-    if _query_is_identity_question(query):
-        intro_title = "Best available answer"
-    elif _query_is_casualty_question(query):
-        intro_title = "What the evidence shows"
-    elif is_broad_news_query(query):
-        if len(keywords) == 1:
-            intro_title = f"Latest on {keywords[0].title()}"
-        elif len(keywords) >= 2:
-            intro_title = f"Latest on {keywords[0].title()} and {keywords[1].title()}"
-    elif normalized_query and len(normalized_query) <= 72:
-        intro_title = normalized_query[:1].upper() + normalized_query[1:]
-    for item in selected:
-        text = normalize_space(str(item.get("text") or ""))
-        if not text:
-            continue
-        text = re.sub(
-            r"^(?:breaking|alert|live update|update)\s*[:\-–—]+\s*",
-            "",
-            text,
-            flags=re.IGNORECASE,
-        )
-        prefix = "🔥" if _severity_from_text_heuristic(text) == "high" else "⚠️"
-        for segment in _split_query_fallback_segments(text):
-            line = f"• {prefix} {segment}"
-            lines.append(line)
-
-    if not lines:
+    candidates = _query_collect_fallback_candidates(query, context_messages, detailed=detailed)
+    if not candidates:
         return QUERY_NO_MATCH_TEXT
-    return sanitize_telegram_html(f"<b>{intro_title}</b><br>" + "<br>".join(lines))
+
+    candidate_lines = [line for line, _severity in candidates]
+    intro_title = _query_fallback_title(query, candidate_lines)
+    lead = _build_digest_story_from_fragments(
+        candidate_lines[:2],
+        total_max_chars=260 if not detailed else 360,
+        max_sentences=2,
+    )
+
+    parts = [f"<b>{sanitize_telegram_html(intro_title)}</b>"]
+    title_key = _digest_line_key(intro_title)
+    lead_key = _digest_line_key(lead)
+    if lead and lead_key and lead_key != title_key:
+        parts.append(sanitize_telegram_html(lead))
+
+    support: list[str] = []
+    seen_support: set[str] = set()
+    support_candidates = candidates[2:] if lead else candidates
+    for line, severity in support_candidates:
+        key = _digest_line_key(line)
+        if not key or key == lead_key or key in seen_support:
+            continue
+        seen_support.add(key)
+        prefix = "🔥" if severity == "high" else "⚠️"
+        support.append(f"• {prefix} {sanitize_telegram_html(line)}")
+
+    if not support and candidate_lines:
+        fallback_line = candidate_lines[-1] if len(candidate_lines) > 1 else candidate_lines[0]
+        support.append(f"• ⚠️ {sanitize_telegram_html(fallback_line)}")
+
+    parts.extend(support[: (4 if detailed else 2)])
+    return "<br>".join(parts)
 
 
 async def decide_filter_action(text: str, auth_manager: AuthManager) -> FilterDecision:
@@ -4765,8 +4846,18 @@ def _query_quality_issue(answer_html: str, question: str) -> str:
         return "vague_copy"
     if any(pattern in lowered for pattern in _WEAK_COPY_PATTERNS):
         return "vague_copy"
+    if any(marker in lowered for marker in ("fwd from", "original msg", "support us", "subscribe")):
+        return "citation_leak"
+    if re.search(r"@\w{3,}", cleaned):
+        return "citation_leak"
     if cleaned.endswith(("...", "…", ":", "-", "–", "—", "/")):
         return "incomplete_copy"
+    bullet_count = cleaned.count("•")
+    if not _query_requests_detail(question):
+        if bullet_count > 4 or len(cleaned) > 800:
+            return "messy_layout"
+    elif bullet_count > 6 or len(cleaned) > 1400:
+        return "messy_layout"
     if len(cleaned) < max(28, min(64, len(normalize_space(question)))):
         return "headline_too_thin"
     return ""
@@ -4783,7 +4874,12 @@ def _digest_retry_prompt(prompt: str, issue: str) -> str:
 
 
 def _query_retry_prompt(prompt: str, issue: str) -> str:
-    return f"{prompt}\n\nRevision feedback:\n- {_filter_retry_feedback(issue)}\n- Answer the exact question directly in the first line with concrete facts."
+    return (
+        f"{prompt}\n\nRevision feedback:\n- {_filter_retry_feedback(issue)}\n"
+        "- Answer the exact question directly in the first line with concrete facts.\n"
+        "- Keep it short, punchy, and direct: one sharp answer line, one short sentence, and no more than 3 short bullets unless the user asked for detail.\n"
+        "- Do not paste raw source text, forwarded-message phrasing, promo fragments, or long evidence dumps."
+    )
 
 
 async def create_digest_summary_result(

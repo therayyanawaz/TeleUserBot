@@ -1392,12 +1392,12 @@ def _query_web_max_results() -> int:
 
 
 def _query_web_max_hours_back() -> int:
-    raw = getattr(config, "QUERY_WEB_MAX_HOURS_BACK", 24)
+    raw = getattr(config, "QUERY_WEB_MAX_HOURS_BACK", 24 * 7)
     try:
         value = int(raw)
     except Exception:
-        value = 24
-    return max(1, min(value, 72))
+        value = 24 * 7
+    return max(1, min(value, 24 * 7))
 
 
 def _query_web_require_recent() -> bool:
@@ -1451,6 +1451,50 @@ def _query_analysis_status(telegram_count: int, web_count: int) -> str:
 
 def _query_writing_status() -> str:
     return "Writing a clear answer from the strongest evidence... ⏳"
+
+
+def _query_expand_status() -> str:
+    return "Need more context. Widening the Telegram scan to the last 7 days... ⏳"
+
+
+def _query_expanded_window_hours() -> int:
+    return 24 * 7
+
+
+def _query_window_strategy(*, requested_hours: int, explicit_time_filter: bool) -> tuple[int, int]:
+    primary_hours = max(1, int(requested_hours))
+    if explicit_time_filter:
+        return primary_hours, primary_hours
+    return min(primary_hours, 24), max(primary_hours, _query_expanded_window_hours())
+
+
+def _query_needs_expanded_window(
+    query: str,
+    results: Sequence[Dict[str, object]],
+    *,
+    broad_query: bool,
+) -> bool:
+    if len(results) < _query_web_min_telegram_results():
+        return True
+    if broad_query and len(results) < max(4, _query_web_min_telegram_results() + 1):
+        return True
+
+    terms = {
+        normalize_space(term).lower()
+        for term in expand_query_terms(query)
+        if len(normalize_space(term)) >= 3
+    }
+    if not terms:
+        return False
+
+    matched_rows = 0
+    for row in list(results)[:6]:
+        text = normalize_space(str(row.get("text") or "")).lower()
+        if not text:
+            continue
+        if any(term in text for term in terms):
+            matched_rows += 1
+    return matched_rows == 0
 
 
 def _is_high_risk_news_query(query: str) -> bool:
@@ -9318,6 +9362,13 @@ async def _handle_query_request(
         return
     query_last_request_ts[sender_id] = now
 
+    plan = build_query_plan(text, default_hours=_query_default_hours_back())
+    parsed_hours = plan.hours_back
+    primary_hours, expanded_hours = _query_window_strategy(
+        requested_hours=parsed_hours,
+        explicit_time_filter=bool(getattr(plan, "explicit_time_filter", False)),
+    )
+
     progress = await _safe_reply_markdown(
         event_ref,  # type: ignore[arg-type]
         _query_search_status(_is_query_web_fallback_enabled()),
@@ -9329,8 +9380,6 @@ async def _handle_query_request(
         return
 
     try:
-        plan = build_query_plan(text, default_hours=_query_default_hours_back())
-        parsed_hours = plan.hours_back
         cleaned_query = plan.cleaned_query
         effective_query = plan.original_query or text
         broad_query = plan.broad_query
@@ -9338,16 +9387,8 @@ async def _handle_query_request(
         query_numbers = list(plan.numbers)
         high_risk_query = _is_high_risk_news_query(effective_query)
         context_limit = _query_max_messages() * (2 if broad_query or len(query_keywords) <= 2 else 1)
-
-        preload_web_search = bool(
-            _is_query_web_fallback_enabled()
-            and (broad_query or bool(query_keywords) or bool(query_numbers))
-            and (
-                _query_prefers_web_crosscheck(effective_query)
-                or high_risk_query
-                or broad_query
-            )
-        )
+        active_hours = primary_hours
+        expanded_window_used = False
 
         telegram_task = asyncio.create_task(
             search_recent_messages(
@@ -9355,31 +9396,50 @@ async def _handle_query_request(
                 monitored_source_chat_ids,
                 cleaned_query,
                 max_messages=context_limit,
-                default_hours_back=parsed_hours,
+                default_hours_back=primary_hours,
                 logger=LOGGER,
             )
         )
-        web_task: asyncio.Task[list[dict[str, object]]] | None = None
-        if preload_web_search:
-            web_task = asyncio.create_task(
-                _search_recent_news_web_bounded(
-                    cleaned_query,
-                    hours_back=min(parsed_hours, _query_web_max_hours_back()),
-                    max_results=_query_web_max_results(),
-                    allowed_domains=_query_web_allowed_domains(),
-                    require_recent=_query_web_require_recent(),
-                    logger=LOGGER,
-                )
-            )
 
         telegram_results = await telegram_task
+
+        if (
+            expanded_hours > primary_hours
+            and _query_needs_expanded_window(
+                effective_query,
+                telegram_results,
+                broad_query=broad_query,
+            )
+        ):
+            await _safe_reply_markdown(
+                event_ref,  # type: ignore[arg-type]
+                _query_expand_status(),
+                edit_message=progress,
+                prefer_bot_identity=prefer_bot_identity,
+                bot_chat_id=bot_chat_id,
+            )
+            expanded_results = await search_recent_messages(
+                _require_client(),
+                monitored_source_chat_ids,
+                cleaned_query,
+                max_messages=context_limit,
+                default_hours_back=expanded_hours,
+                logger=LOGGER,
+            )
+            telegram_results = _merge_query_context(
+                telegram_results,
+                expanded_results,
+                limit=max(context_limit, 40),
+            )
+            active_hours = expanded_hours
+            expanded_window_used = True
 
         queue_results: list[dict[str, object]] = []
         archive_results: list[dict[str, object]] = []
         if broad_query or len(telegram_results) < _query_web_min_telegram_results():
             queue_results = _load_queue_query_context(
                 query_text=effective_query,
-                hours_back=parsed_hours,
+                hours_back=active_hours,
                 limit=max(context_limit * 3, 80),
                 broad_query=broad_query,
             )
@@ -9393,7 +9453,7 @@ async def _handle_query_request(
         if broad_query or len(telegram_results) < _query_web_min_telegram_results():
             archive_results = _load_archive_query_context(
                 query_text=effective_query,
-                hours_back=parsed_hours,
+                hours_back=active_hours,
                 limit=max(context_limit * 3, 80),
                 broad_query=broad_query,
             )
@@ -9406,21 +9466,11 @@ async def _handle_query_request(
 
         web_results: list[dict[str, object]] = []
         web_fallback_used = False
-        ran_web_search = bool(preload_web_search)
+        ran_web_search = False
 
-        should_run_web_search = bool(
-            _is_query_web_fallback_enabled()
-            and (broad_query or bool(query_keywords) or bool(query_numbers))
-            and (
-                _query_prefers_web_crosscheck(effective_query)
-                or
-                high_risk_query
-                or broad_query
-                or len(telegram_results) < _query_web_min_telegram_results()
-            )
-        )
+        should_run_web_search = bool(_is_query_web_fallback_enabled())
 
-        if should_run_web_search and web_task is None:
+        if should_run_web_search:
             ran_web_search = True
             await _safe_reply_markdown(
                 event_ref,  # type: ignore[arg-type]
@@ -9431,14 +9481,12 @@ async def _handle_query_request(
             )
             web_results = await _search_recent_news_web_bounded(
                 cleaned_query,
-                hours_back=min(parsed_hours, _query_web_max_hours_back()),
+                hours_back=active_hours,
                 max_results=_query_web_max_results(),
                 allowed_domains=_query_web_allowed_domains(),
                 require_recent=_query_web_require_recent(),
                 logger=LOGGER,
             )
-        elif web_task is not None:
-            web_results = await web_task
 
         if should_run_web_search and web_results:
             required_sources = _query_web_require_min_sources()
@@ -9482,7 +9530,7 @@ async def _handle_query_request(
                 results=results,
                 history=history,
                 digest_mode=broad_query,
-                digest_hours_back=parsed_hours,
+                digest_hours_back=active_hours,
                 prefer_bot_identity=prefer_bot_identity,
                 bot_chat_id=bot_chat_id,
                 root_reply_to=reply_to,
@@ -9493,9 +9541,9 @@ async def _handle_query_request(
                 answer = await create_digest_summary(
                     list(results),
                     auth_manager=_require_auth_manager(),
-                    interval_minutes=max(1, parsed_hours * 60),
+                    interval_minutes=max(1, active_hours * 60),
                 )
-                answer = _wrap_query_digest_answer(answer, hours_back=parsed_hours)
+                answer = _wrap_query_digest_answer(answer, hours_back=active_hours)
             else:
                 answer = await generate_answer_from_context(
                     query=effective_query,
@@ -9527,7 +9575,8 @@ async def _handle_query_request(
             sender_id=sender_id,
             chat_id=chat_id,
             query_length=len(text),
-            hours_back=parsed_hours,
+            hours_back=active_hours,
+            requested_hours_back=parsed_hours,
             messages_found=len(results),
             telegram_messages_found=len(telegram_results),
             queue_messages_found=len(queue_results),
@@ -9535,6 +9584,7 @@ async def _handle_query_request(
             web_messages_found=len(web_results),
             web_fallback_used=web_fallback_used,
             web_search_ran=ran_web_search,
+            expanded_window_used=expanded_window_used,
             broad_query=broad_query,
             high_risk_query=high_risk_query,
             response_chars=len(answer),

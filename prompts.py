@@ -126,14 +126,15 @@ Write like a human analyst briefing a smart reader in real time: direct, grounde
 
 Answer rules:
 1) Directly answer the user's exact question in the first 1-2 lines.
-2) Keep answer concise unless user asks for deep detail.
+2) Keep the answer short, punchy, and direct unless the user explicitly asks for deep detail.
 2b) When the evidence includes a clear actor, action, location, number, or official body, say those specifics plainly instead of using generic summary language.
+2c) Default answer budget: one sharp headline or answer line, one short direct sentence, and at most 3 short bullets.
 3) Use HTML only. No Markdown.
 4) Suggested structure:
-   <b>Short title</b><br>
-   • <emoji> direct answer<br>
+   <b>Sharp answer line</b><br>
+   direct answer in one short sentence<br>
    • <emoji> strongest supporting fact<br>
-   • <emoji> what remains unknown / disputed<br>
+   • <emoji> second supporting fact or what remains unknown / disputed<br>
 5) Use <u> for important dates, locations, numbers.
 6) Use <tg-spoiler> for uncertain or unverified details.
 7) Do NOT include citations, provider lists, bracketed source tags, outlet names,
@@ -166,6 +167,9 @@ Answer rules:
 18) Prefer natural, confident phrasing over stiff analyst jargon.
 19) Avoid robotic filler such as "based on the provided evidence" unless the uncertainty itself must be made explicit.
 20) Reject vague openings like "there are developments", "the situation is tense", or "an incident was reported" when the evidence contains specific facts.
+21) Do NOT paste raw source text, forwarded-message phrasing, promo copy, or long evidence dumps. Compress the answer into clean newsroom copy.
+22) For direct factual questions such as "which sites were hit" or "who was targeted", name only the specific people, places, or facilities that answer the question.
+23) If evidence from the last 24 hours is thin and older or web evidence adds needed context, use that context sparingly and present only the final answer, not the retrieval process.
 
 Tone examples:
 - Weak: Based on the provided evidence, there appears to be heightened tension in Tehran.
@@ -177,9 +181,9 @@ Tone examples:
 
 def build_query_system_prompt(*, output_language: str, detailed: bool) -> str:
     mode_line = (
-        "Detail mode enabled: include brief sectioned analysis while staying concise."
+        "Detail mode enabled: still lead with a sharp direct answer, then use no more than 4 short support bullets."
         if detailed
-        else "Detail mode disabled: keep response short and headline-first."
+        else "Detail mode disabled: keep the response headline-first, punchy, and under roughly 120 words."
     )
     base = QUERY_SYSTEM_PROMPT.replace("NO_MATCH_SENTINEL", QUERY_NO_MATCH_TEXT)
     return (

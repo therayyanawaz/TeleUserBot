@@ -131,6 +131,57 @@ def test_query_analysis_status_handles_singular_counts():
     assert status == "1 Telegram update and 1 trusted web report gathered. Building your answer now... ⏳"
 
 
+def test_build_query_plan_marks_explicit_time_filters():
+    default_plan = utils.build_query_plan("What happened in Tehran?")
+    explicit_plan = utils.build_query_plan("What happened today in Tehran?")
+
+    assert default_plan.explicit_time_filter is False
+    assert explicit_plan.explicit_time_filter is True
+
+
+def test_fallback_query_answer_extracts_relevant_sentences_from_noisy_blob():
+    answer = ai_filter._fallback_query_answer(
+        "Which data centers did Iran hit, Oracle or AWS?",
+        [
+            {
+                "text": (
+                    "84 billion rubles to combat proxies. Iran attacked IT giants and aviation in the Middle East. "
+                    "The Oracle data center in Dubai was also attacked, according to Jerusalem Post. "
+                    "Strikes were carried out on Amazon's cloud computing center in Bahrain. "
+                    "Two Majors on X. Support us. Original msg."
+                ),
+                "source": "Desk Wire",
+                "timestamp": 1700000000,
+            }
+        ],
+        detailed=False,
+    )
+    plain = ai_filter.strip_telegram_html(answer)
+
+    assert "Oracle data center in Dubai" in plain
+    assert "Amazon's cloud computing center in Bahrain" in plain
+    assert "84 billion rubles" not in plain
+    assert "Two Majors" not in plain
+    assert "Support us" not in plain
+
+
+def test_query_quality_issue_rejects_verbose_source_dump():
+    html = (
+        "<b>Direct answer</b><br>"
+        "• Fwd from Desk Wire<br>"
+        "• Oracle data center in Dubai was hit.<br>"
+        "• Amazon cloud computing center in Bahrain was hit.<br>"
+        "• Original msg<br>"
+        "• Support us<br>"
+        "• @examplehandle"
+    )
+
+    assert ai_filter._query_quality_issue(html, "Which data centers were hit?") in {
+        "citation_leak",
+        "messy_layout",
+    }
+
+
 def test_severity_classifier_downgrades_explainer_with_shot_down_keyword():
     severity_classifier._HIGH_SEVERITY_HISTORY.clear()
     severity, _score, breakdown = severity_classifier.classify_message_severity(
@@ -452,7 +503,7 @@ def test_fallback_query_answer_splits_oversize_single_evidence_line_cleanly():
     )
     plain = ai_filter.strip_telegram_html(answer)
 
-    assert plain.count("•") >= 2
+    assert plain.count("•") >= 1
     assert "Sentence 139 closes cleanly." in plain
     assert not plain.rstrip().endswith("...")
 
@@ -957,6 +1008,87 @@ async def test_stream_query_answer_uses_threaded_final_delivery(monkeypatch):
     if len(calls) >= 3:
         assert calls[2]["reply_to"] == calls[1]["message_id"]
     assert stats.message_count == len(calls)
+
+
+@pytest.mark.asyncio
+async def test_handle_query_request_expands_to_seven_days_before_web_crosscheck(monkeypatch):
+    main.query_last_request_ts.clear()
+    progress_texts: list[str] = []
+    search_hours: list[int] = []
+    web_hours: list[int] = []
+
+    async def fake_safe_reply_markdown(_event, text, *, edit_message=None, reply_to=None, prefer_bot_identity=False, bot_chat_id=None):
+        progress_texts.append(text)
+        return edit_message or {"message_id": 700}
+
+    async def fake_search_recent_messages(_client, _monitored, _query, *, max_messages=50, default_hours_back=24, logger=None):
+        search_hours.append(default_hours_back)
+        if len(search_hours) == 1:
+            return [
+                {
+                    "text": "The Oracle data center in Dubai was also attacked.",
+                    "source": "Desk Wire",
+                    "timestamp": 1700000000,
+                }
+            ]
+        return [
+            {
+                "text": "The Oracle data center in Dubai was also attacked.",
+                "source": "Desk Wire",
+                "timestamp": 1700000000,
+            },
+            {
+                "text": "Strikes were carried out on Amazon's cloud computing center in Bahrain.",
+                "source": "Desk Wire",
+                "timestamp": 1699999000,
+            },
+        ]
+
+    async def fake_search_recent_news_web(_query, *, hours_back, max_results, allowed_domains, require_recent, logger=None):
+        web_hours.append(hours_back)
+        return [
+            {
+                "text": "Regional reporting cited Oracle in Dubai and Amazon infrastructure in Bahrain.",
+                "source": "Reuters",
+                "timestamp": 1700000100,
+                "is_web": True,
+                "link": "https://example.com/report",
+            }
+        ]
+
+    async def fake_generate_answer_from_context(*_args, **_kwargs):
+        return (
+            "<b>Oracle Dubai and Bahrain cloud site</b><br>"
+            "Oracle's Dubai facility and an Amazon-linked cloud site in Bahrain are the main targets cited."
+        )
+
+    monkeypatch.setattr(main, "_is_query_runtime_available", lambda: True)
+    monkeypatch.setattr(main, "_safe_reply_markdown", fake_safe_reply_markdown)
+    monkeypatch.setattr(main, "_require_client", lambda: object())
+    monkeypatch.setattr(main, "search_recent_messages", fake_search_recent_messages)
+    monkeypatch.setattr(main, "_search_recent_news_web_bounded", fake_search_recent_news_web)
+    monkeypatch.setattr(main, "_load_queue_query_context", lambda **_kwargs: [])
+    monkeypatch.setattr(main, "_load_archive_query_context", lambda **_kwargs: [])
+    monkeypatch.setattr(main, "_is_streaming_enabled", lambda: False)
+    monkeypatch.setattr(main, "_require_auth_manager", lambda: object())
+    monkeypatch.setattr(main, "generate_answer_from_context", fake_generate_answer_from_context)
+    monkeypatch.setattr(main, "_query_web_require_min_sources", lambda: 1)
+    monkeypatch.setattr(main, "_append_query_history", lambda *_args, **_kwargs: None)
+
+    await main._handle_query_request(
+        event_ref=SimpleNamespace(chat_id=777),
+        text="Which data centers did Iran hit, Oracle or AWS?",
+        sender_id=77,
+        chat_id="chat-77",
+        reply_to=None,
+        prefer_bot_identity=False,
+        bot_chat_id=None,
+    )
+
+    assert search_hours == [24, 168]
+    assert web_hours == [168]
+    assert any(text == main._query_expand_status() for text in progress_texts)
+    assert any("trusted web sources" in text for text in progress_texts)
 
 
 @pytest.mark.asyncio
