@@ -247,6 +247,29 @@ async def test_create_digest_summary_result_falls_back_after_weak_ai_retry(monke
     assert calls["count"] == 2
 
 
+def test_json_digest_to_html_renders_headline_rail_for_short_window():
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "headline": "Top headlines from the last 30 minutes",
+            "headlines": [
+                "Port reopens after a three-day shutdown.",
+                "Security checks remain in place around the eastern gate.",
+                "Air defenses were activated over the northern district after a fresh barrage.",
+            ],
+        },
+        interval_minutes=30,
+        max_lines=12,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "<b>Top headlines from the last 30 minutes</b>" in html
+    assert "Port reopens after a three-day shutdown." in plain
+    assert "Security checks remain in place around the eastern gate." in plain
+    assert "Air defenses were activated over the northern district after a fresh barrage." in plain
+    assert "Officials said cargo traffic resumes at dawn" not in plain
+
+
 def test_json_digest_to_html_renders_narrative_digest():
     html = ai_filter._json_digest_to_html(
         {
@@ -264,7 +287,7 @@ def test_json_digest_to_html_renders_narrative_digest():
                 "Air defenses were activated over the northern district after a fresh barrage."
             ],
         },
-        interval_minutes=30,
+        interval_minutes=24 * 60,
         max_lines=12,
     )
     plain = ai_filter.strip_telegram_html(html)
@@ -296,7 +319,7 @@ def test_json_digest_to_html_normalizes_legacy_payload_to_narrative_shape():
                 "Air defenses were activated over the northern district after a fresh barrage."
             ],
         },
-        interval_minutes=30,
+        interval_minutes=24 * 60,
         max_lines=12,
     )
     plain = ai_filter.strip_telegram_html(html)
@@ -325,7 +348,7 @@ def test_json_digest_to_html_dedupes_story_highlights_and_also_moving():
                 "Air defenses were activated over the northern district after a fresh barrage.",
             ],
         },
-        interval_minutes=30,
+        interval_minutes=24 * 60,
         max_lines=12,
     )
     plain = ai_filter.strip_telegram_html(html)
@@ -347,7 +370,7 @@ def test_local_fallback_digest_keeps_all_distinct_updates():
                 "source_name": "Desk",
             },
         ],
-        interval_minutes=30,
+        interval_minutes=24 * 60,
     )
     plain = ai_filter.strip_telegram_html(html)
 
@@ -357,6 +380,28 @@ def test_local_fallback_digest_keeps_all_distinct_updates():
     assert "Residents reported new blasts near the ridge" in plain
     assert plain.count("Officials reopened the port after three days of disruption") == 1
     assert plain.count("Air defenses fired over the northern district after a fresh barrage") == 1
+
+
+def test_local_fallback_digest_uses_headline_rail_for_short_window():
+    html = ai_filter.local_fallback_digest(
+        [
+            {
+                "text": "Officials reopened the port after three days of disruption. Cargo traffic resumes at dawn.",
+                "source_name": "Desk",
+            },
+            {
+                "text": "Air defenses fired over the northern district after a fresh barrage. Residents reported new blasts near the ridge.",
+                "source_name": "Desk",
+            },
+        ],
+        interval_minutes=30,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "Top headlines from the last 30 minutes" in plain
+    assert "Officials reopened the port after three days of disruption" in plain
+    assert "Air defenses fired over the northern district after a fresh barrage" in plain
+    assert "Cargo traffic resumes at dawn" not in plain
 
 
 def test_html_digest_cleanup_strips_promo_handles_and_duplicate_blocks():
@@ -478,7 +523,14 @@ def test_digest_quality_issue_rejects_direct_citation_language():
         "Hebrew-language sources reported continuous unusual explosions in Tel Aviv."
     )
 
-    assert ai_filter._digest_quality_issue(html, ai_filter.quiet_period_message(30)) == "citation_leak"
+    assert (
+        ai_filter._digest_quality_issue(
+            html,
+            ai_filter.quiet_period_message(30),
+            interval_minutes=30,
+        )
+        == "citation_leak"
+    )
 
 
 def test_digest_quality_issue_rejects_source_leaks_and_messy_layout():
@@ -488,7 +540,11 @@ def test_digest_quality_issue_rejects_source_leaks_and_messy_layout():
         "• @stayfreeworld"
     )
 
-    assert ai_filter._digest_quality_issue(html, ai_filter.quiet_period_message(30)) in {
+    assert ai_filter._digest_quality_issue(
+        html,
+        ai_filter.quiet_period_message(30),
+        interval_minutes=30,
+    ) in {
         "citation_leak",
         "source_leak",
         "messy_layout",

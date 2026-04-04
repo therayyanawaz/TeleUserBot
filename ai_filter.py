@@ -2736,6 +2736,13 @@ def _render_digest_layout(
         clean_also = clean_also[: _digest_also_moving_cap()]
 
     if headline_mode:
+        story_headlines = _clean_digest_support_items(
+            _split_digest_sentences(clean_story),
+            max_chars=180,
+            seen=seen,
+        )
+        if story_headlines:
+            clean_highlights = [*story_headlines, *clean_highlights]
         if not clean_highlights:
             clean_highlights = _clean_digest_support_items([clean_story], max_chars=180, seen=seen)
         if not clean_highlights and not clean_also:
@@ -3223,7 +3230,13 @@ def local_fallback_digest(posts: Sequence[Dict[str, object]], *, interval_minute
             text = _post_text(post)
             if not text or _likely_noise(text) or _digest_needs_english_rewrite(text, "English"):
                 continue
-            candidate = _digest_clean_line(_fallback_headline(text) or text, max_chars=180, allow_short=True)
+            sentences = [_digest_finalize_sentence(part, max_chars=180) for part in _split_digest_sentences(text)]
+            sentences = [sentence for sentence in sentences if sentence]
+            candidate = _digest_clean_line(
+                sentences[0] if sentences else (_fallback_headline(text) or text),
+                max_chars=180,
+                allow_short=True,
+            )
             key = _digest_line_key(candidate)
             if not candidate or not key or key in seen:
                 continue

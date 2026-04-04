@@ -33,12 +33,13 @@ def test_format_digest_message_uses_clean_two_line_header():
         total_updates=41,
         sources=[],
         title="30-Minute Digest (22:00-22:30)",
+        interval_minutes=30,
     )
 
     lines = formatted.splitlines()
     assert lines[0] == "<b>📰 30-Minute Digest (22:00-22:30)</b>"
-    assert "41 updates reviewed" in lines[1]
-    assert "41 updates reviewed" in formatted
+    assert "41 headlines tracked" in lines[1]
+    assert "41 headlines tracked" in formatted
     assert "headlines from" not in formatted
 
 
@@ -77,3 +78,23 @@ def test_split_digest_body_blocks_repeats_story_context_across_parts():
     assert all("<b>Central Israel Impact Reports</b>" in chunk for chunk in chunks)
     assert all("Initial impact reports concentrated around Petah Tikva" in chunk for chunk in chunks)
     assert "Also moving" in chunks[-1]
+
+
+def test_split_digest_body_blocks_preserves_headline_rail_across_parts():
+    digest_body = (
+        "<b>Top headlines from the last 30 minutes</b><br>"
+        + "<br>".join(
+            f"• Headline {idx} closes cleanly with a concrete fact."
+            for idx in range(1, 8)
+        )
+    )
+
+    chunks = main._split_digest_body_blocks(
+        digest_body,
+        max_chars=220,
+    )
+
+    assert len(chunks) >= 2
+    assert all(len(chunk) <= 220 for chunk in chunks)
+    assert all("<b>Top headlines from the last 30 minutes</b>" in chunk for chunk in chunks)
+    assert all("Headline" in chunk for chunk in chunks)
