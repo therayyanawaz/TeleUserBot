@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 from types import SimpleNamespace
@@ -263,6 +264,54 @@ def _print_cli_status(symbol: str, text: str, *, level: str = "info") -> None:
     print(f"{_c(symbol, color, bold=True)} {text}")
 
 
+def _pull_latest_repo_version_on_startup() -> bool:
+    repo_root = Path(__file__).resolve().parent
+    try:
+        result = subprocess.run(
+            ["git", "pull", "origin", "main"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except FileNotFoundError:
+        LOGGER.warning("Skipping startup git pull because git is not installed.")
+        return False
+    except Exception:
+        LOGGER.exception("Startup git pull failed before runtime initialization.")
+        return False
+
+    stdout = normalize_space(result.stdout or "")
+    stderr = normalize_space(result.stderr or "")
+    combined = normalize_space(" ".join(part for part in (stdout, stderr) if part))
+
+    if result.returncode != 0:
+        LOGGER.warning(
+            "Startup git pull failed: %s",
+            combined or f"exit code {result.returncode}",
+        )
+        return False
+
+    updated = not re.search(
+        r"\b(?:already up to date|already up-to-date)\b",
+        combined,
+        flags=re.IGNORECASE,
+    )
+    log_structured(
+        LOGGER,
+        "startup_git_pull",
+        updated=updated,
+        output=combined or None,
+    )
+    return updated
+
+
+def _restart_process_after_startup_update() -> None:
+    LOGGER.info("Restarting process after startup git update.")
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
 ensure_runtime_dir()
 
 RUNTIME_LOG_PATH = ensure_runtime_dir() / "runtime.log"
@@ -473,6 +522,7 @@ auth_failure_reason: str = ""
 auth_features_disabled: List[str] = []
 startup_auth_repair_status: str = "not_needed"
 startup_auth_repair_message: str = ""
+startup_git_updated: bool = False
 pipeline_worker_tasks: List[asyncio.Task] = []
 pipeline_sentence_transformer_warm_task: asyncio.Task | None = None
 pipeline_query_web_semaphore: asyncio.Semaphore | None = None
@@ -10325,7 +10375,7 @@ async def main() -> None:
     global client, auth_manager, digest_scheduler_task
     global daily_digest_scheduler_task, queue_clear_scheduler_task, query_bot_poll_task
     global instance_lock_handle, web_status_server, started_as_username, started_as_user_id
-    global startup_phase, startup_ready, startup_error
+    global startup_phase, startup_ready, startup_error, startup_git_updated
 
     try:
         _configure_runtime_logging()
@@ -10333,6 +10383,11 @@ async def main() -> None:
         startup_error = ""
         _set_startup_phase("booting", reason="startup_entered")
         _print_cli_banner()
+        _print_cli_status("•", "Pulling latest code from origin/main...", level="info")
+        startup_git_updated = _pull_latest_repo_version_on_startup()
+        if startup_git_updated:
+            _print_cli_status("↻", "Repository updated. Restarting to load latest code...", level="warn")
+            _restart_process_after_startup_update()
         if _is_web_server_enabled():
             try:
                 web_status_server = WebStatusServer(

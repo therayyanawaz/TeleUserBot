@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -358,3 +359,31 @@ async def test_status_payload_and_digest_status_include_auth_health(monkeypatch)
     assert "degraded" in event.messages[0]
     assert "query_mode, ocr_translation" in event.messages[0]
     assert "Startup repair" in event.messages[0]
+
+
+def test_pull_latest_repo_version_on_startup_detects_no_change(monkeypatch):
+    monkeypatch.setattr(
+        main.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="Already up to date.\n",
+            stderr="",
+        ),
+    )
+
+    assert main._pull_latest_repo_version_on_startup() is False
+
+
+def test_pull_latest_repo_version_on_startup_detects_update(monkeypatch):
+    monkeypatch.setattr(
+        main.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="Updating 123..456 Fast-forward\n",
+            stderr="",
+        ),
+    )
+
+    assert main._pull_latest_repo_version_on_startup() is True
