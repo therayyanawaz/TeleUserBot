@@ -274,6 +274,38 @@ def test_runtime_timezone_accepts_ist_alias(monkeypatch):
     assert getattr(tz, "key", "") == "Asia/Kolkata"
 
 
+def test_load_archive_query_context_uses_runtime_timezone_for_date_labels(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "load_archive_since",
+        lambda *_args, **_kwargs: [
+            {
+                "timestamp": 1712277000,
+                "channel_id": "-1001",
+                "message_id": 10,
+                "source_name": "Archive Source",
+                "message_link": "",
+                "text": "Strike reports continued overnight.",
+            }
+        ],
+    )
+    monkeypatch.setattr(main, "extract_query_keywords", lambda _query: ["strike"])
+    monkeypatch.setattr(main, "expand_query_terms", lambda _query: ["strike"])
+    monkeypatch.setattr(main, "extract_query_numbers", lambda _query: [])
+    monkeypatch.setattr(main, "runtime_timezone", lambda: utils.runtime_timezone())
+    monkeypatch.setattr(main.config, "TIMEZONE", "Asia/Kolkata", raising=False)
+
+    rows = main._load_archive_query_context(
+        query_text="strike",
+        hours_back=24,
+        limit=5,
+        broad_query=False,
+    )
+
+    assert rows
+    assert rows[0]["date"].endswith("+05:30")
+
+
 @pytest.mark.asyncio
 async def test_search_recent_news_web_respects_default_seven_day_query_contract(monkeypatch):
     urls: list[str] = []
