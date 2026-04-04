@@ -383,6 +383,8 @@ class QueryPlan:
     original_query: str
     cleaned_query: str
     hours_back: int
+    start_ts: int | None
+    end_ts: int | None
     explicit_time_filter: bool
     broad_query: bool
     keywords: tuple[str, ...]
@@ -393,9 +395,14 @@ class QueryPlan:
 
 def build_query_plan(query: str, *, default_hours: int = 24) -> QueryPlan:
     original = normalize_space(query)
-    hours_back, cleaned = parse_time_filter_from_query(original, default_hours)
+    hours_back, cleaned, start_ts, end_ts = parse_time_filter_from_query(original, default_hours)
     effective = cleaned or original
-    explicit_time_filter = hours_back != max(1, int(default_hours)) or effective != original
+    explicit_time_filter = (
+        hours_back != max(1, int(default_hours))
+        or effective != original
+        or start_ts is not None
+        or end_ts is not None
+    )
     broad = is_broad_news_query(original)
     keywords = tuple(extract_query_keywords(effective))
     expanded_terms = tuple(expand_query_terms(effective))
@@ -405,6 +412,8 @@ def build_query_plan(query: str, *, default_hours: int = 24) -> QueryPlan:
         original_query=original,
         cleaned_query=effective,
         hours_back=hours_back,
+        start_ts=start_ts,
+        end_ts=end_ts,
         explicit_time_filter=explicit_time_filter,
         broad_query=broad,
         keywords=keywords,
@@ -1468,7 +1477,10 @@ class NearDuplicateDetector:
         return values[-int(limit) :]
 
 
-def parse_time_filter_from_query(query: str, default_hours: int = 24) -> tuple[int, str]:
+def parse_time_filter_from_query(
+    query: str,
+    default_hours: int = 24,
+) -> tuple[int, str, int | None, int | None]:
     """
     Parse time constraints from natural-language query.
 
@@ -1479,6 +1491,8 @@ def parse_time_filter_from_query(query: str, default_hours: int = 24) -> tuple[i
     lowered = text.lower()
 
     hours_back = max(1, int(default_hours))
+    start_ts: int | None = None
+    end_ts: int | None = None
     cleanup_patterns: list[str] = []
 
     # explicit relative windows
@@ -1505,12 +1519,29 @@ def parse_time_filter_from_query(query: str, default_hours: int = 24) -> tuple[i
             break
 
     # calendar-style shortcuts
+    now_local = runtime_now()
+    now_utc = now_local.astimezone(timezone.utc)
     if re.search(r"\byesterday\b", lowered):
-        hours_back = max(hours_back, 48)
+        local_midnight_today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        local_midnight_yesterday = local_midnight_today - timedelta(days=1)
+        start_utc = local_midnight_yesterday.astimezone(timezone.utc)
+        end_utc = local_midnight_today.astimezone(timezone.utc)
+        start_ts = int(start_utc.timestamp())
+        end_ts = int(end_utc.timestamp())
+        hours_back = max(
+            hours_back,
+            max(1, math.ceil((now_utc - start_utc).total_seconds() / 3600)),
+        )
         cleanup_patterns.append(r"\byesterday\b")
     if re.search(r"\btoday\b", lowered):
-        now_local = runtime_now()
-        hours_back = max(hours_back, now_local.hour + 1)
+        local_midnight_today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_utc = local_midnight_today.astimezone(timezone.utc)
+        start_ts = int(start_utc.timestamp())
+        end_ts = int(now_utc.timestamp())
+        hours_back = max(
+            hours_back,
+            max(1, math.ceil((now_utc - start_utc).total_seconds() / 3600)),
+        )
         cleanup_patterns.append(r"\btoday\b")
 
     cleaned = text
@@ -1520,7 +1551,7 @@ def parse_time_filter_from_query(query: str, default_hours: int = 24) -> tuple[i
     if not cleaned:
         cleaned = text
 
-    return hours_back, cleaned
+    return hours_back, cleaned, start_ts, end_ts
 
 
 async def search_recent_messages(
@@ -1547,6 +1578,8 @@ async def search_recent_messages(
     resolved_max = max(20, min(int(max_messages), 60))
     plan = build_query_plan(query, default_hours=default_hours_back)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=plan.hours_back)
+    start_bound_ts = int(plan.start_ts or int(cutoff.timestamp()))
+    end_bound_ts = int(plan.end_ts or 0)
 
     broad_query = plan.broad_query
     keyword_terms = set(plan.expanded_terms)
@@ -1587,7 +1620,10 @@ async def search_recent_messages(
             return
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        if dt < cutoff:
+        message_ts = int(dt.timestamp())
+        if message_ts < start_bound_ts:
+            return
+        if end_bound_ts > 0 and message_ts >= end_bound_ts:
             return
 
         text_value = _extract_message_text(msg)
@@ -1796,6 +1832,8 @@ async def search_recent_news_web(
 
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=resolved_hours)
+    start_bound_ts = int(plan.start_ts or int(cutoff.timestamp()))
+    end_bound_ts = int(plan.end_ts or 0)
     dedupe: set[str] = set()
     rows: list[dict[str, Any]] = []
     search_variants = [
@@ -1876,7 +1914,12 @@ async def search_recent_news_web(
                         if require_recent:
                             if pub_dt is None:
                                 continue
-                            if pub_dt < cutoff or pub_dt > now + timedelta(minutes=5):
+                            pub_ts = int(pub_dt.timestamp())
+                            if pub_ts < start_bound_ts:
+                                continue
+                            if end_bound_ts > 0 and pub_ts >= end_bound_ts:
+                                continue
+                            if pub_dt > now + timedelta(minutes=5):
                                 continue
                         if pub_dt is None:
                             pub_dt = now
