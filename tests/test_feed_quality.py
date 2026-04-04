@@ -153,6 +153,40 @@ def test_strip_query_answer_citations_removes_known_channel_aliases_but_keeps_na
     main.source_title_cache.clear()
 
 
+def test_strip_known_source_aliases_is_contextual_not_global():
+    main.source_alias_cache.clear()
+    main.source_title_cache.clear()
+    main._register_source_aliases("-1001", "Middle East Eye", "middleeasteye")
+
+    assert (
+        main._strip_known_source_aliases("Middle East Eye reported strikes hit the area.")
+        == "Middle East Eye reported strikes hit the area."
+    )
+    assert main._strip_known_source_aliases("Middle East Eye: strikes hit the area.") == "Strikes hit the area."
+
+    main.source_alias_cache.clear()
+    main.source_title_cache.clear()
+
+
+def test_strip_query_answer_citations_rewrites_known_channel_attribution_without_dropping_fact():
+    main.source_alias_cache.clear()
+    main.source_title_cache.clear()
+    main._register_source_aliases("-1001", "Middle East Eye", "middleeasteye")
+
+    cleaned = main._strip_query_answer_citations(
+        "Middle East Eye reported strikes hit the area.<br>"
+        "According to Middle East Eye, explosions were heard nearby."
+    )
+    plain = ai_filter.strip_telegram_html(cleaned)
+
+    assert "Middle East Eye" not in plain
+    assert "Reports indicate strikes hit the area." in plain
+    assert "explosions were heard nearby." in plain
+
+    main.source_alias_cache.clear()
+    main.source_title_cache.clear()
+
+
 def test_build_query_plan_marks_explicit_time_filters():
     default_plan = utils.build_query_plan("What happened in Tehran?")
     explicit_plan = utils.build_query_plan("What happened today in Tehran?")

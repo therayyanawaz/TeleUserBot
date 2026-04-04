@@ -3518,33 +3518,98 @@ def _collect_monitored_source_aliases(source_title: str = "") -> list[str]:
     return sorted(aliases, key=len, reverse=True)
 
 
+_KNOWN_SOURCE_ATTRIBUTION_VERB_RE = (
+    r"(?:reported|reports|said|says|claim(?:ed|s)?|indicate(?:d|s)?|warn(?:ed|ing|s)?|"
+    r"posted|posts|wrote|writes)"
+)
+
+
+def _capitalize_sentence_start(text: str) -> str:
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return ""
+    if cleaned[:1].islower():
+        return cleaned[:1].upper() + cleaned[1:]
+    return cleaned
+
+
+def _is_known_source_alias_line(text: str, *, source_title: str = "") -> bool:
+    plain = normalize_space(strip_telegram_html(str(text or "")))
+    if not plain:
+        return False
+    known = {
+        normalize_space(strip_telegram_html(alias)).lower()
+        for alias in _collect_monitored_source_aliases(source_title)
+        if normalize_space(strip_telegram_html(alias))
+    }
+    return plain.lower() in known
+
+
 def _strip_known_source_aliases(text: str, *, source_title: str = "") -> str:
     cleaned = str(text or "")
     for alias in _collect_monitored_source_aliases(source_title):
         bare = alias.lstrip("@")
         if not bare:
             continue
-        if alias.startswith("@") or re.fullmatch(r"[A-Za-z0-9_]{2,}", bare):
+        if alias.startswith("@"):
             cleaned = re.sub(
-                rf"(?<!\w)@?{re.escape(bare)}(?!\w)",
+                rf"(?<!\w){re.escape(alias)}(?!\w)",
                 "",
                 cleaned,
                 flags=re.IGNORECASE,
             )
-        if " " in bare or len(bare) >= 6:
-            cleaned = re.sub(
-                rf"(?<![A-Za-z0-9]){re.escape(bare)}(?![A-Za-z0-9])",
-                "",
-                cleaned,
-                flags=re.IGNORECASE,
-            )
-        else:
-            cleaned = re.sub(
-                rf"^\s*{re.escape(bare)}\s*[:\-–—|]+\s*",
-                "",
-                cleaned,
-                flags=re.IGNORECASE,
-            )
+        cleaned = re.sub(
+            rf"(?i)^\s*@?{re.escape(bare)}\s*$",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            rf"(?i)^\s*@?{re.escape(bare)}\s*(?:[:\-–—|]+\s*|,\s*)(?P<rest>.+)$",
+            lambda match: _capitalize_sentence_start(match.group("rest")),
+            cleaned,
+        )
+    return cleaned
+
+
+def _rewrite_known_source_alias_attribution(text: str, *, source_title: str = "") -> str:
+    cleaned = str(text or "")
+
+    def _generic_reports_line(rest: str) -> str:
+        candidate = normalize_space(strip_telegram_html(rest).strip(" ,;:-|"))
+        candidate = re.sub(r"(?i)^that\s+", "", candidate)
+        candidate = re.sub(r"(?i)^reportedly\b[:,]?\s*", "", candidate)
+        candidate = normalize_space(candidate.strip(" ,;:-|"))
+        if not candidate:
+            return ""
+        if re.match(
+            r"(?i)^(?:initial|preliminary|early|unconfirmed)\s+reports?\s+(?:indicate|suggest|point to)\b",
+            candidate,
+        ):
+            return _capitalize_sentence_start(candidate)
+        if re.match(r"(?i)^reports?\s+(?:indicate|suggest|point to)\b", candidate):
+            return _capitalize_sentence_start(candidate)
+        return f"Reports indicate {candidate}"
+
+    for alias in _collect_monitored_source_aliases(source_title):
+        bare = alias.lstrip("@")
+        if not bare:
+            continue
+        escaped = re.escape(bare)
+        cleaned = re.sub(
+            rf"(?i)^\s*(?:according to|via|from)\s+@?{escaped}\b[:,]?\s*(?P<rest>.+)$",
+            lambda match: _generic_reports_line(match.group("rest")),
+            cleaned,
+        )
+        cleaned = re.sub(
+            rf"(?i)^\s*@?{escaped}\s+{_KNOWN_SOURCE_ATTRIBUTION_VERB_RE}\s+(?:that\s+)?(?P<rest>.+)$",
+            lambda match: _generic_reports_line(match.group("rest")),
+            cleaned,
+        )
+        cleaned = re.sub(
+            rf"(?i)(?P<prefix>^|[.;:!?]\s*)according to\s+@?{escaped}\b[:,]?\s*",
+            lambda match: match.group("prefix"),
+            cleaned,
+        )
     return cleaned
 
 
@@ -8834,6 +8899,7 @@ def _strip_query_answer_citations(text: str) -> str:
             line = re.sub(r"\s*\[[^\[\]<>]{2,60}\]", "", line)
             line = re.sub(r"\bRead more\b", "", line, flags=re.IGNORECASE)
             line = _CAPTION_TELEGRAM_LINK_RE.sub("", line)
+            line = _rewrite_known_source_alias_attribution(line)
             line = _strip_known_source_aliases(line)
             line = _CAPTION_HANDLE_RE.sub("", line)
             line = re.sub(r"(?i)^\s*(?:fwd from|forwarded from)\b[^<]{0,120}", "", line)
@@ -8855,6 +8921,8 @@ def _strip_query_answer_citations(text: str) -> str:
                 break
         plain_line = normalize_space(strip_telegram_html(line).strip(" ,;:-|/[](){}"))
         if not plain_line:
+            continue
+        if _is_known_source_alias_line(line):
             continue
         cleaned_lines.append(line)
 
