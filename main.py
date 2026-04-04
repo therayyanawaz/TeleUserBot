@@ -8959,7 +8959,28 @@ def _load_archive_query_context(
     )
 
 
-def _wrap_query_digest_answer(answer: str, *, hours_back: int) -> str:
+def _query_digest_title(*, hours_back: int, query_text: str = "") -> str:
+    lowered = normalize_space(query_text).lower()
+    if re.search(r"\byesterday\b", lowered):
+        return "<b>Yesterday digest</b>"
+    if re.search(r"\btoday\b", lowered):
+        return "<b>Today digest</b>"
+
+    day_match = re.search(r"\b(?:last|past)\s+(\d{1,2})\s*(?:days?|d)\b", lowered)
+    if day_match:
+        return f"<b>{max(1, int(day_match.group(1)))}-day digest</b>"
+
+    hour_match = re.search(r"\b(?:last|past)\s+(\d{1,3})\s*(?:hours?|hrs?|h)\b", lowered)
+    if hour_match:
+        return f"<b>{max(1, int(hour_match.group(1)))}-hour digest</b>"
+
+    title_hours = max(1, int(hours_back))
+    if title_hours % 24 == 0 and title_hours >= 24:
+        return f"<b>{title_hours // 24}-day digest</b>"
+    return f"<b>{title_hours}-hour digest</b>"
+
+
+def _wrap_query_digest_answer(answer: str, *, hours_back: int, query_text: str = "") -> str:
     cleaned = normalize_space(answer)
     if not cleaned:
         return answer
@@ -8967,7 +8988,7 @@ def _wrap_query_digest_answer(answer: str, *, hours_back: int) -> str:
         return answer
     if "no major developments right now" in strip_telegram_html(cleaned).lower():
         return answer
-    title = f"<b>{max(1, int(hours_back))}-hour digest</b>"
+    title = _query_digest_title(hours_back=hours_back, query_text=query_text)
     return f"{title}<br><br>{answer.strip()}"
 
 
