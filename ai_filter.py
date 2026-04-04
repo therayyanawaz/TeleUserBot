@@ -27,6 +27,7 @@ from prompts import (
     build_digest_input_block,
     build_digest_system_prompt,
     build_query_system_prompt,
+    digest_output_style,
     quiet_period_message,
 )
 from shared_http import get_codex_http_client, reset_shared_http_client
@@ -2440,11 +2441,86 @@ def _legacy_digest_to_narrative(
     return headline, story, highlights, also_moving
 
 
+def _digest_is_headline_rail(interval_minutes: int) -> bool:
+    return digest_output_style(interval_minutes) == "headline_rail"
+
+
+def _headline_rail_title(interval_minutes: int) -> str:
+    minutes = max(1, int(interval_minutes))
+    if minutes == 60:
+        return "Top headlines from the last hour"
+    if minutes < 60:
+        return f"Top headlines from the last {minutes} minutes"
+    hours = max(1, round(minutes / 60))
+    return f"Top headlines from the last {hours} hours"
+
+
 def _digest_payload_to_narrative(
     payload: Dict[str, Any],
     *,
     max_lines: int,
+    interval_minutes: int,
 ) -> tuple[str, str, List[str], List[str]]:
+    headline_mode = _digest_is_headline_rail(interval_minutes)
+    if headline_mode:
+        headline = _digest_clean_line(
+            payload.get("headline") or _headline_rail_title(interval_minutes),
+            max_chars=120,
+            allow_short=True,
+        )
+        headline_key = _digest_line_key(headline)
+
+        headlines_raw = payload.get("headlines")
+        if not isinstance(headlines_raw, list):
+            headlines_raw = payload.get("highlights")
+        if not isinstance(headlines_raw, list):
+            headlines_raw = payload.get("facts")
+        if not isinstance(headlines_raw, list):
+            headlines_raw = []
+
+        also_raw = payload.get("also_moving")
+        if not isinstance(also_raw, list):
+            also_raw = []
+
+        seen: set[str] = set()
+        if headline_key:
+            seen.add(headline_key)
+        highlights = _clean_digest_support_items(headlines_raw, max_chars=180, seen=seen)
+        also_moving = _clean_digest_support_items(also_raw, max_chars=180, seen=seen)
+
+        if not highlights:
+            fallback_values: list[Any] = []
+            for value in (
+                payload.get("story"),
+                payload.get("summary"),
+                payload.get("scene_setter"),
+            ):
+                if normalize_space(str(value or "")):
+                    fallback_values.append(value)
+            legacy_blocks = payload.get("major_blocks")
+            if isinstance(legacy_blocks, list):
+                for block in legacy_blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    fallback_values.extend(
+                        [
+                            block.get("headline") or "",
+                            block.get("lede") or "",
+                            *(block.get("facts") or [] if isinstance(block.get("facts"), list) else []),
+                        ]
+                    )
+            timeline_items = payload.get("timeline_items")
+            if isinstance(timeline_items, list):
+                fallback_values.extend(timeline_items)
+            highlights = _clean_digest_support_items(fallback_values, max_chars=180, seen=seen)
+
+        if len(also_moving) > _digest_also_moving_cap(max_lines):
+            highlights.extend(also_moving[_digest_also_moving_cap(max_lines) :])
+            also_moving = also_moving[: _digest_also_moving_cap(max_lines)]
+        if not headline and highlights:
+            headline = _headline_rail_title(interval_minutes)
+        return headline, "", highlights, also_moving
+
     headline = _digest_clean_line(payload.get("headline") or "", max_chars=120, allow_short=True)
     headline_key = _digest_line_key(headline)
     story = _build_digest_story_from_fragments(

@@ -10,6 +10,13 @@ def quiet_period_message(interval_minutes: int) -> str:
     return "<b>🟢 No major developments right now.</b>"
 
 
+def digest_output_style(interval_minutes: int) -> str:
+    minutes = max(1, int(interval_minutes))
+    if minutes <= 60:
+        return "headline_rail"
+    return "story_digest"
+
+
 HTML_RULES = """
 Output format is STRICT Telegram HTML only.
 Allowed tags only: <b>, <i>, <u>, <s>, <tg-spoiler>, <code>, <pre>, <blockquote>, <a href="...">, <br>
@@ -41,15 +48,11 @@ Core rules:
 2) Remove promo/spam/noise/polls/meme chatter/source branding before writing.
 3) Merge duplicates and paraphrased echoes, but do not lose any distinct factual update.
 4) Every meaningful post in the provided batch must be represented somewhere in the digest, either directly or inside a merged story block.
-5) Default to one narrative-first digest brief, not a pile of separate micro-blocks.
-6) The digest must contain:
-   - one sharp headline
-   - one short story paragraph that covers the whole window
-   - a small highlights list for the most important specifics
-   - an optional short "Also moving" rail for overflow only
-7) The story paragraph must summarize the full window, not merely introduce it.
-7b) When the source gives a clear actor, action, location, object, number, or official body, keep those specifics.
-7c) Reject vague leads like "incident reported", "developments continue", "situation update", or "explosions shake [country]" when the source provides something more specific.
+5) Choose the format that matches the window:
+   - short rolling windows: a headline rail with all distinct headlines and no story paragraph
+   - long windows such as daily recaps: one narrative-first story digest
+6) In both modes, keep concrete actors, actions, locations, numbers, and official bodies when the source provides them.
+7) Reject vague leads like "incident reported", "developments continue", "situation update", or "explosions shake [country]" when the source provides something more specific.
 8) Use direct, hard-hitting, uncensored phrasing when the facts support it, but do not fabricate, exaggerate, or add commentary beyond the evidence.
 9) Preserve uncertainty explicitly when the source is hedged or disputed, but use generic wording only:
    - allowed: "initial reports indicate", "preliminary reports suggest", "early indications point to"
@@ -79,6 +82,7 @@ def build_digest_system_prompt(
     output_language: str,
     include_source_tags: bool,
 ) -> str:
+    style = digest_output_style(interval_minutes)
     prompt = DIGEST_PROMPT_CORE.replace(
         "QUIET_PERIOD_SENTINEL",
         quiet_period_message(interval_minutes),
@@ -92,16 +96,31 @@ def build_digest_system_prompt(
         HTML_RULES,
     ]
     if json_mode:
-        toggles.append(
-            'Return ONLY one JSON object with this schema: {"quiet": boolean, "headline": string, "story": string, "highlights": [string, ...], "also_moving": [string, ...]}.'
-        )
-        toggles.append("The story must be one compact paragraph that covers the whole digest window.")
-        toggles.append("highlights must hold the key specifics that support the story.")
-        toggles.append("also_moving is optional and should contain only a few smaller overflow updates.")
+        if style == "headline_rail":
+            toggles.append(
+                'Return ONLY one JSON object with this schema: {"quiet": boolean, "headline": string, "headlines": [string, ...], "also_moving": [string, ...]}.'
+            )
+            toggles.append("This is a short rolling digest. Output a headline rail, not a story digest.")
+            toggles.append("headline should be a short rail label, not a narrative sentence.")
+            toggles.append("headlines must contain all distinct developments as short standalone headline lines.")
+            toggles.append("Do not include a story paragraph in this mode.")
+            toggles.append("also_moving is optional and should contain only a few overflow headline lines.")
+        else:
+            toggles.append(
+                'Return ONLY one JSON object with this schema: {"quiet": boolean, "headline": string, "story": string, "highlights": [string, ...], "also_moving": [string, ...]}.'
+            )
+            toggles.append("This is a long-window digest. Build one story digest, not a headline rail.")
+            toggles.append("The story must be one compact paragraph that covers the whole digest window.")
+            toggles.append("highlights must hold the key specifics that support the story.")
+            toggles.append("also_moving is optional and should contain only a few smaller overflow updates.")
         toggles.append("Do not include HTML inside JSON values.")
     else:
-        toggles.append("Return Telegram HTML only using this order: one bold headline, one short story paragraph, bullet highlights, then an italic Also moving rail only if needed.")
-        toggles.append("Keep the digest narrative-first and easy to read like a mini brief, not a stack of unrelated blocks.")
+        if style == "headline_rail":
+            toggles.append("Return Telegram HTML only using this order: one bold rail label, a bullet list of all distinct headlines, then an italic Also moving rail only if needed.")
+            toggles.append("Do not write a story paragraph in this mode.")
+        else:
+            toggles.append("Return Telegram HTML only using this order: one bold headline, one short story paragraph, bullet highlights, then an italic Also moving rail only if needed.")
+            toggles.append("Keep the digest narrative-first and easy to read like a mini brief, not a stack of unrelated blocks.")
     if not include_links:
         toggles.append("Do not output links, URLs, source brackets, or citation markers.")
     if not include_source_tags:
