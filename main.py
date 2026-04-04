@@ -6992,32 +6992,55 @@ def _render_digest_body_sections(
 ) -> str:
     clean_headline = normalize_space(strip_telegram_html(headline))
     clean_story = normalize_space(strip_telegram_html(story))
+    clean_highlights = [
+        normalize_space(strip_telegram_html(item))
+        for item in highlights
+        if normalize_space(strip_telegram_html(item))
+    ]
+    clean_also = [
+        normalize_space(strip_telegram_html(item))
+        for item in also_moving
+        if normalize_space(strip_telegram_html(item))
+    ]
+    if clean_headline and not clean_story and clean_highlights:
+        blocks = [
+            "<br>".join(
+                [
+                    f"<b>{sanitize_telegram_html(clean_headline)}</b>",
+                    *[f"• {sanitize_telegram_html(item)}" for item in clean_highlights],
+                ]
+            )
+        ]
+        if clean_also:
+            blocks.append(
+                "<br>".join(
+                    [
+                        "<i>Also moving</i>",
+                        *[f"• {sanitize_telegram_html(item)}" for item in clean_also],
+                    ]
+                )
+            )
+        return sanitize_telegram_html("<br><br>".join(blocks))
     if not clean_headline or not clean_story:
-        return sanitize_telegram_html(normalize_space(strip_telegram_html(story or headline)))
+        return sanitize_telegram_html(
+            normalize_space(strip_telegram_html(story or headline or " ".join(clean_highlights)))
+        )
 
     blocks = [
         "<br>".join(
             [
                 f"<b>{sanitize_telegram_html(clean_headline)}</b>",
                 sanitize_telegram_html(clean_story),
-                *[
-                    f"• {sanitize_telegram_html(normalize_space(strip_telegram_html(item)))}"
-                    for item in highlights
-                    if normalize_space(strip_telegram_html(item))
-                ],
+                *[f"• {sanitize_telegram_html(item)}" for item in clean_highlights],
             ]
         )
     ]
-    if any(normalize_space(strip_telegram_html(item)) for item in also_moving):
+    if clean_also:
         blocks.append(
             "<br>".join(
                 [
                     "<i>Also moving</i>",
-                    *[
-                        f"• {sanitize_telegram_html(normalize_space(strip_telegram_html(item)))}"
-                        for item in also_moving
-                        if normalize_space(strip_telegram_html(item))
-                    ],
+                    *[f"• {sanitize_telegram_html(item)}" for item in clean_also],
                 ]
             )
         )
@@ -7061,8 +7084,56 @@ def _split_digest_body_blocks(digest_body: str, *, max_chars: int) -> List[str]:
         digest_body,
         max_lines=_digest_support_line_limit(),
     )
-    if not headline or not story:
+    if not headline:
         return [sanitize_telegram_html(cleaned)]
+    if not story and highlights:
+        remaining_highlights = list(highlights)
+        remaining_also = list(also_moving)
+        support_limit = _digest_support_line_limit()
+        chunks: List[str] = []
+
+        while remaining_highlights or remaining_also:
+            part_highlights: List[str] = []
+            part_also: List[str] = []
+
+            while remaining_highlights and len(part_highlights) + len(part_also) < support_limit:
+                candidate = _render_digest_body_sections(
+                    headline,
+                    "",
+                    [*part_highlights, remaining_highlights[0]],
+                    part_also,
+                )
+                if len(candidate) > max_chars and part_highlights:
+                    break
+                part_highlights.append(remaining_highlights.pop(0))
+
+            while remaining_also and len(part_highlights) + len(part_also) < support_limit:
+                candidate = _render_digest_body_sections(
+                    headline,
+                    "",
+                    part_highlights,
+                    [*part_also, remaining_also[0]],
+                )
+                if len(candidate) > max_chars and (part_also or part_highlights):
+                    break
+                part_also.append(remaining_also.pop(0))
+
+            if not part_highlights and not part_also:
+                if remaining_highlights:
+                    part_highlights.append(remaining_highlights.pop(0))
+                elif remaining_also:
+                    part_also.append(remaining_also.pop(0))
+
+            rendered = _render_digest_body_sections(
+                headline,
+                "",
+                part_highlights,
+                part_also,
+            )
+            if normalize_space(strip_telegram_html(rendered)):
+                chunks.append(rendered)
+
+        return chunks or [_render_digest_body_sections(headline, "", highlights, also_moving)]
 
     story_chunks = _split_digest_story_sentences(
         story,
