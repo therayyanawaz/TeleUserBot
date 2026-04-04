@@ -27,7 +27,7 @@ TeleUserBot fixes that by combining:
 - hourly and daily digest generation
 - OCR translation for media-only posts
 - private query mode with Telegram-first evidence search
-- optional trusted web fallback when Telegram evidence is thin
+- mandatory trusted web cross-check for query answers
 - Telegram HTML output with optional premium emoji rendering
 
 ## 🧠 Core Capabilities
@@ -342,7 +342,7 @@ Ask natural-language questions such as:
 - `recent beirut updates`
 - `who died recently in iran`
 
-The assistant checks recent Telegram evidence first and only uses trusted web fallback when configured and when Telegram results are too weak.
+The assistant checks the last 24 hours of Telegram evidence first, widens to the last 7 days when coverage is thin, and then runs a trusted web cross-check before answering.
 
 ## 📰 Digest Configuration
 
@@ -461,15 +461,13 @@ Not allowed:
 
 This restriction is intentional and keeps the query workflow private and predictable.
 
-## 🌐 Query Web Fallback
+## 🌐 Query Web Cross-Check
 
-When Telegram evidence is not strong enough, the bot can search trusted news sites:
+Every query answer is verified against trusted news sites after the Telegram search:
 
 ```env
-QUERY_WEB_FALLBACK_ENABLED=true
 QUERY_WEB_MIN_TELEGRAM_RESULTS=3
 QUERY_WEB_MAX_RESULTS=12
-QUERY_WEB_MAX_HOURS_BACK=24
 QUERY_WEB_REQUIRE_RECENT=true
 QUERY_WEB_REQUIRE_MIN_SOURCES=2
 QUERY_WEB_ALLOWED_DOMAINS=["reuters.com","apnews.com","bbc.com","aljazeera.com","cnn.com","nytimes.com","washingtonpost.com","bloomberg.com","ft.com","theguardian.com","dw.com","france24.com","aa.com.tr","npr.org"]
@@ -478,7 +476,8 @@ QUERY_WEB_ALLOWED_DOMAINS=["reuters.com","apnews.com","bbc.com","aljazeera.com",
 Notes:
 
 - Telegram evidence stays the primary source
-- web fallback is used only when needed
+- web verification always runs after Telegram evidence gathering
+- the web verification window is fixed at 7 days to match the Telegram expansion contract
 - higher-risk questions are handled more conservatively
 
 ## 🧵 Output and Delivery Details
