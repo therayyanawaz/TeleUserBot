@@ -37,7 +37,7 @@ from news_signals import looks_like_live_event_update, should_downgrade_explaine
 from shared_http import get_web_http_client
 
 
-_QUERY_WEB_MAX_HOURS_BACK = 24 * 7
+_QUERY_MAX_HOURS_BACK = 24 * 30
 
 
 def estimate_tokens_rough(text: str) -> int:
@@ -1469,7 +1469,7 @@ def parse_time_filter_from_query(query: str, default_hours: int = 24) -> tuple[i
     for pattern in patterns:
         match = re.search(pattern, lowered)
         if match:
-            hours_back = max(1, min(24 * 30, int(match.group(1))))
+            hours_back = max(1, min(_QUERY_MAX_HOURS_BACK, int(match.group(1))))
             cleanup_patterns.append(pattern)
             break
 
@@ -1480,7 +1480,7 @@ def parse_time_filter_from_query(query: str, default_hours: int = 24) -> tuple[i
     for pattern in day_patterns:
         match = re.search(pattern, lowered)
         if match:
-            hours_back = max(24, min(24 * 30, int(match.group(1)) * 24))
+            hours_back = max(24, min(_QUERY_MAX_HOURS_BACK, int(match.group(1)) * 24))
             cleanup_patterns.append(pattern)
             break
 
@@ -1762,7 +1762,7 @@ async def search_recent_news_web(
     if len(text) < 3:
         return []
 
-    resolved_hours = max(1, min(int(plan.hours_back), _QUERY_WEB_MAX_HOURS_BACK))
+    resolved_hours = max(1, min(int(plan.hours_back), _QUERY_MAX_HOURS_BACK))
     resolved_max = max(3, min(int(max_results), 40))
     trusted_domains = list(allowed_domains or [])
 

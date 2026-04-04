@@ -1393,10 +1393,28 @@ def _query_web_max_results() -> int:
     return max(3, min(value, 40))
 
 
-def _query_web_max_hours_back() -> int:
-    # Query verification is contractually capped at 7 days to match the
-    # Telegram expansion window used before the mandatory web cross-check.
+def _query_default_crosscheck_hours_back() -> int:
+    # Default query verification follows the normal 24h -> 7d expansion path.
     return 24 * 7
+
+
+def _query_max_supported_hours_back() -> int:
+    # Explicit user windows can widen both Telegram and web verification, but
+    # only up to the same 30-day cap supported by natural-language query parsing.
+    return 24 * 30
+
+
+def _query_web_crosscheck_hours_back(*, requested_hours: int, explicit_time_filter: bool) -> int:
+    limit = (
+        _query_max_supported_hours_back()
+        if explicit_time_filter
+        else _query_default_crosscheck_hours_back()
+    )
+    try:
+        value = int(requested_hours)
+    except Exception:
+        value = _query_default_crosscheck_hours_back()
+    return max(1, min(value, limit))
 
 
 def _query_web_require_recent() -> bool:
@@ -1457,7 +1475,7 @@ def _query_expand_status() -> str:
 
 
 def _query_expanded_window_hours() -> int:
-    return 24 * 7
+    return _query_default_crosscheck_hours_back()
 
 
 def _query_window_strategy(*, requested_hours: int, explicit_time_filter: bool) -> tuple[int, int]:
@@ -9708,7 +9726,10 @@ async def _handle_query_request(
 
         if should_run_web_search:
             ran_web_search = True
-            web_hours = min(active_hours, _query_web_max_hours_back())
+            web_hours = _query_web_crosscheck_hours_back(
+                requested_hours=active_hours,
+                explicit_time_filter=bool(getattr(plan, "explicit_time_filter", False)),
+            )
             await _safe_reply_markdown(
                 event_ref,  # type: ignore[arg-type]
                 _query_crosscheck_status(high_risk=high_risk_query),
@@ -10198,7 +10219,8 @@ def _startup_health_check() -> None:
         severity_routing=_is_severity_routing_enabled(),
         query_mode=_is_query_mode_enabled(),
         query_web_crosscheck_required=_is_query_web_crosscheck_required(),
-        query_web_max_hours_back=_query_web_max_hours_back(),
+        query_web_default_hours_back=_query_default_crosscheck_hours_back(),
+        query_web_explicit_max_hours_back=_query_max_supported_hours_back(),
         html_formatting=_is_html_formatting_enabled(),
         premium_emoji=_is_premium_emoji_enabled(),
         premium_emoji_count=len(premium_emoji_map),
@@ -10225,7 +10247,7 @@ def _startup_health_check() -> None:
         quota_health=get_quota_health(),
     )
     LOGGER.info(
-        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s query_web_crosscheck=%s query_web_hours=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%s scope=%s pin_hourly=%s pin_daily=%s web=%s@%s:%s",
+        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s query_web_crosscheck=%s query_web_default_hours=%s query_web_explicit_max_hours=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%s scope=%s pin_hourly=%s pin_daily=%s web=%s@%s:%s",
         mode,
         pending,
         inflight,
@@ -10234,7 +10256,8 @@ def _startup_health_check() -> None:
         _is_severity_routing_enabled(),
         _is_query_mode_enabled(),
         _is_query_web_crosscheck_required(),
-        _query_web_max_hours_back(),
+        _query_default_crosscheck_hours_back(),
+        _query_max_supported_hours_back(),
         _is_html_formatting_enabled(),
         _is_premium_emoji_enabled(),
         len(premium_emoji_map),
