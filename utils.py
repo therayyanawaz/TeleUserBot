@@ -37,6 +37,9 @@ from news_signals import looks_like_live_event_update, should_downgrade_explaine
 from shared_http import get_web_http_client
 
 
+_QUERY_WEB_MAX_HOURS_BACK = 24 * 7
+
+
 def estimate_tokens_rough(text: str) -> int:
     """Fast rough token estimate (works well enough for budgeting)."""
     if not text:
@@ -1759,7 +1762,7 @@ async def search_recent_news_web(
     if len(text) < 3:
         return []
 
-    resolved_hours = max(1, min(int(plan.hours_back), 72))
+    resolved_hours = max(1, min(int(plan.hours_back), _QUERY_WEB_MAX_HOURS_BACK))
     resolved_max = max(3, min(int(max_results), 40))
     trusted_domains = list(allowed_domains or [])
 
