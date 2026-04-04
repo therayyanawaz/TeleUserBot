@@ -245,7 +245,7 @@ def test_build_query_plan_marks_explicit_time_filters():
 
 
 @pytest.mark.asyncio
-async def test_search_recent_news_web_respects_seven_day_query_contract(monkeypatch):
+async def test_search_recent_news_web_respects_default_seven_day_query_contract(monkeypatch):
     urls: list[str] = []
 
     class _FakeResponse:
@@ -282,6 +282,46 @@ async def test_search_recent_news_web_respects_seven_day_query_contract(monkeypa
     assert results
     assert any("168h" in url for url in urls)
     assert all("72h" not in url for url in urls)
+
+
+@pytest.mark.asyncio
+async def test_search_recent_news_web_honors_explicit_thirty_day_window(monkeypatch):
+    urls: list[str] = []
+
+    class _FakeResponse:
+        status_code = 200
+        text = (
+            "<rss><channel><item>"
+            "<title>Regional reporting referenced multiple infrastructure sites</title>"
+            "<link>https://example.com/report</link>"
+            "<description>Oracle and Amazon-linked facilities were both mentioned.</description>"
+            "</item></channel></rss>"
+        )
+
+    class _FakeHTTP:
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+
+        async def get(self, url: str):
+            urls.append(url)
+            return _FakeResponse()
+
+    async def fake_get_web_http_client():
+        return _FakeHTTP()
+
+    monkeypatch.setattr(utils, "get_web_http_client", fake_get_web_http_client)
+
+    results = await utils.search_recent_news_web(
+        "Which data centers did Iran hit in the last 30 days, Oracle or AWS?",
+        hours_back=24 * 30,
+        max_results=3,
+        allowed_domains=[],
+        require_recent=False,
+    )
+
+    assert results
+    assert any("720h" in url for url in urls)
+    assert all("168h" not in url for url in urls)
 
 
 def test_strip_query_answer_citations_keeps_follow_up_language_while_removing_follow_promos():
@@ -1263,6 +1303,84 @@ async def test_handle_query_request_expands_to_seven_days_before_web_crosscheck(
     assert search_hours == [24, 168]
     assert web_hours == [168]
     assert any(text == main._query_expand_status() for text in progress_texts)
+    assert any("trusted web sources" in text for text in progress_texts)
+
+
+@pytest.mark.asyncio
+async def test_handle_query_request_honors_explicit_thirty_day_window_for_web_crosscheck(monkeypatch):
+    main.query_last_request_ts.clear()
+    progress_texts: list[str] = []
+    search_hours: list[int] = []
+    web_hours: list[int] = []
+
+    async def fake_safe_reply_markdown(_event, text, *, edit_message=None, reply_to=None, prefer_bot_identity=False, bot_chat_id=None):
+        progress_texts.append(text)
+        return edit_message or {"message_id": 701}
+
+    async def fake_search_recent_messages(_client, _monitored, _query, *, max_messages=50, default_hours_back=24, logger=None):
+        search_hours.append(default_hours_back)
+        return [
+            {
+                "text": "Oracle's Dubai facility was cited in attack reporting.",
+                "source": "Desk Wire",
+                "timestamp": 1700000000,
+            },
+            {
+                "text": "Amazon-linked cloud infrastructure in Bahrain was also named.",
+                "source": "Desk Wire",
+                "timestamp": 1699999000,
+            },
+            {
+                "text": "Additional retrospective reporting discussed broader regional infrastructure targeting.",
+                "source": "Desk Wire",
+                "timestamp": 1699998000,
+            },
+        ]
+
+    async def fake_search_recent_news_web(_query, *, hours_back, max_results, allowed_domains, require_recent, logger=None):
+        web_hours.append(hours_back)
+        return [
+            {
+                "text": "Cross-check reporting over the same window referenced Oracle in Dubai and Amazon-linked infrastructure in Bahrain.",
+                "source": "Reuters",
+                "timestamp": 1700000100,
+                "is_web": True,
+                "link": "https://example.com/report",
+            }
+        ]
+
+    async def fake_generate_answer_from_context(*_args, **_kwargs):
+        return (
+            "<b>Oracle Dubai and Bahrain cloud site</b><br>"
+            "Oracle's Dubai facility and an Amazon-linked cloud site in Bahrain are the main targets cited."
+        )
+
+    monkeypatch.setattr(main, "_is_query_runtime_available", lambda: True)
+    monkeypatch.setattr(main, "_safe_reply_markdown", fake_safe_reply_markdown)
+    monkeypatch.setattr(main, "_require_client", lambda: object())
+    monkeypatch.setattr(main, "search_recent_messages", fake_search_recent_messages)
+    monkeypatch.setattr(main, "_search_recent_news_web_bounded", fake_search_recent_news_web)
+    monkeypatch.setattr(main, "_load_queue_query_context", lambda **_kwargs: [])
+    monkeypatch.setattr(main, "_load_archive_query_context", lambda **_kwargs: [])
+    monkeypatch.setattr(main, "_is_streaming_enabled", lambda: False)
+    monkeypatch.setattr(main, "_require_auth_manager", lambda: object())
+    monkeypatch.setattr(main, "generate_answer_from_context", fake_generate_answer_from_context)
+    monkeypatch.setattr(main, "_query_web_require_min_sources", lambda: 1)
+    monkeypatch.setattr(main, "_append_query_history", lambda *_args, **_kwargs: None)
+
+    await main._handle_query_request(
+        event_ref=SimpleNamespace(chat_id=778),
+        text="Which data centers did Iran hit in the last 30 days, Oracle or AWS?",
+        sender_id=78,
+        chat_id="chat-78",
+        reply_to=None,
+        prefer_bot_identity=False,
+        bot_chat_id=None,
+    )
+
+    assert search_hours == [720]
+    assert web_hours == [720]
+    assert all(text != main._query_expand_status() for text in progress_texts)
     assert any("trusted web sources" in text for text in progress_texts)
 
 
