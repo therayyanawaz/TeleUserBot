@@ -274,17 +274,15 @@ DIGEST_POST_PROCESSORS = _env_list("DIGEST_POST_PROCESSORS", [])  # type: list[s
 QUERY_MODE_ENABLED = _env_bool("QUERY_MODE_ENABLED", True)  # type: bool
 QUERY_MAX_MESSAGES = _env_int("QUERY_MAX_MESSAGES", 50)  # type: int
 QUERY_DEFAULT_HOURS_BACK = _env_int("QUERY_DEFAULT_HOURS_BACK", 24)  # type: int
-# Optional web fallback when Telegram channel evidence is weak.
-QUERY_WEB_FALLBACK_ENABLED = _env_bool("QUERY_WEB_FALLBACK_ENABLED", True)  # type: bool
-# Trigger web fallback when Telegram matches are below this count.
+# Expand Telegram search to the last 7 days when recent coverage is too thin
+# before the mandatory trusted web cross-check runs.
+# Trigger web verification when Telegram matches are below this count.
 QUERY_WEB_MIN_TELEGRAM_RESULTS = _env_int("QUERY_WEB_MIN_TELEGRAM_RESULTS", 3)  # type: int
 # Maximum web evidence items to attach in query context.
 QUERY_WEB_MAX_RESULTS = _env_int("QUERY_WEB_MAX_RESULTS", 12)  # type: int
-# Maximum age window for web evidence (hours).
-QUERY_WEB_MAX_HOURS_BACK = _env_int("QUERY_WEB_MAX_HOURS_BACK", 24)  # type: int
 # Enforce recency filter on web evidence timestamps.
 QUERY_WEB_REQUIRE_RECENT = _env_bool("QUERY_WEB_REQUIRE_RECENT", True)  # type: bool
-# Require at least this many unique web sources before using fallback evidence.
+# Require at least this many unique web sources before using web evidence.
 QUERY_WEB_REQUIRE_MIN_SOURCES = _env_int("QUERY_WEB_REQUIRE_MIN_SOURCES", 2)  # type: int
 # Optional trusted news domains allowlist (empty = accept all news RSS domains).
 QUERY_WEB_ALLOWED_DOMAINS = _env_list(
