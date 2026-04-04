@@ -1210,7 +1210,7 @@ def format_ts(ts: int | None) -> str:
     if not ts:
         return "never"
     try:
-        return datetime.fromtimestamp(int(ts), tz=runtime_timezone()).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(int(ts), tz=runtime_timezone()).strftime("%Y-%m-%d %H:%M:%S %Z")
     except Exception:
         return "never"
 
