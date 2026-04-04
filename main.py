@@ -8736,10 +8736,40 @@ def _strip_query_answer_citations(text: str) -> str:
     value = str(text or "").strip()
     if not value:
         return value
-    value = re.sub(r'\s*<a href="[^"]+">[^<]*</a>', "", value, flags=re.IGNORECASE)
-    value = re.sub(r"\s*<i>\[[^<>\]]+\]</i>", "", value, flags=re.IGNORECASE)
-    value = re.sub(r"\s*\[[^\[\]<>]{2,60}\]", "", value)
-    value = re.sub(r"\bRead more\b", "", value, flags=re.IGNORECASE)
+    raw_lines = re.split(r"(?i)<br\s*/?>", value)
+    cleaned_lines: list[str] = []
+
+    for raw_line in raw_lines:
+        line = raw_line
+        if not normalize_space(strip_telegram_html(line)):
+            continue
+        for _ in range(4):
+            previous = line
+            line = re.sub(r'\s*<a href="[^"]+">[^<]*</a>', "", line, flags=re.IGNORECASE)
+            line = re.sub(r"\s*<i>\[[^<>\]]+\]</i>", "", line, flags=re.IGNORECASE)
+            line = re.sub(r"\s*\[[^\[\]<>]{2,60}\]", "", line)
+            line = re.sub(r"\bRead more\b", "", line, flags=re.IGNORECASE)
+            line = _CAPTION_TELEGRAM_LINK_RE.sub("", line)
+            line = _strip_known_source_aliases(line)
+            line = _CAPTION_HANDLE_RE.sub("", line)
+            line = re.sub(r"(?i)^\s*(?:fwd from|forwarded from)\b[^<]{0,120}", "", line)
+            line = re.sub(r"(?i)\b(?:original msg|subscribe|follow(?: us)?|join(?: us| our channel)?)\b.*$", "", line)
+            line = re.sub(
+                r"(?i)\b(?:channel|channel username|username)\s*[:\-–—|]+\s*",
+                "",
+                line,
+            )
+            line = re.sub(r"\s+([,.;:!?])", r"\1", line)
+            line = re.sub(r"<(b|i|u|s|code|pre|blockquote|tg-spoiler)>\s*</\1>", "", line, flags=re.IGNORECASE)
+            line = normalize_space(line.strip(" ,;:-|/[](){}"))
+            if line == previous:
+                break
+        plain_line = normalize_space(strip_telegram_html(line).strip(" ,;:-|/[](){}"))
+        if not plain_line:
+            continue
+        cleaned_lines.append(line)
+
+    value = "<br>".join(cleaned_lines)
     value = re.sub(r"(?:<br>\s*){3,}", "<br><br>", value, flags=re.IGNORECASE)
     value = re.sub(r"[ \t]{2,}", " ", value)
     return sanitize_telegram_html(value.strip())
