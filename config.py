@@ -154,11 +154,7 @@ OPENAI_AUTH_STARTUP_MODE = _env_str("OPENAI_AUTH_STARTUP_MODE", "auto").lower() 
 DIGEST_MODE = _env_bool("DIGEST_MODE", True)  # type: bool
 DIGEST_INTERVAL_MINUTES = _env_int("DIGEST_INTERVAL_MINUTES", 30)  # type: int
 DIGEST_DAILY_TIMES = _env_list("DIGEST_DAILY_TIMES", ["00:00"])  # type: list[str]
-# 0 disables automatic queue clearing (recommended to preserve full flow).
-DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES = _env_int("DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES", 0)  # type: int
-DIGEST_QUEUE_CLEAR_INCLUDE_INFLIGHT = _env_bool("DIGEST_QUEUE_CLEAR_INCLUDE_INFLIGHT", True)  # type: bool
-# Deprecated (runtime queue clear scheduler is disabled to preserve full flow).
-DIGEST_QUEUE_CLEAR_SCOPE = _env_str("DIGEST_QUEUE_CLEAR_SCOPE", "inflight").lower()  # type: str
+# Digest queue clearing is intentionally disabled at runtime to preserve full intake flow.
 # Daily digest window in hours (midnight digest summarizes this trailing window).
 DIGEST_DAILY_WINDOW_HOURS = _env_int("DIGEST_DAILY_WINDOW_HOURS", 24)  # type: int
 DIGEST_DAILY_MAX_POSTS = _env_int("DIGEST_DAILY_MAX_POSTS", 300)  # type: int

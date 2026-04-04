@@ -1147,23 +1147,11 @@ def _digest_queue_clear_interval_seconds() -> int:
 
 
 def _digest_queue_clear_include_inflight() -> bool:
-    return _bool_flag(getattr(config, "DIGEST_QUEUE_CLEAR_INCLUDE_INFLIGHT", True), True)
+    return False
 
 
 def _digest_queue_clear_scope() -> str:
-    """
-    Queue clear scope:
-    - inflight: clear only stuck claimed rows (safe default)
-    - pending: clear only unsent rows
-    - all: clear everything
-    """
-    raw = str(getattr(config, "DIGEST_QUEUE_CLEAR_SCOPE", "") or "").strip().lower()
-    if raw in {"inflight", "pending", "all"}:
-        return raw
-    # Backward-compat with older include_inflight flag behavior.
-    # Historical setting true used to mean "all", false meant "pending".
-    legacy_include = _digest_queue_clear_include_inflight()
-    return "all" if legacy_include else "pending"
+    return "disabled"
 
 
 def _digest_daily_window_hours() -> int:
@@ -8753,7 +8741,7 @@ def _digest_status_text() -> str:
     queue_clear_every = (
         f"{queue_clear_interval_seconds // 60}m" if queue_clear_interval_seconds > 0 else "off"
     )
-    queue_clear_scope = _digest_queue_clear_scope() if queue_clear_interval_seconds > 0 else "disabled"
+    queue_clear_scope = _digest_queue_clear_scope()
     daily_window_hours = _digest_daily_window_hours()
     auth_status = _auth_status_summary()
     auth_reason = sanitize_telegram_html(_trim_runtime_reason(auth_failure_reason or ""))
@@ -10291,7 +10279,6 @@ def _startup_health_check() -> None:
         digest_daily_window_hours=_digest_daily_window_hours(),
         digest_queue_clear_minutes=queue_clear_minutes,
         digest_queue_clear_enabled=bool(queue_clear_interval_seconds > 0),
-        digest_queue_clear_inflight=_digest_queue_clear_include_inflight(),
         digest_queue_clear_scope=queue_clear_scope,
         digest_pin_hourly=_digest_pin_hourly_enabled(),
         digest_pin_daily=_digest_pin_daily_enabled(),

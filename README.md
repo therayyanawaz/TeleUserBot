@@ -360,7 +360,6 @@ DIGEST_INTERVAL_MINUTES=30
 DIGEST_DAILY_TIMES=["00:00"]
 DIGEST_DAILY_WINDOW_HOURS=24
 DIGEST_MAX_POSTS=80
-DIGEST_QUEUE_CLEAR_INTERVAL_MINUTES=0
 OUTPUT_LANGUAGE="English"
 ```
 
@@ -369,6 +368,7 @@ Notes:
 - `TIMEZONE` controls local-time logic across the bot; for IST use `Asia/Kolkata`
 - rolling digests are clock-aligned to `:00` and `:30`
 - digest windows are claimed from SQLite, not held only in memory
+- digest queue clearing is intentionally disabled; queued items are drained only by claimed digest windows
 - if a digest exceeds Telegram message limits, it is delivered as sequential `Part 1/N`, `Part 2/N`, ... messages
 - rolling and daily digests are forced to English output
 
