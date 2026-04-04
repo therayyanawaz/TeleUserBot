@@ -291,6 +291,37 @@ def test_parse_time_filter_yesterday_uses_calendar_day_boundaries(monkeypatch):
     assert end_ts == int(datetime(2026, 4, 4, 18, 30, tzinfo=timezone.utc).timestamp())
 
 
+def test_wrap_query_digest_answer_uses_today_title():
+    wrapped = main._wrap_query_digest_answer(
+        "Major events unfolded across the city.",
+        hours_back=6,
+        query_text="What happened today in Tehran?",
+    )
+
+    assert wrapped.startswith("<b>Today digest</b><br><br>")
+
+
+def test_wrap_query_digest_answer_uses_yesterday_title_instead_of_horizon():
+    wrapped = main._wrap_query_digest_answer(
+        "Strikes and outages dominated the day.",
+        hours_back=26,
+        query_text="What happened yesterday in Tehran?",
+    )
+
+    assert wrapped.startswith("<b>Yesterday digest</b><br><br>")
+    assert "26-hour digest" not in wrapped
+
+
+def test_wrap_query_digest_answer_uses_explicit_day_window_title():
+    wrapped = main._wrap_query_digest_answer(
+        "A month of developments reshaped the front.",
+        hours_back=24 * 30,
+        query_text="What happened in the last 30 days in Tehran?",
+    )
+
+    assert wrapped.startswith("<b>30-day digest</b><br><br>")
+
+
 def test_runtime_timezone_accepts_ist_alias(monkeypatch):
     monkeypatch.setattr(utils.config, "TIMEZONE", "IST", raising=False)
 
