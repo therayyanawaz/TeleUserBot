@@ -59,7 +59,7 @@ from ai_filter import (
     summarize_or_skip,
     translate_ocr_text_to_english,
 )
-from prompts import QUERY_NO_MATCH_TEXT
+from prompts import QUERY_NO_MATCH_TEXT, digest_output_style
 from auth import (
     ENV_AUTH_ENV_ONLY,
     ENV_AUTH_JSON,
@@ -6963,11 +6963,14 @@ def _format_digest_message(
     sources: List[str],
     *,
     title: str = "Digest",
+    interval_minutes: int | None = None,
 ) -> str:
     timestamp = datetime.now().astimezone().strftime("%H:%M %Z").strip()
     label = sanitize_telegram_html(title.strip() or "Digest")
     header = f"<b>📰 {label}</b>"
-    metadata = sanitize_telegram_html(f"{timestamp} • {total_updates} updates reviewed")
+    style = digest_output_style(interval_minutes or 24 * 60)
+    stat_label = "headlines tracked" if style == "headline_rail" else "updates reviewed"
+    metadata = sanitize_telegram_html(f"{timestamp} • {total_updates} {stat_label}")
     _ = sources
     return sanitize_telegram_html(f"{header}<br>{metadata}<br><br>{digest_body.strip()}")
 
@@ -7466,6 +7469,7 @@ async def _build_window_digest_messages(
                 total_updates=total_updates,
                 sources=[],
                 title=title_builder(1, 1),
+                interval_minutes=interval_minutes,
             )
         ], {
             "part_count": 1,
@@ -7549,6 +7553,7 @@ async def _build_window_digest_messages(
                 total_updates=total_updates,
                 sources=[],
                 title=title_builder(part_index, part_count),
+                interval_minutes=interval_minutes,
             )
         )
 

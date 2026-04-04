@@ -2623,6 +2623,7 @@ def extract_digest_narrative_parts(
     story_fragments: List[str] = []
     highlight_candidates: List[str] = []
     also_candidates: List[str] = []
+    saw_non_bullet_body = False
 
     for raw_block in raw_blocks:
         block_has_bold = bool(re.search(r"<b>.*?</b>", raw_block, flags=re.IGNORECASE | re.DOTALL))
@@ -2656,6 +2657,7 @@ def extract_digest_narrative_parts(
             if is_bullet:
                 highlight_candidates.append(line)
             else:
+                saw_non_bullet_body = True
                 story_fragments.append(line)
 
     story = _build_digest_story_from_fragments(
@@ -2686,7 +2688,7 @@ def extract_digest_narrative_parts(
     highlights = _clean_digest_support_items(highlight_candidates, seen=seen)
     also_moving = _clean_digest_support_items(also_candidates, max_chars=200, seen=seen)
 
-    if not story and highlights:
+    if not story and highlights and not (headline and not saw_non_bullet_body):
         story = highlights.pop(0)
 
     return headline, story, highlights, also_moving
@@ -2701,25 +2703,60 @@ def _render_digest_layout(
     interval_minutes: int,
 ) -> str:
     quiet = quiet_period_message(interval_minutes)
+    headline_mode = _digest_is_headline_rail(interval_minutes)
 
     clean_headline = _digest_clean_line(headline, max_chars=120, allow_short=True)
+    if headline_mode and not clean_headline:
+        clean_headline = _headline_rail_title(interval_minutes)
     clean_story = _build_digest_story_from_fragments([story], total_max_chars=_DIGEST_STORY_MAX_CHARS, max_sentences=4)
-    if not clean_headline or not clean_story:
+    if not clean_headline:
         return quiet
 
     seen: set[str] = set()
     headline_key = _digest_line_key(clean_headline)
-    story_key = _digest_line_key(clean_story)
     if headline_key:
         seen.add(headline_key)
-    if story_key:
-        seen.add(story_key)
+    if clean_story:
+        story_key = _digest_line_key(clean_story)
+        if story_key:
+            seen.add(story_key)
 
-    clean_highlights = _clean_digest_support_items(highlights, seen=seen)
-    clean_also = _clean_digest_support_items(also_moving, max_chars=200, seen=seen)
+    clean_highlights = _clean_digest_support_items(
+        highlights,
+        max_chars=(180 if headline_mode else 220),
+        seen=seen,
+    )
+    clean_also = _clean_digest_support_items(
+        also_moving,
+        max_chars=(180 if headline_mode else 200),
+        seen=seen,
+    )
     if len(clean_also) > _digest_also_moving_cap():
         clean_highlights.extend(clean_also[_digest_also_moving_cap() :])
         clean_also = clean_also[: _digest_also_moving_cap()]
+
+    if headline_mode:
+        if not clean_highlights:
+            clean_highlights = _clean_digest_support_items([clean_story], max_chars=180, seen=seen)
+        if not clean_highlights and not clean_also:
+            return quiet
+
+        rendered_blocks = [
+            "<br>".join(
+                [
+                    f"<b>{sanitize_telegram_html(clean_headline)}</b>",
+                    *[f"• {sanitize_telegram_html(item)}" for item in clean_highlights],
+                ]
+            )
+        ]
+        if clean_also:
+            also_lines = ["<i>Also moving</i>"]
+            also_lines.extend(f"• {sanitize_telegram_html(item)}" for item in clean_also)
+            rendered_blocks.append("<br>".join(also_lines))
+        return sanitize_telegram_html("<br><br>".join(rendered_blocks))
+
+    if not clean_story:
+        return quiet
 
     story_sentences = _collect_digest_story_sentences([clean_story], max_sentences=4)
     if story_sentences and SequenceMatcher(None, story_sentences[0].lower(), clean_headline.lower()).ratio() >= 0.86:
@@ -2755,6 +2792,7 @@ def _json_digest_to_html(payload: Dict[str, Any], *, interval_minutes: int, max_
     headline, story, highlights, also_moving = _digest_payload_to_narrative(
         payload,
         max_lines=max_lines,
+        interval_minutes=interval_minutes,
     )
     return _render_digest_layout(
         headline=headline,
@@ -2800,7 +2838,7 @@ def _digest_english_rewrite_prompt() -> str:
     return (
         "Rewrite this Telegram HTML digest into clean English only.\n"
         "Rules:\n"
-        "- Keep the same narrative-first structure: one headline, one short story paragraph, support bullets, and a short Also moving rail only when needed\n"
+        "- Keep the same digest shape the input already uses: headline rail stays a headline rail, story digest stays a story digest\n"
         "- Make the English sound sharp, human, and slightly unhinged without inventing anything\n"
         "- Translate every non-English word or phrase into English\n"
         "- Remove citations, source names, bracket tags, outlet names, links, handles, hashtags, and any 'Read more' text\n"
@@ -3177,6 +3215,27 @@ def _fallback_digest_layout(posts: Sequence[Dict[str, object]]) -> tuple[str, st
 def local_fallback_digest(posts: Sequence[Dict[str, object]], *, interval_minutes: int) -> str:
     if not posts:
         return quiet_period_message(interval_minutes)
+
+    if _digest_is_headline_rail(interval_minutes):
+        seen: set[str] = set()
+        headlines: list[str] = []
+        for post in posts:
+            text = _post_text(post)
+            if not text or _likely_noise(text) or _digest_needs_english_rewrite(text, "English"):
+                continue
+            candidate = _digest_clean_line(_fallback_headline(text) or text, max_chars=180, allow_short=True)
+            key = _digest_line_key(candidate)
+            if not candidate or not key or key in seen:
+                continue
+            seen.add(key)
+            headlines.append(candidate)
+        return _render_digest_layout(
+            headline=_headline_rail_title(interval_minutes),
+            story="",
+            highlights=headlines,
+            also_moving=[],
+            interval_minutes=interval_minutes,
+        )
 
     headline, story, highlights, also_moving = _fallback_digest_layout(posts)
     return _render_digest_layout(
@@ -4852,15 +4911,16 @@ def _make_generated_text_result(
     )
 
 
-def _digest_render_counts(text: str) -> tuple[int, int]:
-    headline, story, _highlights, also_moving = extract_digest_narrative_parts(
+def _digest_render_counts(text: str, *, interval_minutes: int) -> tuple[int, int]:
+    headline, story, highlights, also_moving = extract_digest_narrative_parts(
         text,
         max_lines=max(_resolve_digest_max_lines(), 6),
     )
-    return (1 if headline and story else 0, len(also_moving))
+    has_primary_block = bool(headline and (story or highlights))
+    return (1 if has_primary_block else 0, len(also_moving))
 
 
-def _digest_quality_issue(text: str, quiet_text: str) -> str:
+def _digest_quality_issue(text: str, quiet_text: str, *, interval_minutes: int) -> str:
     cleaned = normalize_space(strip_telegram_html(text))
     if not cleaned:
         return "empty_output"
@@ -4877,25 +4937,31 @@ def _digest_quality_issue(text: str, quiet_text: str) -> str:
         text,
         max_lines=max(_resolve_digest_max_lines(), 6),
     )
+    headline_mode = _digest_is_headline_rail(interval_minutes)
     if not headline:
         return "headline_too_thin"
-    if not story:
+    if not story and not headline_mode:
         return "missing_story"
+    if headline_mode and not highlights and not also_moving:
+        return "headline_too_thin"
 
-    story_issue = _news_copy_quality_issue(story, story, allow_short=True)
-    if story_issue in {"vague_copy", "incomplete_copy"}:
-        return story_issue
+    if story:
+        story_issue = _news_copy_quality_issue(story, story, allow_short=True)
+        if story_issue in {"vague_copy", "incomplete_copy"}:
+            return story_issue
 
-    if _digest_line_key(story) == _digest_line_key(headline):
-        return "duplication"
-    story_sentences = _collect_digest_story_sentences([story], max_sentences=1)
-    if story_sentences and SequenceMatcher(None, story_sentences[0].lower(), headline.lower()).ratio() >= 0.86:
-        return "duplication"
+    if story:
+        if _digest_line_key(story) == _digest_line_key(headline):
+            return "duplication"
+        story_sentences = _collect_digest_story_sentences([story], max_sentences=1)
+        if story_sentences and SequenceMatcher(None, story_sentences[0].lower(), headline.lower()).ratio() >= 0.86:
+            return "duplication"
     if len(also_moving) > _digest_also_moving_cap():
         return "oversized_also_moving"
 
     seen_digest_lines: set[str] = set()
-    for line in [headline, story, *highlights, *also_moving]:
+    digest_lines = [headline, *([story] if story else []), *highlights, *also_moving]
+    for line in digest_lines:
         key = _digest_line_key(line)
         if not key:
             return "messy_layout"
@@ -4906,7 +4972,10 @@ def _digest_quality_issue(text: str, quiet_text: str) -> str:
         if issue in {"vague_copy", "incomplete_copy"}:
             return issue
 
-    if not highlights and not also_moving and len(story.split()) < 8:
+    if headline_mode:
+        if len(highlights) < 1 and len(also_moving) < 1:
+            return "headline_too_thin"
+    elif not highlights and not also_moving and len(story.split()) < 8:
         return "headline_too_thin"
     return ""
 
@@ -4942,7 +5011,7 @@ def _query_quality_issue(answer_html: str, question: str) -> str:
 def _digest_retry_prompt(prompt: str, issue: str) -> str:
     return (
         f"{prompt}\n\nRevision feedback:\n- {_filter_retry_feedback(issue)}\n"
-        "- Rebuild the digest as one narrative-first newsroom brief with one headline, one short story paragraph, support bullets, and a very short Also moving rail only if needed.\n"
+        "- Rebuild the digest in the correct window style: short rolling windows need a headline rail, while long windows need a story digest.\n"
         "- Do not leave any meaningful update behind.\n"
         "- Keep it English-only and remove all source branding, handles, hashtags, promo junk, and citation-style phrasing.\n"
         "- If uncertainty is needed, use generic wording only, such as 'initial reports indicate' or 'preliminary reports suggest'."
@@ -5054,7 +5123,10 @@ async def create_digest_summary_result(
             )
         except Exception as exc:
             fallback_html = local_fallback_digest(prepared_posts, interval_minutes=interval_minutes)
-            major_block_count, timeline_item_count = _digest_render_counts(fallback_html)
+            major_block_count, timeline_item_count = _digest_render_counts(
+                fallback_html,
+                interval_minutes=interval_minutes,
+            )
             result = _make_generated_text_result(
                 fallback_html,
                 copy_origin="fallback",
@@ -5090,7 +5162,10 @@ async def create_digest_summary_result(
             retry_issue = "empty_output"
             if round_number == 2:
                 fallback_html = local_fallback_digest(prepared_posts, interval_minutes=interval_minutes)
-                major_block_count, timeline_item_count = _digest_render_counts(fallback_html)
+                major_block_count, timeline_item_count = _digest_render_counts(
+                    fallback_html,
+                    interval_minutes=interval_minutes,
+                )
                 result = _make_generated_text_result(
                     fallback_html,
                     copy_origin="fallback",
@@ -5129,7 +5204,10 @@ async def create_digest_summary_result(
                 retry_issue = "invalid_payload"
                 if round_number == 2:
                     fallback_html = local_fallback_digest(prepared_posts, interval_minutes=interval_minutes)
-                    major_block_count, timeline_item_count = _digest_render_counts(fallback_html)
+                    major_block_count, timeline_item_count = _digest_render_counts(
+                        fallback_html,
+                        interval_minutes=interval_minutes,
+                    )
                     result = _make_generated_text_result(
                         fallback_html,
                         copy_origin="fallback",
@@ -5175,12 +5253,19 @@ async def create_digest_summary_result(
             interval_minutes=interval_minutes,
             max_lines=max_lines,
         )
-        quality_issue = _digest_quality_issue(normalized, quiet_text)
+        quality_issue = _digest_quality_issue(
+            normalized,
+            quiet_text,
+            interval_minutes=interval_minutes,
+        )
         if quality_issue:
             retry_issue = quality_issue
             if round_number == 2:
                 fallback_html = local_fallback_digest(prepared_posts, interval_minutes=interval_minutes)
-                major_block_count, timeline_item_count = _digest_render_counts(fallback_html)
+                major_block_count, timeline_item_count = _digest_render_counts(
+                    fallback_html,
+                    interval_minutes=interval_minutes,
+                )
                 result = _make_generated_text_result(
                     fallback_html,
                     copy_origin="fallback",
@@ -5213,7 +5298,10 @@ async def create_digest_summary_result(
                 return result
             continue
 
-        major_block_count, timeline_item_count = _digest_render_counts(normalized)
+        major_block_count, timeline_item_count = _digest_render_counts(
+            normalized,
+            interval_minutes=interval_minutes,
+        )
         result = _make_generated_text_result(
             normalized,
             copy_origin="ai",
@@ -5245,7 +5333,10 @@ async def create_digest_summary_result(
         return result
 
     fallback_html = local_fallback_digest(prepared_posts, interval_minutes=interval_minutes)
-    major_block_count, timeline_item_count = _digest_render_counts(fallback_html)
+    major_block_count, timeline_item_count = _digest_render_counts(
+        fallback_html,
+        interval_minutes=interval_minutes,
+    )
     result = _make_generated_text_result(
         fallback_html,
         copy_origin="fallback",
