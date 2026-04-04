@@ -43,6 +43,21 @@ def test_format_digest_message_uses_clean_two_line_header():
     assert "headlines from" not in formatted
 
 
+def test_format_digest_message_uses_story_metadata_for_hourly_digest():
+    formatted = main._format_digest_message(
+        "<b>Central Israel Impact Reports</b><br>Initial impact reports concentrated around Petah Tikva.",
+        total_updates=12,
+        sources=[],
+        title="60-Minute Digest (22:00-23:00)",
+        interval_minutes=60,
+    )
+
+    lines = formatted.splitlines()
+    assert lines[0] == "<b>📰 60-Minute Digest (22:00-23:00)</b>"
+    assert "12 updates reviewed" in lines[1]
+    assert "headlines tracked" not in formatted
+
+
 def test_rolling_digest_title_omits_part_label_for_first_message(monkeypatch):
     monkeypatch.setattr(main, "_digest_window_label", lambda *_args, **_kwargs: "22:00-22:30")
 

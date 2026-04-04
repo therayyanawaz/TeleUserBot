@@ -7,6 +7,7 @@ import pytest
 
 import ai_filter
 import main
+import prompts
 import severity_classifier
 import utils
 
@@ -116,6 +117,12 @@ def test_query_status_copy_stays_polished():
     assert "latest details" in crosscheck
     assert "Thinking" not in writing
     assert "strongest evidence" in writing
+
+
+def test_digest_output_style_only_uses_headline_rail_for_thirty_minute_windows():
+    assert prompts.digest_output_style(30) == "headline_rail"
+    assert prompts.digest_output_style(60) == "story_digest"
+    assert prompts.digest_output_style(24 * 60) == "story_digest"
 
 
 def test_query_analysis_status_reads_like_a_sentence():
