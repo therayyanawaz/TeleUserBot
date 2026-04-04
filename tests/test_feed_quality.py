@@ -223,6 +223,46 @@ def test_build_query_plan_marks_explicit_time_filters():
     assert explicit_plan.explicit_time_filter is True
 
 
+@pytest.mark.asyncio
+async def test_search_recent_news_web_respects_seven_day_query_contract(monkeypatch):
+    urls: list[str] = []
+
+    class _FakeResponse:
+        status_code = 200
+        text = (
+            "<rss><channel><item>"
+            "<title>Oracle site named in regional reporting</title>"
+            "<link>https://example.com/report</link>"
+            "<description>Amazon infrastructure in Bahrain was also mentioned.</description>"
+            "</item></channel></rss>"
+        )
+
+    class _FakeHTTP:
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+
+        async def get(self, url: str):
+            urls.append(url)
+            return _FakeResponse()
+
+    async def fake_get_web_http_client():
+        return _FakeHTTP()
+
+    monkeypatch.setattr(utils, "get_web_http_client", fake_get_web_http_client)
+
+    results = await utils.search_recent_news_web(
+        "Which data centers did Iran hit, Oracle or AWS?",
+        hours_back=24 * 7,
+        max_results=3,
+        allowed_domains=[],
+        require_recent=False,
+    )
+
+    assert results
+    assert any("168h" in url for url in urls)
+    assert all("72h" not in url for url in urls)
+
+
 def test_strip_query_answer_citations_keeps_follow_up_language_while_removing_follow_promos():
     cleaned = main._strip_query_answer_citations(
         "NBC News confirmed follow-up explosions after the strike.<br>"
