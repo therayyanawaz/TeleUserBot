@@ -175,7 +175,7 @@ def test_claim_digest_window_persists_active_window_and_pages_rows(isolated_db):
     db.save_to_digest_queue("chan-1", 102, "Window item two", timestamp=2500, source_name="Desk")
     db.save_to_digest_queue("chan-1", 103, "Next window item", timestamp=3700, source_name="Desk")
 
-    batch_id, claimed = db.claim_digest_window(3600)
+    batch_id, claimed = db.claim_digest_window(3600, window_start_ts=1800)
 
     assert batch_id
     assert claimed == 2
@@ -199,10 +199,24 @@ def test_claim_digest_window_persists_active_window_and_pages_rows(isolated_db):
     assert db.count_pending() == 1
 
 
+def test_claim_digest_window_respects_lower_bound_and_leaves_older_backlog_pending(isolated_db):
+    db.save_to_digest_queue("chan-1", 201, "Older backlog item", timestamp=1200, source_name="Desk")
+    db.save_to_digest_queue("chan-1", 202, "Current window item", timestamp=1810, source_name="Desk")
+    db.save_to_digest_queue("chan-1", 203, "Current window item two", timestamp=2500, source_name="Desk")
+
+    batch_id, claimed = db.claim_digest_window(3600, window_start_ts=1800)
+
+    assert batch_id
+    assert claimed == 2
+    page = db.load_batch_rows_page(batch_id, limit=10)
+    assert [row["message_id"] for row in page] == [202, 203]
+    assert db.count_pending() == 1
+
+
 def test_restore_digest_window_resets_claim_and_keeps_rows_pending(isolated_db):
     db.save_to_digest_queue("chan-1", 201, "Window item", timestamp=1810, source_name="Desk")
 
-    batch_id, claimed = db.claim_digest_window(3600)
+    batch_id, claimed = db.claim_digest_window(3600, window_start_ts=1800)
     restored = db.restore_digest_window(batch_id)
 
     assert claimed == 1

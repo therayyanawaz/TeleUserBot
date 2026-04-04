@@ -7527,8 +7527,18 @@ def _digest_window_label(window_start_ts: int, window_end_ts: int) -> str:
     return f"{start_label}-{end_label}"
 
 
-def _rolling_digest_title(window_start_ts: int, window_end_ts: int, *, part_index: int, part_count: int) -> str:
-    base = f"30-Minute Digest ({_digest_window_label(window_start_ts, window_end_ts)})"
+def _rolling_digest_title(
+    window_start_ts: int,
+    window_end_ts: int,
+    *,
+    interval_minutes: int,
+    part_index: int,
+    part_count: int,
+) -> str:
+    base = (
+        f"{max(1, int(interval_minutes))}-Minute Digest "
+        f"({_digest_window_label(window_start_ts, window_end_ts)})"
+    )
     if part_count > 1 and part_index > 1:
         return f"{base} • Part {part_index}/{part_count}"
     return base
@@ -7555,6 +7565,20 @@ async def _send_digest_message_sequence(messages: Sequence[str]) -> object | Non
 
 def _effective_interval_seconds() -> int:
     return _digest_interval_seconds()
+
+
+def _headline_rail_body_title(interval_minutes: int) -> str:
+    minutes = max(1, int(interval_minutes))
+    if minutes == 60:
+        return "Top headlines from the last hour"
+    if minutes < 60:
+        return f"Top headlines from the last {minutes} minutes"
+    hours = max(1, round(minutes / 60))
+    return f"Top headlines from the last {hours} hours"
+
+
+def _digest_line_key(text: str) -> str:
+    return normalize_space(strip_telegram_html(text)).lower()
 
 
 def _adaptive_batch_size() -> int:
@@ -7691,6 +7715,7 @@ async def _build_window_digest_messages(
 ) -> Tuple[List[str], Dict[str, object]]:
     token_budget = _digest_input_token_budget()
     page_size = _digest_window_page_size()
+    headline_mode = digest_output_style(interval_minutes) == "headline_rail"
     logical_part_count = sum(
         1
         for _ in _iter_digest_row_groups(
@@ -7736,6 +7761,9 @@ async def _build_window_digest_messages(
         }
 
     rendered_bodies: List[str] = []
+    merged_headline = ""
+    merged_highlights: List[str] = []
+    merged_seen: set[str] = set()
     total_chars = 0
     ai_parts = 0
     fallback_parts = 0
@@ -7773,12 +7801,26 @@ async def _build_window_digest_messages(
                 "fallback_reason": result.fallback_reason,
             },
         )
-        rendered_bodies.extend(
-            _split_digest_body_blocks(
+        if headline_mode:
+            part_headline, _part_story, part_highlights, part_also = extract_digest_narrative_parts(
                 digest_body,
-                max_chars=max_body_chars,
+                max_lines=_digest_support_line_limit(),
             )
-        )
+            if part_headline and not merged_headline:
+                merged_headline = part_headline
+            for item in [*part_highlights, *part_also]:
+                key = _digest_line_key(item)
+                if not item or not key or key in merged_seen:
+                    continue
+                merged_seen.add(key)
+                merged_highlights.append(normalize_space(strip_telegram_html(item)))
+        else:
+            rendered_bodies.extend(
+                _split_digest_body_blocks(
+                    digest_body,
+                    max_chars=max_body_chars,
+                )
+            )
         total_chars += len(digest_body)
         if result.copy_origin == "ai":
             ai_parts += 1
@@ -7790,6 +7832,18 @@ async def _build_window_digest_messages(
         translation_applied_count += int(result.translation_applied_count or 0)
         citation_stripped_count += int(result.citation_stripped_count or 0)
         duplicate_collapsed_count += int(result.duplicate_collapsed_count or 0)
+
+    if headline_mode:
+        support_limit = _digest_support_line_limit()
+        capped_highlights = merged_highlights[:support_limit]
+        rendered_bodies = [
+            _render_digest_body_sections(
+                merged_headline or _headline_rail_body_title(interval_minutes),
+                "",
+                capped_highlights,
+                [],
+            )
+        ] if capped_highlights else [quiet_period_message(interval_minutes)]
 
     if not rendered_bodies:
         rendered_bodies = [quiet_period_message(interval_minutes)]
@@ -7841,7 +7895,10 @@ async def _flush_digest_queue_once() -> bool:
             if due_window_end_ts is None:
                 return False
             window_end_ts = int(due_window_end_ts)
-            batch_id, claimed_rows = claim_digest_window(window_end_ts)
+        batch_id, claimed_rows = claim_digest_window(
+            window_end_ts,
+            window_start_ts=window_start_ts,
+        )
 
         interval_minutes = max(1, _digest_interval_seconds() // 60)
         window_start_ts = max(0, window_end_ts - _digest_interval_seconds())
@@ -7867,12 +7924,13 @@ async def _flush_digest_queue_once() -> bool:
                 row_loader,
                 total_updates=claimed_rows,
                 interval_minutes=interval_minutes,
-                title_builder=lambda part_index, part_count: _rolling_digest_title(
-                    window_start_ts,
-                    window_end_ts,
-                    part_index=part_index,
-                    part_count=part_count,
-                ),
+            title_builder=lambda part_index, part_count: _rolling_digest_title(
+                window_start_ts,
+                window_end_ts,
+                interval_minutes=interval_minutes,
+                part_index=part_index,
+                part_count=part_count,
+            ),
                 context={
                     "batch_id": batch_id,
                     "window_start_ts": window_start_ts,

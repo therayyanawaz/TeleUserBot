@@ -1589,6 +1589,19 @@ def _digest_also_moving_cap(max_lines: int | None = None) -> int:
     return max(1, min(3, max(1, resolved // 3)))
 
 
+def _cap_headline_rail_support(
+    highlights: Sequence[str],
+    also_moving: Sequence[str],
+    *,
+    max_lines: int,
+) -> tuple[List[str], List[str]]:
+    total_cap = max(1, int(max_lines))
+    capped_highlights = list(highlights[:total_cap])
+    remaining = max(0, total_cap - len(capped_highlights))
+    capped_also = list(also_moving[: min(_digest_also_moving_cap(max_lines), remaining)])
+    return capped_highlights, capped_also
+
+
 def _resolve_digest_token_budget() -> int:
     raw_max = getattr(config, "DIGEST_MAX_TOKENS", DEFAULT_DIGEST_MAX_TOKENS)
     raw_context = getattr(config, "CODEX_MODEL_CONTEXT_TOKENS", 200000)
@@ -2522,6 +2535,11 @@ def _digest_payload_to_narrative(
         if len(also_moving) > _digest_also_moving_cap(max_lines):
             highlights.extend(also_moving[_digest_also_moving_cap(max_lines) :])
             also_moving = also_moving[: _digest_also_moving_cap(max_lines)]
+        highlights, also_moving = _cap_headline_rail_support(
+            highlights,
+            also_moving,
+            max_lines=max_lines,
+        )
         if not headline and highlights:
             headline = _headline_rail_title(interval_minutes)
         return headline, "", highlights, also_moving
@@ -2750,6 +2768,11 @@ def _render_digest_layout(
             clean_highlights = [*story_headlines, *clean_highlights]
         if not clean_highlights:
             clean_highlights = _clean_digest_support_items([clean_story], max_chars=180, seen=seen)
+        clean_highlights, clean_also = _cap_headline_rail_support(
+            clean_highlights,
+            clean_also,
+            max_lines=_resolve_digest_max_lines(),
+        )
         if not clean_highlights and not clean_also:
             return quiet
 
@@ -3250,6 +3273,11 @@ def local_fallback_digest(posts: Sequence[Dict[str, object]], *, interval_minute
                     continue
                 seen.add(key)
                 headlines.append(candidate)
+        headlines, _ = _cap_headline_rail_support(
+            headlines,
+            [],
+            max_lines=_resolve_digest_max_lines(),
+        )
         return _render_digest_layout(
             headline=_headline_rail_title(interval_minutes),
             story="",

@@ -1016,10 +1016,16 @@ def load_active_digest_window_claim() -> Tuple[str, int | None, int]:
     return batch_id, (window_end_ts if window_end_ts > 0 else None), claimed_rows
 
 
-def claim_digest_window(window_end_ts: int, *, batch_id: str | None = None) -> Tuple[str, int]:
+def claim_digest_window(
+    window_end_ts: int,
+    *,
+    batch_id: str | None = None,
+    window_start_ts: int | None = None,
+) -> Tuple[str, int]:
     cutoff_ts = int(max(0, window_end_ts))
     if cutoff_ts <= 0:
         return "", 0
+    lower_bound_ts = int(max(0, int(window_start_ts or 0)))
 
     resolved_batch_id = (batch_id or uuid.uuid4().hex).strip()
     if not resolved_batch_id:
@@ -1049,10 +1055,11 @@ def claim_digest_window(window_end_ts: int, *, batch_id: str | None = None) -> T
             SELECT id
             FROM digest_queue
             WHERE processed = 0
+              AND timestamp > ?
               AND timestamp <= ?
             ORDER BY timestamp ASC, id ASC
             """,
-            (cutoff_ts,),
+            (lower_bound_ts, cutoff_ts),
         ).fetchall()
         ids = [int(row["id"]) for row in row_ids]
         if ids:

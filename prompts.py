@@ -49,7 +49,7 @@ Core rules:
 3) Merge duplicates and paraphrased echoes, but do not lose any distinct factual update.
 4) Every meaningful post in the provided batch must be represented somewhere in the digest, either directly or inside a merged story block.
 5) Choose the format that matches the window:
-   - 30-minute rolling windows: a headline rail with all distinct headlines and no story paragraph
+   - 30-minute rolling windows: a compact headline rail with only the main distinct headlines and no story paragraph
    - longer windows such as hourly or daily recaps: one narrative-first story digest
 6) In both modes, keep concrete actors, actions, locations, numbers, and official bodies when the source provides them.
 7) Reject vague leads like "incident reported", "developments continue", "situation update", or "explosions shake [country]" when the source provides something more specific.
@@ -102,9 +102,10 @@ def build_digest_system_prompt(
             )
             toggles.append("This is a short rolling digest. Output a headline rail, not a story digest.")
             toggles.append("headline should be a short rail label, not a narrative sentence.")
-            toggles.append("headlines must contain all distinct developments as short standalone headline lines.")
+            toggles.append("headlines must contain only the main distinct developments as short standalone headline lines.")
+            toggles.append("Keep the rail tight enough to fit one clean Telegram message whenever possible.")
             toggles.append("Do not include a story paragraph in this mode.")
-            toggles.append("also_moving is optional and should contain only a few overflow headline lines.")
+            toggles.append("also_moving is optional and should contain at most a few overflow headline lines.")
         else:
             toggles.append(
                 'Return ONLY one JSON object with this schema: {"quiet": boolean, "headline": string, "story": string, "highlights": [string, ...], "also_moving": [string, ...]}.'

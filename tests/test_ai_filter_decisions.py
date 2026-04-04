@@ -270,6 +270,25 @@ def test_json_digest_to_html_renders_headline_rail_for_short_window():
     assert "Officials said cargo traffic resumes at dawn" not in plain
 
 
+def test_json_digest_to_html_caps_headline_rail_lines_for_short_window():
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "headline": "Top headlines from the last 30 minutes",
+            "headlines": [f"Headline {idx} carries a concrete fact." for idx in range(1, 9)],
+            "also_moving": [f"Overflow item {idx}." for idx in range(1, 4)],
+        },
+        interval_minutes=30,
+        max_lines=5,
+    )
+
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert plain.count("Headline ") == 5
+    assert "Headline 6 carries a concrete fact." not in plain
+    assert "Also moving" not in plain
+
+
 def test_json_digest_to_html_renders_narrative_digest():
     html = ai_filter._json_digest_to_html(
         {
@@ -420,6 +439,22 @@ def test_local_fallback_digest_headline_rail_keeps_distinct_updates_from_one_pos
     assert "Top headlines from the last 30 minutes" in plain
     assert "First site was hit in Dubai" in plain
     assert "Second site was hit in Bahrain" in plain
+
+
+def test_local_fallback_digest_headline_rail_caps_to_main_lines(monkeypatch):
+    monkeypatch.setattr(ai_filter.config, "DIGEST_MAX_LINES", 4, raising=False)
+
+    html = ai_filter.local_fallback_digest(
+        [
+            {"text": f"Headline {idx} remains specific and concrete.", "source_name": "Desk"}
+            for idx in range(1, 8)
+        ],
+        interval_minutes=30,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert plain.count("Headline ") == 4
+    assert "Headline 5 remains specific and concrete." not in plain
 
 
 def test_html_digest_cleanup_strips_promo_handles_and_duplicate_blocks():

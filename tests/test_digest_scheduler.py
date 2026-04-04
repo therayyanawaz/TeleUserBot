@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pytest
+
 import main
 
 
@@ -93,13 +95,97 @@ def test_rolling_digest_title_omits_part_label_for_first_message(monkeypatch):
     monkeypatch.setattr(main, "_digest_window_label", lambda *_args, **_kwargs: "22:00-22:30")
 
     assert (
-        main._rolling_digest_title(79200, 81000, part_index=1, part_count=2)
+        main._rolling_digest_title(79200, 81000, interval_minutes=30, part_index=1, part_count=2)
         == "30-Minute Digest (22:00-22:30)"
     )
     assert (
-        main._rolling_digest_title(79200, 81000, part_index=2, part_count=2)
+        main._rolling_digest_title(79200, 81000, interval_minutes=30, part_index=2, part_count=2)
         == "30-Minute Digest (22:00-22:30) • Part 2/2"
     )
+
+
+def test_rolling_digest_title_uses_real_interval(monkeypatch):
+    monkeypatch.setattr(main, "_digest_window_label", lambda *_args, **_kwargs: "22:00-23:00")
+
+    assert (
+        main._rolling_digest_title(79200, 82800, interval_minutes=60, part_index=1, part_count=1)
+        == "60-Minute Digest (22:00-23:00)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_window_digest_messages_merges_short_window_groups_into_one_message(monkeypatch):
+    async def fake_run_post_processors(text, context):
+        return text
+
+    async def fake_hydrate_digest_posts(rows):
+        return rows
+
+    async def fake_create_digest_summary_result(_posts, _auth_manager, interval_minutes):
+        idx = fake_create_digest_summary_result.calls
+        fake_create_digest_summary_result.calls += 1
+        if idx == 0:
+            html = (
+                "<b>Top headlines from the last 30 minutes</b><br>"
+                "• First headline from group one.<br>"
+                "• Second headline from group one."
+            )
+        else:
+            html = (
+                "<b>Top headlines from the last 30 minutes</b><br>"
+                "• Third headline from group two.<br>"
+                "• Fourth headline from group two."
+            )
+        return type(
+            "Result",
+            (),
+            {
+                "html": html,
+                "copy_origin": "ai",
+                "fallback_reason": "",
+                "major_block_count": 1,
+                "timeline_item_count": 0,
+                "noise_stripped_count": 0,
+                "translation_applied_count": 0,
+                "citation_stripped_count": 0,
+                "duplicate_collapsed_count": 0,
+            },
+        )()
+
+    fake_create_digest_summary_result.calls = 0
+
+    monkeypatch.setattr(main, "_digest_input_token_budget", lambda: 1000)
+    monkeypatch.setattr(main, "_digest_window_page_size", lambda: 100)
+    monkeypatch.setattr(main, "_digest_send_chunk_size", lambda: 3600)
+    monkeypatch.setattr(main, "_require_auth_manager", lambda: object())
+    monkeypatch.setattr(main, "_run_post_processors", fake_run_post_processors)
+    monkeypatch.setattr(
+        main,
+        "_iter_digest_row_groups",
+        lambda *_args, **_kwargs: iter([[{"id": 1}], [{"id": 2}]]),
+    )
+    monkeypatch.setattr(main, "_hydrate_digest_posts", fake_hydrate_digest_posts)
+    monkeypatch.setattr(main, "create_digest_summary_result", fake_create_digest_summary_result)
+
+    messages, stats = await main._build_window_digest_messages(
+        lambda after_id=0, limit=100: [],
+        total_updates=4,
+        interval_minutes=30,
+        title_builder=lambda part_index, part_count: main._rolling_digest_title(
+            79200,
+            81000,
+            interval_minutes=30,
+            part_index=part_index,
+            part_count=part_count,
+        ),
+        context={},
+    )
+
+    assert len(messages) == 1
+    assert "First headline from group one." in messages[0]
+    assert "Fourth headline from group two." in messages[0]
+    assert "Part 1/" not in messages[0]
+    assert stats["part_count"] == 1
 
 
 def test_split_digest_body_blocks_repeats_story_context_across_parts():
