@@ -1425,6 +1425,34 @@ def _query_web_allowed_domains() -> list[str]:
     return out
 
 
+def _query_count_label(count: int, singular: str, plural: str | None = None) -> str:
+    noun = singular if count == 1 else (plural or f"{singular}s")
+    return f"{count} {noun}"
+
+
+def _query_search_status(include_web: bool) -> str:
+    if include_web:
+        return "Searching your channels and trusted web sources... ⏳"
+    return "Searching your channels for recent coverage... ⏳"
+
+
+def _query_crosscheck_status(*, high_risk: bool) -> str:
+    if high_risk:
+        return "High-risk query detected. Verifying with trusted web sources... ⏳"
+    return "Checking trusted web sources to confirm the latest details... ⏳"
+
+
+def _query_analysis_status(telegram_count: int, web_count: int) -> str:
+    parts = [_query_count_label(telegram_count, "Telegram update")]
+    if web_count > 0:
+        parts.append(_query_count_label(web_count, "trusted web report"))
+    return f"{' and '.join(parts)} gathered. Building your answer now... ⏳"
+
+
+def _query_writing_status() -> str:
+    return "Writing a clear answer from the strongest evidence... ⏳"
+
+
 def _is_high_risk_news_query(query: str) -> bool:
     lowered = normalize_space(query).lower()
     if not lowered:
@@ -9208,7 +9236,7 @@ async def _stream_query_answer(
         send_message=_send_query_message,
         edit_message=_edit_query_message,
         get_message_id=lambda ref: _message_ref_id(ref) or 0,
-        placeholder_text="Thinking... ⏳",
+        placeholder_text=_query_writing_status(),
         edit_interval_ms=_stream_edit_interval_ms(),
         max_chars_per_edit=_stream_max_chars_per_edit(),
         typing_enabled=False,
@@ -9292,11 +9320,7 @@ async def _handle_query_request(
 
     progress = await _safe_reply_markdown(
         event_ref,  # type: ignore[arg-type]
-        (
-            "Searching channels + trusted web... ⏳"
-            if _is_query_web_fallback_enabled()
-            else "Searching your channels... ⏳"
-        ),
+        _query_search_status(_is_query_web_fallback_enabled()),
         reply_to=reply_to,
         prefer_bot_identity=prefer_bot_identity,
         bot_chat_id=bot_chat_id,
@@ -9400,11 +9424,7 @@ async def _handle_query_request(
             ran_web_search = True
             await _safe_reply_markdown(
                 event_ref,  # type: ignore[arg-type]
-                (
-                    "Cross-checking channels with trusted web news... ⏳"
-                    if not high_risk_query
-                    else "High-risk query detected. Cross-checking trusted web news... ⏳"
-                ),
+                _query_crosscheck_status(high_risk=high_risk_query),
                 edit_message=progress,
                 prefer_bot_identity=prefer_bot_identity,
                 bot_chat_id=bot_chat_id,
@@ -9445,11 +9465,7 @@ async def _handle_query_request(
 
         await _safe_reply_markdown(
             event_ref,  # type: ignore[arg-type]
-            (
-                f"Found {len(telegram_results)} evidence items"
-                + (f" + {len(web_results)} web reports" if web_results else "")
-                + " -> analyzing... ⏳"
-            ),
+            _query_analysis_status(len(telegram_results), len(web_results)),
             edit_message=progress,
             prefer_bot_identity=prefer_bot_identity,
             bot_chat_id=bot_chat_id,

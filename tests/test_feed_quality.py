@@ -105,6 +105,32 @@ def test_choose_alert_label_upgrades_network_disruption_emoji():
     assert label == "📡 Network Disruption"
 
 
+def test_query_status_copy_stays_polished():
+    initial = main._query_search_status(include_web=True)
+    crosscheck = main._query_crosscheck_status(high_risk=False)
+    writing = main._query_writing_status()
+
+    assert "->" not in initial
+    assert "trusted web sources" in initial
+    assert "->" not in crosscheck
+    assert "latest details" in crosscheck
+    assert "Thinking" not in writing
+    assert "strongest evidence" in writing
+
+
+def test_query_analysis_status_reads_like_a_sentence():
+    status = main._query_analysis_status(100, 4)
+
+    assert status == "100 Telegram updates and 4 trusted web reports gathered. Building your answer now... ⏳"
+    assert "->" not in status
+
+
+def test_query_analysis_status_handles_singular_counts():
+    status = main._query_analysis_status(1, 1)
+
+    assert status == "1 Telegram update and 1 trusted web report gathered. Building your answer now... ⏳"
+
+
 def test_severity_classifier_downgrades_explainer_with_shot_down_keyword():
     severity_classifier._HIGH_SEVERITY_HISTORY.clear()
     severity, _score, breakdown = severity_classifier.classify_message_severity(
