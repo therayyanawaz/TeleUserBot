@@ -274,6 +274,13 @@ def test_runtime_timezone_accepts_ist_alias(monkeypatch):
     assert getattr(tz, "key", "") == "Asia/Kolkata"
 
 
+def test_format_ts_uses_runtime_timezone(monkeypatch):
+    monkeypatch.setattr(utils.config, "TIMEZONE", "Asia/Kolkata", raising=False)
+
+    assert utils.format_ts(0) == "never"
+    assert utils.format_ts(1800) == "1970-01-01 06:00:00"
+
+
 def test_load_archive_query_context_uses_runtime_timezone_for_date_labels(monkeypatch):
     monkeypatch.setattr(
         main,
