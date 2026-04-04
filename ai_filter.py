@@ -209,8 +209,12 @@ _FEED_TELEGRAM_LINK_RE = re.compile(
     r"(?i)\b(?:https?://)?(?:t\.me|telegram\.me)/[A-Za-z0-9_+./-]+"
 )
 _FEED_PROMO_TO_END_RE = re.compile(
-    r"(?i)\b(?:our channel|subscribe|follow(?: us)?|join(?: us| our channel)?|"
+    r"(?i)\b(?:our channel|subscribe|follow\s+us|join(?: us| our channel)?|"
     r"watch here|watch live|livestream|live stream)\b.*$"
+)
+_FEED_FOLLOW_PROMO_ONLY_RE = re.compile(
+    r"(?i)^\s*follow(?=\s*(?:$|\||discussion\b|boost the channel\b|our channel\b|"
+    r"subscribe\b|join\b|watch\b|:|[-–—](?=\s|$))).*$"
 )
 _FEED_INCOMPLETE_TAIL_WORDS = {
     "a",
@@ -516,6 +520,7 @@ def _clean_generated_delivery_segment(line: str) -> str:
     cleaned = _FEED_TELEGRAM_LINK_RE.sub("", cleaned)
     cleaned = _FEED_HANDLE_RE.sub("", cleaned)
     cleaned = _FEED_PROMO_TO_END_RE.sub("", cleaned)
+    cleaned = _FEED_FOLLOW_PROMO_ONLY_RE.sub("", cleaned)
     cleaned = re.sub(r"(?i)\b(?:channel|source)\s*[:\-–—|]+\s*$", "", cleaned)
     prefix_match = re.match(
         r"^(?P<prefix>[A-Za-z][A-Za-z0-9&'._ /-]{1,50})(?P<sep>\s*[:\-–—|]+\s*)(?P<rest>.+)$",
@@ -524,7 +529,7 @@ def _clean_generated_delivery_segment(line: str) -> str:
     if prefix_match and _looks_like_generated_source_prefix(prefix_match.group("prefix")):
         separator = normalize_space(prefix_match.group("sep"))
         rest = normalize_space(prefix_match.group("rest"))
-        if not (separator == "-" and re.match(r"^[a-z][A-Za-z0-9-]{2,}", rest)):
+        if not (separator == "-" and re.match(r"^[a-z][A-Za-z0-9-]*\b", rest)):
             cleaned = rest
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
     return normalize_space(cleaned.strip(" ,;:-|/[](){}"))

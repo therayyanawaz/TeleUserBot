@@ -161,6 +161,36 @@ def test_build_query_plan_marks_explicit_time_filters():
     assert explicit_plan.explicit_time_filter is True
 
 
+def test_strip_query_answer_citations_keeps_follow_up_language_while_removing_follow_promos():
+    cleaned = main._strip_query_answer_citations(
+        "NBC News confirmed follow-up explosions after the strike.<br>"
+        "Follow Us | Discussion<br>"
+        "Follow @desk_wire"
+    )
+    plain = ai_filter.strip_telegram_html(cleaned)
+
+    assert "follow-up explosions" in plain
+    assert "Follow Us" not in plain
+    assert "@desk_wire" not in plain
+
+
+def test_clean_generated_delivery_segment_keeps_follow_up_language():
+    assert (
+        ai_filter._clean_generated_delivery_segment(
+            "Follow-up explosions were reported across the district."
+        )
+        == "Follow-up explosions were reported across the district."
+    )
+    assert ai_filter._clean_generated_delivery_segment("Follow @DeskWire") == ""
+
+
+def test_strip_caption_promo_noise_keeps_follow_up_language():
+    assert (
+        main._strip_caption_promo_noise("Follow-up explosions were reported across the district.")
+        == "Follow-up explosions were reported across the district."
+    )
+
+
 def test_fallback_query_answer_extracts_relevant_sentences_from_noisy_blob():
     answer = ai_filter._fallback_query_answer(
         "Which data centers did Iran hit, Oracle or AWS?",

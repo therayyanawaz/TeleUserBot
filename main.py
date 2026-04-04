@@ -3376,9 +3376,13 @@ _CAPTION_TELEGRAM_LINK_RE = re.compile(
     r"(?i)\b(?:https?://)?(?:t\.me|telegram\.me)/[A-Za-z0-9_+./-]+"
 )
 _CAPTION_PROMO_TO_END_RE = re.compile(
-    r"(?i)\b(?:our channel|subscribe|follow(?: us)?|join(?: us| our channel)?|"
+    r"(?i)\b(?:our channel|subscribe|follow\s+us|join(?: us| our channel)?|"
     r"watch here|watch live|livestream|live stream|full stream|full video|"
     r"watch the livestream|watch the full livestream)\b.*$"
+)
+_CAPTION_FOLLOW_PROMO_ONLY_RE = re.compile(
+    r"(?i)^\s*follow(?=\s*(?:$|\||discussion\b|boost the channel\b|our channel\b|"
+    r"subscribe\b|join\b|watch\b|:|[-–—](?=\s|$))).*$"
 )
 _CAPTION_SOURCE_CLAUSE_RE = re.compile(
     r"(?i)\b(?:our channel|source|channel)\s*[:\-–—|]+\s*$"
@@ -3552,13 +3556,17 @@ def _strip_caption_promo_noise(text: str, *, source_title: str = "") -> str:
         cleaned = _strip_known_source_aliases(cleaned, source_title=source_title)
         cleaned = _CAPTION_HANDLE_RE.sub("", cleaned)
         cleaned = _CAPTION_PROMO_TO_END_RE.sub("", cleaned)
+        cleaned = _CAPTION_FOLLOW_PROMO_ONLY_RE.sub("", cleaned)
         cleaned = _CAPTION_SOURCE_CLAUSE_RE.sub("", cleaned)
         prefix_match = re.match(
-            r"^(?P<prefix>[A-Za-z][A-Za-z0-9&'._ /-]{1,50})\s*[:\-–—|]+\s*(?P<rest>.+)$",
+            r"^(?P<prefix>[A-Za-z][A-Za-z0-9&'._ /-]{1,50})(?P<sep>\s*[:\-–—|]+\s*)(?P<rest>.+)$",
             cleaned,
         )
         if prefix_match and _looks_like_caption_source_prefix(prefix_match.group("prefix")):
-            cleaned = normalize_space(prefix_match.group("rest"))
+            separator = normalize_space(prefix_match.group("sep"))
+            rest = normalize_space(prefix_match.group("rest"))
+            if not (separator == "-" and re.match(r"^[a-z][A-Za-z0-9-]*\b", rest)):
+                cleaned = rest
         cleaned = re.sub(r"(?i)\b(?:via|from)\s*[:\-–—|]+\s*$", "", cleaned)
         cleaned = normalize_space(cleaned.strip(" ,;:-|/[](){}"))
         if cleaned == previous:
@@ -8829,7 +8837,12 @@ def _strip_query_answer_citations(text: str) -> str:
             line = _strip_known_source_aliases(line)
             line = _CAPTION_HANDLE_RE.sub("", line)
             line = re.sub(r"(?i)^\s*(?:fwd from|forwarded from)\b[^<]{0,120}", "", line)
-            line = re.sub(r"(?i)\b(?:original msg|subscribe|follow(?: us)?|join(?: us| our channel)?)\b.*$", "", line)
+            line = re.sub(
+                r"(?i)\b(?:original msg|subscribe|follow\s+us|join(?: us| our channel)?)\b.*$",
+                "",
+                line,
+            )
+            line = _CAPTION_FOLLOW_PROMO_ONLY_RE.sub("", line)
             line = re.sub(
                 r"(?i)\b(?:channel|channel username|username)\s*[:\-–—|]+\s*",
                 "",
