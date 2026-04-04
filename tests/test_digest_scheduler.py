@@ -79,6 +79,16 @@ def test_format_digest_message_uses_runtime_timezone(monkeypatch):
     assert "09:30 UTC+05:30" in lines[1]
 
 
+def test_digest_window_label_uses_runtime_timezone(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "runtime_timezone",
+        lambda: datetime.fromisoformat("2026-04-05T00:00:00+05:30").tzinfo,
+    )
+
+    assert main._digest_window_label(0, 1800) == "05:30-06:00"
+
+
 def test_rolling_digest_title_omits_part_label_for_first_message(monkeypatch):
     monkeypatch.setattr(main, "_digest_window_label", lambda *_args, **_kwargs: "22:00-22:30")
 

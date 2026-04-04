@@ -7483,8 +7483,9 @@ async def _hydrate_digest_posts(rows: Sequence[Dict[str, object]]) -> List[Dict[
 
 
 def _digest_window_label(window_start_ts: int, window_end_ts: int) -> str:
-    start_label = datetime.fromtimestamp(max(0, window_start_ts)).strftime("%H:%M")
-    end_label = datetime.fromtimestamp(max(0, window_end_ts)).strftime("%H:%M")
+    tz = runtime_timezone()
+    start_label = datetime.fromtimestamp(max(0, window_start_ts), tz=tz).strftime("%H:%M")
+    end_label = datetime.fromtimestamp(max(0, window_end_ts), tz=tz).strftime("%H:%M")
     return f"{start_label}-{end_label}"
 
 
