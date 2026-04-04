@@ -131,6 +131,28 @@ def test_query_analysis_status_handles_singular_counts():
     assert status == "1 Telegram update and 1 trusted web report gathered. Building your answer now... ⏳"
 
 
+def test_strip_query_answer_citations_removes_known_channel_aliases_but_keeps_named_entities():
+    main.source_alias_cache.clear()
+    main.source_title_cache.clear()
+    main._register_source_aliases("-1001", "War & News Alert", "war_news_alert")
+
+    cleaned = main._strip_query_answer_citations(
+        "<b>War & News Alert</b><br>"
+        "NBC News said Donald Trump spoke after the strike.<br>"
+        "War & News Alert: Oracle's Dubai facility was among the reported targets.<br>"
+        "@war_news_alert"
+    )
+    plain = ai_filter.strip_telegram_html(cleaned)
+
+    assert "War & News Alert" not in plain
+    assert "@war_news_alert" not in plain
+    assert "NBC News" in plain
+    assert "Donald Trump" in plain
+    assert "Oracle's Dubai facility" in plain
+    main.source_alias_cache.clear()
+    main.source_title_cache.clear()
+
+
 def test_build_query_plan_marks_explicit_time_filters():
     default_plan = utils.build_query_plan("What happened in Tehran?")
     explicit_plan = utils.build_query_plan("What happened today in Tehran?")
