@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -242,6 +243,35 @@ def test_build_query_plan_marks_explicit_time_filters():
 
     assert default_plan.explicit_time_filter is False
     assert explicit_plan.explicit_time_filter is True
+
+
+def test_parse_time_filter_today_uses_configured_timezone(monkeypatch):
+    class _FakeDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            base = datetime(2026, 4, 4, 0, 30, tzinfo=timezone.utc)
+            if tz is None:
+                return base.replace(tzinfo=None)
+            return base.astimezone(tz)
+
+    monkeypatch.setattr(utils.config, "TIMEZONE", "Asia/Kolkata", raising=False)
+    monkeypatch.setattr(utils, "datetime", _FakeDateTime)
+
+    hours_back, cleaned = utils.parse_time_filter_from_query(
+        "What happened today in Tehran?",
+        default_hours=1,
+    )
+
+    assert hours_back == 6
+    assert cleaned == "What happened in Tehran?"
+
+
+def test_runtime_timezone_accepts_ist_alias(monkeypatch):
+    monkeypatch.setattr(utils.config, "TIMEZONE", "IST", raising=False)
+
+    tz = utils.runtime_timezone()
+
+    assert getattr(tz, "key", "") == "Asia/Kolkata"
 
 
 @pytest.mark.asyncio

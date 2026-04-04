@@ -66,7 +66,12 @@ TeleUserBot fixes that by combining:
 - Ask questions in **Saved Messages**
 - Or use a **private chat with your own bot**
 - Search recent Telegram evidence first
-- Fall back to trusted web coverage only when configured and necessary
+- Always cross-check against trusted web coverage before answering
+
+### 🕒 Stable Timezone
+
+- Set one runtime timezone in `.env` so `today`, `yesterday`, daily digests, and other local-time logic stay stable across restarts and servers
+- Use an IANA timezone name such as `Asia/Kolkata` for IST
 
 ### 🖼️ OCR for Media-Only Posts
 
@@ -349,6 +354,7 @@ The assistant checks the last 24 hours of Telegram evidence first, widens to the
 Recommended baseline:
 
 ```env
+TIMEZONE="Asia/Kolkata"
 DIGEST_MODE=true
 DIGEST_INTERVAL_MINUTES=30
 DIGEST_DAILY_TIMES=["00:00"]
@@ -360,6 +366,7 @@ OUTPUT_LANGUAGE="English"
 
 Notes:
 
+- `TIMEZONE` controls local-time logic across the bot; for IST use `Asia/Kolkata`
 - rolling digests are clock-aligned to `:00` and `:30`
 - digest windows are claimed from SQLite, not held only in memory
 - if a digest exceeds Telegram message limits, it is delivered as sequential `Part 1/N`, `Part 2/N`, ... messages

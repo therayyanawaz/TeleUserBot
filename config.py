@@ -271,6 +271,7 @@ DIGEST_POST_PROCESSORS = _env_list("DIGEST_POST_PROCESSORS", [])  # type: list[s
 # -----------------------------------------------------------------------------
 # Query Assistant Mode
 # -----------------------------------------------------------------------------
+TIMEZONE = _env_str("TIMEZONE", "UTC")  # type: str
 QUERY_MODE_ENABLED = _env_bool("QUERY_MODE_ENABLED", True)  # type: bool
 QUERY_MAX_MESSAGES = _env_int("QUERY_MAX_MESSAGES", 50)  # type: int
 QUERY_DEFAULT_HOURS_BACK = _env_int("QUERY_DEFAULT_HOURS_BACK", 24)  # type: int

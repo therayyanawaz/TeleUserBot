@@ -23,7 +23,9 @@ import time
 from typing import Any, Awaitable, Callable, Iterable, List, Sequence, Tuple
 from urllib.parse import quote_plus, urlparse
 import xml.etree.ElementTree as ET
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import config
 from db import (
     load_recent_breaking,
     load_recent_media_signatures,
@@ -38,6 +40,24 @@ from shared_http import get_web_http_client
 
 
 _QUERY_MAX_HOURS_BACK = 24 * 30
+
+
+def runtime_timezone():
+    raw = str(getattr(config, "TIMEZONE", "UTC") or "").strip()
+    if not raw:
+        raw = "UTC"
+    aliases = {
+        "IST": "Asia/Kolkata",
+    }
+    zone_name = aliases.get(raw.upper(), raw)
+    try:
+        return ZoneInfo(zone_name)
+    except ZoneInfoNotFoundError:
+        return timezone.utc
+
+
+def runtime_now() -> datetime:
+    return datetime.now(runtime_timezone())
 
 
 def estimate_tokens_rough(text: str) -> int:
@@ -1225,7 +1245,7 @@ def seconds_until_next_daily_time(daily_times: List[Tuple[int, int]]) -> int:
     if not daily_times:
         return 0
 
-    now = datetime.now()
+    now = runtime_now()
     candidates = []
     for hour, minute in daily_times:
         candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -1489,7 +1509,7 @@ def parse_time_filter_from_query(query: str, default_hours: int = 24) -> tuple[i
         hours_back = max(hours_back, 48)
         cleanup_patterns.append(r"\byesterday\b")
     if re.search(r"\btoday\b", lowered):
-        now_local = datetime.now()
+        now_local = runtime_now()
         hours_back = max(hours_back, now_local.hour + 1)
         cleanup_patterns.append(r"\btoday\b")
 
