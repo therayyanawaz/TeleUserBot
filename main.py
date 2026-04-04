@@ -172,6 +172,8 @@ from utils import (
     sanitize_telegram_html,
     search_recent_news_web,
     search_recent_messages,
+    runtime_now,
+    runtime_timezone,
     seconds_until_next_daily_time,
     split_html_chunks,
     split_markdown_chunks,
@@ -7103,7 +7105,7 @@ def _format_digest_message(
     title: str = "Digest",
     interval_minutes: int | None = None,
 ) -> str:
-    timestamp = datetime.now().astimezone().strftime("%H:%M %Z").strip()
+    timestamp = runtime_now().strftime("%H:%M %Z").strip()
     label = sanitize_telegram_html(title.strip() or "Digest")
     header = f"<b>📰 {label}</b>"
     style = digest_output_style(interval_minutes or 24 * 60)
@@ -8881,7 +8883,7 @@ def _filter_stored_query_rows(
 
         timestamp = int(row.get("timestamp") or 0)
         date_label = (
-            datetime.fromtimestamp(timestamp).astimezone().isoformat()
+            datetime.fromtimestamp(timestamp, tz=runtime_timezone()).isoformat()
             if timestamp > 0
             else ""
         )
