@@ -3545,6 +3545,22 @@ def _is_known_source_alias_line(text: str, *, source_title: str = "") -> bool:
     return plain.lower() in known
 
 
+def _contains_known_source_alias(text: str, *, source_title: str = "") -> bool:
+    plain = normalize_space(strip_telegram_html(str(text or "")))
+    if not plain:
+        return False
+    for alias in _collect_monitored_source_aliases(source_title):
+        bare = alias.lstrip("@")
+        if not bare:
+            continue
+        if alias.startswith("@"):
+            if re.search(rf"(?i)(?<!\w){re.escape(alias)}(?!\w)", plain):
+                return True
+        if re.search(rf"(?i)(?<![A-Za-z0-9]){re.escape(bare)}(?![A-Za-z0-9])", plain):
+            return True
+    return False
+
+
 def _strip_known_source_aliases(text: str, *, source_title: str = "") -> str:
     cleaned = str(text or "")
     for alias in _collect_monitored_source_aliases(source_title):
@@ -3606,7 +3622,17 @@ def _rewrite_known_source_alias_attribution(text: str, *, source_title: str = ""
             cleaned,
         )
         cleaned = re.sub(
+            rf"(?i)^\s*(?:as\s+)?{_KNOWN_SOURCE_ATTRIBUTION_VERB_RE}\s+by\s+@?{escaped}\b[:,]?\s*(?P<rest>.+)$",
+            lambda match: _generic_reports_line(match.group("rest")),
+            cleaned,
+        )
+        cleaned = re.sub(
             rf"(?i)(?:\s*,\s*|\s+)according to\s+@?{escaped}\b\s*,\s*",
+            " ",
+            cleaned,
+        )
+        cleaned = re.sub(
+            rf"(?i)(?:\s*,\s*|\s+)(?:as\s+)?{_KNOWN_SOURCE_ATTRIBUTION_VERB_RE}\s+by\s+@?{escaped}\b\s*,\s*",
             " ",
             cleaned,
         )
@@ -3622,6 +3648,11 @@ def _rewrite_known_source_alias_attribution(text: str, *, source_title: str = ""
         )
         cleaned = re.sub(
             rf"(?i)\s+according to\s+@?{escaped}\b(?=\s*[.?!]|$)",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            rf"(?i)\s*,?\s*(?:as\s+)?{_KNOWN_SOURCE_ATTRIBUTION_VERB_RE}\s+by\s+@?{escaped}\b(?=\s*[.?!]|$)",
             "",
             cleaned,
         )
@@ -8940,6 +8971,8 @@ def _strip_query_answer_citations(text: str) -> str:
         if not plain_line:
             continue
         if _is_known_source_alias_line(line):
+            continue
+        if _contains_known_source_alias(line):
             continue
         cleaned_lines.append(line)
 

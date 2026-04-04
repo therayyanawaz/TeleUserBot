@@ -215,6 +215,27 @@ def test_strip_query_answer_citations_removes_inline_known_channel_attribution()
     main.source_title_cache.clear()
 
 
+def test_strip_query_answer_citations_removes_reported_by_known_channel_forms():
+    main.source_alias_cache.clear()
+    main.source_title_cache.clear()
+    main._register_source_aliases("-1001", "Middle East Eye", "middleeasteye")
+
+    cleaned = main._strip_query_answer_citations(
+        "Strikes hit the area, reported by Middle East Eye.<br>"
+        "The strike, as reported by @middleeasteye, hit a fuel depot."
+    )
+    plain = ai_filter.strip_telegram_html(cleaned)
+
+    assert "Middle East Eye" not in plain
+    assert "@middleeasteye" not in plain
+    assert "reported by" not in plain.lower()
+    assert "Strikes hit the area." in plain
+    assert "The strike hit a fuel depot." in plain
+
+    main.source_alias_cache.clear()
+    main.source_title_cache.clear()
+
+
 def test_build_query_plan_marks_explicit_time_filters():
     default_plan = utils.build_query_plan("What happened in Tehran?")
     explicit_plan = utils.build_query_plan("What happened today in Tehran?")
