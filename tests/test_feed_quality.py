@@ -1102,6 +1102,7 @@ async def test_handle_query_request_expands_to_seven_days_before_web_crosscheck(
     progress_texts: list[str] = []
     search_hours: list[int] = []
     web_hours: list[int] = []
+    monkeypatch.setattr(main.config, "QUERY_WEB_FALLBACK_ENABLED", False, raising=False)
 
     async def fake_safe_reply_markdown(_event, text, *, edit_message=None, reply_to=None, prefer_bot_identity=False, bot_chat_id=None):
         progress_texts.append(text)

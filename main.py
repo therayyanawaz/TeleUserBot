@@ -1370,7 +1370,10 @@ def _query_default_hours_back() -> int:
 
 
 def _is_query_web_fallback_enabled() -> bool:
-    return _bool_flag(getattr(config, "QUERY_WEB_FALLBACK_ENABLED", True), True)
+    # Query answers always require a web cross-check. The legacy config flag is
+    # kept for backward compatibility in settings, but it no longer disables the
+    # verification step.
+    return True
 
 
 def _query_web_min_telegram_results() -> int:
