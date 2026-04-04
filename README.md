@@ -342,7 +342,7 @@ Ask natural-language questions such as:
 - `recent beirut updates`
 - `who died recently in iran`
 
-The assistant checks the last 24 hours of Telegram evidence first, widens to the last 7 days when coverage is thin, and then runs a trusted web cross-check before answering.
+The assistant checks the last 24 hours of Telegram evidence first, widens to the last 7 days when coverage is thin, and then runs a trusted web cross-check before answering. If the user explicitly asks for a wider time window, Telegram and web verification both follow that same window up to 30 days.
 
 ## 📰 Digest Configuration
 
@@ -477,7 +477,8 @@ Notes:
 
 - Telegram evidence stays the primary source
 - web verification always runs after Telegram evidence gathering
-- the web verification window is fixed at 7 days to match the Telegram expansion contract
+- the default web verification window is 7 days to match the normal Telegram expansion contract
+- if the user explicitly asks for a wider window, Telegram and web verification follow that same window up to 30 days
 - higher-risk questions are handled more conservatively
 
 ## 🧵 Output and Delivery Details
