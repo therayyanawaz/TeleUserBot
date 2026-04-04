@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import main
 
 
@@ -56,6 +58,25 @@ def test_format_digest_message_uses_story_metadata_for_hourly_digest():
     assert lines[0] == "<b>📰 60-Minute Digest (22:00-23:00)</b>"
     assert "12 updates reviewed" in lines[1]
     assert "headlines tracked" not in formatted
+
+
+def test_format_digest_message_uses_runtime_timezone(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "runtime_now",
+        lambda: datetime.fromisoformat("2026-04-05T09:30:00+05:30"),
+    )
+
+    formatted = main._format_digest_message(
+        "<b>Headline</b><br>Story.",
+        total_updates=5,
+        sources=[],
+        title="30-Minute Digest (09:00-09:30)",
+        interval_minutes=30,
+    )
+
+    lines = formatted.splitlines()
+    assert "09:30 UTC+05:30" in lines[1]
 
 
 def test_rolling_digest_title_omits_part_label_for_first_message(monkeypatch):
