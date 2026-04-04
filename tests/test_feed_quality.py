@@ -285,7 +285,7 @@ def test_load_archive_query_context_uses_runtime_timezone_for_date_labels(monkey
                 "message_id": 10,
                 "source_name": "Archive Source",
                 "message_link": "",
-                "text": "Strike reports continued overnight.",
+                "raw_text": "Strike reports continued overnight.",
             }
         ],
     )
