@@ -235,3 +235,17 @@ def test_ack_digest_window_does_not_rewind_last_completed_checkpoint(isolated_db
     assert claimed == 1
     assert acked == 1
     assert db.get_meta(db.ROLLING_DIGEST_LAST_COMPLETED_KEY) == "3600"
+
+
+def test_claim_digest_window_for_catchup_excludes_current_open_window(isolated_db):
+    db.save_to_digest_queue("chan-1", 401, "Older overdue item", timestamp=1200, source_name="Desk")
+    db.save_to_digest_queue("chan-1", 402, "Latest closed window item", timestamp=3500, source_name="Desk")
+    db.save_to_digest_queue("chan-1", 403, "Current open window item", timestamp=3610, source_name="Desk")
+
+    batch_id, claimed = db.claim_digest_window(3600, window_start_ts=0)
+
+    assert batch_id
+    assert claimed == 2
+    page = db.load_batch_rows_page(batch_id, limit=10)
+    assert [row["message_id"] for row in page] == [401, 402]
+    assert db.count_pending() == 1

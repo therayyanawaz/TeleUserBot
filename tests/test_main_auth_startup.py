@@ -61,6 +61,7 @@ def _reset_auth_state() -> None:
     main.auth_features_disabled = []
     main.startup_auth_repair_status = "not_needed"
     main.startup_auth_repair_message = ""
+    main._clear_digest_recovery_state()
     main._last_cli_status_signature = None
     main._last_cli_status_at = 0.0
 
@@ -341,11 +342,13 @@ async def test_status_payload_and_digest_status_include_auth_health(monkeypatch)
     monkeypatch.setattr(main, "_digest_queue_clear_scope", lambda: "disabled")
     monkeypatch.setattr(main, "_digest_daily_window_hours", lambda: 24)
     monkeypatch.setattr(main, "_digest_429_threshold_per_hour", lambda: 3)
+    monkeypatch.setattr(main, "peek_oldest_pending_digest_timestamp", lambda: None)
     monkeypatch.setattr(main, "get_quota_health", lambda: {"status": "healthy", "recent_429_count": 0})
     monkeypatch.setattr(main, "dupe_detector", None)
 
     payload = main._web_status_payload()
     assert payload["query_mode_available"] is False
+    assert payload["digest_recovery"]["state"] == "normal"
     assert payload["auth"]["mode_effective"] == "degraded"
     assert payload["auth"]["ready"] is False
     assert payload["auth"]["degraded"] is True
@@ -359,6 +362,7 @@ async def test_status_payload_and_digest_status_include_auth_health(monkeypatch)
     assert "degraded" in event.messages[0]
     assert "query_mode, ocr_translation" in event.messages[0]
     assert "Startup repair" in event.messages[0]
+    assert "Recovery mode" in event.messages[0]
 
 
 def test_pull_latest_repo_version_on_startup_detects_no_change(monkeypatch):

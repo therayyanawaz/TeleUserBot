@@ -101,6 +101,7 @@ from db import (
     is_seen,
     load_active_digest_window_claim,
     load_archive_window_page,
+    load_batch_row_timestamp_bounds,
     load_batch_rows_page,
     load_inbound_job_counts,
     load_recent_inbound_job_failures,
@@ -492,6 +493,14 @@ digest_next_run_ts: float | None = None
 digest_retry_backoff_seconds: int = 0
 digest_loop_lock = asyncio.Lock()
 ROLLING_DIGEST_LAST_COMPLETED_META_KEY = "rolling_digest_last_completed_window_end_ts"
+_DIGEST_BACKLOG_RECOVERY_STALE_INTERVALS = 4
+digest_recovery_state: Dict[str, object] = {
+    "active": False,
+    "mode": "normal",
+    "window_start_ts": None,
+    "window_end_ts": None,
+    "claimed_rows": 0,
+}
 dupe_detector: HybridDuplicateEngine | None = None
 monitored_source_chat_ids: List[int] = []
 query_last_request_ts: Dict[int, float] = {}
@@ -7554,11 +7563,85 @@ def _rolling_digest_title(
     return base
 
 
+def _catchup_digest_title(
+    window_start_ts: int,
+    window_end_ts: int,
+    *,
+    part_index: int,
+    part_count: int,
+) -> str:
+    base = f"Catch-up Digest ({_digest_window_label(window_start_ts, window_end_ts)})"
+    if part_count > 1 and part_index > 1:
+        return f"{base} • Part {part_index}/{part_count}"
+    return base
+
+
 def _daily_digest_title(window_hours: int, *, part_index: int, part_count: int) -> str:
     base = f"24h Digest (last {window_hours}h)"
     if part_count > 1 and part_index > 1:
         return f"{base} • Part {part_index}/{part_count}"
     return base
+
+
+def _set_digest_recovery_state(
+    *,
+    active: bool,
+    window_start_ts: int | None = None,
+    window_end_ts: int | None = None,
+    claimed_rows: int = 0,
+) -> None:
+    digest_recovery_state["active"] = bool(active)
+    digest_recovery_state["mode"] = "compact" if active else "normal"
+    digest_recovery_state["window_start_ts"] = int(window_start_ts) if window_start_ts else None
+    digest_recovery_state["window_end_ts"] = int(window_end_ts) if window_end_ts else None
+    digest_recovery_state["claimed_rows"] = max(0, int(claimed_rows or 0))
+
+
+def _clear_digest_recovery_state() -> None:
+    _set_digest_recovery_state(active=False, window_start_ts=None, window_end_ts=None, claimed_rows=0)
+
+
+def _digest_backlog_snapshot(now_ts: int | None = None) -> Dict[str, int | bool | None]:
+    resolved_now = int(time.time() if now_ts is None else now_ts)
+    interval_seconds = max(60, _digest_interval_seconds())
+    last_closed_window_end = _last_closed_digest_window_end(resolved_now)
+    oldest_pending_ts = peek_oldest_pending_digest_timestamp()
+    oldest_closed_window_end: int | None = None
+    oldest_closed_window_start: int | None = None
+    oldest_closed_window_age_seconds: int | None = None
+    stale_intervals = 0
+    recovery_due = False
+
+    if oldest_pending_ts is not None:
+        candidate_window_end = _align_digest_window_end(
+            oldest_pending_ts,
+            interval_seconds=interval_seconds,
+        )
+        if candidate_window_end <= last_closed_window_end:
+            oldest_closed_window_end = candidate_window_end
+            oldest_closed_window_start = max(0, candidate_window_end - interval_seconds)
+            oldest_closed_window_age_seconds = max(0, resolved_now - candidate_window_end)
+            stale_intervals = max(0, (last_closed_window_end - candidate_window_end) // interval_seconds)
+            recovery_due = stale_intervals >= _DIGEST_BACKLOG_RECOVERY_STALE_INTERVALS
+
+    return {
+        "interval_seconds": interval_seconds,
+        "last_closed_window_end": last_closed_window_end,
+        "oldest_pending_ts": int(oldest_pending_ts) if oldest_pending_ts else None,
+        "oldest_closed_window_start": oldest_closed_window_start,
+        "oldest_closed_window_end": oldest_closed_window_end,
+        "oldest_closed_window_age_seconds": oldest_closed_window_age_seconds,
+        "stale_intervals": stale_intervals,
+        "recovery_due": recovery_due,
+    }
+
+
+def _digest_batch_is_catchup(*, batch_min_ts: int | None, window_end_ts: int) -> bool:
+    if not batch_min_ts or window_end_ts <= 0:
+        return False
+    interval_seconds = max(60, _digest_interval_seconds())
+    normal_window_start = max(0, window_end_ts - interval_seconds)
+    return int(batch_min_ts) <= normal_window_start
 
 
 async def _send_digest_message_sequence(messages: Sequence[str]) -> object | None:
@@ -7700,6 +7783,25 @@ async def _pin_digest_message_ref(ref: object | None, *, kind: str) -> None:
         set_meta(meta_key, str(message_id))
     except Exception:
         LOGGER.exception("Failed rotating %s digest pin.", kind)
+
+
+def _digest_recovery_status_snapshot(now_ts: int | None = None) -> Dict[str, object]:
+    backlog = _digest_backlog_snapshot(now_ts)
+    active = bool(digest_recovery_state.get("active"))
+    state = "recovering" if active else ("queued" if bool(backlog.get("recovery_due")) else "normal")
+    return {
+        "state": state,
+        "active": active,
+        "mode": str(digest_recovery_state.get("mode") or ("compact" if active else "normal")),
+        "due": bool(backlog.get("recovery_due")),
+        "oldest_pending_closed_window_start_ts": backlog.get("oldest_closed_window_start"),
+        "oldest_pending_closed_window_end_ts": backlog.get("oldest_closed_window_end"),
+        "oldest_pending_closed_window_age_seconds": backlog.get("oldest_closed_window_age_seconds"),
+        "stale_intervals": int(backlog.get("stale_intervals") or 0),
+        "active_window_start_ts": digest_recovery_state.get("window_start_ts"),
+        "active_window_end_ts": digest_recovery_state.get("window_end_ts"),
+        "active_claimed_rows": int(digest_recovery_state.get("claimed_rows") or 0),
+    }
 
 
 async def _send_digest_message(text: str) -> object | None:
@@ -7886,31 +7988,284 @@ async def _build_window_digest_messages(
     }
 
 
+def _flatten_digest_body_for_catchup(digest_body: str) -> str:
+    headline, story, highlights, also_moving = extract_digest_narrative_parts(
+        digest_body,
+        max_lines=_digest_support_line_limit(),
+    )
+    parts: List[str] = []
+    for value in (headline, story):
+        cleaned = normalize_space(strip_telegram_html(value))
+        if cleaned:
+            parts.append(cleaned)
+    for item in list(highlights)[:3]:
+        cleaned = normalize_space(strip_telegram_html(item))
+        if cleaned:
+            parts.append(cleaned)
+    for item in list(also_moving)[:1]:
+        cleaned = normalize_space(strip_telegram_html(item))
+        if cleaned:
+            parts.append(cleaned)
+    return normalize_space(" ".join(parts))
+
+
+async def _build_catchup_digest_messages(
+    row_loader,
+    *,
+    total_updates: int,
+    window_start_ts: int,
+    window_end_ts: int,
+    context: Dict[str, object],
+) -> Tuple[List[str], Dict[str, object]]:
+    token_budget = _digest_input_token_budget()
+    page_size = _digest_window_page_size()
+    row_groups = list(
+        _iter_digest_row_groups(
+            row_loader,
+            token_budget=token_budget,
+            page_size=page_size,
+        )
+    )
+    range_minutes = max(61, max(1, int((max(1, window_end_ts - window_start_ts) + 59) // 60)))
+    quiet_body = quiet_period_message(range_minutes)
+
+    if not row_groups:
+        quiet_body = await _run_post_processors(
+            quiet_body,
+            {
+                **context,
+                "posts": [],
+                "part_index": 1,
+                "part_count": 1,
+                "copy_origin": "fallback",
+                "fallback_reason": "",
+            },
+        )
+        return [
+            _format_digest_message(
+                digest_body=quiet_body,
+                total_updates=total_updates,
+                sources=[],
+                title=_catchup_digest_title(window_start_ts, window_end_ts, part_index=1, part_count=1),
+                interval_minutes=range_minutes,
+            )
+        ], {
+            "part_count": 1,
+            "quiet": True,
+            "response_chars": len(quiet_body),
+            "ai_parts": 0,
+            "fallback_parts": 1,
+            "major_block_count": 0,
+            "timeline_item_count": 0,
+            "noise_stripped_count": 0,
+            "translation_applied_count": 0,
+            "citation_stripped_count": 0,
+            "duplicate_collapsed_count": 0,
+        }
+
+    digest_seed_posts: List[Dict[str, object]] = []
+    total_chars = 0
+    ai_parts = 0
+    fallback_parts = 0
+    major_block_count = 0
+    timeline_item_count = 0
+    noise_stripped_count = 0
+    translation_applied_count = 0
+    citation_stripped_count = 0
+    duplicate_collapsed_count = 0
+
+    for group_index, row_group in enumerate(row_groups, start=1):
+        posts = await _hydrate_digest_posts(row_group)
+        if not posts:
+            continue
+        result = await create_digest_summary_result(
+            posts,
+            _require_auth_manager(),
+            interval_minutes=range_minutes,
+        )
+        digest_body = result.html.strip() or quiet_body
+        digest_body = await _run_post_processors(
+            digest_body,
+            {
+                **context,
+                "posts": posts,
+                "part_index": group_index,
+                "part_count": len(row_groups),
+                "copy_origin": result.copy_origin,
+                "fallback_reason": result.fallback_reason,
+            },
+        )
+        seed_text = _flatten_digest_body_for_catchup(digest_body)
+        if seed_text:
+            digest_seed_posts.append(
+                {
+                    "id": group_index,
+                    "channel_id": "",
+                    "message_id": group_index,
+                    "source_name": "",
+                    "raw_text": seed_text,
+                    "message_link": "",
+                    "timestamp": max(int(row.get("timestamp") or 0) for row in row_group),
+                }
+            )
+        total_chars += len(digest_body)
+        if result.copy_origin == "ai":
+            ai_parts += 1
+        else:
+            fallback_parts += 1
+        major_block_count += int(result.major_block_count or 0)
+        timeline_item_count += int(result.timeline_item_count or 0)
+        noise_stripped_count += int(result.noise_stripped_count or 0)
+        translation_applied_count += int(result.translation_applied_count or 0)
+        citation_stripped_count += int(result.citation_stripped_count or 0)
+        duplicate_collapsed_count += int(result.duplicate_collapsed_count or 0)
+
+    final_posts = digest_seed_posts or await _hydrate_digest_posts(row_groups[0])
+    final_result = await create_digest_summary_result(
+        final_posts,
+        _require_auth_manager(),
+        interval_minutes=range_minutes,
+    )
+    final_body = final_result.html.strip() or quiet_body
+    final_body = await _run_post_processors(
+        final_body,
+        {
+            **context,
+            "posts": final_posts,
+            "part_index": 1,
+            "part_count": 1,
+            "copy_origin": final_result.copy_origin,
+            "fallback_reason": final_result.fallback_reason,
+        },
+    )
+
+    if final_result.copy_origin == "ai":
+        ai_parts += 1
+    else:
+        fallback_parts += 1
+    total_chars += len(final_body)
+    major_block_count += int(final_result.major_block_count or 0)
+    timeline_item_count += int(final_result.timeline_item_count or 0)
+    noise_stripped_count += int(final_result.noise_stripped_count or 0)
+    translation_applied_count += int(final_result.translation_applied_count or 0)
+    citation_stripped_count += int(final_result.citation_stripped_count or 0)
+    duplicate_collapsed_count += int(final_result.duplicate_collapsed_count or 0)
+
+    rendered_bodies = _split_digest_body_blocks(
+        final_body,
+        max_chars=max(1200, _digest_send_chunk_size() - 220),
+    )
+    if not rendered_bodies:
+        rendered_bodies = [quiet_body]
+
+    messages = [
+        _format_digest_message(
+            digest_body=digest_body,
+            total_updates=total_updates,
+            sources=[],
+            title=_catchup_digest_title(window_start_ts, window_end_ts, part_index=index, part_count=len(rendered_bodies)),
+            interval_minutes=range_minutes,
+        )
+        for index, digest_body in enumerate(rendered_bodies, start=1)
+    ]
+
+    return messages, {
+        "part_count": len(rendered_bodies),
+        "quiet": False,
+        "response_chars": total_chars,
+        "ai_parts": ai_parts,
+        "fallback_parts": fallback_parts,
+        "major_block_count": major_block_count,
+        "timeline_item_count": timeline_item_count,
+        "noise_stripped_count": noise_stripped_count,
+        "translation_applied_count": translation_applied_count,
+        "citation_stripped_count": citation_stripped_count,
+        "duplicate_collapsed_count": duplicate_collapsed_count,
+    }
+
+
 async def _flush_digest_queue_once() -> bool:
     global digest_retry_backoff_seconds
 
     async with digest_loop_lock:
+        interval_seconds = max(60, _digest_interval_seconds())
+        interval_minutes = max(1, interval_seconds // 60)
         active_batch_id, active_window_end_ts, active_rows = load_active_digest_window_claim()
         batch_id = active_batch_id
         window_end_ts = int(active_window_end_ts or 0)
         claimed_rows = int(active_rows or 0)
+        recovery_mode = False
 
         if batch_id and window_end_ts <= 0:
             restore_digest_window(batch_id)
             batch_id = ""
             claimed_rows = 0
 
+        if batch_id:
+            batch_min_ts, _batch_max_ts, batch_row_count = load_batch_row_timestamp_bounds(batch_id)
+            if batch_row_count <= 0:
+                restore_digest_window(batch_id)
+                batch_id = ""
+                claimed_rows = 0
+            else:
+                recovery_mode = _digest_batch_is_catchup(
+                    batch_min_ts=batch_min_ts,
+                    window_end_ts=window_end_ts,
+                )
+                if recovery_mode:
+                    aligned_start_end = _align_digest_window_end(
+                        int(batch_min_ts or 0),
+                        interval_seconds=interval_seconds,
+                    )
+                    window_start_ts = max(0, aligned_start_end - interval_seconds)
+                    _set_digest_recovery_state(
+                        active=True,
+                        window_start_ts=window_start_ts,
+                        window_end_ts=window_end_ts,
+                        claimed_rows=claimed_rows,
+                    )
+                else:
+                    window_start_ts = max(0, window_end_ts - interval_seconds)
+                    _clear_digest_recovery_state()
+
         if not batch_id:
-            due_window_end_ts = _next_digest_window_end_to_process()
-            if due_window_end_ts is None:
-                return False
-            window_end_ts = int(due_window_end_ts)
-        interval_minutes = max(1, _digest_interval_seconds() // 60)
-        window_start_ts = max(0, window_end_ts - _digest_interval_seconds())
-        batch_id, claimed_rows = claim_digest_window(
-            window_end_ts,
-            window_start_ts=window_start_ts,
-        )
+            backlog = _digest_backlog_snapshot()
+            if bool(backlog.get("recovery_due")):
+                recovery_mode = True
+                window_start_ts = int(backlog.get("oldest_closed_window_start") or 0)
+                window_end_ts = int(backlog.get("last_closed_window_end") or 0)
+                batch_id, claimed_rows = claim_digest_window(
+                    window_end_ts,
+                    window_start_ts=0,
+                )
+                _set_digest_recovery_state(
+                    active=True,
+                    window_start_ts=window_start_ts,
+                    window_end_ts=window_end_ts,
+                    claimed_rows=claimed_rows,
+                )
+                log_structured(
+                    LOGGER,
+                    "digest_recovery_entered",
+                    window_start_ts=window_start_ts,
+                    window_end_ts=window_end_ts,
+                    claimed_rows=claimed_rows,
+                    stale_intervals=int(backlog.get("stale_intervals") or 0),
+                    oldest_closed_window_age_seconds=backlog.get("oldest_closed_window_age_seconds"),
+                )
+            else:
+                due_window_end_ts = _next_digest_window_end_to_process()
+                if due_window_end_ts is None:
+                    _clear_digest_recovery_state()
+                    return False
+                window_end_ts = int(due_window_end_ts)
+                window_start_ts = max(0, window_end_ts - interval_seconds)
+                batch_id, claimed_rows = claim_digest_window(
+                    window_end_ts,
+                    window_start_ts=window_start_ts,
+                )
+                _clear_digest_recovery_state()
+
         pending_before = count_pending() + claimed_rows
         log_structured(
             LOGGER,
@@ -7921,6 +8276,7 @@ async def _flush_digest_queue_once() -> bool:
             claimed=claimed_rows,
             pending_before=pending_before,
             quota_health=get_quota_health(),
+            recovery_mode=recovery_mode,
         )
 
         try:
@@ -7929,31 +8285,58 @@ async def _flush_digest_queue_once() -> bool:
                 after_id=after_id,
                 limit=limit,
             )
-            messages, stats = await _build_window_digest_messages(
-                row_loader,
-                total_updates=claimed_rows,
-                interval_minutes=interval_minutes,
-            title_builder=lambda part_index, part_count: _rolling_digest_title(
-                window_start_ts,
-                window_end_ts,
-                interval_minutes=interval_minutes,
-                part_index=part_index,
-                part_count=part_count,
-            ),
-                context={
-                    "batch_id": batch_id,
-                    "window_start_ts": window_start_ts,
-                    "window_end_ts": window_end_ts,
-                    "pending_before": pending_before,
-                    "surface": "rolling_digest",
-                },
-            )
+            if recovery_mode:
+                messages, stats = await _build_catchup_digest_messages(
+                    row_loader,
+                    total_updates=claimed_rows,
+                    window_start_ts=window_start_ts,
+                    window_end_ts=window_end_ts,
+                    context={
+                        "batch_id": batch_id,
+                        "window_start_ts": window_start_ts,
+                        "window_end_ts": window_end_ts,
+                        "pending_before": pending_before,
+                        "surface": "rolling_digest_catchup",
+                    },
+                )
+            else:
+                messages, stats = await _build_window_digest_messages(
+                    row_loader,
+                    total_updates=claimed_rows,
+                    interval_minutes=interval_minutes,
+                    title_builder=lambda part_index, part_count: _rolling_digest_title(
+                        window_start_ts,
+                        window_end_ts,
+                        interval_minutes=interval_minutes,
+                        part_index=part_index,
+                        part_count=part_count,
+                    ),
+                    context={
+                        "batch_id": batch_id,
+                        "window_start_ts": window_start_ts,
+                        "window_end_ts": window_end_ts,
+                        "pending_before": pending_before,
+                        "surface": "rolling_digest",
+                    },
+                )
             sent_ref = await _send_digest_message_sequence(messages)
-            await _pin_digest_message_ref(sent_ref, kind="hourly")
+            if not recovery_mode:
+                await _pin_digest_message_ref(sent_ref, kind="hourly")
 
             acked = ack_digest_window(batch_id, window_end_ts=window_end_ts)
             set_last_digest_timestamp(int(time.time()))
             digest_retry_backoff_seconds = 0
+            if recovery_mode:
+                log_structured(
+                    LOGGER,
+                    "digest_recovery_exited",
+                    window_start_ts=window_start_ts,
+                    window_end_ts=window_end_ts,
+                    claimed_rows=claimed_rows,
+                    acked=acked,
+                    pending_after=count_pending(),
+                )
+                _clear_digest_recovery_state()
 
             log_structured(
                 LOGGER,
@@ -7975,14 +8358,16 @@ async def _flush_digest_queue_once() -> bool:
                 translation_applied_count=int(stats.get("translation_applied_count") or 0),
                 citation_stripped_count=int(stats.get("citation_stripped_count") or 0),
                 duplicate_collapsed_count=int(stats.get("duplicate_collapsed_count") or 0),
-                digest_mode="strict_digest_only",
+                digest_mode="catchup_recovery" if recovery_mode else "strict_digest_only",
             )
             return True
         except asyncio.CancelledError:
             restore_digest_window(batch_id)
+            _clear_digest_recovery_state()
             raise
         except Exception as exc:
             restored = restore_digest_window(batch_id)
+            _clear_digest_recovery_state()
             base = _digest_retry_base_seconds()
             max_backoff = _digest_retry_max_seconds()
             digest_retry_backoff_seconds = (
@@ -7999,6 +8384,7 @@ async def _flush_digest_queue_once() -> bool:
                 restored=restored,
                 backoff_seconds=digest_retry_backoff_seconds,
                 error=str(exc),
+                recovery_mode=recovery_mode,
             )
             LOGGER.exception("Digest generation/sending failed.")
             return False
@@ -8785,6 +9171,7 @@ def _web_status_payload() -> Dict[str, object]:
     except Exception:
         recent_story_decisions = {}
     context_stats = _delivery_context_stats_snapshot()
+    digest_recovery = _digest_recovery_status_snapshot(now_ts=int(now))
     return {
         "ok": not bool(startup_error),
         "ready": bool(startup_ready),
@@ -8796,6 +9183,7 @@ def _web_status_payload() -> Dict[str, object]:
         "timestamp": int(now),
         "pending_queue": pending,
         "inflight_queue": inflight,
+        "digest_recovery": digest_recovery,
         "next_digest_in_seconds": next_in,
         "last_digest_at": format_ts(last_ts),
         "sources_monitored": len(monitored_source_chat_ids),
@@ -8860,6 +9248,7 @@ def _digest_status_text() -> str:
     )
     queue_clear_scope = _digest_queue_clear_scope()
     daily_window_hours = _digest_daily_window_hours()
+    recovery = _digest_recovery_status_snapshot()
     auth_status = _auth_status_summary()
     auth_reason = sanitize_telegram_html(_trim_runtime_reason(auth_failure_reason or ""))
     disabled_features = ", ".join(auth_features_disabled) if auth_features_disabled else "none"
@@ -8867,6 +9256,13 @@ def _digest_status_text() -> str:
     query_state = "on" if _is_query_mode_enabled() else "off"
     if _is_query_mode_enabled() and not _is_query_runtime_available():
         query_state = "degraded"
+    recovery_age = recovery.get("oldest_pending_closed_window_age_seconds")
+    recovery_age_label = format_eta(recovery_age) if isinstance(recovery_age, int) and recovery_age > 0 else "n/a"
+    recovery_label = str(recovery.get("state") or "normal")
+    if recovery_label == "recovering":
+        recovery_label = "compacting stale backlog"
+    elif recovery_label == "queued":
+        recovery_label = "stale backlog queued"
 
     return (
         "<b>🧠 Digest Status</b><br>"
@@ -8878,6 +9274,8 @@ def _digest_status_text() -> str:
         f"• Interval base: <code>{_digest_interval_seconds() // 60}m</code><br>"
         f"• Daily digest times: <code>{sanitize_telegram_html(daily_display)}</code><br>"
         f"• Daily window: <code>{daily_window_hours}h</code><br>"
+        f"• Recovery mode: <code>{sanitize_telegram_html(recovery_label)}</code><br>"
+        f"• Oldest closed backlog age: <code>{sanitize_telegram_html(recovery_age_label)}</code><br>"
         f"• Queue clear every: <code>{sanitize_telegram_html(str(queue_clear_every))}</code><br>"
         f"• Queue clear scope: <code>{sanitize_telegram_html(queue_clear_scope)}</code><br>"
         f"• Dedupe: <code>{dupe_state}</code> ({sanitize_telegram_html(detector_backend)})<br>"
@@ -10365,6 +10763,7 @@ def _startup_health_check() -> None:
     pending = count_pending()
     inflight = count_inflight()
     last_ts = get_last_digest_timestamp()
+    recovery = _digest_recovery_status_snapshot()
     queue_clear_interval_seconds = _digest_queue_clear_interval_seconds()
     queue_clear_minutes = (
         (queue_clear_interval_seconds // 60) if queue_clear_interval_seconds > 0 else 0
@@ -10394,6 +10793,9 @@ def _startup_health_check() -> None:
         digest_interval_minutes=_digest_interval_seconds() // 60,
         digest_daily_times=[f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()],
         digest_daily_window_hours=_digest_daily_window_hours(),
+        digest_recovery_state=recovery.get("state"),
+        digest_recovery_due=bool(recovery.get("due")),
+        digest_oldest_closed_backlog_age_seconds=recovery.get("oldest_pending_closed_window_age_seconds"),
         digest_queue_clear_minutes=queue_clear_minutes,
         digest_queue_clear_enabled=bool(queue_clear_interval_seconds > 0),
         digest_queue_clear_scope=queue_clear_scope,
@@ -10409,7 +10811,7 @@ def _startup_health_check() -> None:
         quota_health=get_quota_health(),
     )
     LOGGER.info(
-        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s query_web_crosscheck=%s query_web_default_hours=%s query_web_explicit_max_hours=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s queue_clear=%s scope=%s pin_hourly=%s pin_daily=%s web=%s@%s:%s",
+        "Startup health: mode=%s pending=%s inflight=%s last_digest=%s dupe=%s severity=%s query=%s query_web_crosscheck=%s query_web_default_hours=%s query_web_explicit_max_hours=%s html=%s premium_emoji=%s map=%s humanized=%s prob=%.2f topic_threads=%s interval=%sm daily=%s recovery=%s backlog_age=%s queue_clear=%s scope=%s pin_hourly=%s pin_daily=%s web=%s@%s:%s",
         mode,
         pending,
         inflight,
@@ -10428,6 +10830,8 @@ def _startup_health_check() -> None:
         _is_breaking_topic_threads_enabled(),
         _digest_interval_seconds() // 60,
         ",".join(f"{h:02d}:{m:02d}" for h, m in _digest_daily_times()) or "off",
+        recovery.get("state") or "normal",
+        recovery.get("oldest_pending_closed_window_age_seconds") or 0,
         queue_clear_display,
         queue_clear_scope,
         _digest_pin_hourly_enabled(),

@@ -1280,6 +1280,38 @@ def load_batch_rows_page(batch_id: str, *, after_id: int = 0, limit: int = 200) 
     return _to_rows_dict(rows)
 
 
+def load_batch_row_timestamp_bounds(batch_id: str) -> Tuple[int | None, int | None, int]:
+    cleaned_batch_id = (batch_id or "").strip()
+    if not cleaned_batch_id:
+        return None, None, 0
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT MIN(timestamp) AS min_ts,
+                   MAX(timestamp) AS max_ts,
+                   COUNT(*) AS row_count
+            FROM digest_queue
+            WHERE batch_id = ?
+            """,
+            (cleaned_batch_id,),
+        ).fetchone()
+    if row is None:
+        return None, None, 0
+    try:
+        min_ts = int(row["min_ts"] or 0)
+    except Exception:
+        min_ts = 0
+    try:
+        max_ts = int(row["max_ts"] or 0)
+    except Exception:
+        max_ts = 0
+    try:
+        row_count = int(row["row_count"] or 0)
+    except Exception:
+        row_count = 0
+    return (min_ts if min_ts > 0 else None), (max_ts if max_ts > 0 else None), max(0, row_count)
+
+
 def load_and_clear_digest_queue(limit: int | None = None) -> List[Dict[str, object]]:
     """Compatibility helper: atomically claim then delete one batch."""
     resolved_limit = int(limit if (limit is not None and limit > 0) else 1000000)
