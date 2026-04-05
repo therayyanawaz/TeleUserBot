@@ -24,7 +24,7 @@ TeleUserBot fixes that by combining:
 - multi-layer duplicate suppression
 - severity-aware routing
 - breaking-story continuity
-- hourly and daily digest generation
+- 30-minute rolling and daily 24-hour digest generation
 - OCR translation for media-only posts
 - private query mode with Telegram-first evidence search
 - mandatory trusted web cross-check for query answers
@@ -55,9 +55,10 @@ TeleUserBot fixes that by combining:
 
 ### 📰 Digest Publishing
 
-- 30-minute rolling digest mode
+- 30-minute rolling headline-rail digest mode
 - Daily 24-hour digest mode
 - SQLite-backed queue/archive storage with restart-safe window claiming
+- Automatic stale-backlog recovery via compact catch-up digests
 - Multi-message digest delivery when one Telegram message is not enough
 - Optional pin rotation for latest digest posts
 
@@ -333,7 +334,7 @@ Each incoming Telegram post is evaluated and can be:
 
 Instead of forwarding every post as-is, TeleUserBot can publish:
 
-- 30-minute rolling digests
+- 30-minute rolling headline rails
 - daily digests
 
 Digest mode is designed for people who want signal density without raw-feed chaos. When `DIGEST_MODE=true`, monitored updates are queued into persistent SQLite storage and delivered through digests only.
@@ -367,6 +368,8 @@ Notes:
 
 - `TIMEZONE` controls local-time logic across the bot; for IST use `Asia/Kolkata`
 - rolling digests are clock-aligned to `:00` and `:30`
+- rolling 30-minute windows publish only the main headlines, not a full story digest
+- if stale rolling backlog falls at least 4 closed windows behind, the bot compacts it into one `Catch-up Digest` and then resumes normal cadence
 - digest windows are claimed from SQLite, not held only in memory
 - digest queue clearing is intentionally disabled; queued items are drained only by claimed digest windows
 - if a digest exceeds Telegram message limits, it is delivered as sequential `Part 1/N`, `Part 2/N`, ... messages
@@ -540,13 +543,15 @@ python main.py
 
 Startup flow:
 
-1. validates config
-2. ensures only one instance is active
-3. initializes runtime DB and caches
-4. repairs auth inline when interactive mode detects stale or missing auth
-5. connects your Telegram session
-6. resolves sources
-7. starts feed, digest, query, and optional web server pipelines
+1. pulls the latest code from `origin/main`
+2. restarts automatically if new code was pulled
+3. validates config
+4. ensures only one instance is active
+5. initializes runtime DB and caches
+6. repairs auth inline when interactive mode detects stale or missing auth
+7. connects your Telegram session
+8. resolves sources
+9. starts feed, digest, query, and optional web server pipelines
 
 ## 🧪 Tests
 
@@ -654,8 +659,12 @@ If anything sensitive leaks, rotate it immediately.
 
 ## 📦 Upgrade Workflow
 
+Normal startup already runs `git pull origin main` and restarts once if fresh code is pulled.
+
+If you still want a manual upgrade path:
+
 ```bash
-git pull
+git pull origin main
 source .venv/bin/activate
 pip install -r requirements.txt --upgrade
 pip install -r requirements.optional.txt --upgrade
