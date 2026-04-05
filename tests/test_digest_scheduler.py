@@ -15,6 +15,14 @@ def test_next_digest_window_end_to_process_uses_oldest_pending_when_no_checkpoin
     assert main._next_digest_window_end_to_process(now_ts=3700) == 3600
 
 
+def test_next_digest_window_end_to_process_prioritizes_stranded_older_backlog(monkeypatch):
+    monkeypatch.setattr(main, "_digest_interval_seconds", lambda: 1800)
+    monkeypatch.setattr(main, "_get_last_completed_digest_window_end", lambda: 3600)
+    monkeypatch.setattr(main, "peek_oldest_pending_digest_timestamp", lambda: 1200)
+
+    assert main._next_digest_window_end_to_process(now_ts=5400) == 1800
+
+
 def test_compute_next_scheduler_delay_seconds_aligns_to_next_half_hour_boundary(monkeypatch):
     monkeypatch.setattr(main, "_next_digest_window_end_to_process", lambda now_ts=None: None)
     monkeypatch.setattr(main, "_next_digest_boundary_timestamp", lambda now_ts=None: 5400)
@@ -186,6 +194,57 @@ async def test_build_window_digest_messages_merges_short_window_groups_into_one_
     assert "Fourth headline from group two." in messages[0]
     assert "Part 1/" not in messages[0]
     assert stats["part_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_flush_digest_queue_once_passes_computed_window_start_to_claim(monkeypatch):
+    claim_args = {}
+
+    async def fake_build_window_digest_messages(*args, **kwargs):
+        return (
+            ["<b>Top headlines from the last 30 minutes</b><br>• Headline."],
+            {
+                "part_count": 1,
+                "quiet": False,
+                "response_chars": 20,
+                "ai_parts": 1,
+                "fallback_parts": 0,
+                "major_block_count": 1,
+                "timeline_item_count": 0,
+                "noise_stripped_count": 0,
+                "translation_applied_count": 0,
+                "citation_stripped_count": 0,
+                "duplicate_collapsed_count": 0,
+            },
+        )
+
+    async def fake_send_digest_message_sequence(messages):
+        return None
+
+    async def fake_pin_digest_message_ref(ref, *, kind):
+        return None
+
+    def fake_claim_digest_window(window_end_ts, *, batch_id=None, window_start_ts=None):
+        claim_args["window_end_ts"] = window_end_ts
+        claim_args["window_start_ts"] = window_start_ts
+        return "batch-1", 1
+
+    monkeypatch.setattr(main, "load_active_digest_window_claim", lambda: ("", None, 0))
+    monkeypatch.setattr(main, "_next_digest_window_end_to_process", lambda: 3600)
+    monkeypatch.setattr(main, "_digest_interval_seconds", lambda: 1800)
+    monkeypatch.setattr(main, "claim_digest_window", fake_claim_digest_window)
+    monkeypatch.setattr(main, "_build_window_digest_messages", fake_build_window_digest_messages)
+    monkeypatch.setattr(main, "_send_digest_message_sequence", fake_send_digest_message_sequence)
+    monkeypatch.setattr(main, "_pin_digest_message_ref", fake_pin_digest_message_ref)
+    monkeypatch.setattr(main, "ack_digest_window", lambda batch_id, *, window_end_ts: 1)
+    monkeypatch.setattr(main, "set_last_digest_timestamp", lambda _ts: None)
+    monkeypatch.setattr(main, "count_pending", lambda: 0)
+    monkeypatch.setattr(main, "get_quota_health", lambda: {"status": "healthy"})
+
+    processed = await main._flush_digest_queue_once()
+
+    assert processed is True
+    assert claim_args == {"window_end_ts": 3600, "window_start_ts": 1800}
 
 
 def test_split_digest_body_blocks_repeats_story_context_across_parts():

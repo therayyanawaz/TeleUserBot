@@ -223,3 +223,15 @@ def test_restore_digest_window_resets_claim_and_keeps_rows_pending(isolated_db):
     assert restored == 1
     assert db.load_active_digest_window_claim() == ("", None, 0)
     assert db.count_pending() == 1
+
+
+def test_ack_digest_window_does_not_rewind_last_completed_checkpoint(isolated_db):
+    db.set_meta(db.ROLLING_DIGEST_LAST_COMPLETED_KEY, "3600")
+    db.save_to_digest_queue("chan-1", 301, "Older backlog item", timestamp=1200, source_name="Desk")
+
+    batch_id, claimed = db.claim_digest_window(1800, window_start_ts=0)
+    acked = db.ack_digest_window(batch_id, window_end_ts=1800)
+
+    assert claimed == 1
+    assert acked == 1
+    assert db.get_meta(db.ROLLING_DIGEST_LAST_COMPLETED_KEY) == "3600"

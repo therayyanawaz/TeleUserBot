@@ -1173,15 +1173,31 @@ def ack_digest_window(batch_id: str, *, window_end_ts: int) -> int:
         )
         now_ts = int(time.time())
         if resolved_window_end > 0:
+            existing_row = conn.execute(
+                "SELECT value FROM digest_meta WHERE key = ? LIMIT 1",
+                (ROLLING_DIGEST_LAST_COMPLETED_KEY,),
+            ).fetchone()
+            try:
+                existing_window_end = int(existing_row["value"] or 0) if existing_row is not None else 0
+            except Exception:
+                existing_window_end = 0
             conn.execute(
                 """
                 INSERT INTO digest_meta (key, value, updated_at)
                 VALUES (?, ?, ?)
                 ON CONFLICT(key) DO UPDATE SET
-                    value = excluded.value,
+                    value = CASE
+                        WHEN CAST(COALESCE(digest_meta.value, '0') AS INTEGER) > CAST(excluded.value AS INTEGER)
+                            THEN digest_meta.value
+                        ELSE excluded.value
+                    END,
                     updated_at = excluded.updated_at
                 """,
-                (ROLLING_DIGEST_LAST_COMPLETED_KEY, str(resolved_window_end), now_ts),
+                (
+                    ROLLING_DIGEST_LAST_COMPLETED_KEY,
+                    str(max(existing_window_end, resolved_window_end)),
+                    now_ts,
+                ),
             )
         conn.execute(
             "DELETE FROM digest_meta WHERE key IN (?, ?)",

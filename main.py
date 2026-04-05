@@ -7409,13 +7409,23 @@ def _next_digest_window_end_to_process(now_ts: int | None = None) -> int | None:
     interval_seconds = max(60, _digest_interval_seconds())
     last_closed_window_end = _last_closed_digest_window_end(now_ts)
     last_completed_window_end = _get_last_completed_digest_window_end()
+    oldest_pending_ts = peek_oldest_pending_digest_timestamp()
     if last_completed_window_end is not None:
+        if oldest_pending_ts is not None:
+            oldest_pending_window_end = _align_digest_window_end(
+                oldest_pending_ts,
+                interval_seconds=interval_seconds,
+            )
+            if (
+                oldest_pending_window_end < last_completed_window_end
+                and oldest_pending_window_end <= last_closed_window_end
+            ):
+                return oldest_pending_window_end
         next_window_end = last_completed_window_end + interval_seconds
         if next_window_end <= last_closed_window_end:
             return next_window_end
         return None
 
-    oldest_pending_ts = peek_oldest_pending_digest_timestamp()
     if oldest_pending_ts is not None:
         next_window_end = _align_digest_window_end(oldest_pending_ts, interval_seconds=interval_seconds)
         if next_window_end <= last_closed_window_end:
@@ -7895,13 +7905,12 @@ async def _flush_digest_queue_once() -> bool:
             if due_window_end_ts is None:
                 return False
             window_end_ts = int(due_window_end_ts)
+        interval_minutes = max(1, _digest_interval_seconds() // 60)
+        window_start_ts = max(0, window_end_ts - _digest_interval_seconds())
         batch_id, claimed_rows = claim_digest_window(
             window_end_ts,
             window_start_ts=window_start_ts,
         )
-
-        interval_minutes = max(1, _digest_interval_seconds() // 60)
-        window_start_ts = max(0, window_end_ts - _digest_interval_seconds())
         pending_before = count_pending() + claimed_rows
         log_structured(
             LOGGER,
