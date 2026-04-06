@@ -2986,7 +2986,7 @@ async def _source_title_from_channel_id(channel_id: str) -> str:
 
 
 def _media_text_ocr_enabled() -> bool:
-    return bool(getattr(config, "MEDIA_TEXT_OCR_ENABLED", True))
+    return False
 
 
 def _media_text_ocr_video_enabled() -> bool:
@@ -3148,76 +3148,13 @@ async def _message_media_signature(msg: Message) -> tuple[str, str]:
 
 
 async def _check_single_media_duplicate(msg: Message) -> bool:
-    media_hash, media_kind = await _message_media_signature(msg)
-    if not media_hash:
-        return False
-    raw_text = normalize_space(str(getattr(msg, "message", "") or ""))
-    result = await asyncio.to_thread(
-        check_and_store_media_duplicate,
-        channel_id=str(msg.chat_id),
-        message_id=int(msg.id or 0),
-        media_hash=media_hash,
-        raw_text=raw_text,
-        media_kind=media_kind,
-        timestamp=int(time.time()),
-        history_hours=_media_dupe_history_hours(),
-    )
-    if not result.duplicate:
-        return False
-    log_structured(
-        LOGGER,
-        "media_duplicate_suppressed",
-        channel_id=str(msg.chat_id),
-        message_id=int(msg.id or 0),
-        media_kind=media_kind,
-        media_hash=media_hash,
-        score=round(float(result.match_score), 4),
-        matched_channel_id=result.matched_channel_id,
-        matched_message_id=result.matched_message_id,
-    )
-    return True
+    _ = msg
+    return False
 
 
 async def _check_album_media_duplicate(messages: List[Message]) -> bool:
-    if not messages:
-        return False
-    signatures: list[str] = []
-    for msg in messages:
-        media_hash, _media_kind = await _message_media_signature(msg)
-        if media_hash:
-            signatures.append(media_hash)
-    album_hash = build_media_signature_digest(signatures)
-    if not album_hash:
-        return False
-    raw_text = normalize_space(
-        " ".join(str(getattr(msg, "message", "") or "") for msg in messages)
-    )
-    first = messages[0]
-    result = await asyncio.to_thread(
-        check_and_store_media_duplicate,
-        channel_id=str(first.chat_id),
-        message_id=int(first.id or 0),
-        media_hash=album_hash,
-        raw_text=raw_text,
-        media_kind="album",
-        timestamp=int(time.time()),
-        history_hours=_media_dupe_history_hours(),
-    )
-    if not result.duplicate:
-        return False
-    log_structured(
-        LOGGER,
-        "album_media_duplicate_suppressed",
-        channel_id=str(first.chat_id),
-        message_id=int(first.id or 0),
-        media_kind="album",
-        media_hash=album_hash,
-        score=round(float(result.match_score), 4),
-        matched_channel_id=result.matched_channel_id,
-        matched_message_id=result.matched_message_id,
-        album_size=len(messages),
-    )
-    return True
+    _ = messages
+    return False
 
 
 def _normalize_media_ocr_text(text: str) -> str:
@@ -3297,41 +3234,13 @@ async def _extract_media_ocr_translation(msg: Message) -> str | None:
 
 
 async def _caption_for_media_without_text(msg: Message) -> str | None:
-    """
-    Media-only posts get caption text only when OCR finds non-English text that
-    can be translated. No source-label fallback, no visual descriptions.
-    """
-    return await _extract_media_ocr_translation(msg)
+    _ = msg
+    return None
 
 
 async def _caption_for_album_without_text(messages: List[Message]) -> str | None:
-    if not messages or not _media_text_ocr_enabled():
-        return None
-
-    snippets: List[str] = []
-    seen_plain: set[str] = set()
-    for msg in messages:
-        translated = await _extract_media_ocr_translation(msg)
-        if not translated:
-            continue
-        plain = normalize_space(strip_telegram_html(translated)).lower()
-        if not plain or plain in seen_plain:
-            continue
-        seen_plain.add(plain)
-        snippets.append(translated)
-        if len(snippets) >= 3:
-            break
-
-    if not snippets:
-        return None
-
-    combined = "\n\n".join(snippets)
-    limit = min(_media_text_ocr_max_chars(), 1000)
-    plain = strip_telegram_html(combined)
-    if len(plain) <= limit:
-        return combined
-    truncated = plain[: limit - 3].rsplit(" ", 1)[0].rstrip()
-    return sanitize_telegram_html(f"{truncated}...")
+    _ = messages
+    return None
 
 
 def _queue_for_digest(
@@ -5714,66 +5623,6 @@ async def _process_single_message(msg: Message) -> None:
     text = (msg.message or "").strip()
     source, link = await _source_info(msg)
 
-    if msg.media and not text:
-        reply_message = await _load_reply_message(msg)
-        media_caption = await _caption_for_media_without_text(msg)
-        reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
-        if not media_caption:
-            media_caption = reply_caption
-        archive_text = normalize_space(strip_telegram_html(media_caption) if media_caption else reply_context_text)
-        if archive_text:
-            _queue_for_digest(
-                channel_id,
-                msg.id,
-                archive_text,
-                source_name=source,
-                message_link=link,
-            )
-            _archive_for_query_search(
-                channel_id,
-                msg.id,
-                archive_text,
-                source_name=source,
-                message_link=link,
-            )
-            log_structured(
-                LOGGER,
-                "digest_media_queued",
-                channel_id=channel_id,
-                message_id=msg.id,
-                source=source,
-                pending=count_pending(),
-                has_media=True,
-            )
-        mark_seen(channel_id, msg.id)
-        return
-
-    if msg.media and text:
-        summary = await summarize_or_skip(text, _require_auth_manager())
-        if summary is None:
-            mark_seen(channel_id, msg.id)
-            return
-        reply_to = await _resolve_source_reply_target(msg)
-        summary_headline, summary_context = extract_feed_summary_parts(summary, text)
-        resolved_context = await _resolve_dynamic_delivery_context(
-            current_text=text,
-            headline=summary_headline,
-            candidate_context=summary_context,
-            source_title=source,
-        )
-        sent_ref = await _send_single_media(
-            msg,
-            _format_summary_text(source, summary, raw_text=text, context_override=resolved_context),
-            reply_to=reply_to,
-        )
-        _register_source_delivery_refs(
-            channel_id=channel_id,
-            source_message_ids=[msg.id],
-            sent_ref=sent_ref,
-        )
-        mark_seen(channel_id, msg.id)
-        return
-
     if not text:
         mark_seen(channel_id, msg.id)
         return
@@ -5819,37 +5668,6 @@ async def _process_album(messages: List[Message]) -> None:
     combined_caption = "\n".join(captions).strip()
 
     if not combined_caption:
-        reply_message = await _load_reply_message(messages[0])
-        media_caption = await _caption_for_album_without_text(messages)
-        reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
-        if not media_caption:
-            media_caption = reply_caption
-        archive_text = normalize_space(strip_telegram_html(media_caption) if media_caption else reply_context_text)
-        if archive_text:
-            _queue_for_digest(
-                channel_id,
-                messages[0].id,
-                archive_text,
-                source_name=source,
-                message_link=link,
-            )
-            _archive_for_query_search(
-                channel_id,
-                messages[0].id,
-                archive_text,
-                source_name=source,
-                message_link=link,
-            )
-            log_structured(
-                LOGGER,
-                "digest_album_media_queued",
-                channel_id=channel_id,
-                first_message_id=messages[0].id,
-                album_size=len(messages),
-                source=source,
-                pending=count_pending(),
-                has_media=True,
-            )
         mark_seen_many(channel_id, message_ids)
         return
 
@@ -5866,8 +5684,7 @@ async def _process_album(messages: List[Message]) -> None:
         candidate_context=summary_context,
         source_title=source,
     )
-    sent_ref = await _send_album(
-        messages,
+    sent_ref = await _send_text_with_ref(
         _format_summary_text(
             source,
             summary,
@@ -5892,58 +5709,6 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
     text = (msg.message or "").strip()
     source, link = await _source_info(msg)
 
-    if msg.media and not text:
-        reply_message = await _load_reply_message(msg)
-        media_caption = await _caption_for_media_without_text(msg)
-        reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
-        if not media_caption:
-            media_caption = reply_caption
-        digest_text = normalize_space(
-            _plain_text_from_html_fragment(media_caption) or reply_context_text or ""
-        )
-        if not digest_text:
-            mark_seen(channel_id, msg.id)
-            return
-        severity = "medium"
-        severity_score = 0.0
-        severity_breakdown: dict = {}
-        if _is_severity_routing_enabled():
-            severity, severity_score, severity_breakdown = _classify_severity_with_breakdown(
-                text=digest_text,
-                source=source,
-                channel_id=channel_id,
-                message_id=msg.id,
-                has_media=True,
-                has_link=bool(link),
-                reply_to=_reply_to_message_id(msg),
-            )
-        elif _contains_breaking_keyword(digest_text):
-            severity = "high"
-        _queue_for_digest(
-            channel_id,
-            msg.id,
-            digest_text,
-            source_name=source,
-            message_link=link,
-        )
-        mark_seen(channel_id, msg.id)
-        log_structured(
-            LOGGER,
-            "digest_item_queued",
-            channel_id=channel_id,
-            message_id=msg.id,
-            source=source,
-            severity=severity,
-            severity_score=severity_score,
-            severity_emoji=_severity_emoji(severity),
-            has_link=bool(link),
-            has_media=True,
-            text_tokens=estimate_tokens_rough(digest_text),
-            pending=count_pending(),
-            severity_breakdown=severity_breakdown,
-        )
-        return
-
     if not text:
         mark_seen(channel_id, msg.id)
         return
@@ -5957,7 +5722,7 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
             source=source,
             channel_id=channel_id,
             message_id=msg.id,
-            has_media=bool(msg.media),
+            has_media=False,
             has_link=bool(link),
             reply_to=_reply_to_message_id(msg),
         )
@@ -6051,57 +5816,7 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
     combined_caption = "\n".join(captions).strip()
 
     if not combined_caption:
-        reply_message = await _load_reply_message(messages[0])
-        media_caption = await _caption_for_album_without_text(messages)
-        reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
-        if not media_caption:
-            media_caption = reply_caption
-        digest_text = normalize_space(
-            _plain_text_from_html_fragment(media_caption) or reply_context_text or ""
-        )
-        if not digest_text:
-            mark_seen_many(channel_id, message_ids)
-            return
-        severity = "medium"
-        severity_score = 0.0
-        severity_breakdown: dict = {}
-        if _is_severity_routing_enabled():
-            severity, severity_score, severity_breakdown = _classify_severity_with_breakdown(
-                text=digest_text,
-                source=source,
-                channel_id=channel_id,
-                message_id=messages[0].id,
-                has_media=True,
-                has_link=bool(link),
-                reply_to=_reply_to_message_id(messages[0]),
-                album_size=len(messages),
-            )
-        elif _contains_breaking_keyword(digest_text):
-            severity = "high"
-        _queue_for_digest(
-            channel_id,
-            messages[0].id,
-            digest_text,
-            source_name=source,
-            message_link=link,
-        )
         mark_seen_many(channel_id, message_ids)
-        log_structured(
-            LOGGER,
-            "digest_album_queued",
-            channel_id=channel_id,
-            first_message_id=messages[0].id,
-            album_size=len(messages),
-            source=source,
-            severity=severity,
-            severity_score=severity_score,
-            severity_emoji=_severity_emoji(severity),
-            has_link=bool(link),
-            has_media=True,
-            text_tokens=estimate_tokens_rough(digest_text),
-            pending=count_pending(),
-            severity_breakdown=severity_breakdown,
-        )
         return
 
     severity = "medium"
@@ -6113,7 +5828,7 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
             source=source,
             channel_id=channel_id,
             message_id=messages[0].id,
-            has_media=True,
+            has_media=False,
             has_link=bool(link),
             reply_to=_reply_to_message_id(messages[0]),
             album_size=len(messages),
@@ -6198,7 +5913,6 @@ def _pipeline_worker_targets() -> Dict[str, int]:
         INBOUND_STAGE_TRIAGE: max(1, int(getattr(config, "PIPELINE_TRIAGE_WORKERS", 4) or 4)),
         INBOUND_STAGE_AI_DECISION: max(1, int(getattr(config, "PIPELINE_AI_WORKERS", 2) or 2)),
         INBOUND_STAGE_DELIVERY: max(1, int(getattr(config, "PIPELINE_DELIVERY_WORKERS", 2) or 2)),
-        INBOUND_STAGE_OCR: max(1, int(getattr(config, "PIPELINE_OCR_WORKERS", 1) or 1)),
         "query_web": max(1, int(getattr(config, "PIPELINE_QUERY_WEB_WORKERS", 1) or 1)),
     }
     if _is_low_memory_runtime():
@@ -6207,7 +5921,6 @@ def _pipeline_worker_targets() -> Dict[str, int]:
         targets[INBOUND_STAGE_TRIAGE] = min(targets[INBOUND_STAGE_TRIAGE], triage_cap)
         targets[INBOUND_STAGE_AI_DECISION] = min(targets[INBOUND_STAGE_AI_DECISION], 1)
         targets[INBOUND_STAGE_DELIVERY] = min(targets[INBOUND_STAGE_DELIVERY], 1)
-        targets[INBOUND_STAGE_OCR] = min(targets[INBOUND_STAGE_OCR], 1)
         targets["query_web"] = min(targets["query_web"], 1)
         _log_low_memory_runtime_once("pipeline worker fan-out reduced for constrained Linux host")
     return targets
@@ -6232,7 +5945,6 @@ def _pipeline_stage_latency_snapshot() -> Dict[str, Dict[str, float]]:
     out: Dict[str, Dict[str, float]] = {}
     for stage in (
         INBOUND_STAGE_TRIAGE,
-        INBOUND_STAGE_OCR,
         INBOUND_STAGE_AI_DECISION,
         INBOUND_STAGE_DELIVERY,
         INBOUND_STAGE_ARCHIVE,
@@ -6423,7 +6135,6 @@ async def _handle_triage_inbound_job(job: Dict[str, object]) -> None:
     combined_text = normalize_space(
         "\n".join((item.message or "").strip() for item in messages if (item.message or "").strip())
     )
-    has_media = any(bool(item.media) for item in messages)
     message_ids = [int(item.id or 0) for item in messages if int(item.id or 0) > 0]
 
     severity = "medium"
@@ -6436,7 +6147,7 @@ async def _handle_triage_inbound_job(job: Dict[str, object]) -> None:
                 source=source,
                 channel_id=str(primary.chat_id),
                 message_id=int(primary.id or 0),
-                has_media=has_media,
+                has_media=False,
                 has_link=bool(link),
                 reply_to=_reply_to_message_id(primary),
                 album_size=len(messages),
@@ -6466,26 +6177,22 @@ async def _handle_triage_inbound_job(job: Dict[str, object]) -> None:
             "candidate_text": combined_text,
             "archive_text": combined_text,
             "has_text": bool(combined_text),
-            "has_media": has_media,
+            "has_media": False,
             "severity": severity,
             "severity_score": float(severity_score),
             "severity_breakdown": severity_breakdown,
         }
     )
 
-    if not combined_text and not has_media:
+    if not combined_text:
         payload["final_action"] = "skip"
         payload["skip_reason"] = "empty_message"
         await _advance_job_to_archive(job, payload)
         return
 
-    next_stage = INBOUND_STAGE_AI_DECISION if combined_text else INBOUND_STAGE_DELIVERY
-    if not combined_text and has_media and _media_text_ocr_enabled():
-        next_stage = INBOUND_STAGE_OCR
-
     advance_inbound_job(
         int(job["id"]),
-        next_stage=next_stage,
+        next_stage=INBOUND_STAGE_AI_DECISION,
         payload_json=_pipeline_payload_json(payload),
         priority=_pipeline_priority_for_severity(severity),
     )
@@ -6493,33 +6200,9 @@ async def _handle_triage_inbound_job(job: Dict[str, object]) -> None:
 
 async def _handle_ocr_inbound_job(job: Dict[str, object]) -> None:
     payload = _load_inbound_payload(job)
-    messages = await _fetch_messages_for_payload(payload)
-    if not messages:
-        payload["final_action"] = "skip"
-        payload["skip_reason"] = "message_missing"
-        await _advance_job_to_archive(job, payload)
-        return
-
-    caption_html = ""
-    if str(payload.get("kind") or "single") == "album":
-        caption_html = str(await _caption_for_album_without_text(messages) or "")
-    else:
-        caption_html = str(await _caption_for_media_without_text(messages[0]) or "")
-
-    plain_text = _plain_text_from_html_fragment(caption_html)
-    payload["ocr_caption_html"] = caption_html
-    payload["ocr_plain_text"] = plain_text
-    if plain_text and not str(payload.get("candidate_text") or "").strip():
-        payload["candidate_text"] = plain_text
-        payload["archive_text"] = plain_text
-
-    next_stage = INBOUND_STAGE_AI_DECISION if str(payload.get("candidate_text") or "").strip() else INBOUND_STAGE_DELIVERY
-    advance_inbound_job(
-        int(job["id"]),
-        next_stage=next_stage,
-        payload_json=_pipeline_payload_json(payload),
-        priority=_pipeline_priority_for_severity(str(payload.get("severity") or "medium")),
-    )
+    payload["final_action"] = "skip"
+    payload["skip_reason"] = "media_unsupported"
+    await _advance_job_to_archive(job, payload)
 
 
 async def _handle_ai_inbound_job(job: Dict[str, object]) -> None:
@@ -6592,7 +6275,6 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
     message_ids = [int(item.id or 0) for item in messages if int(item.id or 0) > 0]
     source = str(payload.get("source") or "")
     link = normalize_space(str(payload.get("message_link") or ""))
-    has_media = bool(payload.get("has_media"))
     severity = str(payload.get("severity") or "medium")
     candidate_text = normalize_space(str(payload.get("candidate_text") or payload.get("combined_text") or ""))
     decision = payload.get("filter_decision")
@@ -6606,45 +6288,9 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
         await _advance_job_to_archive(job, payload)
         return
 
-    if not candidate_text and has_media:
-        reply_message = await _load_reply_message(primary)
-        media_caption = str(payload.get("ocr_caption_html") or "")
-        reply_caption, reply_context_text = await _build_reply_context_caption(source, reply_message)
-        if not media_caption:
-            media_caption = reply_caption or ""
-        digest_text = (
-            _plain_text_from_html_fragment(media_caption)
-            or normalize_space(reply_context_text or "")
-            or normalize_space(str(payload.get("archive_text") or ""))
-        )
-        if digest_text:
-            _queue_for_digest(
-                channel_id,
-                int(primary.id or 0),
-                digest_text,
-                source_name=source,
-                message_link=link or None,
-            )
-            payload["archive_text"] = digest_text
-            payload["final_action"] = "digest_queued"
-            log_structured(
-                LOGGER,
-                "digest_pipeline_media_queued",
-                channel_id=channel_id,
-                message_id=int(primary.id or 0),
-                severity=severity,
-                source=source,
-                kind=kind,
-                pending=count_pending(),
-                copy_origin=str(decision.get("copy_origin") or ""),
-                routing_origin=str(decision.get("routing_origin") or ""),
-                fallback_reason=str(decision.get("fallback_reason") or ""),
-                ai_attempt_count=int(decision.get("ai_attempt_count") or 1),
-                ai_quality_retry_used=bool(decision.get("ai_quality_retry_used")),
-            )
-        else:
-            payload["final_action"] = "skip"
-            payload["skip_reason"] = "media_digest_text_missing"
+    if not candidate_text:
+        payload["final_action"] = "skip"
+        payload["skip_reason"] = "empty_message"
         await _advance_job_to_archive(job, payload)
         return
 
@@ -6786,13 +6432,7 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
         payload["archive_text"] = candidate_text
         await _advance_job_to_archive(job, payload)
         return
-    if has_media:
-        if kind == "album":
-            sent_ref = await _send_album(messages, formatted_summary, reply_to=reply_to)
-        else:
-            sent_ref = await _send_single_media(primary, formatted_summary, reply_to=reply_to)
-    else:
-        sent_ref = await _send_text_with_ref(formatted_summary, reply_to=reply_to)
+    sent_ref = await _send_text_with_ref(formatted_summary, reply_to=reply_to)
 
     _register_source_delivery_refs(
         channel_id=channel_id,
@@ -6899,7 +6539,6 @@ async def _start_pipeline_workers() -> None:
 
     for stage in (
         INBOUND_STAGE_TRIAGE,
-        INBOUND_STAGE_OCR,
         INBOUND_STAGE_AI_DECISION,
         INBOUND_STAGE_DELIVERY,
         INBOUND_STAGE_ARCHIVE,
@@ -8359,9 +7998,6 @@ async def _flush_album_after_wait(key: Tuple[str, int]) -> None:
         album_tasks.pop(key, None)
         if items:
             items = await _refresh_album_messages(items)
-            if await _check_album_media_duplicate(items):
-                mark_seen_many(str(items[0].chat_id), [int(m.id or 0) for m in items])
-                return
             inserted = await _enqueue_inbound_messages(
                 items,
                 kind="album",
@@ -10462,13 +10098,6 @@ async def _on_new_message(event: events.NewMessage.Event) -> None:
     try:
         if is_seen(channel_id, msg.id):
             return
-
-        if msg.media and not msg.grouped_id:
-            # Limit concurrent media duplicate checks to prevent OOM on constrained hosts.
-            async with (pipeline_media_semaphore or contextlib.nullcontext()):
-                if await _check_single_media_duplicate(msg):
-                    mark_seen(channel_id, msg.id)
-                    return
 
         if _is_dupe_detection_enabled():
             dupe_result = await is_duplicate_and_handle(event)
