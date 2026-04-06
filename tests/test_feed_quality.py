@@ -971,6 +971,54 @@ async def test_send_album_single_item_preserves_original_caption(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_send_single_media_uses_text_only_fallback(monkeypatch):
+    sent_calls: list[tuple[str, int | None]] = []
+    overflow_calls: list[tuple[list[str], object]] = []
+
+    async def fake_send_text_with_ref(text, reply_to=None):
+        sent_calls.append((text, reply_to))
+        return {"message_id": 909}
+
+    async def fake_send_media_caption_overflow(chunks, *, sent_ref):
+        overflow_calls.append((list(chunks), sent_ref))
+
+    monkeypatch.setattr(main, "_destination_uses_bot_api", lambda: True)
+    monkeypatch.setattr(main, "_send_text_with_ref", fake_send_text_with_ref)
+    monkeypatch.setattr(main, "_send_media_caption_overflow", fake_send_media_caption_overflow)
+
+    message = SimpleNamespace(media=object(), file=None)
+    sent_ref = await main._send_single_media(message, "Headline only.", reply_to=14)
+
+    assert sent_ref == {"message_id": 909}
+    assert sent_calls == [("Headline only.", 14)]
+    assert overflow_calls == [([], {"message_id": 909})]
+
+
+@pytest.mark.asyncio
+async def test_send_album_multiple_items_uses_text_only_fallback(monkeypatch):
+    sent_calls: list[tuple[str, int | None]] = []
+    overflow_calls: list[tuple[list[str], object]] = []
+
+    async def fake_send_text_with_ref(text, reply_to=None):
+        sent_calls.append((text, reply_to))
+        return {"message_id": 910}
+
+    async def fake_send_media_caption_overflow(chunks, *, sent_ref):
+        overflow_calls.append((list(chunks), sent_ref))
+
+    monkeypatch.setattr(main, "_destination_uses_bot_api", lambda: False)
+    monkeypatch.setattr(main, "_send_text_with_ref", fake_send_text_with_ref)
+    monkeypatch.setattr(main, "_send_media_caption_overflow", fake_send_media_caption_overflow)
+
+    messages = [SimpleNamespace(media=object()), SimpleNamespace(media=object())]
+    sent_ref = await main._send_album(messages, "Album summary.", reply_to=22)
+
+    assert sent_ref == {"message_id": 910}
+    assert sent_calls == [("Album summary.", 22)]
+    assert overflow_calls == [([], {"message_id": 910})]
+
+
+@pytest.mark.asyncio
 async def test_send_media_caption_overflow_replies_to_media(monkeypatch):
     sent_calls: list[tuple[str, int | None]] = []
 

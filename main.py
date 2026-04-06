@@ -5672,105 +5672,14 @@ async def _send_single_media(
     *,
     reply_to: int | None = None,
 ) -> object:
-    if _destination_uses_bot_api():
-        safe_caption, overflow_chunks = _prepare_media_caption_chunks(
-            caption,
-            allow_premium_tags=True,
-        )
-
-        file_size = getattr(msg.file, "size", 0) if msg.file else 0
-        # Bot API limit is 50MB. We use 48MB as a safe margin.
-        if file_size > 48 * 1024 * 1024:
-            LOGGER.warning(
-                "Media too large for Bot API (%s MiB). Falling back to text-only.",
-                int(file_size / (1024 * 1024)),
-            )
-            return await _send_text_with_ref(caption)
-
-        raw = await msg.download_media(file=bytes)
-        if raw is None:
-            raise RuntimeError("Failed to download media for bot destination.")
-
-        media_type = _media_type_for_bot(msg)
-        method_map = {
-            "photo": "sendPhoto",
-            "video": "sendVideo",
-            "document": "sendDocument",
-        }
-        upload_field = {
-            "photo": "photo",
-            "video": "video",
-            "document": "document",
-        }[media_type]
-        data = {
-            "chat_id": _require_bot_destination_chat_id(),
-            "caption": _to_bot_text(safe_caption, max_len=1024) or "",
-            "parse_mode": "HTML" if _is_html_formatting_enabled() else "Markdown",
-        }
-        if reply_to:
-            data["reply_to_message_id"] = str(reply_to)
-        files = {
-            upload_field: (
-                _filename_for_bot_media(msg, 0),
-                raw,
-                "application/octet-stream",
-            )
-        }
-        try:
-            sent_ref = await _bot_api_request(method_map[media_type], data=data, files=files)
-        except Exception as exc:
-            if "413" in str(exc) or "Request Entity Too Large" in str(exc):
-                LOGGER.warning("Bot API rejected large media (413). Falling back to text-only.")
-                return await _send_text_with_ref(caption)
-
-            if reply_to and _is_reply_target_missing_error(exc):
-                LOGGER.debug("Reply target missing for media send; retrying without reply_to.")
-                retry_data = dict(data)
-                retry_data.pop("reply_to_message_id", None)
-                sent_ref = await _bot_api_request(method_map[media_type], data=retry_data, files=files)
-                await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
-                return sent_ref
-            data.pop("parse_mode", None)
-            if safe_caption:
-                fallback_caption = (
-                    strip_telegram_html(safe_caption)
-                    if _is_html_formatting_enabled()
-                    else safe_caption
-                )
-                data["caption"] = _to_plain_text(fallback_caption, max_len=1024) or ""
-            sent_ref = await _bot_api_request(method_map[media_type], data=data, files=files)
-            await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
-            return sent_ref
-
-        await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
-        return sent_ref
-
-    tg = _require_client()
     safe_caption, overflow_chunks = _prepare_media_caption_chunks(
         caption,
-        allow_premium_tags=False,
+        allow_premium_tags=_destination_uses_bot_api(),
     )
-    try:
-        sent_ref = await _call_with_floodwait(
-            tg.send_file,
-            _require_destination_peer(),
-            msg.media,
-            caption=safe_caption,
-            parse_mode="html" if _is_html_formatting_enabled() else "md",
-            reply_to=reply_to,
-        )
-    except ChatForwardsRestrictedError:
-        raw = await msg.download_media(file=bytes)
-        if raw is None:
-            raise RuntimeError("Failed to download restricted media for re-send.")
-        sent_ref = await _call_with_floodwait(
-            tg.send_file,
-            _require_destination_peer(),
-            raw,
-            caption=safe_caption,
-            parse_mode="html" if _is_html_formatting_enabled() else "md",
-            reply_to=reply_to,
-        )
+    if not safe_caption:
+        return None
+    LOGGER.info("Media support disabled; sending text-only fallback for single media.")
+    sent_ref = await _send_text_with_ref(safe_caption, reply_to=reply_to)
     await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
     return sent_ref
 
@@ -5781,135 +5690,18 @@ async def _send_album(
     *,
     reply_to: int | None = None,
 ) -> object | None:
-    if _destination_uses_bot_api():
-        if len(messages) == 1:
-            return await _send_single_media(messages[0], caption, reply_to=reply_to)
-        safe_caption, overflow_chunks = _prepare_media_caption_chunks(
-            caption,
-            allow_premium_tags=True,
-        )
-        if not messages:
-            if safe_caption:
-                sent_ref = await _send_text_with_ref(safe_caption, reply_to=reply_to)
-                await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
-                return sent_ref
-            return
-
-        media_entries: List[dict] = []
-        files: Dict[str, tuple[str, bytes, str]] = {}
-        downloaded_messages: List[Message] = []
-        total_size = 0
-        
-        async with (pipeline_media_semaphore or contextlib.nullcontext()):
-            for idx, msg in enumerate(messages):
-                msg_size = getattr(msg.file, "size", 0) if msg.file else 0
-                if total_size + msg_size > 48 * 1024 * 1024:
-                    LOGGER.warning("Album total size exceeds Bot API limit. Skipping further files.")
-                    break
-
-                raw = await msg.download_media(file=bytes)
-                if raw is None:
-                    continue
-
-                total_size += len(raw)
-                media_type = _media_type_for_bot(msg)
-                field_name = f"file{idx}"
-                downloaded_messages.append(msg)
-                files[field_name] = (
-                    _filename_for_bot_media(msg, idx),
-                    raw,
-                    "application/octet-stream",
-                )
-                item = {"type": media_type, "media": f"attach://{field_name}"}
-                if idx == 0 and safe_caption:
-                    item["caption"] = _to_bot_text(safe_caption, max_len=1024) or ""
-                    item["parse_mode"] = "HTML" if _is_html_formatting_enabled() else "Markdown"
-                media_entries.append(item)
-
-        if not media_entries:
-            LOGGER.warning("No media could be downloaded for album. Falling back to text-only.")
-            return await _send_text_with_ref(caption)
-
-        if len(media_entries) == 1:
-            only_msg = downloaded_messages[0]
-            return await _send_single_media(only_msg, caption, reply_to=reply_to)
-
-        data = {
-            "chat_id": _require_bot_destination_chat_id(),
-            "media": json.dumps(media_entries),
-        }
-        if reply_to:
-            data["reply_to_message_id"] = str(reply_to)
-        try:
-            sent_ref = await _bot_api_request("sendMediaGroup", data=data, files=files)
-        except Exception as exc:
-            if "413" in str(exc) or "Request Entity Too Large" in str(exc):
-                LOGGER.warning("Bot API rejected media group (413). Falling back to text-only.")
-                return await _send_text_with_ref(caption)
-
-            if reply_to and _is_reply_target_missing_error(exc):
-                LOGGER.debug("Reply target missing for media group send; retrying without reply_to.")
-                retry_data = dict(data)
-                retry_data.pop("reply_to_message_id", None)
-                sent_ref = await _bot_api_request("sendMediaGroup", data=retry_data, files=files)
-                await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
-                return sent_ref
-            if safe_caption and media_entries:
-                fallback_caption = (
-                    strip_telegram_html(safe_caption)
-                    if _is_html_formatting_enabled()
-                    else safe_caption
-                )
-                media_entries[0]["caption"] = _to_plain_text(
-                    fallback_caption,
-                    max_len=1024,
-                ) or ""
-                media_entries[0].pop("parse_mode", None)
-                data["media"] = json.dumps(media_entries)
-            sent_ref = await _bot_api_request("sendMediaGroup", data=data, files=files)
-            await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
-            return sent_ref
-        await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
-        return sent_ref
-
-    tg = _require_client()
+    if len(messages) == 1:
+        return await _send_single_media(messages[0], caption, reply_to=reply_to)
     safe_caption, overflow_chunks = _prepare_media_caption_chunks(
         caption,
-        allow_premium_tags=False,
+        allow_premium_tags=_destination_uses_bot_api(),
     )
-    media_items = [m.media for m in messages if m.media]
-    if not media_items:
-        if safe_caption:
-            sent_ref = await _send_text_with_ref(safe_caption, reply_to=reply_to)
-            await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
-            return sent_ref
-        return
-
-    try:
-        sent_ref = await _call_with_floodwait(
-            tg.send_file,
-            _require_destination_peer(),
-            media_items,
-            caption=safe_caption,
-            parse_mode="html" if _is_html_formatting_enabled() else "md",
-            reply_to=reply_to,
-        )
-    except ChatForwardsRestrictedError:
-        downloaded = []
-        for msg in messages:
-            blob = await msg.download_media(file=bytes)
-            if blob is not None:
-                downloaded.append(blob)
-        if not downloaded:
-            raise RuntimeError("Failed to download album media for restricted chat.")
-        sent_ref = await _call_with_floodwait(
-            tg.send_file,
-            _require_destination_peer(),
-            downloaded,
-            caption=safe_caption,
-            parse_mode="html" if _is_html_formatting_enabled() else "md",
-            reply_to=reply_to,
-        )
+    if not safe_caption:
+        return None
+    LOGGER.info(
+        "Media support disabled; sending text-only fallback for album.",
+    )
+    sent_ref = await _send_text_with_ref(safe_caption, reply_to=reply_to)
     await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
     return sent_ref
 
