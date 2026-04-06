@@ -245,6 +245,13 @@ def test_build_query_plan_marks_explicit_time_filters():
     assert explicit_plan.explicit_time_filter is True
 
 
+def test_build_query_plan_does_not_treat_noisy_day_phrase_as_time_filter():
+    plan = utils.build_query_plan("why user query replying with 1 day digest")
+
+    assert plan.explicit_time_filter is False
+    assert plan.hours_back == 24
+
+
 def test_parse_time_filter_today_uses_configured_timezone(monkeypatch):
     class _FakeDateTime:
         @classmethod
@@ -291,11 +298,24 @@ def test_parse_time_filter_yesterday_uses_calendar_day_boundaries(monkeypatch):
     assert end_ts == int(datetime(2026, 4, 4, 18, 30, tzinfo=timezone.utc).timestamp())
 
 
+def test_parse_time_filter_accepts_subject_shorthand_window():
+    hours_back, cleaned, start_ts, end_ts = utils.parse_time_filter_from_query(
+        "Tehran 3d",
+        default_hours=24,
+    )
+
+    assert hours_back == 72
+    assert cleaned == "Tehran"
+    assert start_ts is None
+    assert end_ts is None
+
+
 def test_wrap_query_digest_answer_uses_today_title():
     wrapped = main._wrap_query_digest_answer(
         "Major events unfolded across the city.",
         hours_back=6,
         query_text="What happened today in Tehran?",
+        explicit_time_filter=True,
     )
 
     assert wrapped.startswith("<b>Today digest</b><br><br>")
@@ -306,6 +326,7 @@ def test_wrap_query_digest_answer_uses_yesterday_title_instead_of_horizon():
         "Strikes and outages dominated the day.",
         hours_back=26,
         query_text="What happened yesterday in Tehran?",
+        explicit_time_filter=True,
     )
 
     assert wrapped.startswith("<b>Yesterday digest</b><br><br>")
@@ -317,9 +338,33 @@ def test_wrap_query_digest_answer_uses_explicit_day_window_title():
         "A month of developments reshaped the front.",
         hours_back=24 * 30,
         query_text="What happened in the last 30 days in Tehran?",
+        explicit_time_filter=True,
     )
 
     assert wrapped.startswith("<b>30-day digest</b><br><br>")
+
+
+def test_wrap_query_digest_answer_uses_neutral_title_without_explicit_window():
+    wrapped = main._wrap_query_digest_answer(
+        "Major events unfolded across the city.",
+        hours_back=24,
+        query_text="What happened in Tehran?",
+        explicit_time_filter=False,
+    )
+
+    assert wrapped.startswith("<b>Digest</b><br><br>")
+    assert "1-day digest" not in wrapped
+
+
+def test_wrap_query_digest_answer_uses_shorthand_day_title():
+    wrapped = main._wrap_query_digest_answer(
+        "A month of developments reshaped the front.",
+        hours_back=24 * 3,
+        query_text="Tehran 3d",
+        explicit_time_filter=True,
+    )
+
+    assert wrapped.startswith("<b>3-day digest</b><br><br>")
 
 
 def test_runtime_timezone_accepts_ist_alias(monkeypatch):

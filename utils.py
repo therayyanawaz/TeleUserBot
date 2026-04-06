@@ -1495,12 +1495,52 @@ def parse_time_filter_from_query(
     end_ts: int | None = None
     cleanup_patterns: list[str] = []
 
-    # explicit relative windows
-    patterns = [
-        r"\b(?:last|past)\s+(\d{1,3})\s*(?:hours?|hrs?|h)\b",
-        r"\b(\d{1,3})\s*(?:hours?|hrs?|h)\b",
+    def _shorthand_subject_ok(subject: str) -> bool:
+        normalized = normalize_space(subject)
+        if not normalized or "?" in normalized:
+            return False
+        if len(normalized.split()) > 3:
+            return False
+        blocked_markers = (
+            "what",
+            "why",
+            "when",
+            "where",
+            "who",
+            "how",
+            "show",
+            "give",
+            "tell",
+            "reply",
+            "replying",
+            "digest",
+            "summary",
+            "recap",
+            "latest",
+            "news",
+            "update",
+            "updates",
+            "happened",
+            "happening",
+            "today",
+            "yesterday",
+            "last",
+            "past",
+        )
+        subject_lowered = normalized.lower()
+        return not any(re.search(rf"\b{re.escape(marker)}\b", subject_lowered) for marker in blocked_markers)
+
+    shorthand_patterns = [
+        r"^(?P<fragment>(?P<value>\d{1,3})\s*(?P<unit>hours?|hrs?|h|days?|d))$",
+        r"^(?P<fragment>(?P<value>\d{1,3})\s*(?P<unit>hours?|hrs?|h|days?|d))\s+(?P<subject>.+)$",
+        r"^(?P<subject>.+?)\s+(?P<fragment>(?P<value>\d{1,3})\s*(?P<unit>hours?|hrs?|h|days?|d))$",
     ]
-    for pattern in patterns:
+
+    # explicit relative windows
+    hour_patterns = [
+        r"\b(?:last|past)\s+(\d{1,3})\s*(?:hours?|hrs?|h)\b",
+    ]
+    for pattern in hour_patterns:
         match = re.search(pattern, lowered)
         if match:
             hours_back = max(1, min(_QUERY_MAX_HOURS_BACK, int(match.group(1))))
@@ -1509,13 +1549,29 @@ def parse_time_filter_from_query(
 
     day_patterns = [
         r"\b(?:last|past)\s+(\d{1,2})\s*(?:days?|d)\b",
-        r"\b(\d{1,2})\s*(?:days?|d)\b",
     ]
     for pattern in day_patterns:
         match = re.search(pattern, lowered)
         if match:
             hours_back = max(24, min(_QUERY_MAX_HOURS_BACK, int(match.group(1)) * 24))
             cleanup_patterns.append(pattern)
+            break
+
+    if not cleanup_patterns:
+        for pattern in shorthand_patterns:
+            match = re.match(pattern, lowered)
+            if not match:
+                continue
+            subject = normalize_space(match.groupdict().get("subject") or "")
+            if subject and not _shorthand_subject_ok(subject):
+                continue
+            value = int(match.group("value"))
+            unit = match.group("unit").lower()
+            if unit.startswith("d"):
+                hours_back = max(24, min(_QUERY_MAX_HOURS_BACK, value * 24))
+            else:
+                hours_back = max(1, min(_QUERY_MAX_HOURS_BACK, value))
+            cleanup_patterns.append(re.escape(match.group("fragment")))
             break
 
     # calendar-style shortcuts

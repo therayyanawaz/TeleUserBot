@@ -9462,7 +9462,15 @@ def _load_archive_query_context(
     )
 
 
-def _query_digest_title(*, hours_back: int, query_text: str = "") -> str:
+def _query_digest_title(
+    *,
+    hours_back: int,
+    query_text: str = "",
+    explicit_time_filter: bool = False,
+) -> str:
+    if not explicit_time_filter:
+        return "<b>Digest</b>"
+
     lowered = normalize_space(query_text).lower()
     if re.search(r"\byesterday\b", lowered):
         return "<b>Yesterday digest</b>"
@@ -9477,13 +9485,30 @@ def _query_digest_title(*, hours_back: int, query_text: str = "") -> str:
     if hour_match:
         return f"<b>{max(1, int(hour_match.group(1)))}-hour digest</b>"
 
+    shorthand_match = re.match(
+        r"^(?:.+?\s+)?(?P<value>\d{1,3})\s*(?P<unit>hours?|hrs?|h|days?|d)(?:\s+.+)?$",
+        lowered,
+    )
+    if shorthand_match:
+        value = max(1, int(shorthand_match.group("value")))
+        unit = shorthand_match.group("unit").lower()
+        if unit.startswith("d"):
+            return f"<b>{value}-day digest</b>"
+        return f"<b>{value}-hour digest</b>"
+
     title_hours = max(1, int(hours_back))
     if title_hours % 24 == 0 and title_hours >= 24:
         return f"<b>{title_hours // 24}-day digest</b>"
     return f"<b>{title_hours}-hour digest</b>"
 
 
-def _wrap_query_digest_answer(answer: str, *, hours_back: int, query_text: str = "") -> str:
+def _wrap_query_digest_answer(
+    answer: str,
+    *,
+    hours_back: int,
+    query_text: str = "",
+    explicit_time_filter: bool = False,
+) -> str:
     cleaned = normalize_space(answer)
     if not cleaned:
         return answer
@@ -9491,7 +9516,11 @@ def _wrap_query_digest_answer(answer: str, *, hours_back: int, query_text: str =
         return answer
     if "no major developments right now" in strip_telegram_html(cleaned).lower():
         return answer
-    title = _query_digest_title(hours_back=hours_back, query_text=query_text)
+    title = _query_digest_title(
+        hours_back=hours_back,
+        query_text=query_text,
+        explicit_time_filter=explicit_time_filter,
+    )
     return f"{title}<br><br>{answer.strip()}"
 
 
@@ -10054,6 +10083,7 @@ async def _stream_query_answer(
     history: Sequence[Dict[str, str]],
     digest_mode: bool = False,
     digest_hours_back: int | None = None,
+    digest_explicit_time_filter: bool = False,
     prefer_bot_identity: bool = False,
     bot_chat_id: int | None = None,
     root_reply_to: int | None = None,
@@ -10102,6 +10132,7 @@ async def _stream_query_answer(
             answer,
             hours_back=digest_hours_back or 1,
             query_text=query_text,
+            explicit_time_filter=digest_explicit_time_filter,
         )
     else:
         answer = await generate_answer_from_context(
@@ -10346,6 +10377,7 @@ async def _handle_query_request(
                 history=history,
                 digest_mode=broad_query,
                 digest_hours_back=active_hours,
+                digest_explicit_time_filter=bool(getattr(plan, "explicit_time_filter", False)),
                 prefer_bot_identity=prefer_bot_identity,
                 bot_chat_id=bot_chat_id,
                 root_reply_to=reply_to,
@@ -10362,6 +10394,7 @@ async def _handle_query_request(
                     answer,
                     hours_back=active_hours,
                     query_text=plan.original_query,
+                    explicit_time_filter=bool(getattr(plan, "explicit_time_filter", False)),
                 )
             else:
                 answer = await generate_answer_from_context(
