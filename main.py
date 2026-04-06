@@ -1657,17 +1657,21 @@ class _QueryProgressTracker:
         scope = normalize_space(str(payload.get("scope") or "")).lower()
         phase = normalize_space(str(payload.get("phase") or "")).lower()
         variant = normalize_space(str(payload.get("variant") or ""))
+        force = False
         if scope == "telegram":
             if phase == "fallback":
                 self._remember(self._telegram_terms, "recent history scan", max_items=3)
+                force = True
             elif variant:
                 self._remember(self._telegram_terms, variant, max_items=3)
+                force = len(self._telegram_terms) <= 1
         elif scope == "web":
             provider_key = normalize_space(str(payload.get("provider") or "")).lower()
             provider = _QUERY_PROGRESS_PROVIDER_LABELS.get(provider_key, provider_key.replace("_", " ").title())
             label = provider if not variant else f"{provider}: {variant}"
             self._remember(self._web_terms, label, max_items=2)
-        await self._refresh(force=False)
+            force = len(self._web_terms) <= 1
+        await self._refresh(force=force)
 
 
 def _query_expanded_window_hours() -> int:
