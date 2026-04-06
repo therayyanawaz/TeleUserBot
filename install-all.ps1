@@ -182,9 +182,6 @@ Write-Step "Upgrading pip tooling"
 Write-Step "Installing Python dependencies"
 & $venvPython -m pip install -r requirements.txt -r requirements.optional.txt
 
-Write-Step "Installing FFmpeg"
-Ensure-WingetPackage -Id "Gyan.FFmpeg.Essentials"
-
 Write-Step "Warming sentence-transformers model cache"
 $env:PYTHONIOENCODING = "utf-8"
 & $venvPython -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2'); print('model-ready')"

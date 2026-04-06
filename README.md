@@ -212,7 +212,6 @@ This script:
 - selects the newest installed Python 3.11+ interpreter, or installs the newest available Python 3 package if needed
 - creates `.venv`
 - installs `requirements.txt` and `requirements.optional.txt`
-- installs FFmpeg
 - warms the `sentence-transformers` cache
 
 ### Ubuntu
@@ -224,7 +223,6 @@ bash install-all-ubuntu.sh
 This script:
 
 - selects the newest installed Python 3.11+ interpreter, or installs the newest available `python3.x` package when needed
-- installs FFmpeg and Tesseract
 - creates `.venv`
 - installs all Python dependencies
 - warms the `sentence-transformers` cache

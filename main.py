@@ -678,7 +678,7 @@ def _is_low_memory_runtime() -> bool:
     budget = _runtime_memory_budget_bytes()
     if budget is None:
         return False
-    # If < 2.5GB RAM, we consider it low memory for a Python/FFmpeg app with no swap.
+    # If < 2.5GB RAM, we consider it low memory for this Python app with no swap.
     return budget <= (2560 * 1024 * 1024)
 
 

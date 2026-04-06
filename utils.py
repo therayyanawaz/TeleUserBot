@@ -10,14 +10,11 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from email.utils import parsedate_to_datetime
 from html import escape as _escape_html, unescape as _unescape_html
 import hashlib
-from io import BytesIO
 import json
 import logging
 import math
 from pathlib import Path
 import re
-import subprocess
-import tempfile
 import threading
 import time
 from typing import Any, Awaitable, Callable, Iterable, List, Sequence, Tuple
@@ -96,41 +93,6 @@ def estimate_tokens_rough(text: str) -> int:
 
 def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
-
-
-def build_media_signature_digest(parts: Sequence[str]) -> str:
-    cleaned = sorted({normalize_space(part) for part in parts if normalize_space(part)})
-    if not cleaned:
-        return ""
-    payload = "\n".join(cleaned).encode("utf-8", errors="ignore")
-    return hashlib.sha1(payload).hexdigest()
-
-
-def compute_visual_media_hash(blob: bytes) -> str:
-    """
-    Perceptual hash for visually identical or recompressed images.
-    Returns empty string if Pillow/runtime decoding fails.
-    """
-    if not blob:
-        return ""
-    try:
-        from PIL import Image  # type: ignore
-    except Exception:
-        return ""
-
-    try:
-        with Image.open(BytesIO(blob)) as img:
-            img = img.convert("L").resize((8, 8))
-            pixels = list(img.getdata())
-    except Exception:
-        return ""
-
-    if not pixels:
-        return ""
-
-    avg = sum(int(value) for value in pixels) / len(pixels)
-    bits = "".join("1" if int(value) >= avg else "0" for value in pixels)
-    return f"{int(bits, 2):016x}"
 
 
 def media_duplicate_match_score(left: str, right: str) -> float:

@@ -120,10 +120,6 @@ if [[ -z "$python_bin" ]]; then
   python_version="$(python_version_of "$python_bin")"
 fi
 
-log "Installing FFmpeg"
-$SUDO apt-get install -y \
-  ffmpeg
-
 log "Checking Python version"
 $python_bin - <<'PY'
 import sys
