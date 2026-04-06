@@ -318,6 +318,13 @@ def test_clean_digest_support_items_drops_incomplete_possessive_tail():
     assert cleaned == []
 
 
+
+def test_feed_segment_is_incomplete_rejects_dangling_possessive_tail():
+    assert ai_filter._feed_segment_is_incomplete(
+        "Joint Chiefs detail a 45-hour CSAR while an A-10 was hit but its."
+    )
+
+
 def test_json_digest_to_html_renders_narrative_digest():
     html = ai_filter._json_digest_to_html(
         {

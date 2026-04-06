@@ -932,6 +932,12 @@ def test_prepare_media_caption_chunks_preserves_complete_sentences():
         assert plain.endswith((".", "!", "?", "〕"))
 
 
+def test_caption_fragment_is_usable_rejects_dangling_possessive_tail():
+    assert not main._caption_fragment_is_usable(
+        "Joint Chiefs detail a 45-hour CSAR while an A-10 was hit but its."
+    )
+
+
 def test_render_digest_body_sections_strips_nested_markers_and_drops_fragments():
     rendered = main._render_digest_body_sections(
         "Top headlines from the last 30 minutes",

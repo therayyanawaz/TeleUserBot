@@ -3095,18 +3095,44 @@ _CAPTION_INCOMPLETE_TAIL_WORDS = {
     "as",
     "at",
     "because",
+    "but",
     "by",
     "for",
     "from",
+    "if",
     "in",
     "into",
     "of",
     "on",
     "or",
     "the",
+    "than",
+    "then",
     "to",
     "via",
+    "while",
     "with",
+}
+_CAPTION_DANGLING_TAIL_WORDS = {
+    "he",
+    "her",
+    "his",
+    "it",
+    "its",
+    "my",
+    "our",
+    "she",
+    "that",
+    "their",
+    "theirs",
+    "them",
+    "they",
+    "this",
+    "those",
+    "these",
+    "whose",
+    "your",
+    "yours",
 }
 _CAPTION_GEO_PREFIX_ALLOWLIST = {
     "beirut",
@@ -3485,7 +3511,7 @@ def _truncate_caption_fragment_complete(text: str, *, limit: int) -> str:
 
     truncated = normalize_space(window[:cut].rstrip(" ,;:-/"))
     words = truncated.split()
-    while words and words[-1].strip(".,;:!?").lower() in _CAPTION_INCOMPLETE_TAIL_WORDS:
+    while words and words[-1].strip(".,;:!?").lower() in (_CAPTION_INCOMPLETE_TAIL_WORDS | _CAPTION_DANGLING_TAIL_WORDS):
         words.pop()
     return normalize_space(" ".join(words))
 
