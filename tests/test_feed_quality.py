@@ -250,6 +250,16 @@ def test_build_query_plan_does_not_treat_noisy_day_phrase_as_time_filter():
     assert plan.hours_back == 24
 
 
+def test_build_query_search_variants_prioritize_subject_terms_for_choice_queries():
+    variants = utils.build_query_search_variants("Which data centers did Iran hit, Oracle or AWS?")
+
+    assert "data centers iran hit" in variants
+    assert "oracle aws" in variants
+    assert "oracle" in variants
+    assert "aws" in variants
+    assert "which data centers did" not in variants
+
+
 def test_parse_time_filter_today_uses_configured_timezone(monkeypatch):
     class _FakeDateTime:
         @classmethod
@@ -1402,9 +1412,10 @@ async def test_stream_query_answer_uses_threaded_final_delivery(monkeypatch):
     assert "What's the update in war" in answer
     assert len(calls) >= 2
     assert calls[0]["edit_message"] == {"message_id": 1000}
-    assert calls[1]["reply_to"] == 1000
-    if len(calls) >= 3:
-        assert calls[2]["reply_to"] == calls[1]["message_id"]
+    send_calls = [call for call in calls if call["reply_to"] is not None]
+    assert send_calls[0]["reply_to"] == 1000
+    if len(send_calls) >= 2:
+        assert send_calls[1]["reply_to"] == send_calls[0]["message_id"]
     assert stats.message_count == len(calls)
 
 
@@ -1419,7 +1430,7 @@ async def test_handle_query_request_expands_to_seven_days_before_web_crosscheck(
         progress_texts.append(text)
         return edit_message or {"message_id": 700}
 
-    async def fake_search_recent_messages(_client, _monitored, _query, *, max_messages=50, default_hours_back=24, logger=None):
+    async def fake_search_recent_messages(_client, _monitored, _query, *, max_messages=50, default_hours_back=24, progress_cb=None, logger=None):
         search_hours.append(default_hours_back)
         if len(search_hours) == 1:
             return [
@@ -1442,7 +1453,7 @@ async def test_handle_query_request_expands_to_seven_days_before_web_crosscheck(
             },
         ]
 
-    async def fake_search_recent_news_web(_query, *, hours_back, max_results, allowed_domains, require_recent, logger=None):
+    async def fake_search_recent_news_web(_query, *, hours_back, max_results, allowed_domains, require_recent, progress_cb=None, logger=None):
         web_hours.append(hours_back)
         return [
             {
@@ -1500,7 +1511,7 @@ async def test_handle_query_request_honors_explicit_thirty_day_window_for_web_cr
         progress_texts.append(text)
         return edit_message or {"message_id": 701}
 
-    async def fake_search_recent_messages(_client, _monitored, _query, *, max_messages=50, default_hours_back=24, logger=None):
+    async def fake_search_recent_messages(_client, _monitored, _query, *, max_messages=50, default_hours_back=24, progress_cb=None, logger=None):
         search_hours.append(default_hours_back)
         return [
             {
@@ -1520,7 +1531,7 @@ async def test_handle_query_request_honors_explicit_thirty_day_window_for_web_cr
             },
         ]
 
-    async def fake_search_recent_news_web(_query, *, hours_back, max_results, allowed_domains, require_recent, logger=None):
+    async def fake_search_recent_news_web(_query, *, hours_back, max_results, allowed_domains, require_recent, progress_cb=None, logger=None):
         web_hours.append(hours_back)
         return [
             {
@@ -1565,6 +1576,93 @@ async def test_handle_query_request_honors_explicit_thirty_day_window_for_web_cr
     assert web_hours == [720]
     assert all(text != main._query_expand_status() for text in progress_texts)
     assert any("trusted web sources" in text for text in progress_texts)
+
+
+@pytest.mark.asyncio
+async def test_handle_query_request_streams_search_terms_into_progress(monkeypatch):
+    main.query_last_request_ts.clear()
+    progress_texts: list[str] = []
+
+    async def fake_safe_reply_markdown(_event, text, *, edit_message=None, reply_to=None, prefer_bot_identity=False, bot_chat_id=None):
+        progress_texts.append(text)
+        return edit_message or {"message_id": 702}
+
+    async def fake_search_recent_messages(_client, _monitored, _query, *, max_messages=50, default_hours_back=24, progress_cb=None, logger=None):
+        if progress_cb is not None:
+            await progress_cb(
+                {
+                    "scope": "telegram",
+                    "phase": "variant",
+                    "variant": "oracle aws",
+                    "window_hours": default_hours_back,
+                }
+            )
+            await progress_cb(
+                {
+                    "scope": "telegram",
+                    "phase": "fallback",
+                    "variant": None,
+                    "window_hours": default_hours_back,
+                }
+            )
+        return [
+            {
+                "text": "Oracle's Dubai facility was cited in attack reporting.",
+                "source": "Desk Wire",
+                "timestamp": 1700000000,
+            }
+        ]
+
+    async def fake_search_recent_news_web(_query, *, hours_back, max_results, allowed_domains, require_recent, progress_cb=None, logger=None):
+        if progress_cb is not None:
+            await progress_cb(
+                {
+                    "scope": "web",
+                    "phase": "variant",
+                    "provider": "google_news_rss",
+                    "variant": "oracle aws",
+                    "window_hours": hours_back,
+                }
+            )
+        return [
+            {
+                "text": "Google News and Reuters both referenced Oracle in Dubai.",
+                "source": "Reuters",
+                "timestamp": 1700000100,
+                "is_web": True,
+                "link": "https://example.com/report",
+            }
+        ]
+
+    async def fake_generate_answer_from_context(*_args, **_kwargs):
+        return "<b>Oracle Dubai</b><br>Oracle's Dubai facility is the main cited target."
+
+    monkeypatch.setattr(main, "_is_query_runtime_available", lambda: True)
+    monkeypatch.setattr(main, "_safe_reply_markdown", fake_safe_reply_markdown)
+    monkeypatch.setattr(main, "_require_client", lambda: object())
+    monkeypatch.setattr(main, "search_recent_messages", fake_search_recent_messages)
+    monkeypatch.setattr(main, "_search_recent_news_web_bounded", fake_search_recent_news_web)
+    monkeypatch.setattr(main, "_load_queue_query_context", lambda **_kwargs: [])
+    monkeypatch.setattr(main, "_load_archive_query_context", lambda **_kwargs: [])
+    monkeypatch.setattr(main, "_is_streaming_enabled", lambda: False)
+    monkeypatch.setattr(main, "_require_auth_manager", lambda: object())
+    monkeypatch.setattr(main, "generate_answer_from_context", fake_generate_answer_from_context)
+    monkeypatch.setattr(main, "_query_web_require_min_sources", lambda: 1)
+    monkeypatch.setattr(main, "_append_query_history", lambda *_args, **_kwargs: None)
+
+    await main._handle_query_request(
+        event_ref=SimpleNamespace(chat_id=779),
+        text="Which data centers did Iran hit, Oracle or AWS?",
+        sender_id=79,
+        chat_id="chat-79",
+        reply_to=None,
+        prefer_bot_identity=False,
+        bot_chat_id=None,
+    )
+
+    assert any("oracle aws" in text.lower() for text in progress_texts)
+    assert any("recent history scan" in text.lower() for text in progress_texts)
+    assert any("Google News RSS" in text for text in progress_texts)
 
 
 @pytest.mark.asyncio
