@@ -3600,6 +3600,375 @@ def _query_source_reliability(item: Dict[str, object]) -> float:
     return score
 
 
+_STRATEGIC_TREND_EVENT_MARKERS = (
+    "strike",
+    "strikes",
+    "airstrike",
+    "missile",
+    "missiles",
+    "drone",
+    "drones",
+    "launch",
+    "launched",
+    "salvo",
+    "warning",
+    "warnings",
+    "alert",
+    "alerts",
+    "ceasefire",
+    "truce",
+    "talks",
+    "negotiation",
+    "negotiations",
+    "diplomatic",
+    "diplomacy",
+    "official",
+    "officials",
+    "minister",
+    "military",
+    "army",
+    "idf",
+    "irgc",
+)
+_STRATEGIC_TREND_ESCALATION_MARKERS = (
+    "escalating",
+    "escalation",
+    "intensifying",
+    "intensified",
+    "widening",
+    "broader",
+    "broadened",
+    "expanded",
+    "expanding",
+    "stepped up",
+    "more strikes",
+    "fresh strikes",
+    "another wave",
+    "heavier",
+    "higher tempo",
+    "new wave",
+    "wider front",
+    "retaliation widened",
+    "exchange widened",
+)
+_STRATEGIC_TREND_DEESCALATION_MARKERS = (
+    "de-escalating",
+    "deescalating",
+    "de-escalation",
+    "deescalation",
+    "easing",
+    "eased",
+    "pace was lower",
+    "lower than the earlier peak",
+    "lower tempo",
+    "slower pace",
+    "reduced",
+    "scaled back",
+    "paused",
+    "pause",
+    "restraint",
+    "not widening",
+    "no widening",
+    "held back",
+    "cooling",
+    "calmer",
+    "diplomatic push",
+    "ceasefire",
+    "truce",
+)
+_STRATEGIC_TREND_MIXED_MARKERS = (
+    "mixed signals",
+    "no clear shift",
+    "no clear decisive shift",
+    "still active but",
+    "still active, but",
+    "remains active but",
+    "active but lower",
+    "continued but lower",
+    "still active",
+)
+_STRATEGIC_TREND_RHETORIC_MARKERS = (
+    "religious crusade",
+    "to quote the bible",
+    "speck of sawdust",
+    "plank in your own eye",
+    "look like some kind of",
+    "unhinged",
+    "glorious",
+    "heroic",
+    "evil enemy",
+    "martyrdom",
+)
+_STRATEGIC_TREND_OFFTOPIC_MARKERS = (
+    "support us",
+    "follow us",
+    "subscribe",
+    "original msg",
+    "fwd from",
+)
+
+
+@dataclass(frozen=True)
+class StrategicTrendEvidence:
+    source: str
+    text: str
+    signal: Literal["escalating", "de-escalating", "mixed", "steady"]
+    score: float
+    timestamp: int
+    is_web: bool
+
+
+@dataclass(frozen=True)
+class StrategicTrendSummary:
+    verdict: Literal["escalating", "de-escalating", "mixed", "insufficient"]
+    qualification: str
+    bullets: tuple[str, ...]
+    escalating_evidence: tuple[StrategicTrendEvidence, ...]
+    deescalating_evidence: tuple[StrategicTrendEvidence, ...]
+    mixed_evidence: tuple[StrategicTrendEvidence, ...]
+    distinct_sources: int
+    recent_span_hours: float
+
+
+def _query_is_quote_heavy(text: str) -> bool:
+    raw = str(text or "")
+    quote_count = raw.count('"') + raw.count("“") + raw.count("”") + raw.count("'")
+    return quote_count >= 4
+
+
+def _strategic_query_signal(text: str) -> Literal["escalating", "de-escalating", "mixed", "steady", "none"]:
+    lowered = normalize_space(text).lower()
+    if not lowered:
+        return "none"
+    if re.search(
+        r"\b(?:not|no|without|neither side(?:\s+(?:was|is))?)\b.{0,24}\b(?:widen(?:ing)?|broader|expand(?:ing|ed)?)\b",
+        lowered,
+    ):
+        return "de-escalating"
+    escalation_hits = sum(1 for marker in _STRATEGIC_TREND_ESCALATION_MARKERS if marker in lowered)
+    deescalation_hits = sum(1 for marker in _STRATEGIC_TREND_DEESCALATION_MARKERS if marker in lowered)
+    mixed_hits = sum(1 for marker in _STRATEGIC_TREND_MIXED_MARKERS if marker in lowered)
+    event_hits = sum(1 for marker in _STRATEGIC_TREND_EVENT_MARKERS if marker in lowered)
+
+    if mixed_hits > 0 or (escalation_hits > 0 and deescalation_hits > 0):
+        return "mixed"
+    if escalation_hits > 0:
+        return "escalating"
+    if deescalation_hits > 0:
+        return "de-escalating"
+    if event_hits > 0:
+        return "steady"
+    return "none"
+
+
+def _strategic_query_noise_penalty(text: str) -> float:
+    lowered = normalize_space(text).lower()
+    if not lowered:
+        return 5.0
+    penalty = 0.0
+    if any(marker in lowered for marker in _STRATEGIC_TREND_OFFTOPIC_MARKERS):
+        penalty += 3.5
+    if any(marker in lowered for marker in _STRATEGIC_TREND_RHETORIC_MARKERS):
+        penalty += 4.0
+    if _query_is_quote_heavy(text):
+        penalty += 2.6
+    if len(lowered.split()) < 6:
+        penalty += 1.2
+    if _strategic_query_signal(text) == "none":
+        penalty += 2.8
+    return penalty
+
+
+def _strategic_query_signal_bonus(text: str) -> float:
+    lowered = normalize_space(text).lower()
+    if not lowered:
+        return 0.0
+    event_hits = sum(1 for marker in _STRATEGIC_TREND_EVENT_MARKERS if marker in lowered)
+    escalation_hits = sum(1 for marker in _STRATEGIC_TREND_ESCALATION_MARKERS if marker in lowered)
+    deescalation_hits = sum(1 for marker in _STRATEGIC_TREND_DEESCALATION_MARKERS if marker in lowered)
+    mixed_hits = sum(1 for marker in _STRATEGIC_TREND_MIXED_MARKERS if marker in lowered)
+    official_hits = sum(
+        1
+        for marker in ("official", "officials", "minister", "spokesperson", "military", "idf", "irgc")
+        if marker in lowered
+    )
+
+    bonus = min(2.8, event_hits * 0.3)
+    bonus += min(2.4, max(escalation_hits, deescalation_hits) * 0.8)
+    bonus += min(1.2, mixed_hits * 0.8)
+    bonus += min(1.0, official_hits * 0.25)
+    return bonus
+
+
+def _strategic_query_verdict_title(verdict: Literal["escalating", "de-escalating", "mixed", "insufficient"]) -> str:
+    if verdict == "escalating":
+        return "Still active and escalating"
+    if verdict == "de-escalating":
+        return "Still active, but easing from the earlier peak"
+    if verdict == "mixed":
+        return "Still active with mixed signals; no clear decisive shift"
+    return "Not enough recent evidence to judge direction"
+
+
+def _build_strategic_trend_summary(
+    query: str,
+    context_messages: Sequence[Dict[str, object]],
+) -> StrategicTrendSummary:
+    now_ts = int(time.time())
+    ranked = _rank_query_context(query, context_messages, limit=18)
+    evidence: list[StrategicTrendEvidence] = []
+
+    for item in ranked:
+        source = normalize_space(str(item.get("source") or "unknown"))
+        timestamp = int(item.get("timestamp") or 0)
+        is_web = bool(item.get("is_web"))
+        raw_text = normalize_space(str(item.get("text") or ""))
+        if not raw_text:
+            continue
+        for sentence in _split_digest_sentences(raw_text):
+            cleaned = _digest_finalize_sentence(sentence, max_chars=220)
+            if not cleaned:
+                continue
+            signal = _strategic_query_signal(cleaned)
+            if signal == "none":
+                continue
+            sentence_item = dict(item)
+            sentence_item["text"] = cleaned
+            score = _score_query_context_row(query, sentence_item, now_ts=now_ts)
+            if score <= 0:
+                continue
+            evidence.append(
+                StrategicTrendEvidence(
+                    source=source,
+                    text=cleaned,
+                    signal=signal,
+                    score=score,
+                    timestamp=timestamp,
+                    is_web=is_web,
+                )
+            )
+
+    unique_sources = {item.source.lower() for item in evidence if normalize_space(item.source)}
+    if not evidence:
+        return StrategicTrendSummary(
+            verdict="insufficient",
+            qualification="There is too little recent, reliable evidence here to judge whether the conflict is intensifying or easing.",
+            bullets=(),
+            escalating_evidence=(),
+            deescalating_evidence=(),
+            mixed_evidence=(),
+            distinct_sources=0,
+            recent_span_hours=0.0,
+        )
+
+    best_by_source_signal: dict[tuple[str, str], StrategicTrendEvidence] = {}
+    for item in sorted(evidence, key=lambda entry: (entry.score, entry.timestamp), reverse=True):
+        key = (item.source.lower(), item.signal)
+        if key not in best_by_source_signal:
+            best_by_source_signal[key] = item
+
+    escalating = tuple(
+        sorted(
+            (item for item in best_by_source_signal.values() if item.signal == "escalating"),
+            key=lambda entry: (entry.score, entry.timestamp),
+            reverse=True,
+        )
+    )
+    deescalating = tuple(
+        sorted(
+            (item for item in best_by_source_signal.values() if item.signal == "de-escalating"),
+            key=lambda entry: (entry.score, entry.timestamp),
+            reverse=True,
+        )
+    )
+    mixed = tuple(
+        sorted(
+            (item for item in best_by_source_signal.values() if item.signal in {"mixed", "steady"}),
+            key=lambda entry: (entry.score, entry.timestamp),
+            reverse=True,
+        )
+    )
+
+    escalating_score = sum(item.score for item in escalating)
+    deescalating_score = sum(item.score for item in deescalating)
+    mixed_score = sum(item.score for item in mixed)
+    escalating_sources = {item.source.lower() for item in escalating}
+    deescalating_sources = {item.source.lower() for item in deescalating}
+    timestamps = [item.timestamp for item in evidence if item.timestamp > 0]
+    recent_span_hours = (
+        round(max(0.0, (max(timestamps) - min(timestamps)) / 3600.0), 2)
+        if len(timestamps) >= 2
+        else 0.0
+    )
+
+    verdict: Literal["escalating", "de-escalating", "mixed", "insufficient"]
+    if len(unique_sources) < 2 and not any(item.is_web for item in evidence):
+        verdict = "insufficient"
+    elif escalating_score > 0 and deescalating_score > 0:
+        stronger_score = max(escalating_score, deescalating_score)
+        weaker_score = min(escalating_score, deescalating_score)
+        if stronger_score < (weaker_score + 3.0) or weaker_score >= 3.0:
+            verdict = "mixed"
+        elif escalating_score > deescalating_score and len(escalating_sources) >= 2:
+            verdict = "escalating"
+        elif deescalating_score > escalating_score and len(deescalating_sources) >= 2:
+            verdict = "de-escalating"
+        else:
+            verdict = "mixed"
+    elif escalating_score >= deescalating_score + 2.0 and len(escalating_sources) >= 2:
+        verdict = "escalating"
+    elif deescalating_score >= escalating_score + 2.0 and len(deescalating_sources) >= 2:
+        verdict = "de-escalating"
+    elif escalating or deescalating or mixed:
+        verdict = "mixed"
+    else:
+        verdict = "insufficient"
+
+    if verdict == "escalating":
+        qualification = "Recent multi-source reporting still shows active exchanges and points to a broader or sharper phase, not a clear pullback."
+        bullet_pool = [*escalating[:2], *mixed[:1], *deescalating[:1]]
+    elif verdict == "de-escalating":
+        qualification = "Recent reporting still shows active exchanges, but the pace looks lower than the earlier peak and there is no clear sign of immediate widening."
+        bullet_pool = [*deescalating[:2], *mixed[:1], *escalating[:1]]
+    elif verdict == "mixed":
+        qualification = "Recent reporting still shows active exchanges, but the signals are mixed and there is no clear decisive shift in direction."
+        bullet_pool = [*escalating[:1], *deescalating[:1], *mixed[:1]]
+    else:
+        qualification = "There is too little recent, reliable evidence here to judge whether the conflict is intensifying or easing."
+        bullet_pool = [*mixed[:1], *escalating[:1], *deescalating[:1]]
+
+    bullets: list[str] = []
+    seen_keys: set[str] = set()
+    for item in bullet_pool:
+        key = _digest_line_key(item.text)
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        bullets.append(item.text)
+        if len(bullets) >= 3:
+            break
+
+    return StrategicTrendSummary(
+        verdict=verdict,
+        qualification=qualification,
+        bullets=tuple(bullets),
+        escalating_evidence=escalating,
+        deescalating_evidence=deescalating,
+        mixed_evidence=mixed,
+        distinct_sources=len(unique_sources),
+        recent_span_hours=recent_span_hours,
+    )
+
+
+def _render_strategic_trend_answer(summary: StrategicTrendSummary) -> str:
+    parts = [f"<b>{sanitize_telegram_html(_strategic_query_verdict_title(summary.verdict))}</b>"]
+    if summary.qualification:
+        parts.append(sanitize_telegram_html(summary.qualification))
+    for line in summary.bullets[:3]:
+        parts.append(f"• {sanitize_telegram_html(line)}")
+    return "<br>".join(parts)
+
+
 def _score_query_context_row(
     query: str,
     item: Dict[str, object],
@@ -3668,7 +4037,7 @@ def _score_query_context_row(
         age_hours = max(0.0, (now_ts - timestamp) / 3600.0)
         recency_score = max(0.0, 1.0 - min(age_hours / 48.0, 1.0))
 
-    return (
+    total = (
         keyword_score
         + alias_score
         + number_score
@@ -3678,6 +4047,10 @@ def _score_query_context_row(
         + source_score
         + recency_score
     )
+    if query_prefers_direct_answer(question):
+        total += _strategic_query_signal_bonus(text)
+        total -= _strategic_query_noise_penalty(text)
+    return total
 
 
 def _scored_query_context(
@@ -3705,6 +4078,14 @@ def _query_confidence_allows_answer(
 ) -> bool:
     if not scored_rows:
         return False
+
+    if query_prefers_direct_answer(query):
+        relevant = [
+            row
+            for score, row in scored_rows[:12]
+            if score >= 1.2 and _strategic_query_signal(str(row.get("text") or "")) != "none"
+        ]
+        return bool(relevant)
 
     if is_broad_news_query(query):
         return len(scored_rows) >= 2
@@ -3810,6 +4191,13 @@ def _query_collect_fallback_candidates(
 
 
 def _query_fallback_title(query: str, candidate_lines: Sequence[str]) -> str:
+    if query_prefers_direct_answer(query):
+        return _strategic_query_verdict_title(
+            _build_strategic_trend_summary(
+                query,
+                [{"text": line, "source": "fallback", "timestamp": 0} for line in candidate_lines],
+            ).verdict
+        )
     if candidate_lines:
         headline = _fallback_headline(" ".join(candidate_lines[:2])) or _fallback_headline(candidate_lines[0])
         if headline:
@@ -3963,6 +4351,10 @@ def _fallback_query_answer(
 ) -> str:
     if not context_messages:
         return QUERY_NO_MATCH_TEXT
+
+    if query_prefers_direct_answer(query):
+        summary = _build_strategic_trend_summary(query, context_messages)
+        return _render_strategic_trend_answer(summary)
 
     candidates = _query_collect_fallback_candidates(query, context_messages, detailed=detailed)
     if not candidates:
@@ -5073,6 +5465,19 @@ def _query_quality_issue(answer_html: str, question: str) -> str:
         return "citation_leak"
     if cleaned.endswith(("...", "…", ":", "-", "–", "—", "/")):
         return "incomplete_copy"
+    if query_prefers_direct_answer(question):
+        strategic_markers = (
+            "still active and escalating",
+            "still active, but easing from the earlier peak",
+            "still active with mixed signals; no clear decisive shift",
+            "not enough recent evidence to judge direction",
+        )
+        if not any(marker in lowered for marker in strategic_markers):
+            return "strategic_verdict_missing"
+        if any(marker in lowered for marker in _STRATEGIC_TREND_RHETORIC_MARKERS):
+            return "offtopic_copy"
+        if _query_is_quote_heavy(cleaned):
+            return "offtopic_copy"
     bullet_count = cleaned.count("•")
     if not _query_requests_detail(question):
         if bullet_count > 4 or len(cleaned) > 800:
@@ -5487,11 +5892,29 @@ async def generate_answer_from_context_result(
     manager = auth_manager or AuthManager(logger=LOGGER)
     detailed = _query_requests_detail(question)
     high_risk_query = _query_is_high_risk(question)
+    strategic_trend_query = query_prefers_direct_answer(question)
     strict_confirmation_query = _query_requires_multi_source_confirmation(question)
     scored_context = _scored_query_context(question, context_messages)
     ranked_context = _rank_query_context(question, context_messages, limit=24)
     distinct_sources = _query_distinct_sources(ranked_context[:10] or context_messages)
     output_language = _resolve_output_language()
+
+    if strategic_trend_query:
+        summary = _build_strategic_trend_summary(question, ranked_context or context_messages)
+        result = _make_generated_text_result(
+            _render_strategic_trend_answer(summary),
+            copy_origin="fallback",
+        )
+        log_structured(
+            LOGGER,
+            "query_generation_result",
+            copy_origin=result.copy_origin,
+            fallback_reason=result.fallback_reason,
+            ai_attempt_count=result.ai_attempt_count,
+            ai_quality_retry_used=result.ai_quality_retry_used,
+            output_chars=len(result.html),
+        )
+        return result
 
     # Strict guardrail for high-risk queries (leadership/death/succession):
     # if evidence diversity is weak, do not produce potentially false claims.
@@ -5542,6 +5965,7 @@ async def generate_answer_from_context_result(
     base_prompt = build_query_system_prompt(
         output_language=output_language,
         detailed=detailed,
+        strategic_trend=strategic_trend_query,
     )
     retry_issue = ""
 

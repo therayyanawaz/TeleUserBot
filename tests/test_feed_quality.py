@@ -649,6 +649,22 @@ def test_query_quality_issue_rejects_verbose_source_dump():
     }
 
 
+def test_query_quality_issue_rejects_offtopic_strategic_answer():
+    html = (
+        "<b>Direct answer</b><br>"
+        "Unhinged US leadership dials up religious rhetoric in Iran war.<br>"
+        "• To quote the Bible, why do you look at the speck of sawdust."
+    )
+
+    assert (
+        ai_filter._query_quality_issue(
+            html,
+            "What is the situation regarding the Iran-Israel conflict? Is it escalating or de-escalating, and to what extent?",
+        )
+        == "strategic_verdict_missing"
+    )
+
+
 def test_severity_classifier_downgrades_explainer_with_shot_down_keyword():
     severity_classifier._HIGH_SEVERITY_HISTORY.clear()
     severity, _score, breakdown = severity_classifier.classify_message_severity(
@@ -963,6 +979,80 @@ def test_fallback_query_answer_splits_oversize_single_evidence_line_cleanly():
     assert plain.count("•") >= 1
     assert "Sentence 139 closes cleanly." in plain
     assert not plain.rstrip().endswith("...")
+
+
+def test_fallback_query_answer_returns_mixed_verdict_for_strategic_conflict_query():
+    query = (
+        "What is the situation regarding the Iran-Israel conflict? "
+        "Is it escalating or de-escalating, and to what extent?"
+    )
+    answer = ai_filter._fallback_query_answer(
+        query,
+        [
+            {
+                "text": "Fresh missile warnings and another wave of interceptions were reported overnight.",
+                "source": "Desk Wire",
+                "timestamp": 1700000200,
+            },
+            {
+                "text": "Reuters said the exchange was still active but the pace was lower than the earlier peak.",
+                "source": "Reuters",
+                "timestamp": 1700000100,
+                "is_web": True,
+            },
+            {
+                "text": "Officials said neither side was widening the conflict immediately despite continued alerts.",
+                "source": "AP",
+                "timestamp": 1700000000,
+                "is_web": True,
+            },
+            {
+                "text": "The war is a religious crusade. To quote the Bible, why do you look at the speck of sawdust.",
+                "source": "War & News Alert",
+                "timestamp": 1699999900,
+            },
+        ],
+        detailed=False,
+    )
+    plain = ai_filter.strip_telegram_html(answer)
+
+    assert "Still active with mixed signals" in plain
+    assert "religious crusade" not in plain
+    assert "quote the Bible" not in plain
+
+
+def test_fallback_query_answer_returns_deescalating_verdict_when_sources_lean_that_way():
+    query = (
+        "What is the situation regarding the Iran-Israel conflict? "
+        "Is it escalating or de-escalating, and to what extent?"
+    )
+    answer = ai_filter._fallback_query_answer(
+        query,
+        [
+            {
+                "text": "Reuters said the exchange remained active but the pace was lower than the earlier peak.",
+                "source": "Reuters",
+                "timestamp": 1700000200,
+                "is_web": True,
+            },
+            {
+                "text": "Officials said neither side was widening the conflict immediately and both were showing restraint.",
+                "source": "AP",
+                "timestamp": 1700000100,
+                "is_web": True,
+            },
+            {
+                "text": "Alerts continued overnight, but there was no broader follow-on wave of strikes.",
+                "source": "BBC",
+                "timestamp": 1700000000,
+                "is_web": True,
+            },
+        ],
+        detailed=False,
+    )
+    plain = ai_filter.strip_telegram_html(answer)
+
+    assert "Still active, but easing from the earlier peak" in plain
 
 
 def test_prepare_media_caption_chunks_preserves_complete_sentences():
@@ -1779,6 +1869,39 @@ async def test_handle_query_request_uses_direct_answer_for_broad_trend_query(mon
 
     assert generate_calls == ["called"]
     assert any("pace looks lower" in text.lower() for text in sent_texts)
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_from_context_uses_deterministic_strategy_for_strategic_query(monkeypatch):
+    async def fail_call_codex(*_args, **_kwargs):
+        raise AssertionError("strategic query should not call ai path")
+
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fail_call_codex)
+
+    result = await ai_filter.generate_answer_from_context_result(
+        (
+            "What is the situation regarding the Iran-Israel conflict? "
+            "Is it escalating or de-escalating, and to what extent?"
+        ),
+        [
+            {
+                "text": "Reuters said the exchange remained active but the pace was lower than the earlier peak.",
+                "source": "Reuters",
+                "timestamp": 1700000200,
+                "is_web": True,
+            },
+            {
+                "text": "Officials said neither side was widening the conflict immediately and both were showing restraint.",
+                "source": "AP",
+                "timestamp": 1700000100,
+                "is_web": True,
+            },
+        ],
+        auth_manager=None,
+    )
+
+    plain = ai_filter.strip_telegram_html(result.html)
+    assert "Still active" in plain
 
 
 @pytest.mark.asyncio

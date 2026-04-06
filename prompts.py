@@ -206,11 +206,21 @@ Tone examples:
 """.strip()
 
 
-def build_query_system_prompt(*, output_language: str, detailed: bool) -> str:
+def build_query_system_prompt(
+    *,
+    output_language: str,
+    detailed: bool,
+    strategic_trend: bool = False,
+) -> str:
     mode_line = (
         "Detail mode enabled: still lead with a sharp direct answer, then use no more than 4 short support bullets."
         if detailed
         else "Detail mode disabled: keep the response headline-first, punchy, and under roughly 120 words."
+    )
+    strategic_line = (
+        "Strategic trend query: compare direction across the evidence, distinguish ongoing activity from true acceleration, ignore rhetoric and commentary, and say 'mixed / no clear decisive shift' when the evidence does not clearly lean one way."
+        if strategic_trend
+        else ""
     )
     base = QUERY_SYSTEM_PROMPT.replace("NO_MATCH_SENTINEL", QUERY_NO_MATCH_TEXT)
     return (
@@ -218,5 +228,6 @@ def build_query_system_prompt(*, output_language: str, detailed: bool) -> str:
         f"Output language must be {output_language}. Translate source text when needed.\n"
         f"{HUMAN_NEWSROOM_VOICE}\n"
         f"{HTML_RULES}\n"
-        f"{mode_line}"
+        f"{mode_line}\n"
+        f"{strategic_line}".rstrip()
     )
