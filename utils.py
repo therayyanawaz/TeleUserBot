@@ -1635,6 +1635,8 @@ async def search_recent_messages(
         fallback_limit = max(fallback_limit, 90)
 
     collected: dict[tuple[str, int], dict[str, Any]] = {}
+    collected_lock = asyncio.Lock()
+    scan_parallelism = max(1, min(len(monitored_chats), 6 if sparse_subject_query else 4))
 
     async def _emit_progress(**payload: Any) -> None:
         if progress_cb is None:
@@ -1660,8 +1662,6 @@ async def search_recent_messages(
             return
         chat_id = str(chat_id_raw)
         dedupe_key = (chat_id, message_id)
-        if dedupe_key in collected:
-            return
 
         dt = getattr(msg, "date", None)
         if not isinstance(dt, datetime):
@@ -1698,15 +1698,22 @@ async def search_recent_messages(
             message_id=message_id,
         ) or ""
 
-        collected[dedupe_key] = {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "timestamp": int(dt.timestamp()),
-            "date": dt.isoformat(),
-            "source": source,
-            "text": text_value,
-            "link": link,
-        }
+        async with collected_lock:
+            if dedupe_key in collected:
+                return
+            collected[dedupe_key] = {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "timestamp": int(dt.timestamp()),
+                "date": dt.isoformat(),
+                "source": source,
+                "text": text_value,
+                "link": link,
+            }
+
+    async def _reached_limit() -> bool:
+        async with collected_lock:
+            return len(collected) >= resolved_max
 
     async def _scan_chat(
         chat_ref: int | str,
@@ -1717,13 +1724,15 @@ async def search_recent_messages(
     ) -> None:
         while True:
             try:
+                if await _reached_limit():
+                    return
                 kwargs: dict[str, Any] = {"limit": int(limit)}
                 if search_text:
                     kwargs["search"] = search_text
 
                 async for msg in client.iter_messages(chat_ref, **kwargs):
                     await _append_message(msg, strict_keyword_filter=strict_keyword_filter)
-                    if len(collected) >= resolved_max:
+                    if await _reached_limit():
                         return
                 return
             except FloodWaitError as exc:
@@ -1736,6 +1745,34 @@ async def search_recent_messages(
                     logger.debug("Query search failed for chat=%s", chat_ref, exc_info=True)
                 return
 
+    async def _scan_chat_batch(
+        *,
+        search_text: str | None,
+        limit: int,
+        strict_keyword_filter: bool,
+    ) -> None:
+        semaphore = asyncio.Semaphore(scan_parallelism)
+
+        async def _run(chat_ref: int | str) -> None:
+            async with semaphore:
+                await _scan_chat(
+                    chat_ref,
+                    search_text=search_text,
+                    limit=limit,
+                    strict_keyword_filter=strict_keyword_filter,
+                )
+
+        tasks = [
+            asyncio.create_task(_run(chat_ref), name="query-scan-chat")
+            for chat_ref in monitored_chats
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
     # Stage 1: server-side fuzzy search using multiple variants. Long natural
     # language questions often perform poorly as a single literal search string.
     search_variants = list(plan.search_variants)
@@ -1747,16 +1784,12 @@ async def search_recent_messages(
             variant=search_text,
             window_hours=plan.hours_back,
         )
-        for chat_ref in monitored_chats:
-            await _scan_chat(
-                chat_ref,
-                search_text=search_text,
-                limit=stage_limit,
-                strict_keyword_filter=False,
-            )
-            if len(collected) >= resolved_max:
-                break
-        if len(collected) >= resolved_max:
+        await _scan_chat_batch(
+            search_text=search_text,
+            limit=stage_limit,
+            strict_keyword_filter=False,
+        )
+        if await _reached_limit():
             break
 
     # Stage 2: fallback scan when server-side search is weak, not only fully empty.
@@ -1768,15 +1801,11 @@ async def search_recent_messages(
             variant=None,
             window_hours=plan.hours_back,
         )
-        for chat_ref in monitored_chats:
-            await _scan_chat(
-                chat_ref,
-                search_text=None,
-                limit=fallback_limit,
-                strict_keyword_filter=bool(keyword_terms or query_numbers),
-            )
-            if len(collected) >= resolved_max:
-                break
+        await _scan_chat_batch(
+            search_text=None,
+            limit=fallback_limit,
+            strict_keyword_filter=bool(keyword_terms or query_numbers),
+        )
 
     ordered = sorted(
         collected.values(),
@@ -1895,8 +1924,6 @@ async def search_recent_news_web(
     cutoff = now - timedelta(hours=resolved_hours)
     start_bound_ts = int(plan.start_ts or int(cutoff.timestamp()))
     end_bound_ts = int(plan.end_ts or 0)
-    dedupe: set[str] = set()
-    rows: list[dict[str, Any]] = []
     search_variants = [
         variant for variant in plan.search_variants
         if isinstance(variant, str) and normalize_space(variant)
@@ -1931,111 +1958,134 @@ async def search_recent_news_web(
             if logger:
                 logger.debug("Query progress callback failed during web search.", exc_info=True)
 
+    async def _fetch_variant(
+        http: Any,
+        *,
+        variant: str,
+        provider_name: str,
+        build_url,
+    ) -> list[dict[str, Any]]:
+        search_query = f"{variant} when:{resolved_hours}h"
+        await _emit_progress(
+            scope="web",
+            phase="variant",
+            variant=variant,
+            provider=provider_name,
+            window_hours=resolved_hours,
+        )
+        url = build_url(search_query)
+        response = await http.get(url)
+        if response.status_code != 200:
+            if logger:
+                logger.debug(
+                    "Web cross-check RSS status=%s provider=%s variant=%s",
+                    response.status_code,
+                    provider_name,
+                    variant,
+                )
+            return []
+
+        try:
+            root = ET.fromstring(response.text)
+        except Exception:
+            if logger:
+                logger.debug(
+                    "Web cross-check RSS parse failure provider=%s variant=%s.",
+                    provider_name,
+                    variant,
+                    exc_info=True,
+                )
+            return []
+
+        out: list[dict[str, Any]] = []
+        local_dedupe: set[str] = set()
+        for item in root.findall(".//item"):
+            title = normalize_space(str(item.findtext("title") or ""))
+            link = normalize_space(str(item.findtext("link") or ""))
+            description = _strip_html_tags(str(item.findtext("description") or ""))
+            pub_raw = normalize_space(str(item.findtext("pubDate") or ""))
+            source_tag = item.find("source")
+            source_name = normalize_space(source_tag.text if source_tag is not None else "")
+
+            if not title or not link:
+                continue
+            if not link.startswith("http"):
+                continue
+
+            host = normalize_space(str(urlparse(link).hostname or "")).lower()
+            host_allowed = _domain_allowed(host, trusted_domains)
+            source_allowed = _source_allowed(source_name, trusted_domains)
+            if not host_allowed and not source_allowed:
+                continue
+
+            pub_dt = _parse_pub_datetime(pub_raw)
+            if require_recent:
+                if pub_dt is None:
+                    continue
+                pub_ts = int(pub_dt.timestamp())
+                if pub_ts < start_bound_ts:
+                    continue
+                if end_bound_ts > 0 and pub_ts >= end_bound_ts:
+                    continue
+                if pub_dt > now + timedelta(minutes=5):
+                    continue
+            if pub_dt is None:
+                pub_dt = now
+
+            if not source_name:
+                source_name = host or "web"
+
+            snippet = title
+            if description and description.lower() not in title.lower():
+                snippet = f"{title}. {description}"
+            if len(snippet) > 700:
+                snippet = f"{snippet[:697].rsplit(' ', 1)[0]}..."
+
+            sig = f"{host}|{title.lower()}"
+            if sig in local_dedupe:
+                continue
+            local_dedupe.add(sig)
+
+            out.append(
+                {
+                    "chat_id": "web",
+                    "message_id": 0,
+                    "timestamp": int(pub_dt.timestamp()),
+                    "date": pub_dt.isoformat(),
+                    "source": f"Web:{source_name}",
+                    "text": snippet,
+                    "link": link,
+                    "provider": provider_name,
+                    "is_web": True,
+                }
+            )
+        return out
+
     try:
         http = await get_web_http_client()
         original_headers = dict(http.headers)
         http.headers.update(headers)
         try:
-            for variant in search_variants[:6]:
-                search_query = f"{variant} when:{resolved_hours}h"
-                for provider_name, build_url in providers:
-                    await _emit_progress(
-                        scope="web",
-                        phase="variant",
+            semaphore = asyncio.Semaphore(max(1, min(4, len(search_variants[:6]) * len(providers))))
+
+            async def _run_variant_provider(variant: str, provider_name: str, build_url):
+                async with semaphore:
+                    return await _fetch_variant(
+                        http,
                         variant=variant,
-                        provider=provider_name,
-                        window_hours=resolved_hours,
+                        provider_name=provider_name,
+                        build_url=build_url,
                     )
-                    url = build_url(search_query)
-                    response = await http.get(url)
-                    if response.status_code != 200:
-                        if logger:
-                            logger.debug(
-                                "Web cross-check RSS status=%s provider=%s variant=%s",
-                                response.status_code,
-                                provider_name,
-                                variant,
-                            )
-                        continue
 
-                    try:
-                        root = ET.fromstring(response.text)
-                    except Exception:
-                        if logger:
-                            logger.debug(
-                                "Web cross-check RSS parse failure provider=%s variant=%s.",
-                                provider_name,
-                                variant,
-                                exc_info=True,
-                            )
-                        continue
-
-                    for item in root.findall(".//item"):
-                        title = normalize_space(str(item.findtext("title") or ""))
-                        link = normalize_space(str(item.findtext("link") or ""))
-                        description = _strip_html_tags(str(item.findtext("description") or ""))
-                        pub_raw = normalize_space(str(item.findtext("pubDate") or ""))
-                        source_tag = item.find("source")
-                        source_name = normalize_space(source_tag.text if source_tag is not None else "")
-
-                        if not title or not link:
-                            continue
-                        if not link.startswith("http"):
-                            continue
-
-                        host = normalize_space(str(urlparse(link).hostname or "")).lower()
-                        host_allowed = _domain_allowed(host, trusted_domains)
-                        source_allowed = _source_allowed(source_name, trusted_domains)
-                        if not host_allowed and not source_allowed:
-                            continue
-
-                        pub_dt = _parse_pub_datetime(pub_raw)
-                        if require_recent:
-                            if pub_dt is None:
-                                continue
-                            pub_ts = int(pub_dt.timestamp())
-                            if pub_ts < start_bound_ts:
-                                continue
-                            if end_bound_ts > 0 and pub_ts >= end_bound_ts:
-                                continue
-                            if pub_dt > now + timedelta(minutes=5):
-                                continue
-                        if pub_dt is None:
-                            pub_dt = now
-
-                        if not source_name:
-                            source_name = host or "web"
-
-                        snippet = title
-                        if description and description.lower() not in title.lower():
-                            snippet = f"{title}. {description}"
-                        if len(snippet) > 700:
-                            snippet = f"{snippet[:697].rsplit(' ', 1)[0]}..."
-
-                        sig = f"{host}|{title.lower()}"
-                        if sig in dedupe:
-                            continue
-                        dedupe.add(sig)
-
-                        rows.append(
-                            {
-                                "chat_id": "web",
-                                "message_id": 0,
-                                "timestamp": int(pub_dt.timestamp()),
-                                "date": pub_dt.isoformat(),
-                                "source": f"Web:{source_name}",
-                                "text": snippet,
-                                "link": link,
-                                "provider": provider_name,
-                                "is_web": True,
-                            }
-                        )
-                        if len(rows) >= resolved_max:
-                            break
-                    if len(rows) >= resolved_max:
-                        break
-                if len(rows) >= resolved_max:
-                    break
+            tasks = [
+                asyncio.create_task(
+                    _run_variant_provider(variant, provider_name, build_url),
+                    name="query-web-rss",
+                )
+                for variant in search_variants[:6]
+                for provider_name, build_url in providers
+            ]
+            task_results = await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             http.headers.clear()
             http.headers.update(original_headers)
@@ -2043,6 +2093,22 @@ async def search_recent_news_web(
         if logger:
             logger.debug("Web cross-check search failed.", exc_info=True)
         return []
+
+    dedupe: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    for result in task_results:
+        if isinstance(result, Exception):
+            if logger:
+                logger.debug("Web cross-check task failed.", exc_info=result)
+            continue
+        for row in result:
+            host = normalize_space(str(urlparse(str(row.get("link") or "")).hostname or "")).lower()
+            title = normalize_space(str(row.get("text") or "")).lower()
+            sig = f"{host}|{title}"
+            if sig in dedupe:
+                continue
+            dedupe.add(sig)
+            rows.append(row)
 
     rows.sort(key=lambda row: int(row.get("timestamp", 0)), reverse=True)
     return rows[:resolved_max]

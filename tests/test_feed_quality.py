@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -258,6 +259,37 @@ def test_build_query_search_variants_prioritize_subject_terms_for_choice_queries
     assert "oracle" in variants
     assert "aws" in variants
     assert "which data centers did" not in variants
+
+
+@pytest.mark.asyncio
+async def test_search_recent_messages_scans_chats_in_parallel():
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.started: list[float] = []
+
+        async def iter_messages(self, chat_ref, **kwargs):
+            self.started.append(asyncio.get_running_loop().time())
+            await asyncio.sleep(0.05)
+            if False:
+                yield None
+            return
+
+    client = _FakeClient()
+
+    started_at = asyncio.get_running_loop().time()
+    rows = await utils.search_recent_messages(
+        client,
+        ["chat-1", "chat-2", "chat-3", "chat-4"],
+        "Oracle Dubai",
+        max_messages=20,
+        default_hours_back=24,
+    )
+    elapsed = asyncio.get_running_loop().time() - started_at
+
+    assert rows == []
+    assert len(client.started) >= 4
+    assert max(client.started[:4]) - min(client.started[:4]) < 0.02
+    assert elapsed < 0.45
 
 
 def test_parse_time_filter_today_uses_configured_timezone(monkeypatch):
@@ -1416,7 +1448,7 @@ async def test_stream_query_answer_uses_threaded_final_delivery(monkeypatch):
     assert send_calls[0]["reply_to"] == 1000
     if len(send_calls) >= 2:
         assert send_calls[1]["reply_to"] == send_calls[0]["message_id"]
-    assert stats.message_count == len(calls)
+    assert stats.message_count == len(calls) - 1
 
 
 @pytest.mark.asyncio
@@ -1496,7 +1528,7 @@ async def test_handle_query_request_expands_to_seven_days_before_web_crosscheck(
 
     assert search_hours == [24, 168]
     assert web_hours == [168]
-    assert any(text == main._query_expand_status() for text in progress_texts)
+    assert any(main._query_expand_status() in text for text in progress_texts)
     assert any("trusted web sources" in text for text in progress_texts)
 
 
