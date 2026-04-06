@@ -58,7 +58,6 @@ from ai_filter import (
     summarize_breaking_headline,
     summarize_vital_rational_view,
     summarize_or_skip,
-    translate_ocr_text_to_english,
 )
 from prompts import QUERY_NO_MATCH_TEXT, digest_output_style
 from auth import (
@@ -843,7 +842,7 @@ def _auth_env_only_mode() -> bool:
 def _auth_disabled_features_for_runtime() -> List[str]:
     if auth_ready and not auth_degraded:
         return []
-    return ["query_mode", "ocr_translation", "vital_rational_view"]
+    return ["query_mode", "vital_rational_view"]
 
 
 def _trim_runtime_reason(text: str, *, limit: int = 220) -> str:
@@ -5832,13 +5831,6 @@ async def _handle_triage_inbound_job(job: Dict[str, object]) -> None:
         payload_json=_pipeline_payload_json(payload),
         priority=_pipeline_priority_for_severity(severity),
     )
-
-
-async def _handle_ocr_inbound_job(job: Dict[str, object]) -> None:
-    payload = _load_inbound_payload(job)
-    payload["final_action"] = "skip"
-    payload["skip_reason"] = "media_unsupported"
-    await _advance_job_to_archive(job, payload)
 
 
 async def _handle_ai_inbound_job(job: Dict[str, object]) -> None:

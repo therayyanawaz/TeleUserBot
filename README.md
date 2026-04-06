@@ -25,7 +25,6 @@ TeleUserBot fixes that by combining:
 - severity-aware routing
 - breaking-story continuity
 - 30-minute rolling and daily 24-hour digest generation
-- OCR translation for media-only posts
 - private query mode with Telegram-first evidence search
 - mandatory trusted web cross-check for query answers
 - Telegram HTML output with optional premium emoji rendering
@@ -73,13 +72,6 @@ TeleUserBot fixes that by combining:
 
 - Set one runtime timezone in `.env` so `today`, `yesterday`, daily digests, and other local-time logic stay stable across restarts and servers
 - Use an IANA timezone name such as `Asia/Kolkata` for IST
-
-### 🖼️ OCR for Media-Only Posts
-
-- Image OCR for posts without captions
-- First-frame video OCR for media-only videos
-- Translation only when non-English text is detected
-- No invented visual descriptions, no fake captions
 
 ### 🎨 Clean Telegram Output
 
@@ -135,7 +127,7 @@ That directory stores runtime metadata such as:
 
 1. TeleUserBot connects to your Telegram account.
 2. It resolves sources from your shared folder and extra channels.
-3. Incoming posts pass through duplicate, OCR, and severity logic.
+3. Incoming posts pass through duplicate and severity logic.
 4. High-signal updates can be delivered instantly.
 5. Everything else is organized into digest workflows and searchable history.
 
@@ -146,7 +138,6 @@ That directory stores runtime metadata such as:
 - Telegram `api_id` and `api_hash` from `https://my.telegram.org`
 - A Telegram account for Telethon login
 - Optional bot token for Bot API delivery or bot-PM query mode
-- Optional OCR system packages if you want image/video text extraction
 
 ## 🚀 Quick Start
 
@@ -186,7 +177,7 @@ pip install -r requirements.txt
 pip install -r requirements.optional.txt
 ```
 
-Optional extras enable heavier features like OCR helpers and `sentence-transformers` support if you explicitly choose to use them.
+Optional extras enable heavier features like `sentence-transformers` support if you explicitly choose to use them.
 
 ### 5. Copy the environment template
 
@@ -222,7 +213,6 @@ This script:
 - creates `.venv`
 - installs `requirements.txt` and `requirements.optional.txt`
 - installs FFmpeg
-- installs Tesseract OCR
 - warms the `sentence-transformers` cache
 
 ### Ubuntu
@@ -235,7 +225,6 @@ This script:
 
 - selects the newest installed Python 3.11+ interpreter, or installs the newest available `python3.x` package when needed
 - installs FFmpeg and Tesseract
-- installs multilingual OCR language packs
 - creates `.venv`
 - installs all Python dependencies
 - warms the `sentence-transformers` cache
@@ -595,7 +584,6 @@ Example:
 
 Check:
 
-- OCR is enabled
 - Tesseract is installed
 - language packs are installed
 - the media actually contains readable non-English text

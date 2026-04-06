@@ -120,14 +120,9 @@ if [[ -z "$python_bin" ]]; then
   python_version="$(python_version_of "$python_bin")"
 fi
 
-log "Installing FFmpeg and Tesseract"
+log "Installing FFmpeg"
 $SUDO apt-get install -y \
-  ffmpeg \
-  tesseract-ocr \
-  tesseract-ocr-ara \
-  tesseract-ocr-fas \
-  tesseract-ocr-rus \
-  tesseract-ocr-urd
+  ffmpeg
 
 log "Checking Python version"
 $python_bin - <<'PY'

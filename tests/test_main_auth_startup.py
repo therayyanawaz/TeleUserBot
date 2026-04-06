@@ -105,7 +105,6 @@ async def test_prepare_auth_runtime_degraded_missing_auth_continues(monkeypatch)
     assert main.auth_startup_mode_effective == "degraded"
     assert "Missing OAuth token in env." in main.auth_failure_reason
     assert "query_mode" in main.auth_features_disabled
-    assert "ocr_translation" in main.auth_features_disabled
 
 
 @pytest.mark.asyncio
@@ -318,7 +317,7 @@ async def test_status_payload_and_digest_status_include_auth_health(monkeypatch)
     main.auth_ready = False
     main.auth_degraded = True
     main.auth_failure_reason = "Missing OAuth token in env."
-    main.auth_features_disabled = ["query_mode", "ocr_translation"]
+    main.auth_features_disabled = ["query_mode"]
 
     monkeypatch.setattr(main, "count_pending", lambda: 0)
     monkeypatch.setattr(main, "count_inflight", lambda: 0)
@@ -352,7 +351,7 @@ async def test_status_payload_and_digest_status_include_auth_health(monkeypatch)
     assert payload["auth"]["mode_effective"] == "degraded"
     assert payload["auth"]["ready"] is False
     assert payload["auth"]["degraded"] is True
-    assert payload["auth"]["features_disabled"] == ["query_mode", "ocr_translation"]
+    assert payload["auth"]["features_disabled"] == ["query_mode"]
     assert payload["auth"]["startup_repair_status"] == "not_needed"
 
     event = _FakeEvent()
@@ -360,7 +359,7 @@ async def test_status_payload_and_digest_status_include_auth_health(monkeypatch)
     assert event.messages
     assert "Auth Status" in event.messages[0]
     assert "degraded" in event.messages[0]
-    assert "query_mode, ocr_translation" in event.messages[0]
+    assert "query_mode" in event.messages[0]
     assert "Startup repair" in event.messages[0]
     assert "Recovery mode" in event.messages[0]
 

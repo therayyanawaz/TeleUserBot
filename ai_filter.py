@@ -267,7 +267,6 @@ _SUMMARY_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
 _SEVERITY_CACHE: "OrderedDict[str, str]" = OrderedDict()
 _HEADLINE_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
 _VITAL_VIEW_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
-_OCR_TRANSLATION_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
 _QUOTA_WARNING_LOGGED = False
 _FILTER_DECISION_CACHE_HITS = 0
 _FILTER_DECISION_CACHE_MISSES = 0
@@ -436,20 +435,6 @@ def _vital_view_cache_set(key: str, value: Optional[str]) -> None:
     _VITAL_VIEW_CACHE.move_to_end(key)
     while len(_VITAL_VIEW_CACHE) > CACHE_MAX_ITEMS:
         _VITAL_VIEW_CACHE.popitem(last=False)
-
-
-def _ocr_translation_cache_get(key: str) -> Optional[Optional[str]]:
-    if key not in _OCR_TRANSLATION_CACHE:
-        return None
-    _OCR_TRANSLATION_CACHE.move_to_end(key)
-    return _OCR_TRANSLATION_CACHE[key]
-
-
-def _ocr_translation_cache_set(key: str, value: Optional[str]) -> None:
-    _OCR_TRANSLATION_CACHE[key] = value
-    _OCR_TRANSLATION_CACHE.move_to_end(key)
-    while len(_OCR_TRANSLATION_CACHE) > CACHE_MAX_ITEMS:
-        _OCR_TRANSLATION_CACHE.popitem(last=False)
 
 
 def _likely_noise(text: str) -> bool:
@@ -1176,22 +1161,6 @@ def _vital_rational_view_prompt() -> str:
         "Bad: Why it matters: Civilian danger is increasing.\n"
         "If the anchor detail or new delta is weak, missing, or unsupported, reply exactly: SKIP\n"
         "Do not speculate. Do not take sides. No hashtags. No markdown."
-    )
-
-
-def _ocr_translation_prompt() -> str:
-    return (
-        "You receive OCR text extracted from an image or video frame.\n"
-        "Your job is translation only.\n"
-        "Rules:\n"
-        "- If the OCR text is already English, reply exactly: SKIP\n"
-        "- If the OCR text is unreadable, fragmented, or too noisy to trust, reply exactly: SKIP\n"
-        "- If the OCR text is not English, translate it faithfully into clear English\n"
-        "- Preserve names, numbers, times, place names, and warning language\n"
-        "- Do not summarize\n"
-        "- Do not describe the image or video\n"
-        "- Do not add commentary, source labels, headings, bullets, or markdown\n"
-        "- Output plain translated text only"
     )
 
 
@@ -4927,58 +4896,6 @@ async def summarize_vital_rational_view(
 
     _vital_view_cache_set(key, None)
     return None
-
-
-async def translate_ocr_text_to_english(
-    text: str,
-    auth_manager: AuthManager,
-) -> Optional[str]:
-    cleaned = text.strip()
-    if not cleaned or len(cleaned) < 8:
-        return None
-
-    key = _cache_key(f"ocr_translate::{cleaned}")
-    cached = _ocr_translation_cache_get(key)
-    if cached is not None or key in _OCR_TRANSLATION_CACHE:
-        return cached
-
-    compact = cleaned if len(cleaned) <= 2400 else f"{cleaned[:2397].rsplit(' ', 1)[0]}..."
-
-    try:
-        auth_context = await auth_manager.get_auth_context()
-        raw = await _call_codex(
-            compact,
-            auth_context,
-            instructions=_ocr_translation_prompt(),
-            verbosity="low",
-        )
-    except _CodexAuthError:
-        try:
-            auth_context = await auth_manager.refresh_auth_context()
-            raw = await _call_codex(
-                compact,
-                auth_context,
-                instructions=_ocr_translation_prompt(),
-                verbosity="low",
-            )
-        except Exception:
-            _ocr_translation_cache_set(key, None)
-            return None
-    except (_CodexRateLimitError, httpx.HTTPError, _CodexApiError, ValueError):
-        _ocr_translation_cache_set(key, None)
-        return None
-    except Exception:
-        _ocr_translation_cache_set(key, None)
-        return None
-
-    translated = normalize_space(raw)
-    if not translated or translated.upper().startswith("SKIP"):
-        _ocr_translation_cache_set(key, None)
-        return None
-
-    safe = sanitize_telegram_html(translated)
-    _ocr_translation_cache_set(key, safe or None)
-    return safe or None
 
 
 def _make_generated_text_result(
