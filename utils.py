@@ -414,18 +414,29 @@ def build_query_plan(query: str, *, default_hours: int = 24) -> QueryPlan:
 _QUERY_GENERIC_TERMS = {
     "about",
     "after",
+    "all",
+    "also",
     "and",
+    "any",
     "are",
+    "as",
     "brief",
     "briefing",
+    "can",
+    "could",
     "current",
     "day",
     "days",
     "detail",
     "details",
+    "did",
+    "do",
+    "does",
     "development",
     "developments",
     "digest",
+    "explain",
+    "find",
     "for",
     "from",
     "give",
@@ -435,21 +446,38 @@ _QUERY_GENERIC_TERMS = {
     "happening",
     "headline",
     "headlines",
+    "how",
     "hour",
     "hours",
+    "into",
+    "is",
+    "its",
     "last",
     "latest",
+    "lookup",
+    "look",
+    "me",
+    "my",
     "news",
     "now",
+    "of",
+    "on",
+    "or",
     "past",
+    "please",
     "present",
     "query",
     "recent",
     "recently",
     "recap",
+    "regarding",
     "report",
     "reports",
+    "reply",
+    "replying",
     "roundup",
+    "search",
+    "searching",
     "show",
     "situation",
     "status",
@@ -459,17 +487,24 @@ _QUERY_GENERIC_TERMS = {
     "that",
     "the",
     "tell",
+    "there",
+    "this",
     "today",
+    "up",
     "update",
     "updates",
+    "want",
     "was",
     "were",
     "what",
+    "which",
     "when",
     "where",
     "who",
+    "would",
     "with",
     "why",
+    "you",
     "yesterday",
 }
 
@@ -505,6 +540,26 @@ _QUERY_ALIAS_MAP: dict[str, tuple[str, ...]] = {
     "jordan": ("jordan", "الأردن", "اردن"),
     "egypt": ("egypt", "مصر"),
 }
+
+
+_QUERY_FOCUS_LEAD_IN_RE = re.compile(
+    r"^(?:"
+    r"what(?:'s| is)?|which|who|where|when|why|"
+    r"how(?: many| much)?|"
+    r"tell me|show me|give me|find|search(?: for)?|look(?: up)?|"
+    r"can you|could you|would you|do you know"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_QUERY_FOCUS_TOPIC_RE = re.compile(
+    r"^(?:"
+    r"the\s+|"
+    r"latest|recent|current|new|news|updates?|status|situation|coverage|"
+    r"report(?:ing)?|brief(?:ing)?|summary|recap|about|on|for|regarding|re|around"
+    r")+\b",
+    re.IGNORECASE,
+)
 
 
 def extract_query_keywords(query: str) -> list[str]:
@@ -560,11 +615,69 @@ def expand_query_terms(query: str) -> list[str]:
     return out
 
 
+def extract_query_focus_phrases(query: str) -> list[str]:
+    """
+    Pull shorter focus phrases from natural-language questions so search
+    variants emphasize the subject, not the question framing.
+    """
+    normalized = normalize_space(query)
+    if not normalized:
+        return []
+
+    phrases: list[str] = []
+    seen: set[str] = set()
+
+    def _push(value: str) -> None:
+        cleaned = normalize_space(value)
+        if not cleaned:
+            return
+        key = cleaned.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        phrases.append(cleaned)
+
+    for segment in re.split(r"[,:;|]+", normalized):
+        working = normalize_space(re.sub(r"[?!]+", " ", segment))
+        if not working:
+            continue
+
+        previous = ""
+        while working and working != previous:
+            previous = working
+            working = normalize_space(_QUERY_FOCUS_LEAD_IN_RE.sub("", working))
+            working = normalize_space(_QUERY_FOCUS_TOPIC_RE.sub("", working))
+
+        keywords = extract_query_keywords(working)
+        if keywords:
+            _push(" ".join(keywords[:5]))
+
+        parts = re.split(r"\b(?:or|vs\.?|versus|and/or)\b", working, flags=re.IGNORECASE)
+        if len(parts) <= 1:
+            continue
+
+        comparison_terms: list[str] = []
+        for part in parts:
+            part_keywords = extract_query_keywords(part)
+            if not part_keywords:
+                continue
+            _push(" ".join(part_keywords[:3]))
+            comparison_terms.extend(part_keywords[:2])
+
+        comparison_terms = dedupe_preserve_order(comparison_terms)
+        if len(comparison_terms) >= 2:
+            _push(" ".join(comparison_terms[:4]))
+
+    return phrases
+
+
 def build_query_search_variants(query: str, *, broad_query: bool = False) -> list[str | None]:
     """
     Build multiple retrieval-friendly search variants from one user query.
     """
     normalized = normalize_space(query)
+    base_keywords = extract_query_keywords(query)
+    focus_phrases = extract_query_focus_phrases(query)
     expanded_terms = expand_query_terms(query)
     numbers = extract_query_numbers(query)
 
@@ -591,27 +704,43 @@ def build_query_search_variants(query: str, *, broad_query: bool = False) -> lis
     if normalized:
         _push(normalized)
 
-    if expanded_terms:
-        _push(" ".join(expanded_terms[:4]))
-        if len(expanded_terms) >= 2:
-            _push(" ".join(expanded_terms[:2]))
-        if len(expanded_terms) >= 3:
-            _push(" ".join(expanded_terms[:3]))
-        for term in expanded_terms[:10]:
+    for phrase in focus_phrases[:6]:
+        _push(phrase)
+
+    if base_keywords:
+        _push(" ".join(base_keywords[:5]))
+        if len(base_keywords) >= 2:
+            _push(" ".join(base_keywords[:2]))
+            _push(" ".join(base_keywords[-2:]))
+        if len(base_keywords) >= 3:
+            _push(" ".join(base_keywords[:3]))
+            _push(" ".join(base_keywords[-3:]))
+        for term in base_keywords[:10]:
             _push(term)
-        # Pairwise combinations help lexical search for topical place/event queries.
-        for idx in range(min(len(expanded_terms), 4)):
-            for jdx in range(idx + 1, min(len(expanded_terms), 4)):
-                _push(f"{expanded_terms[idx]} {expanded_terms[jdx]}")
+        pairwise_terms = base_keywords[:6]
+        for idx in range(len(pairwise_terms)):
+            for jdx in range(idx + 1, len(pairwise_terms)):
+                _push(f"{pairwise_terms[idx]} {pairwise_terms[jdx]}")
+
+    if expanded_terms:
+        base_keyword_keys = {item.lower() for item in base_keywords}
+        alias_terms = [
+            term for term in expanded_terms
+            if term.lower() not in base_keyword_keys
+        ]
+        for term in alias_terms[:10]:
+            _push(term)
+        if alias_terms and base_keywords:
+            _push(" ".join([base_keywords[0], alias_terms[0]]))
 
     if numbers:
         for number in numbers[:4]:
             _push(number)
-        if expanded_terms:
-            _push(" ".join([*numbers[:2], *expanded_terms[:2]]))
-            _push(" ".join([*expanded_terms[:2], *numbers[:2]]))
+        if base_keywords:
+            _push(" ".join([*numbers[:2], *base_keywords[:2]]))
+            _push(" ".join([*base_keywords[:2], *numbers[:2]]))
 
-    if broad_query and not expanded_terms and not numbers:
+    if broad_query and not base_keywords and not focus_phrases and not numbers:
         _push(None)
 
     return variants or [None]
@@ -1468,6 +1597,7 @@ async def search_recent_messages(
     *,
     max_messages: int = 50,
     default_hours_back: int = 24,
+    progress_cb: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
     logger: logging.Logger | None = None,
 ) -> list[dict[str, Any]]:
     """
@@ -1505,6 +1635,17 @@ async def search_recent_messages(
         fallback_limit = max(fallback_limit, 90)
 
     collected: dict[tuple[str, int], dict[str, Any]] = {}
+
+    async def _emit_progress(**payload: Any) -> None:
+        if progress_cb is None:
+            return
+        try:
+            maybe = progress_cb(payload)
+            if maybe is not None:
+                await maybe
+        except Exception:
+            if logger:
+                logger.debug("Query progress callback failed during Telegram search.", exc_info=True)
 
     def _extract_message_text(msg: Any) -> str:
         return normalize_space(str(getattr(msg, "message", "") or ""))
@@ -1600,6 +1741,12 @@ async def search_recent_messages(
     search_variants = list(plan.search_variants)
 
     for search_text in search_variants:
+        await _emit_progress(
+            scope="telegram",
+            phase="variant",
+            variant=search_text,
+            window_hours=plan.hours_back,
+        )
         for chat_ref in monitored_chats:
             await _scan_chat(
                 chat_ref,
@@ -1615,6 +1762,12 @@ async def search_recent_messages(
     # Stage 2: fallback scan when server-side search is weak, not only fully empty.
     fallback_trigger = max(4, min(resolved_max, 10 if (keyword_terms or query_numbers) else 8))
     if len(collected) < fallback_trigger:
+        await _emit_progress(
+            scope="telegram",
+            phase="fallback",
+            variant=None,
+            window_hours=plan.hours_back,
+        )
         for chat_ref in monitored_chats:
             await _scan_chat(
                 chat_ref,
@@ -1712,6 +1865,7 @@ async def search_recent_news_web(
     max_results: int = 12,
     allowed_domains: Sequence[str] | None = None,
     require_recent: bool = True,
+    progress_cb: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
     logger: logging.Logger | None = None,
 ) -> list[dict[str, Any]]:
     """
@@ -1766,6 +1920,17 @@ async def search_recent_news_web(
         ),
     )
 
+    async def _emit_progress(**payload: Any) -> None:
+        if progress_cb is None:
+            return
+        try:
+            maybe = progress_cb(payload)
+            if maybe is not None:
+                await maybe
+        except Exception:
+            if logger:
+                logger.debug("Query progress callback failed during web search.", exc_info=True)
+
     try:
         http = await get_web_http_client()
         original_headers = dict(http.headers)
@@ -1774,6 +1939,13 @@ async def search_recent_news_web(
             for variant in search_variants[:6]:
                 search_query = f"{variant} when:{resolved_hours}h"
                 for provider_name, build_url in providers:
+                    await _emit_progress(
+                        scope="web",
+                        phase="variant",
+                        variant=variant,
+                        provider=provider_name,
+                        window_hours=resolved_hours,
+                    )
                     url = build_url(search_query)
                     response = await http.get(url)
                     if response.status_code != 200:

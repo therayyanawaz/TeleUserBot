@@ -1507,6 +1507,169 @@ def _query_expand_status() -> str:
     return "Need more context. Widening the Telegram scan to the last 7 days... ⏳"
 
 
+_QUERY_PROGRESS_PROVIDER_LABELS = {
+    "bing_news_rss": "Bing News RSS",
+    "google_news_rss": "Google News RSS",
+}
+
+
+def _query_window_label(hours_back: int) -> str:
+    try:
+        value = max(1, int(hours_back))
+    except Exception:
+        value = 24
+    if value % 24 == 0 and value >= 24:
+        days = value // 24
+        noun = "day" if days == 1 else "days"
+        return f"last {days} {noun}"
+    noun = "hour" if value == 1 else "hours"
+    return f"last {value} {noun}"
+
+
+def _trim_query_progress_value(value: str, *, max_chars: int = 48) -> str:
+    cleaned = normalize_space(value)
+    if len(cleaned) <= max_chars:
+        return cleaned
+    clipped = cleaned[: max_chars - 3].rsplit(" ", 1)[0].strip()
+    if len(clipped) < max_chars // 2:
+        clipped = cleaned[: max_chars - 3].strip()
+    return f"{clipped}..."
+
+
+class _QueryProgressTracker:
+    def __init__(
+        self,
+        *,
+        event_ref: object,
+        progress_ref: Message | Dict[str, object],
+        include_web: bool,
+        prefer_bot_identity: bool,
+        bot_chat_id: int | None,
+    ) -> None:
+        self._event_ref = event_ref
+        self._progress_ref = progress_ref
+        self._include_web = include_web
+        self._prefer_bot_identity = prefer_bot_identity
+        self._bot_chat_id = bot_chat_id
+        self._stage = _query_search_status(include_web)
+        self._window = ""
+        self._telegram_terms: list[str] = []
+        self._web_terms: list[str] = []
+        self._memory_steps: list[str] = []
+        self._telegram_count = 0
+        self._web_count = 0
+        self._last_render = ""
+        self._last_render_at = 0.0
+
+    @property
+    def message_ref(self) -> Message | Dict[str, object]:
+        return self._progress_ref
+
+    def _remember(self, bucket: list[str], value: str, *, max_items: int) -> None:
+        cleaned = _trim_query_progress_value(value)
+        if not cleaned:
+            return
+        lowered = cleaned.lower()
+        existing_idx = next((idx for idx, item in enumerate(bucket) if item.lower() == lowered), None)
+        if existing_idx is not None:
+            bucket.pop(existing_idx)
+        bucket.append(cleaned)
+        if len(bucket) > max_items:
+            del bucket[:-max_items]
+
+    def seed_telegram_terms(self, variants: Sequence[str | None]) -> None:
+        candidates = [
+            normalize_space(str(item))
+            for item in variants
+            if isinstance(item, str) and normalize_space(str(item))
+        ]
+        compact = [item for item in candidates if len(item.split()) <= 6]
+        for value in (compact or candidates[1:] or candidates)[:3]:
+            self._remember(self._telegram_terms, value, max_items=3)
+
+    def _render(self) -> str:
+        html_mode = _is_html_formatting_enabled()
+
+        def _line(label: str, value: str) -> str:
+            if html_mode:
+                return f"<i>{sanitize_telegram_html(label)}:</i> {sanitize_telegram_html(value)}"
+            return f"{label}: {value}"
+
+        stage = normalize_space(self._stage) or _query_search_status(self._include_web)
+        lines = [f"<b>{sanitize_telegram_html(stage)}</b>" if html_mode else stage]
+        if self._window:
+            lines.append(_line("Window", self._window))
+        if self._telegram_terms:
+            lines.append(_line("Telegram", ", ".join(self._telegram_terms[-3:])))
+        if self._web_terms:
+            lines.append(_line("Web", ", ".join(self._web_terms[-2:])))
+        if self._memory_steps:
+            lines.append(_line("Memory", ", ".join(self._memory_steps[-2:])))
+        if self._telegram_count > 0 or self._web_count > 0:
+            counts = [_query_count_label(self._telegram_count, "Telegram update")]
+            if self._web_count > 0:
+                counts.append(_query_count_label(self._web_count, "trusted web report"))
+            lines.append(_line("Found", " and ".join(counts)))
+        return "<br>".join(lines) if html_mode else "\n".join(lines)
+
+    async def _refresh(self, *, force: bool) -> None:
+        text = self._render()
+        now = time.time()
+        if not force and text == self._last_render:
+            return
+        if not force and (now - self._last_render_at) < 0.35:
+            return
+        updated = await _safe_reply_markdown(
+            self._event_ref,  # type: ignore[arg-type]
+            text,
+            edit_message=self._progress_ref,
+            prefer_bot_identity=self._prefer_bot_identity,
+            bot_chat_id=self._bot_chat_id,
+        )
+        if isinstance(updated, (Message, dict)):
+            self._progress_ref = updated
+        self._last_render = text
+        self._last_render_at = time.time()
+
+    async def set_stage(
+        self,
+        stage: str,
+        *,
+        window_hours: int | None = None,
+        telegram_count: int | None = None,
+        web_count: int | None = None,
+        force: bool = False,
+    ) -> None:
+        self._stage = normalize_space(stage)
+        if window_hours is not None:
+            self._window = _query_window_label(window_hours)
+        if telegram_count is not None:
+            self._telegram_count = max(0, int(telegram_count))
+        if web_count is not None:
+            self._web_count = max(0, int(web_count))
+        await self._refresh(force=force)
+
+    async def note_memory(self, label: str) -> None:
+        self._remember(self._memory_steps, label, max_items=2)
+        await self._refresh(force=False)
+
+    async def handle_search_progress(self, payload: Dict[str, object]) -> None:
+        scope = normalize_space(str(payload.get("scope") or "")).lower()
+        phase = normalize_space(str(payload.get("phase") or "")).lower()
+        variant = normalize_space(str(payload.get("variant") or ""))
+        if scope == "telegram":
+            if phase == "fallback":
+                self._remember(self._telegram_terms, "recent history scan", max_items=3)
+            elif variant:
+                self._remember(self._telegram_terms, variant, max_items=3)
+        elif scope == "web":
+            provider_key = normalize_space(str(payload.get("provider") or "")).lower()
+            provider = _QUERY_PROGRESS_PROVIDER_LABELS.get(provider_key, provider_key.replace("_", " ").title())
+            label = provider if not variant else f"{provider}: {variant}"
+            self._remember(self._web_terms, label, max_items=2)
+        await self._refresh(force=False)
+
+
 def _query_expanded_window_hours() -> int:
     return _query_default_crosscheck_hours_back()
 
@@ -9209,6 +9372,7 @@ async def _stream_query_answer(
         typing_enabled=False,
         html_mode=_is_html_formatting_enabled(),
     )
+    progress_message = await _edit_query_message(progress_message, _query_writing_status())
     await streamer.start(initial_ref=progress_message)
 
     if digest_mode:
@@ -9317,6 +9481,19 @@ async def _handle_query_request(
         context_limit = _query_max_messages() * (2 if broad_query or len(query_keywords) <= 2 else 1)
         active_hours = primary_hours
         expanded_window_used = False
+        progress_tracker = _QueryProgressTracker(
+            event_ref=event_ref,
+            progress_ref=progress,
+            include_web=_is_query_web_crosscheck_required(),
+            prefer_bot_identity=prefer_bot_identity,
+            bot_chat_id=bot_chat_id,
+        )
+        progress_tracker.seed_telegram_terms(plan.search_variants)
+        await progress_tracker.set_stage(
+            _query_search_status(_is_query_web_crosscheck_required()),
+            window_hours=primary_hours,
+            force=True,
+        )
 
         telegram_task = asyncio.create_task(
             search_recent_messages(
@@ -9325,6 +9502,7 @@ async def _handle_query_request(
                 cleaned_query,
                 max_messages=context_limit,
                 default_hours_back=primary_hours,
+                progress_cb=progress_tracker.handle_search_progress,
                 logger=LOGGER,
             )
         )
@@ -9339,12 +9517,10 @@ async def _handle_query_request(
                 broad_query=broad_query,
             )
         ):
-            await _safe_reply_markdown(
-                event_ref,  # type: ignore[arg-type]
+            await progress_tracker.set_stage(
                 _query_expand_status(),
-                edit_message=progress,
-                prefer_bot_identity=prefer_bot_identity,
-                bot_chat_id=bot_chat_id,
+                window_hours=expanded_hours,
+                force=True,
             )
             expanded_results = await search_recent_messages(
                 _require_client(),
@@ -9352,6 +9528,7 @@ async def _handle_query_request(
                 cleaned_query,
                 max_messages=context_limit,
                 default_hours_back=expanded_hours,
+                progress_cb=progress_tracker.handle_search_progress,
                 logger=LOGGER,
             )
             telegram_results = _merge_query_context(
@@ -9365,6 +9542,7 @@ async def _handle_query_request(
         queue_results: list[dict[str, object]] = []
         archive_results: list[dict[str, object]] = []
         if broad_query or len(telegram_results) < _query_web_min_telegram_results():
+            await progress_tracker.note_memory("queue memory")
             queue_results = _load_queue_query_context(
                 query_text=effective_query,
                 hours_back=active_hours,
@@ -9381,6 +9559,7 @@ async def _handle_query_request(
                 )
 
         if broad_query or len(telegram_results) < _query_web_min_telegram_results():
+            await progress_tracker.note_memory("archive history")
             archive_results = _load_archive_query_context(
                 query_text=effective_query,
                 hours_back=active_hours,
@@ -9408,12 +9587,10 @@ async def _handle_query_request(
                 requested_hours=active_hours,
                 explicit_time_filter=bool(getattr(plan, "explicit_time_filter", False)),
             )
-            await _safe_reply_markdown(
-                event_ref,  # type: ignore[arg-type]
+            await progress_tracker.set_stage(
                 _query_crosscheck_status(high_risk=high_risk_query),
-                edit_message=progress,
-                prefer_bot_identity=prefer_bot_identity,
-                bot_chat_id=bot_chat_id,
+                window_hours=web_hours,
+                force=True,
             )
             web_results = await _search_recent_news_web_bounded(
                 cleaned_query,
@@ -9421,6 +9598,7 @@ async def _handle_query_request(
                 max_results=_query_web_max_results(),
                 allowed_domains=_query_web_allowed_domains(),
                 require_recent=_query_web_require_recent(),
+                progress_cb=progress_tracker.handle_search_progress,
                 logger=LOGGER,
             )
 
@@ -9447,12 +9625,12 @@ async def _handle_query_request(
             limit=max(context_limit, _query_max_messages()),
         )
 
-        await _safe_reply_markdown(
-            event_ref,  # type: ignore[arg-type]
+        await progress_tracker.set_stage(
             _query_analysis_status(len(telegram_results), len(web_results)),
-            edit_message=progress,
-            prefer_bot_identity=prefer_bot_identity,
-            bot_chat_id=bot_chat_id,
+            window_hours=active_hours,
+            telegram_count=len(telegram_results),
+            web_count=len(web_results),
+            force=True,
         )
 
         history = list(_query_history_for_sender(sender_id))
@@ -9461,7 +9639,7 @@ async def _handle_query_request(
         if _is_streaming_enabled():
             answer, stream_stats = await _stream_query_answer(
                 event_ref,  # type: ignore[arg-type]
-                progress_message=progress,
+                progress_message=progress_tracker.message_ref,
                 query_text=effective_query,
                 results=results,
                 history=history,
@@ -9503,7 +9681,7 @@ async def _handle_query_request(
                 answer = f"{answer.strip()}<br><br>{evidence_split_section}"
             stream_stats = await _deliver_query_final_answer(
                 event_ref,  # type: ignore[arg-type]
-                progress_message=progress,
+                progress_message=progress_tracker.message_ref,
                 final_text=answer,
                 prefer_bot_identity=prefer_bot_identity,
                 bot_chat_id=bot_chat_id,
