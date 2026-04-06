@@ -19,7 +19,6 @@ def _severity_payload(
     source: str = "Desk Wire",
     channel_id: str = "-1001",
     message_id: int = 1,
-    has_media: bool = False,
     has_link: bool = True,
     reply_to: int = 0,
     text_tokens: int | None = None,
@@ -30,7 +29,6 @@ def _severity_payload(
         "source": source,
         "channel_id": channel_id,
         "message_id": message_id,
-        "has_media": has_media,
         "has_link": has_link,
         "reply_to": reply_to,
         "timestamp": 1774275669,
@@ -609,7 +607,6 @@ def test_severity_classifier_downgrades_explainer_with_shot_down_keyword():
             source="Research Desk",
             channel_id="-1001",
             message_id=7,
-            has_media=False,
             text_tokens=42,
         )
     )
@@ -628,7 +625,6 @@ def test_severity_classifier_returns_high_band_for_trusted_breaking_post():
             source="The War Reporter",
             channel_id="-2001",
             message_id=1,
-            has_media=False,
         )
     )
 
@@ -648,7 +644,6 @@ def test_severity_classifier_returns_medium_band_for_meaningful_update():
             source="Desk Wire",
             channel_id="-2002",
             message_id=2,
-            has_media=True,
         )
     )
 
@@ -667,7 +662,6 @@ def test_severity_classifier_returns_low_band_for_noisy_context_post():
             source="Research Desk",
             channel_id="-2003",
             message_id=3,
-            has_media=False,
         )
     )
 
@@ -684,7 +678,6 @@ def test_severity_classifier_cooldown_downgrade_stays_out_of_high_band():
         "Breaking: Officials confirm missile strike hit Haifa moments ago after air raid sirens. 🚨🔥",
         source="The War Reporter",
         channel_id="-2401",
-        has_media=False,
     )
     final = None
     for message_id in range(1, 5):
@@ -710,7 +703,6 @@ def test_severity_classifier_preserves_medium_band_ordering():
             source="Desk Wire",
             channel_id="-2501",
             message_id=1,
-            has_media=True,
         )
     )
     stronger = severity_classifier.classify_message_severity(
@@ -719,7 +711,6 @@ def test_severity_classifier_preserves_medium_band_ordering():
             source="Desk Wire",
             channel_id="-2502",
             message_id=2,
-            has_media=True,
         )
     )
 
@@ -736,7 +727,6 @@ def test_severity_classifier_preserves_high_band_ordering():
             source="The War Reporter",
             channel_id="-2601",
             message_id=1,
-            has_media=False,
         )
     )
     higher = severity_classifier.classify_message_severity(
@@ -745,7 +735,6 @@ def test_severity_classifier_preserves_high_band_ordering():
             source="The War Reporter",
             channel_id="-2602",
             message_id=2,
-            has_media=True,
         )
     )
 
@@ -864,7 +853,6 @@ def test_validate_filter_decision_strips_source_prefixes_and_promo_from_model_ou
             "confidence": 0.8,
             "reason_code": "delivery",
             "topic_key": "port_reopen",
-            "needs_ocr_translation": False,
         },
         "Officials say the port reopened overnight after a three-day shutdown.",
     )
@@ -964,80 +952,6 @@ def test_render_digest_body_sections_strips_nested_markers_and_drops_fragments()
 
 
 @pytest.mark.asyncio
-async def test_send_album_single_item_preserves_original_caption(monkeypatch):
-    captured: dict[str, object] = {}
-
-    async def fake_send_single_media(msg, caption, *, reply_to=None):
-        captured["msg"] = msg
-        captured["caption"] = caption
-        captured["reply_to"] = reply_to
-        return {"message_id": 88}
-
-    monkeypatch.setattr(main, "_destination_uses_bot_api", lambda: True)
-    monkeypatch.setattr(main, "_send_single_media", fake_send_single_media)
-
-    message = SimpleNamespace()
-    caption = "〔Breaking〕<br><br>Headline.<br><br>" + " ".join(
-        f"Sentence {idx} remains complete."
-        for idx in range(1, 60)
-    )
-    sent_ref = await main._send_album([message], caption, reply_to=21)
-
-    assert sent_ref == {"message_id": 88}
-    assert captured["msg"] is message
-    assert captured["caption"] == caption
-    assert captured["reply_to"] == 21
-
-
-@pytest.mark.asyncio
-async def test_send_single_media_uses_text_only_fallback(monkeypatch):
-    sent_calls: list[tuple[str, int | None]] = []
-    overflow_calls: list[tuple[list[str], object]] = []
-
-    async def fake_send_text_with_ref(text, reply_to=None):
-        sent_calls.append((text, reply_to))
-        return {"message_id": 909}
-
-    async def fake_send_media_caption_overflow(chunks, *, sent_ref):
-        overflow_calls.append((list(chunks), sent_ref))
-
-    monkeypatch.setattr(main, "_destination_uses_bot_api", lambda: True)
-    monkeypatch.setattr(main, "_send_text_with_ref", fake_send_text_with_ref)
-    monkeypatch.setattr(main, "_send_media_caption_overflow", fake_send_media_caption_overflow)
-
-    message = SimpleNamespace(media=object(), file=None)
-    sent_ref = await main._send_single_media(message, "Headline only.", reply_to=14)
-
-    assert sent_ref == {"message_id": 909}
-    assert sent_calls == [("Headline only.", 14)]
-    assert overflow_calls == [([], {"message_id": 909})]
-
-
-@pytest.mark.asyncio
-async def test_send_album_multiple_items_uses_text_only_fallback(monkeypatch):
-    sent_calls: list[tuple[str, int | None]] = []
-    overflow_calls: list[tuple[list[str], object]] = []
-
-    async def fake_send_text_with_ref(text, reply_to=None):
-        sent_calls.append((text, reply_to))
-        return {"message_id": 910}
-
-    async def fake_send_media_caption_overflow(chunks, *, sent_ref):
-        overflow_calls.append((list(chunks), sent_ref))
-
-    monkeypatch.setattr(main, "_destination_uses_bot_api", lambda: False)
-    monkeypatch.setattr(main, "_send_text_with_ref", fake_send_text_with_ref)
-    monkeypatch.setattr(main, "_send_media_caption_overflow", fake_send_media_caption_overflow)
-
-    messages = [SimpleNamespace(media=object()), SimpleNamespace(media=object())]
-    sent_ref = await main._send_album(messages, "Album summary.", reply_to=22)
-
-    assert sent_ref == {"message_id": 910}
-    assert sent_calls == [("Album summary.", 22)]
-    assert overflow_calls == [([], {"message_id": 910})]
-
-
-@pytest.mark.asyncio
 async def test_send_media_caption_overflow_replies_to_media(monkeypatch):
     sent_calls: list[tuple[str, int | None]] = []
 
@@ -1133,7 +1047,6 @@ async def test_handle_delivery_inbound_job_skips_when_caption_is_redacted_empty(
         lambda _job: {
             "channel_id": "-1001",
             "source": "Node of Time EN",
-            "has_media": False,
             "severity": "medium",
             "candidate_text": "Our channel: Node of Time EN Subscribe @NewResistance",
             "filter_decision": {
@@ -1196,7 +1109,6 @@ async def test_queue_single_message_for_digest_skips_media_only_posts(monkeypatc
         queued["kwargs"] = kwargs
 
     monkeypatch.setattr(main, "_source_info", fake_source_info)
-    monkeypatch.setattr(main, "_send_single_media", fail_send)
     monkeypatch.setattr(main, "_queue_for_digest", fake_queue)
 
     await main._queue_single_message_for_digest(
@@ -1218,7 +1130,6 @@ async def test_handle_delivery_inbound_job_queues_deliver_action_when_digest_mod
         lambda _job: {
             "channel_id": "-1001",
             "source": "Desk Wire",
-            "has_media": False,
             "severity": "medium",
             "candidate_text": "Officials reopened the port after three days of disruption.",
             "filter_decision": {
@@ -1273,7 +1184,6 @@ async def test_handle_delivery_inbound_job_skips_media_only_payload(monkeypatch)
         lambda _job: {
             "channel_id": "-1001",
             "source": "Desk Wire",
-            "has_media": True,
             "severity": "medium",
             "candidate_text": "",
             "filter_decision": {
@@ -1298,8 +1208,6 @@ async def test_handle_delivery_inbound_job_skips_media_only_payload(monkeypatch)
 
     monkeypatch.setattr(main, "_fetch_messages_for_payload", fake_fetch_messages)
     monkeypatch.setattr(main, "_advance_job_to_archive", fake_advance_job_to_archive)
-    monkeypatch.setattr(main, "_send_single_media", fail_send)
-    monkeypatch.setattr(main, "_send_album", fail_send)
     monkeypatch.setattr(main, "count_pending", lambda: 1)
 
     await main._handle_delivery_inbound_job({"id": 22})
@@ -1338,7 +1246,6 @@ async def test_handle_triage_inbound_job_skips_media_only_payload(monkeypatch):
 
     assert archived["payload"]["final_action"] == "skip"
     assert archived["payload"]["skip_reason"] == "empty_message"
-    assert archived["payload"]["has_media"] is False
 
 
 @pytest.mark.asyncio
@@ -1355,7 +1262,6 @@ async def test_handle_ai_inbound_job_uses_ai_decision_severity(monkeypatch):
             confidence=0.88,
             reason_code="explainer_digest",
             topic_key="port_reopen",
-            needs_ocr_translation=False,
         )
 
     monkeypatch.setattr(

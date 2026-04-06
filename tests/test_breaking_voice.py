@@ -67,7 +67,6 @@ def test_validate_filter_decision_clears_breaking_bridge_in_unhinged_mode(monkey
             "confidence": 0.8,
             "reason_code": "breaking_update",
             "topic_key": "haifa",
-            "needs_ocr_translation": False,
         },
         "Officials say two rockets landed near Haifa overnight.",
     )
@@ -90,7 +89,6 @@ def test_validate_filter_decision_accepts_contextual_bridge_in_unhinged_mode(mon
             "confidence": 0.8,
             "reason_code": "breaking_update",
             "topic_key": "acre",
-            "needs_ocr_translation": False,
         },
         "Officials say two rockets landed near Acre overnight.",
         recent_context=["42m ago: Officials said rockets landed near Haifa overnight."],

@@ -298,7 +298,6 @@ class FilterDecision:
     confidence: float
     reason_code: str
     topic_key: str
-    needs_ocr_translation: bool
     copy_origin: Literal["ai", "fallback"] = "ai"
     routing_origin: Literal["ai", "system_override", "fallback"] = "ai"
     fallback_reason: str = ""
@@ -1055,7 +1054,7 @@ def _filter_decision_system_prompt() -> str:
         f"Always write HTML fields in {language}. Translate if needed.\n"
         f"{HUMAN_NEWSROOM_VOICE}\n"
         "Return ONLY one JSON object with these keys:\n"
-        "action, severity, summary_html, headline_html, story_bridge_html, confidence, reason_code, topic_key, needs_ocr_translation\n"
+        "action, severity, summary_html, headline_html, story_bridge_html, confidence, reason_code, topic_key\n"
         "action must be one of: skip, deliver, digest\n"
         "severity must be one of: high, medium, low\n"
         "summary_html must be Telegram-safe HTML using only <b>, <i>, <u>, <s>, <tg-spoiler>, <code>, <pre>, <blockquote>, <a href>, <br>\n"
@@ -1066,7 +1065,6 @@ def _filter_decision_system_prompt() -> str:
         "confidence must be a number from 0 to 1\n"
         "reason_code must be a short snake_case code\n"
         "topic_key must be a short normalized topic label\n"
-        "needs_ocr_translation must be true or false\n"
         "Use skip for spam, ads, promos, noise, or clearly irrelevant updates.\n"
         "Use deliver for urgent/breaking items that should be sent immediately.\n"
         "Use digest for meaningful non-breaking items worth keeping.\n"
@@ -1946,7 +1944,6 @@ def _fallback_filter_decision(
             confidence=0.2,
             reason_code="likely_noise",
             topic_key=_sanitize_topic_key("", cleaned),
-            needs_ocr_translation=False,
             copy_origin="fallback",
             routing_origin="fallback",
             fallback_reason=_normalize_filter_fallback_reason(fallback_reason),
@@ -1971,7 +1968,6 @@ def _fallback_filter_decision(
         confidence=0.55 if summary else 0.35,
         reason_code="local_fallback",
         topic_key=_sanitize_topic_key("", cleaned),
-        needs_ocr_translation=False,
         copy_origin="fallback",
         routing_origin="fallback",
         fallback_reason=_normalize_filter_fallback_reason(fallback_reason),
@@ -2044,7 +2040,6 @@ def _validate_filter_decision(
                 evidence=context_evidence,
             )
 
-    needs_ocr_translation = bool(payload.get("needs_ocr_translation", False))
     reason_code = _sanitize_reason_code(payload.get("reason_code"))
     if bool(story_signals.get("downgrade_explainer")) and action != "deliver":
         reason_code = "explainer_digest"
@@ -2064,7 +2059,6 @@ def _validate_filter_decision(
         confidence=confidence,
         reason_code=reason_code,
         topic_key=topic_key,
-        needs_ocr_translation=needs_ocr_translation,
         copy_origin=copy_origin,
         routing_origin=routing_origin,
         fallback_reason=_normalize_filter_fallback_reason(fallback_reason),

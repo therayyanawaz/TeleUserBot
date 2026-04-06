@@ -6,7 +6,7 @@ import asyncio
 from collections import Counter, deque
 import contextlib
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from email.utils import parsedate_to_datetime
 from html import escape as _escape_html, unescape as _unescape_html
 import hashlib
@@ -42,18 +42,44 @@ from shared_http import get_web_http_client
 _QUERY_MAX_HOURS_BACK = 24 * 30
 
 
+class _NamedFixedOffsetZone(tzinfo):
+    def __init__(self, *, key: str, offset: timedelta, name: str) -> None:
+        self.key = key
+        self._offset = offset
+        self._name = name
+
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        return self._offset
+
+    def dst(self, dt: datetime | None) -> timedelta:
+        return timedelta(0)
+
+    def tzname(self, dt: datetime | None) -> str:
+        return self._name
+
+
+_RUNTIME_TZ_ALIASES = {
+    "IST": "Asia/Kolkata",
+}
+
+_RUNTIME_TZ_FIXED_FALLBACKS = {
+    "Asia/Kolkata": _NamedFixedOffsetZone(
+        key="Asia/Kolkata",
+        offset=timedelta(hours=5, minutes=30),
+        name="IST",
+    ),
+}
+
+
 def runtime_timezone():
     raw = str(getattr(config, "TIMEZONE", "UTC") or "").strip()
     if not raw:
         raw = "UTC"
-    aliases = {
-        "IST": "Asia/Kolkata",
-    }
-    zone_name = aliases.get(raw.upper(), raw)
+    zone_name = _RUNTIME_TZ_ALIASES.get(raw.upper(), raw)
     try:
         return ZoneInfo(zone_name)
     except ZoneInfoNotFoundError:
-        return timezone.utc
+        return _RUNTIME_TZ_FIXED_FALLBACKS.get(zone_name, timezone.utc)
 
 
 def runtime_now() -> datetime:

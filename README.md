@@ -427,35 +427,6 @@ Modes:
 - `unhinged` gives harder-hitting breaking formatting and adds context only when the story linkage is strong enough
 - `classic` restores a more restrained layout
 
-## 🖼️ OCR Translation for Media-Only Posts
-
-OCR behavior is intentionally conservative.
-
-- captioned media keeps the original Telegram caption
-- image-only posts get a caption only if OCR finds meaningful non-English text and translation succeeds
-- video-only posts use first-frame OCR
-- English OCR text is ignored
-- failed OCR adds nothing
-
-Example config:
-
-```env
-MEDIA_TEXT_OCR_ENABLED=true
-MEDIA_TEXT_OCR_VIDEO_ENABLED=true
-MEDIA_TEXT_OCR_MIN_CHARS=12
-MEDIA_TEXT_OCR_MAX_CHARS=1600
-MEDIA_TEXT_OCR_VIDEO_MAX_MB=25
-MEDIA_TEXT_OCR_LANGS=eng+ara+fas+urd+rus
-```
-
-If you want OCR on Linux:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y tesseract-ocr ffmpeg
-sudo apt-get install -y tesseract-ocr-ara tesseract-ocr-fas tesseract-ocr-urd tesseract-ocr-rus
-```
-
 ## 🔎 Query Assistant Rules
 
 Allowed contexts:

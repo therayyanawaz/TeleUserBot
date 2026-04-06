@@ -272,7 +272,6 @@ async def test_pipeline_worker_lifecycle_emits_memory_snapshots(
         "_pipeline_worker_targets",
         lambda: {
             main.INBOUND_STAGE_TRIAGE: 1,
-            main.INBOUND_STAGE_OCR: 1,
             main.INBOUND_STAGE_AI_DECISION: 1,
             main.INBOUND_STAGE_DELIVERY: 1,
             main.INBOUND_STAGE_ARCHIVE: 1,
@@ -303,6 +302,6 @@ async def test_pipeline_worker_lifecycle_emits_memory_snapshots(
     started_event = next(payload for payload in memory_events if payload.get("memory_reason") == "pipeline_workers_started")
     stopped_event = next(payload for payload in memory_events if payload.get("memory_reason") == "pipeline_workers_stopped")
 
-    assert started_event["pipeline_worker_count"] == 5
+    assert started_event["pipeline_worker_count"] == 4
     assert stopped_event["pipeline_worker_count"] == 0
-    assert stopped_event["cancelled_worker_count"] == 5
+    assert stopped_event["cancelled_worker_count"] == 4

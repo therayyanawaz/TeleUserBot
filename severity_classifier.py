@@ -467,21 +467,21 @@ def _calc_taxonomy_score(text: str) -> tuple[float, Dict[str, Any], list[str]]:
     return score, details, matched_terms
 
 
-def _calc_style_score(text: str, *, has_link: bool, has_media: bool) -> tuple[float, Dict[str, Any]]:
+def _calc_style_score(text: str, *, has_link: bool) -> tuple[float, Dict[str, Any]]:
     style_cfg = SEVERITY_CONFIG["style"]
     score = 0.0
 
     details: Dict[str, Any] = {
-        "short_with_link_or_media": False,
+        "short_with_link": False,
         "emoji_density_count": 0,
         "caps_ratio": 0.0,
         "punctuation_spike": False,
     }
 
     char_len = len(text)
-    if char_len <= int(style_cfg["short_text_threshold_chars"]) and (has_link or has_media):
+    if char_len <= int(style_cfg["short_text_threshold_chars"]) and has_link:
         score += float(style_cfg["short_with_link_or_media_bonus"])
-        details["short_with_link_or_media"] = True
+        details["short_with_link"] = True
 
     emoji_count = _count_emoji(text)
     details["emoji_density_count"] = emoji_count
@@ -660,7 +660,6 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
     text = _extract_text(msg)
     source_name = _extract_source_name(msg)
     normalized = _normalize_key(text)
-    has_media = bool(msg.get("has_media", False))
     has_link = bool(msg.get("has_link", False)) or bool(_URL_RE.search(text))
     text_tokens = int(msg.get("text_tokens") or max(1, len(_extract_tokens(text))))
     reply_to = int(msg.get("reply_to") or 0)
@@ -672,7 +671,7 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
     tier, source_score = _detect_source_tier(source_name)
     urgency_score, urgency_hits, urgency_hit_count = _calc_urgency_score(text, story_signals=story_signals)
     taxonomy_score, taxonomy_details, taxonomy_hits = _calc_taxonomy_score(text)
-    style_score, style_details = _calc_style_score(text, has_link=has_link, has_media=has_media)
+    style_score, style_details = _calc_style_score(text, has_link=has_link)
     humanized_score, humanized_details = _calc_humanized_score(
         text,
         humanized_probability=humanized_probability,
@@ -788,7 +787,6 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
             "live_event_update": bool(story_signals.get("live_event_update")),
         },
         "has_link": has_link,
-        "has_media": has_media,
         "text_tokens": text_tokens,
         "text_chars": len(text),
         "normalized_text_preview": normalized[:220],

@@ -193,19 +193,6 @@ INCLUDE_SOURCE_TAGS = _env_bool("INCLUDE_SOURCE_TAGS", False)  # type: bool
 OUTBOUND_POST_LAYOUT = _env_str("OUTBOUND_POST_LAYOUT", "editorial_card").lower()  # type: str
 
 # -----------------------------------------------------------------------------
-# Media OCR Translation
-# -----------------------------------------------------------------------------
-# Best-effort OCR for media-only posts. The bot only uses OCR text when it can
-# translate non-English text into English. It does not generate visual
-# descriptions or invented captions.
-MEDIA_TEXT_OCR_ENABLED = _env_bool("MEDIA_TEXT_OCR_ENABLED", True)  # type: bool
-MEDIA_TEXT_OCR_VIDEO_ENABLED = _env_bool("MEDIA_TEXT_OCR_VIDEO_ENABLED", True)  # type: bool
-MEDIA_TEXT_OCR_MIN_CHARS = _env_int("MEDIA_TEXT_OCR_MIN_CHARS", 12)  # type: int
-MEDIA_TEXT_OCR_MAX_CHARS = _env_int("MEDIA_TEXT_OCR_MAX_CHARS", 1600)  # type: int
-MEDIA_TEXT_OCR_VIDEO_MAX_MB = _env_int("MEDIA_TEXT_OCR_VIDEO_MAX_MB", 25)  # type: int
-MEDIA_TEXT_OCR_LANGS = _env_str("MEDIA_TEXT_OCR_LANGS", "eng+ara+fas+urd+rus")  # type: str
-
-# -----------------------------------------------------------------------------
 # Breaking News Fast Path
 # -----------------------------------------------------------------------------
 BREAKING_NEWS_KEYWORDS = _env_list(
@@ -251,8 +238,6 @@ BREAKING_SLA_SECONDS = _env_int("BREAKING_SLA_SECONDS", 15)  # type: int
 PIPELINE_TRIAGE_WORKERS = _env_int("PIPELINE_TRIAGE_WORKERS", 4)  # type: int
 PIPELINE_AI_WORKERS = _env_int("PIPELINE_AI_WORKERS", 2)  # type: int
 PIPELINE_DELIVERY_WORKERS = _env_int("PIPELINE_DELIVERY_WORKERS", 2)  # type: int
-PIPELINE_OCR_WORKERS = _env_int("PIPELINE_OCR_WORKERS", 1)  # type: int
-PIPELINE_MEDIA_CONCURRENCY = _env_int("PIPELINE_MEDIA_CONCURRENCY", 2)  # type: int
 PIPELINE_QUERY_WEB_WORKERS = _env_int("PIPELINE_QUERY_WEB_WORKERS", 1)  # type: int
 PIPELINE_JOB_MAX_RETRIES = _env_int("PIPELINE_JOB_MAX_RETRIES", 4)  # type: int
 PIPELINE_RETRY_BASE_SECONDS = _env_int("PIPELINE_RETRY_BASE_SECONDS", 2)  # type: int

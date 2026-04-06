@@ -144,10 +144,7 @@ from severity_classifier import classify_message_severity, severity_score_floor
 from utils import (
     apply_premium_emoji_html,
     build_alert_header,
-    build_media_signature_digest,
-    check_and_store_media_duplicate,
     choose_alert_label,
-    compute_visual_media_hash,
     LiveTelegramStreamer,
     DuplicateRuntime,
     GlobalDuplicateResult,
@@ -167,10 +164,8 @@ from utils import (
     parse_daily_times,
     parse_time_filter_from_query,
     expand_query_terms,
-    extract_first_video_frame_bytes,
     extract_query_keywords,
     extract_query_numbers,
-    extract_ocr_text_from_image_bytes,
     sanitize_telegram_html,
     search_recent_news_web,
     search_recent_messages,
@@ -535,13 +530,11 @@ startup_git_updated: bool = False
 pipeline_worker_tasks: List[asyncio.Task] = []
 pipeline_sentence_transformer_warm_task: asyncio.Task | None = None
 pipeline_query_web_semaphore: asyncio.Semaphore | None = None
-pipeline_media_semaphore: asyncio.Semaphore | None = None
 pipeline_stage_latency_seconds: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=200))
 pipeline_stage_runs: Dict[str, int] = defaultdict(int)
 runtime_memory_warning_logged: bool = False
 
 INBOUND_STAGE_TRIAGE = "triage"
-INBOUND_STAGE_OCR = "ocr"
 INBOUND_STAGE_AI_DECISION = "ai_decision"
 INBOUND_STAGE_DELIVERY = "delivery_or_queue"
 INBOUND_STAGE_ARCHIVE = "archive"
@@ -691,7 +684,7 @@ def _is_low_memory_runtime() -> bool:
 
 
 def _log_low_memory_runtime_once(reason: str) -> None:
-    global runtime_memory_warning_logged, pipeline_media_semaphore
+    global runtime_memory_warning_logged
 
     if runtime_memory_warning_logged or not _is_low_memory_runtime():
         return
@@ -699,14 +692,6 @@ def _log_low_memory_runtime_once(reason: str) -> None:
     budget = _runtime_memory_budget_bytes()
     mib = int((budget or 0) / (1024 * 1024))
     
-    # Auto-throttle media concurrency if budget is tight.
-    if budget <= (1024 * 1024 * 1024):
-        concurrency = 1
-    else:
-        concurrency = 1
-    
-    if pipeline_media_semaphore and pipeline_media_semaphore._value > concurrency:
-        pipeline_media_semaphore = asyncio.Semaphore(concurrency)
 
     LOGGER.warning(
         "Low-memory runtime detected (%s MiB budget). Applying conservative memory guards: %s",
@@ -2985,264 +2970,6 @@ async def _source_title_from_channel_id(channel_id: str) -> str:
     return title
 
 
-def _media_text_ocr_enabled() -> bool:
-    return False
-
-
-def _media_text_ocr_video_enabled() -> bool:
-    enabled = bool(getattr(config, "MEDIA_TEXT_OCR_VIDEO_ENABLED", True))
-    if enabled and _is_low_memory_runtime():
-        _log_low_memory_runtime_once("video OCR disabled to reduce peak memory use")
-        return False
-    return enabled
-
-
-def _media_text_ocr_min_chars() -> int:
-    try:
-        value = int(getattr(config, "MEDIA_TEXT_OCR_MIN_CHARS", 12))
-    except Exception:
-        value = 12
-    return max(8, min(value, 200))
-
-
-def _media_text_ocr_max_chars() -> int:
-    try:
-        value = int(getattr(config, "MEDIA_TEXT_OCR_MAX_CHARS", 1600))
-    except Exception:
-        value = 1600
-    return max(200, min(value, 4000))
-
-
-def _media_text_ocr_video_max_bytes() -> int:
-    try:
-        value_mb = int(getattr(config, "MEDIA_TEXT_OCR_VIDEO_MAX_MB", 25))
-    except Exception:
-        value_mb = 25
-    value_mb = max(1, min(value_mb, 200))
-    return value_mb * 1024 * 1024
-
-
-def _media_text_ocr_langs() -> str:
-    raw = str(getattr(config, "MEDIA_TEXT_OCR_LANGS", "eng+ara+fas+urd+rus") or "").strip()
-    return raw or "eng+ara+fas+urd+rus"
-
-
-def _message_mime_type(msg: Message) -> str:
-    value = getattr(getattr(msg, "file", None), "mime_type", None)
-    if isinstance(value, str) and value.strip():
-        return value.strip().lower()
-    value = getattr(getattr(msg, "document", None), "mime_type", None)
-    if isinstance(value, str) and value.strip():
-        return value.strip().lower()
-    return ""
-
-
-def _media_dupe_history_hours() -> int:
-    try:
-        value = int(getattr(config, "DUPE_HISTORY_HOURS", 4))
-    except Exception:
-        value = 4
-    return max(1, min(value, 24))
-
-
-def _message_is_image_ocr_candidate(msg: Message) -> bool:
-    if not getattr(msg, "media", None):
-        return False
-    if msg.photo:
-        return True
-    mime_type = _message_mime_type(msg)
-    return mime_type.startswith("image/")
-
-
-def _message_is_video_ocr_candidate(msg: Message) -> bool:
-    if not getattr(msg, "media", None):
-        return False
-    if msg.video:
-        return True
-    mime_type = _message_mime_type(msg)
-    return mime_type.startswith("video/")
-
-
-def _message_media_kind(msg: Message) -> str:
-    if msg.photo or _message_is_image_ocr_candidate(msg):
-        return "image"
-    if msg.video or _message_is_video_ocr_candidate(msg):
-        return "video"
-    if getattr(msg, "document", None):
-        return "document"
-    return "media"
-
-
-async def _download_media_signature_bytes(msg: Message) -> bytes:
-    for thumb in (0, 1, -1):
-        try:
-            blob = await msg.download_media(file=bytes, thumb=thumb)
-        except TypeError:
-            break
-        except Exception:
-            continue
-        if isinstance(blob, (bytes, bytearray)) and len(blob) >= 64:
-            return bytes(blob)
-
-    try:
-        size = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
-    except Exception:
-        size = 0
-    if size and size > (2 * 1024 * 1024):
-        return b""
-    try:
-        blob = await msg.download_media(file=bytes)
-    except Exception:
-        return b""
-    if isinstance(blob, (bytes, bytearray)):
-        return bytes(blob)
-    return b""
-
-
-async def _message_media_signature(msg: Message) -> tuple[str, str]:
-    if not getattr(msg, "media", None):
-        return "", ""
-
-    async with (pipeline_media_semaphore or contextlib.nullcontext()):
-        media_kind = _message_media_kind(msg)
-        parts: list[str] = [media_kind]
-        media_blob = await _download_media_signature_bytes(msg)
-
-        visual_blob = b""
-        if media_kind == "image":
-            visual_blob = media_blob
-        elif media_kind == "video" and media_blob:
-            with contextlib.suppress(Exception):
-                visual_blob = await asyncio.to_thread(extract_first_video_frame_bytes, media_blob)
-
-        visual_hash = ""
-        if visual_blob:
-            visual_hash = await asyncio.to_thread(compute_visual_media_hash, visual_blob)
-        if visual_hash:
-            return f"visual:{media_kind}:{visual_hash}", media_kind
-
-        file_obj = getattr(msg, "file", None)
-        for attr in ("id", "size", "mime_type", "name"):
-            value = getattr(file_obj, attr, None)
-            if value:
-                parts.append(f"{attr}:{value}")
-
-        photo = getattr(msg, "photo", None)
-        if photo is not None:
-            for attr in ("id", "access_hash"):
-                value = getattr(photo, attr, None)
-                if value:
-                    parts.append(f"photo_{attr}:{value}")
-
-        document = getattr(msg, "document", None)
-        if document is not None:
-            for attr in ("id", "access_hash", "mime_type", "size"):
-                value = getattr(document, attr, None)
-                if value:
-                    parts.append(f"doc_{attr}:{value}")
-
-        if media_blob:
-            parts.append(f"thumb_sha1:{hashlib.sha1(media_blob).hexdigest()}")
-
-        return build_media_signature_digest(parts), media_kind
-
-
-async def _check_single_media_duplicate(msg: Message) -> bool:
-    _ = msg
-    return False
-
-
-async def _check_album_media_duplicate(messages: List[Message]) -> bool:
-    _ = messages
-    return False
-
-
-def _normalize_media_ocr_text(text: str) -> str:
-    cleaned = normalize_space(text)
-    if not cleaned:
-        return ""
-    if len(cleaned) < _media_text_ocr_min_chars():
-        return ""
-    limit = _media_text_ocr_max_chars()
-    if len(cleaned) > limit:
-        cleaned = f"{cleaned[: limit - 3].rsplit(' ', 1)[0]}..."
-    return cleaned
-
-
-def _format_ocr_translation_caption(translated_text: str) -> str | None:
-    cleaned = normalize_space(strip_telegram_html(translated_text))
-    if not cleaned:
-        return None
-    capped = _truncate_caption_fragment_complete(
-        cleaned,
-        limit=min(_media_text_ocr_max_chars(), 700),
-    )
-    if not capped or not _caption_fragment_is_usable(capped):
-        return None
-    return f"Translate: {sanitize_telegram_html(capped)}"
-
-
-async def _extract_media_ocr_translation(msg: Message) -> str | None:
-    if not _media_text_ocr_enabled():
-        return None
-    if not getattr(msg, "media", None):
-        return None
-    if not auth_ready:
-        return None
-
-    ocr_text = ""
-
-    if _message_is_image_ocr_candidate(msg):
-        blob = await msg.download_media(file=bytes)
-        if not blob:
-            return None
-        ocr_text = await asyncio.to_thread(
-            extract_ocr_text_from_image_bytes,
-            blob,
-            max_chars=_media_text_ocr_max_chars(),
-            languages=_media_text_ocr_langs(),
-        )
-    elif _message_is_video_ocr_candidate(msg):
-        if not _media_text_ocr_video_enabled():
-            return None
-        media_size = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
-        if media_size and media_size > _media_text_ocr_video_max_bytes():
-            return None
-        blob = await msg.download_media(file=bytes)
-        if not blob:
-            return None
-        frame_blob = await asyncio.to_thread(extract_first_video_frame_bytes, blob)
-        if not frame_blob:
-            return None
-        ocr_text = await asyncio.to_thread(
-            extract_ocr_text_from_image_bytes,
-            frame_blob,
-            max_chars=_media_text_ocr_max_chars(),
-            languages=_media_text_ocr_langs(),
-        )
-    else:
-        return None
-
-    normalized = _normalize_media_ocr_text(ocr_text)
-    if not normalized:
-        return None
-
-    translated = await translate_ocr_text_to_english(normalized, _require_auth_manager())
-    if not translated:
-        return None
-    return _format_ocr_translation_caption(translated)
-
-
-async def _caption_for_media_without_text(msg: Message) -> str | None:
-    _ = msg
-    return None
-
-
-async def _caption_for_album_without_text(messages: List[Message]) -> str | None:
-    _ = messages
-    return None
-
-
 def _queue_for_digest(
     channel_id: str,
     message_id: int,
@@ -4240,7 +3967,6 @@ def _classify_severity_with_breakdown(
     source: str,
     channel_id: str,
     message_id: int,
-    has_media: bool,
     has_link: bool,
     reply_to: int,
     album_size: int = 1,
@@ -4250,7 +3976,6 @@ def _classify_severity_with_breakdown(
         "source": source,
         "channel_id": channel_id,
         "message_id": message_id,
-        "has_media": bool(has_media),
         "has_link": bool(has_link),
         "reply_to": int(reply_to or 0),
         "timestamp": int(time.time()),
@@ -4276,7 +4001,6 @@ def _classify_severity_with_breakdown(
         severity=severity,
         score=score,
         album_size=album_size,
-        has_media=bool(has_media),
         has_link=bool(has_link),
         reply_to=int(reply_to or 0),
         breakdown=breakdown,
@@ -4490,8 +4214,7 @@ async def _resolve_breaking_story_root_ref(cluster: Dict[str, object]) -> object
         return cached
 
     stored_ref = _deserialize_sent_ref(str(cluster.get("root_sent_ref") or ""))
-    has_media = bool(isinstance(stored_ref, dict) and stored_ref.get("has_media"))
-    ref = await _load_destination_message_ref(root_message_id, has_media=has_media)
+    ref = await _load_destination_message_ref(root_message_id)
     if ref is not None:
         breaking_story_ref_cache[cluster_id] = _compact_sent_ref(ref)
     return ref
@@ -4638,14 +4361,7 @@ async def _apply_breaking_story_cluster_policy(
 
     if decision == "new_story" or cluster is None:
         reply_to = await _resolve_source_reply_target(primary, fallback_topic_seed=topic_seed)
-        if any(bool(item.media) for item in messages):
-            sent_ref = (
-                await _send_album(list(messages), payload_text, reply_to=reply_to)
-                if len(messages) > 1
-                else await _send_single_media(primary, payload_text, reply_to=reply_to)
-            )
-        else:
-            sent_ref = await _send_text_with_ref(payload_text, reply_to=reply_to)
+        sent_ref = await _send_text_with_ref(payload_text, reply_to=reply_to)
         root_ref = _primary_message_ref(sent_ref)
         root_message_id = int(_message_ref_id(root_ref) or 0)
         cluster_id = uuid.uuid4().hex
@@ -4773,14 +4489,7 @@ async def _apply_breaking_story_cluster_policy(
 
     if decision == "material_update":
         reply_to = root_message_id or None
-        if any(bool(item.media) for item in messages):
-            sent_ref = (
-                await _send_album(list(messages), payload_text, reply_to=reply_to)
-                if len(messages) > 1
-                else await _send_single_media(primary, payload_text, reply_to=reply_to)
-            )
-        else:
-            sent_ref = await _send_text_with_ref(payload_text, reply_to=reply_to)
+        sent_ref = await _send_text_with_ref(payload_text, reply_to=reply_to)
         sent_message_id = int(_message_ref_id(sent_ref) or 0)
         _persist_breaking_story_cluster(
             cluster_id=cluster_id,
@@ -5315,36 +5024,12 @@ def _primary_message_ref(ref: object) -> object | None:
     return ref
 
 
-def _message_ref_has_media(ref: object) -> bool:
-    target = _primary_message_ref(ref)
-    if isinstance(target, Message):
-        return bool(target.media)
-    if isinstance(target, dict):
-        return any(
-            key in target
-            for key in (
-                "animation",
-                "audio",
-                "document",
-                "photo",
-                "sticker",
-                "video",
-                "video_note",
-                "voice",
-            )
-        )
-    return False
-
-
 def _serialize_sent_ref(ref: object) -> str:
     target = _primary_message_ref(ref)
     message_id = _message_ref_id(target)
     if not message_id:
         return ""
-    payload = {
-        "message_id": int(message_id),
-        "has_media": bool(_message_ref_has_media(target)),
-    }
+    payload = {"message_id": int(message_id)}
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -5361,10 +5046,7 @@ def _deserialize_sent_ref(value: str) -> object | None:
     message_id = int(payload.get("message_id") or 0)
     if message_id <= 0:
         return None
-    return {
-        "message_id": message_id,
-        "has_media": bool(payload.get("has_media")),
-    }
+    return {"message_id": message_id}
 
 
 def _acquire_instance_lock():
@@ -5487,24 +5169,25 @@ async def _edit_sent_text(ref: object, text: str) -> object:
         message_id = _message_ref_id(target_ref)
         if not message_id:
             raise RuntimeError("Cannot edit Bot API message without message_id.")
-        is_media_ref = _message_ref_has_media(target_ref)
-
         data = {
             "chat_id": _require_bot_destination_chat_id(),
             "message_id": str(message_id),
             "disable_web_page_preview": "true",
             "parse_mode": "HTML" if _is_html_formatting_enabled() else "Markdown",
         }
-        method = "editMessageText"
-        if is_media_ref:
-            data["caption"] = _to_bot_text(payload_text) or ""
-            method = "editMessageCaption"
-            data.pop("disable_web_page_preview", None)
-        else:
-            data["text"] = _to_bot_text(payload_text) or ""
+        data["text"] = _to_bot_text(payload_text) or ""
         try:
-            result = await _bot_api_request(method, data=data)
-            # Bot API can return `True` for some cases; keep original ref for continuity.
+            result = await _bot_api_request("editMessageText", data=data)
+            if isinstance(result, dict):
+                return result
+            return ref
+        except Exception:
+            data.pop("parse_mode", None)
+            fallback_text = (
+                strip_telegram_html(payload_text) if _is_html_formatting_enabled() else payload_text
+            )
+            data["text"] = _to_plain_text(fallback_text) or ""
+            result = await _bot_api_request("editMessageText", data=data)
             if isinstance(result, dict):
                 return result
             return ref
@@ -5527,10 +5210,7 @@ async def _edit_sent_text(ref: object, text: str) -> object:
         message_id = _message_ref_id(target_ref)
         if not message_id:
             raise RuntimeError("Telethon edit requires a message reference or message_id.")
-        fetched_ref = await _load_destination_message_ref(
-            message_id,
-            has_media=_message_ref_has_media(target_ref),
-        )
+        fetched_ref = await _load_destination_message_ref(message_id)
         fetched_target = _primary_message_ref(fetched_ref)
         if not isinstance(fetched_target, Message):
             raise RuntimeError(f"Failed to reload destination message {message_id} for edit.")
@@ -5553,12 +5233,12 @@ async def _edit_sent_text(ref: object, text: str) -> object:
         return await target_ref.edit(fallback_text, parse_mode=None, link_preview=False)
 
 
-async def _load_destination_message_ref(message_id: int, *, has_media: bool = False) -> object | None:
+async def _load_destination_message_ref(message_id: int) -> object | None:
     resolved_id = int(message_id or 0)
     if resolved_id <= 0:
         return None
     if _destination_uses_bot_api():
-        return {"message_id": resolved_id, "has_media": bool(has_media)}
+        return {"message_id": resolved_id}
 
     tg = _require_client()
     fetched = await _call_with_floodwait(
@@ -5573,46 +5253,6 @@ async def _load_destination_message_ref(message_id: int, *, has_media: bool = Fa
             if isinstance(item, Message):
                 return item
     return None
-
-
-async def _send_single_media(
-    msg: Message,
-    caption: str | None,
-    *,
-    reply_to: int | None = None,
-) -> object:
-    safe_caption, overflow_chunks = _prepare_media_caption_chunks(
-        caption,
-        allow_premium_tags=_destination_uses_bot_api(),
-    )
-    if not safe_caption:
-        return None
-    LOGGER.info("Media support disabled; sending text-only fallback for single media.")
-    sent_ref = await _send_text_with_ref(safe_caption, reply_to=reply_to)
-    await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
-    return sent_ref
-
-
-async def _send_album(
-    messages: List[Message],
-    caption: str | None,
-    *,
-    reply_to: int | None = None,
-) -> object | None:
-    if len(messages) == 1:
-        return await _send_single_media(messages[0], caption, reply_to=reply_to)
-    safe_caption, overflow_chunks = _prepare_media_caption_chunks(
-        caption,
-        allow_premium_tags=_destination_uses_bot_api(),
-    )
-    if not safe_caption:
-        return None
-    LOGGER.info(
-        "Media support disabled; sending text-only fallback for album.",
-    )
-    sent_ref = await _send_text_with_ref(safe_caption, reply_to=reply_to)
-    await _send_media_caption_overflow(overflow_chunks, sent_ref=sent_ref)
-    return sent_ref
 
 
 async def _process_single_message(msg: Message) -> None:
@@ -5722,7 +5362,6 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
             source=source,
             channel_id=channel_id,
             message_id=msg.id,
-            has_media=False,
             has_link=bool(link),
             reply_to=_reply_to_message_id(msg),
         )
@@ -5828,7 +5467,6 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
             source=source,
             channel_id=channel_id,
             message_id=messages[0].id,
-            has_media=False,
             has_link=bool(link),
             reply_to=_reply_to_message_id(messages[0]),
             album_size=len(messages),
@@ -6147,7 +5785,6 @@ async def _handle_triage_inbound_job(job: Dict[str, object]) -> None:
                 source=source,
                 channel_id=str(primary.chat_id),
                 message_id=int(primary.id or 0),
-                has_media=False,
                 has_link=bool(link),
                 reply_to=_reply_to_message_id(primary),
                 album_size=len(messages),
@@ -6177,7 +5814,6 @@ async def _handle_triage_inbound_job(job: Dict[str, object]) -> None:
             "candidate_text": combined_text,
             "archive_text": combined_text,
             "has_text": bool(combined_text),
-            "has_media": False,
             "severity": severity,
             "severity_score": float(severity_score),
             "severity_breakdown": severity_breakdown,
@@ -6231,7 +5867,6 @@ async def _handle_ai_inbound_job(job: Dict[str, object]) -> None:
         "confidence": decision.confidence,
         "reason_code": decision.reason_code,
         "topic_key": decision.topic_key,
-        "needs_ocr_translation": decision.needs_ocr_translation,
         "copy_origin": decision.copy_origin,
         "routing_origin": decision.routing_origin,
         "fallback_reason": decision.fallback_reason,
@@ -6461,7 +6096,6 @@ async def _handle_archive_inbound_job(job: Dict[str, object]) -> None:
         "breaking_root_edited",
         "breaking_suppressed",
         "delivered",
-        "media_passthrough",
     } and archive_text:
         _archive_for_query_search(
             channel_id,
@@ -6478,9 +6112,6 @@ async def _handle_archive_inbound_job(job: Dict[str, object]) -> None:
 async def _handle_inbound_job(stage: str, job: Dict[str, object]) -> None:
     if stage == INBOUND_STAGE_TRIAGE:
         await _handle_triage_inbound_job(job)
-        return
-    if stage == INBOUND_STAGE_OCR:
-        await _handle_ocr_inbound_job(job)
         return
     if stage == INBOUND_STAGE_AI_DECISION:
         await _handle_ai_inbound_job(job)
@@ -6525,13 +6156,12 @@ async def _run_inbound_stage_worker(stage: str, worker_index: int) -> None:
 
 
 async def _start_pipeline_workers() -> None:
-    global pipeline_query_web_semaphore, pipeline_media_semaphore
+    global pipeline_query_web_semaphore
     if pipeline_worker_tasks:
         return
 
     targets = _pipeline_worker_targets()
     pipeline_query_web_semaphore = asyncio.Semaphore(max(1, int(targets.get("query_web", 1) or 1)))
-    pipeline_media_semaphore = asyncio.Semaphore(max(1, int(getattr(config, "PIPELINE_MEDIA_CONCURRENCY", 2) or 2)))
     reset_in_progress_inbound_jobs(older_than_seconds=0)
     purge_ai_decision_cache(
         older_than_ts=int(time.time()) - (max(1, int(getattr(config, "AI_DECISION_CACHE_HOURS", 72) or 72)) * 3600)
@@ -6554,7 +6184,6 @@ async def _start_pipeline_workers() -> None:
         "pipeline_workers_started",
         pipeline_worker_count=len(pipeline_worker_tasks),
         pipeline_worker_targets=targets,
-        pipeline_media_concurrency=int(getattr(config, "PIPELINE_MEDIA_CONCURRENCY", 2) or 2),
     )
 
 

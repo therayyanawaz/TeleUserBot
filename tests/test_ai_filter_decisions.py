@@ -41,7 +41,6 @@ async def test_decide_filter_action_uses_persistent_cache(isolated_db, monkeypat
                 "confidence": 0.92,
                 "reason_code": "newsworthy_update",
                 "topic_key": "power_grid",
-                "needs_ocr_translation": False,
             }
         )
 
@@ -71,7 +70,6 @@ def test_validate_filter_decision_sanitizes_and_clamps():
             "confidence": 9.0,
             "reason_code": "bad value !!!",
             "topic_key": "Topic Key / 123",
-            "needs_ocr_translation": "yes",
         },
         "A long enough news text that should not be treated as noise.",
     )
@@ -83,7 +81,6 @@ def test_validate_filter_decision_sanitizes_and_clamps():
     assert decision.reason_code == "bad_value"
     assert " " not in decision.topic_key
     assert decision.topic_key.lower() == decision.topic_key
-    assert decision.needs_ocr_translation is True
 
 
 @pytest.mark.asyncio
@@ -127,8 +124,7 @@ async def test_decide_filter_action_retries_weak_ai_copy_before_accepting(isolat
                     "confidence": 0.88,
                     "reason_code": "breaking_update",
                     "topic_key": "tehran_update",
-                    "needs_ocr_translation": False,
-                }
+                    }
             )
         return json.dumps(
             {
@@ -143,7 +139,6 @@ async def test_decide_filter_action_retries_weak_ai_copy_before_accepting(isolat
                 "confidence": 0.91,
                 "reason_code": "breaking_update",
                 "topic_key": "tehran_airspace",
-                "needs_ocr_translation": False,
             }
         )
 
