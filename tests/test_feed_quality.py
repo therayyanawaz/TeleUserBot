@@ -944,6 +944,25 @@ def test_prepare_media_caption_chunks_preserves_complete_sentences():
         assert plain.endswith((".", "!", "?", "〕"))
 
 
+def test_render_digest_body_sections_strips_nested_markers_and_drops_fragments():
+    rendered = main._render_digest_body_sections(
+        "Top headlines from the last 30 minutes",
+        "",
+        [
+            "Context- 🔴BSF arrested a smuggler in Karimpur with 24 kg of silver.",
+            "The targeted assassination wave hit 3 vehicles: ● a pickup in Meifdoun ● a Rapid on the coastal road.",
+            '"It is highly likely that some traces of interference will be found" on the attempt to blow up...',
+        ],
+        [],
+    )
+
+    plain = ai_filter.strip_telegram_html(rendered)
+    assert "Context-" not in plain
+    assert "🔴" not in plain
+    assert "●" not in plain
+    assert "blow up..." not in plain
+
+
 @pytest.mark.asyncio
 async def test_send_album_single_item_preserves_original_caption(monkeypatch):
     captured: dict[str, object] = {}

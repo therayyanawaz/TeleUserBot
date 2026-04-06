@@ -539,6 +539,8 @@ def _feed_segment_is_incomplete(line: str) -> bool:
     cleaned = normalize_space(line)
     if not cleaned:
         return True
+    if cleaned.endswith(('...', '…')):
+        return True
     if cleaned.endswith((':', '/', '-', '|', '•')):
         return True
     if cleaned.startswith(("@", "/", "\\")):
@@ -2139,6 +2141,13 @@ _DIGEST_REPORTS_OF_RE = re.compile(
 _DIGEST_WEAK_SCENE_SETTER_RE = re.compile(
     r"(?i)^(?:the window stayed active|the main development in this window was|the half-hour was dominated by)\b"
 )
+_DIGEST_CONTEXT_PREFIX_RE = re.compile(r"(?i)^context\s*[-:]\s*")
+_DIGEST_LEADING_MARKER_RE = re.compile(r"^(?:[•●▪■◆◦▸🔴🟠🟡🟢🔵🟣⚫⚪🟥🟧🟨🟩🟦🟪⬛⬜]+\s*)+")
+_DIGEST_INLINE_BULLET_RE = re.compile(r"\s+[•●▪■◆◦▸]+\s+")
+_DIGEST_INLINE_ALERT_RE = re.compile(r"\s*[🔴🟠🟡🟢🔵🟣⚫⚪🟥🟧🟨🟩🟦🟪⬛⬜]+\s*")
+_DIGEST_SPECIFIC_ACTION_RE = re.compile(
+    r"(?i)\b(?:arrested|attack|attacked|captures?|captured|confirmed|destroyed|explosions?|fell|fired|hit|hits|intercepted|killed|launched|missile|raided|reports? of|seized|smuggler|strike|strikes|targeted)\b"
+)
 
 
 def _digest_line_key(text: str) -> str:
@@ -2233,6 +2242,45 @@ def _digest_has_citation_language(text: str) -> bool:
     return False
 
 
+def _strip_digest_display_noise(text: str) -> str:
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return ""
+    cleaned = _DIGEST_CONTEXT_PREFIX_RE.sub("", cleaned)
+    cleaned = _DIGEST_LEADING_MARKER_RE.sub("", cleaned)
+    cleaned = re.sub(r":\s+[•●▪■◆◦▸]+\s+", ": ", cleaned)
+    cleaned = _DIGEST_INLINE_BULLET_RE.sub(", ", cleaned)
+    cleaned = _DIGEST_INLINE_ALERT_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    return normalize_space(cleaned.strip(" ,;:-|/[]{}()"))
+
+
+def _digest_support_item_is_specific(text: str) -> bool:
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return False
+    if len(cleaned.split()) < 5:
+        return False
+    return bool(_DIGEST_SPECIFIC_ACTION_RE.search(cleaned) or re.search(r"\b\d+\b", cleaned))
+
+
+def _digest_polish_support_item(text: str, *, max_chars: int) -> str:
+    cleaned = _strip_digest_display_noise(_digest_finalize_sentence(text, max_chars=max_chars))
+    if not cleaned:
+        return ""
+    prefix_match = _DIGEST_GENERIC_UNCERTAINTY_RE.match(cleaned)
+    if prefix_match:
+        candidate = normalize_space(cleaned[prefix_match.end() :]).strip(" ,;:-")
+        if _digest_support_item_is_specific(candidate):
+            cleaned = candidate
+    if _feed_segment_is_incomplete(cleaned):
+        return ""
+    cleaned = _truncate_digest_fact(cleaned, max_chars=max_chars)
+    if not cleaned or _feed_segment_is_incomplete(cleaned):
+        return ""
+    return cleaned
+
+
 def _digest_clean_line(text: str, *, max_chars: int, allow_short: bool = False) -> str:
     cleaned = normalize_space(strip_telegram_html(str(text or "")))
     if not cleaned:
@@ -2245,6 +2293,7 @@ def _digest_clean_line(text: str, *, max_chars: int, allow_short: bool = False) 
     cleaned = _clean_generated_delivery_segment(cleaned)
     cleaned, _ = _digest_rewrite_source_attribution(cleaned)
     cleaned = _DIGEST_PROMO_FRAGMENT_RE.sub("", cleaned)
+    cleaned = _strip_digest_display_noise(cleaned)
     cleaned = re.sub(r"(?:[\U0001F300-\U0001FAFF\u2600-\u26FF\u2700-\u27BF\uFE0F]+\s*)+$", "", cleaned)
     cleaned = _rewrite_reports_of_phrase(cleaned)
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
@@ -2398,7 +2447,7 @@ def _clean_digest_support_items(
         if not raw:
             continue
         for part in re.split(r"\n+", raw):
-            cleaned = _digest_finalize_sentence(part, max_chars=max_chars)
+            cleaned = _digest_polish_support_item(part, max_chars=max_chars)
             key = _digest_line_key(cleaned)
             if not cleaned or not key or key in local_seen:
                 continue
@@ -3045,7 +3094,25 @@ def _truncate_digest_fact(text: str, *, max_chars: int) -> str:
     cleaned = normalize_space(text)
     if len(cleaned) <= max_chars:
         return cleaned
-    return f"{cleaned[: max_chars - 3].rsplit(' ', 1)[0]}..."
+    punctuation_cut = max(cleaned.rfind(mark, 0, max_chars) for mark in ".!?;:")
+    if punctuation_cut >= int(max_chars * 0.55):
+        candidate = cleaned[: punctuation_cut + 1].strip()
+    else:
+        candidate = cleaned[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;:-|/")
+    if not candidate:
+        return ""
+    if _feed_segment_is_incomplete(candidate):
+        candidate = re.sub(
+            r"(?i)\b(?:and|or|but|with|after|before|near|from|to|of|in|on|at|by|as|for|while|since|during)\s+\S+$",
+            "",
+            candidate,
+        ).rstrip(" ,;:-|/")
+    candidate = normalize_space(candidate)
+    if not candidate or _feed_segment_is_incomplete(candidate):
+        return ""
+    if not candidate.endswith((".", "!", "?")):
+        candidate = f"{candidate}."
+    return candidate
 
 
 def _split_digest_sentences(text: str) -> List[str]:

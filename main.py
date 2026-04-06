@@ -6602,23 +6602,38 @@ def _digest_support_line_limit() -> int:
     return max(3, min(value, 12))
 
 
+def _normalize_digest_display_item(text: str) -> str:
+    cleaned = normalize_space(strip_telegram_html(text))
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"(?i)^context\s*[-:]\s*", "", cleaned)
+    cleaned = re.sub(r"^(?:[•●▪■◆◦▸🔴🟠🟡🟢🔵🟣⚫⚪🟥🟧🟨🟩🟦🟪⬛⬜]+\s*)+", "", cleaned)
+    cleaned = re.sub(r":\s+[•●▪■◆◦▸]+\s+", ": ", cleaned)
+    cleaned = re.sub(r"\s+[•●▪■◆◦▸]+\s+", ", ", cleaned)
+    cleaned = re.sub(r"\s*[🔴🟠🟡🟢🔵🟣⚫⚪🟥🟧🟨🟩🟦🟪⬛⬜]+\s*", " ", cleaned)
+    cleaned = normalize_space(cleaned.strip(" ,;:-|/[]{}()"))
+    if cleaned.endswith(("...", "…")):
+        return ""
+    return cleaned
+
+
 def _render_digest_body_sections(
     headline: str,
     story: str,
     highlights: Sequence[str],
     also_moving: Sequence[str],
 ) -> str:
-    clean_headline = normalize_space(strip_telegram_html(headline))
-    clean_story = normalize_space(strip_telegram_html(story))
+    clean_headline = _normalize_digest_display_item(headline)
+    clean_story = _normalize_digest_display_item(story)
     clean_highlights = [
-        normalize_space(strip_telegram_html(item))
+        _normalize_digest_display_item(item)
         for item in highlights
-        if normalize_space(strip_telegram_html(item))
+        if _normalize_digest_display_item(item)
     ]
     clean_also = [
-        normalize_space(strip_telegram_html(item))
+        _normalize_digest_display_item(item)
         for item in also_moving
-        if normalize_space(strip_telegram_html(item))
+        if _normalize_digest_display_item(item)
     ]
     if clean_headline and not clean_story and clean_highlights:
         blocks = [

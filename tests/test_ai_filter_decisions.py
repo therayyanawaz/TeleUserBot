@@ -556,6 +556,35 @@ def test_digest_clean_line_rewrites_citation_style_attribution_to_generic_uncert
     assert cleaned == "Initial reports indicate continuous unusual explosions in Tel Aviv."
 
 
+def test_clean_digest_support_items_strips_markers_and_context_prefixes():
+    cleaned = ai_filter._clean_digest_support_items(
+        [
+            "Context- 🔴BSF arrested a smuggler in Karimpur with 24 kg of silver.",
+            'Initial reports indicate An Iranian missile fell in "Ramat Gan".',
+            "The targeted assassination wave hit 3 vehicles: ● a pickup in Meifdoun ● a Rapid on the coastal road.",
+        ],
+        max_chars=220,
+    )
+
+    assert cleaned[0] == "BSF arrested a smuggler in Karimpur with 24 kg of silver."
+    assert cleaned[1] == 'An Iranian missile fell in "Ramat Gan".'
+    assert "●" not in cleaned[2]
+    assert "🔴" not in cleaned[2]
+
+
+
+def test_truncate_digest_fact_prefers_complete_output_without_ellipsis():
+    truncated = ai_filter._truncate_digest_fact(
+        "The targeted assassination wave in the south targeted 3 vehicles and a motorcycle since this morning and left investigators tracking follow-on movement across multiple roads in the district.",
+        max_chars=110,
+    )
+
+    assert truncated
+    assert not truncated.endswith("...")
+    assert not truncated.endswith("…")
+    assert truncated.endswith((".", "!", "?"))
+
+
 @pytest.mark.asyncio
 async def test_prepare_digest_posts_collapses_duplicate_citation_variants():
     prepared, stats = await ai_filter._prepare_digest_posts(

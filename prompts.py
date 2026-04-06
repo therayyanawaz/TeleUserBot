@@ -103,6 +103,9 @@ def build_digest_system_prompt(
                 'Return ONLY one JSON object with this schema: {"quiet": boolean, "headline": string, "headlines": [string, ...], "also_moving": [string, ...]}.'
             )
             toggles.append("This is a short rolling digest. Output a headline rail, not a story digest.")
+            toggles.append("Never include alert glyphs like 🔴 or copied list bullets like ● inside a headline line.")
+            toggles.append("Do not start headline lines with wrappers like Context-, Initial reports indicate, or Preliminary reports suggest when the concrete fact can stand alone.")
+            toggles.append("Every final headline line must be self-contained. No trailing ellipses, clipped clauses, or broken fragments.")
             toggles.append("headline should be a short rail label, not a narrative sentence.")
             toggles.append("headlines must contain only the main distinct developments as short standalone headline lines.")
             toggles.append("For each headline line, pick the strongest concrete fact, not the softest setup line.")
