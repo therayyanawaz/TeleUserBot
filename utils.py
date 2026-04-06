@@ -561,6 +561,45 @@ _QUERY_FOCUS_TOPIC_RE = re.compile(
     re.IGNORECASE,
 )
 
+_QUERY_TREND_MARKERS = (
+    "escalating",
+    "escalation",
+    "de-escalating",
+    "deescalating",
+    "de-escalation",
+    "deescalation",
+    "worsening",
+    "worsen",
+    "intensifying",
+    "intensify",
+    "easing",
+    "ease",
+    "cooling",
+    "cool off",
+    "calming",
+    "stabilizing",
+    "trajectory",
+    "trend",
+    "direction",
+    "momentum",
+)
+
+_QUERY_ASSESSMENT_MARKERS = (
+    "what is the situation",
+    "what's the situation",
+    "current situation",
+    "where things stand",
+    "to what extent",
+    "how serious",
+    "how intense",
+    "how bad",
+    "how severe",
+    "is it escalating",
+    "is this escalating",
+    "is it de-escalating",
+    "is this de-escalating",
+)
+
 
 def extract_query_keywords(query: str) -> list[str]:
     """
@@ -842,6 +881,41 @@ def is_broad_news_query(query: str) -> bool:
         return True
 
     return not extract_query_keywords(lowered)
+
+
+def query_prefers_direct_answer(query: str) -> bool:
+    """
+    Some broad strategic questions still need a direct analytical answer instead
+    of a digest-style recap.
+    """
+    lowered = normalize_space(query).lower()
+    if not lowered:
+        return False
+
+    has_assessment_marker = any(marker in lowered for marker in _QUERY_ASSESSMENT_MARKERS)
+    has_trend_marker = any(marker in lowered for marker in _QUERY_TREND_MARKERS)
+    has_question_shape = (
+        "?" in lowered
+        or lowered.startswith(("what ", "what's ", "how ", "is ", "are ", "where "))
+    )
+    has_comparison = bool(
+        re.search(
+            r"\b(?:escalat(?:ing|ion)|worsen(?:ing)?|intensif(?:ying|ication))\b.+\b(?:or|vs\.?|versus)\b.+\b(?:de-?escalat(?:ing|ion)|eas(?:ing|e)|calm(?:ing)?)\b",
+            lowered,
+        )
+    )
+
+    return bool(
+        has_question_shape
+        and (
+            has_assessment_marker
+            or has_comparison
+            or (
+                has_trend_marker
+                and any(marker in lowered for marker in ("situation", "conflict", "war", "front", "exchange"))
+            )
+        )
+    )
 
 
 def dedupe_preserve_order(items: Sequence[str]) -> List[str]:

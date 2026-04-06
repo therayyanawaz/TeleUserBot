@@ -168,6 +168,7 @@ from utils import (
     sanitize_telegram_html,
     search_recent_news_web,
     search_recent_messages,
+    query_prefers_direct_answer,
     runtime_now,
     runtime_timezone,
     seconds_until_next_daily_time,
@@ -9479,6 +9480,7 @@ async def _handle_query_request(
         cleaned_query = plan.cleaned_query
         effective_query = plan.original_query or text
         broad_query = plan.broad_query
+        direct_answer_query = query_prefers_direct_answer(effective_query)
         query_keywords = list(plan.keywords)
         query_numbers = list(plan.numbers)
         high_risk_query = _is_high_risk_news_query(effective_query)
@@ -9647,7 +9649,7 @@ async def _handle_query_request(
                 query_text=effective_query,
                 results=results,
                 history=history,
-                digest_mode=broad_query,
+                digest_mode=(broad_query and not direct_answer_query),
                 digest_hours_back=active_hours,
                 digest_explicit_time_filter=bool(getattr(plan, "explicit_time_filter", False)),
                 prefer_bot_identity=prefer_bot_identity,
@@ -9656,7 +9658,7 @@ async def _handle_query_request(
                 final_suffix_html=evidence_split_section,
             )
         else:
-            if broad_query:
+            if broad_query and not direct_answer_query:
                 answer = await create_digest_summary(
                     list(results),
                     auth_manager=_require_auth_manager(),
@@ -9710,6 +9712,7 @@ async def _handle_query_request(
             web_search_ran=ran_web_search,
             expanded_window_used=expanded_window_used,
             broad_query=broad_query,
+            direct_answer_query=direct_answer_query,
             high_risk_query=high_risk_query,
             response_chars=len(answer),
             stream_enabled=_is_streaming_enabled(),

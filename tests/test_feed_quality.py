@@ -261,6 +261,17 @@ def test_build_query_search_variants_prioritize_subject_terms_for_choice_queries
     assert "which data centers did" not in variants
 
 
+def test_query_prefers_direct_answer_for_conflict_trend_question():
+    query = (
+        "What is the situation regarding the Iran-Israel conflict? "
+        "Is it escalating or de-escalating, and to what extent?"
+    )
+
+    assert utils.is_broad_news_query(query) is True
+    assert utils.query_prefers_direct_answer(query) is True
+    assert utils.query_prefers_direct_answer("What happened today in Tehran?") is False
+
+
 @pytest.mark.asyncio
 async def test_search_recent_messages_scans_chats_in_parallel():
     class _FakeClient:
@@ -1695,6 +1706,79 @@ async def test_handle_query_request_streams_search_terms_into_progress(monkeypat
     assert any("oracle aws" in text.lower() for text in progress_texts)
     assert any("recent history scan" in text.lower() for text in progress_texts)
     assert any("Google News RSS" in text for text in progress_texts)
+
+
+@pytest.mark.asyncio
+async def test_handle_query_request_uses_direct_answer_for_broad_trend_query(monkeypatch):
+    main.query_last_request_ts.clear()
+    sent_texts: list[str] = []
+    generate_calls: list[str] = []
+
+    async def fake_safe_reply_markdown(_event, text, *, edit_message=None, reply_to=None, prefer_bot_identity=False, bot_chat_id=None):
+        sent_texts.append(text)
+        return edit_message or {"message_id": 703}
+
+    async def fake_search_recent_messages(_client, _monitored, _query, *, max_messages=50, default_hours_back=24, progress_cb=None, logger=None):
+        return [
+            {
+                "text": "Iran and Israel exchanged more strikes overnight, but the tempo was lower than the previous peak.",
+                "source": "Desk Wire",
+                "timestamp": 1700000000,
+            },
+            {
+                "text": "Officials signaled they were not widening the conflict immediately despite continued alerts.",
+                "source": "Desk Wire",
+                "timestamp": 1699999000,
+            },
+        ]
+
+    async def fake_search_recent_news_web(_query, *, hours_back, max_results, allowed_domains, require_recent, progress_cb=None, logger=None):
+        return [
+            {
+                "text": "Reuters said the exchange was still active but had eased from the earlier surge in strikes.",
+                "source": "Reuters",
+                "timestamp": 1700000100,
+                "is_web": True,
+                "link": "https://example.com/report",
+            }
+        ]
+
+    async def fake_generate_answer_from_context(*_args, **_kwargs):
+        generate_calls.append("called")
+        return "<b>Direct answer</b><br>The conflict is still active, but the pace looks lower than the earlier peak."
+
+    async def fail_create_digest_summary(*_args, **_kwargs):
+        raise AssertionError("digest path should not run for this query")
+
+    monkeypatch.setattr(main, "_is_query_runtime_available", lambda: True)
+    monkeypatch.setattr(main, "_safe_reply_markdown", fake_safe_reply_markdown)
+    monkeypatch.setattr(main, "_require_client", lambda: object())
+    monkeypatch.setattr(main, "search_recent_messages", fake_search_recent_messages)
+    monkeypatch.setattr(main, "_search_recent_news_web_bounded", fake_search_recent_news_web)
+    monkeypatch.setattr(main, "_load_queue_query_context", lambda **_kwargs: [])
+    monkeypatch.setattr(main, "_load_archive_query_context", lambda **_kwargs: [])
+    monkeypatch.setattr(main, "_is_streaming_enabled", lambda: False)
+    monkeypatch.setattr(main, "_require_auth_manager", lambda: object())
+    monkeypatch.setattr(main, "generate_answer_from_context", fake_generate_answer_from_context)
+    monkeypatch.setattr(main, "create_digest_summary", fail_create_digest_summary)
+    monkeypatch.setattr(main, "_query_web_require_min_sources", lambda: 1)
+    monkeypatch.setattr(main, "_append_query_history", lambda *_args, **_kwargs: None)
+
+    await main._handle_query_request(
+        event_ref=SimpleNamespace(chat_id=780),
+        text=(
+            "What is the situation regarding the Iran-Israel conflict? "
+            "Is it escalating or de-escalating, and to what extent?"
+        ),
+        sender_id=80,
+        chat_id="chat-80",
+        reply_to=None,
+        prefer_bot_identity=False,
+        bot_chat_id=None,
+    )
+
+    assert generate_calls == ["called"]
+    assert any("pace looks lower" in text.lower() for text in sent_texts)
 
 
 @pytest.mark.asyncio

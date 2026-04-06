@@ -39,6 +39,7 @@ from utils import (
     is_broad_news_query,
     log_structured,
     normalize_space,
+    query_prefers_direct_answer,
     sanitize_telegram_html,
     strip_telegram_html,
 )
@@ -3825,6 +3826,8 @@ def _query_fallback_title(query: str, candidate_lines: Sequence[str]) -> str:
         return "Best available answer"
     if _query_is_casualty_question(query):
         return "What the evidence shows"
+    if query_prefers_direct_answer(query):
+        return "Direct answer"
     if is_broad_news_query(query):
         return "Latest update"
     return "Direct answer"
