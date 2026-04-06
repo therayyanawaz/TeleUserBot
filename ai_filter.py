@@ -532,7 +532,10 @@ def _feed_segment_is_incomplete(line: str) -> bool:
     words = re.findall(r"[A-Za-z0-9][A-Za-z0-9.'/-]*", cleaned)
     if not words:
         return True
-    if words[-1].strip(".,;:!?").lower() in _FEED_INCOMPLETE_TAIL_WORDS:
+    tail_word = words[-1].strip(".,;:!?").lower()
+    if tail_word in _FEED_INCOMPLETE_TAIL_WORDS:
+        return True
+    if tail_word in {"its", "their", "his", "her", "our", "your", "my", "whose"}:
         return True
     match = re.match(
         r"^(?P<prefix>[A-Za-z][A-Za-z0-9&'._ -]{1,40})\s*:\s*(?P<rest>.+)$",
@@ -2529,8 +2532,8 @@ def _digest_payload_to_narrative(
         seen: set[str] = set()
         if headline_key:
             seen.add(headline_key)
-        highlights = _clean_digest_support_items(headlines_raw, max_chars=180, seen=seen)
-        also_moving = _clean_digest_support_items(also_raw, max_chars=180, seen=seen)
+        highlights = _clean_digest_support_items(headlines_raw, max_chars=0, seen=seen)
+        also_moving = _clean_digest_support_items(also_raw, max_chars=0, seen=seen)
 
         if not highlights:
             fallback_values: list[Any] = []
@@ -2556,7 +2559,7 @@ def _digest_payload_to_narrative(
             timeline_items = payload.get("timeline_items")
             if isinstance(timeline_items, list):
                 fallback_values.extend(timeline_items)
-            highlights = _clean_digest_support_items(fallback_values, max_chars=180, seen=seen)
+            highlights = _clean_digest_support_items(fallback_values, max_chars=0, seen=seen)
 
         if len(also_moving) > _digest_also_moving_cap(max_lines):
             highlights.extend(also_moving[_digest_also_moving_cap(max_lines) :])
@@ -2772,12 +2775,12 @@ def _render_digest_layout(
 
     clean_highlights = _clean_digest_support_items(
         highlights,
-        max_chars=(180 if headline_mode else 220),
+        max_chars=(0 if headline_mode else 220),
         seen=seen,
     )
     clean_also = _clean_digest_support_items(
         also_moving,
-        max_chars=(180 if headline_mode else 200),
+        max_chars=(0 if headline_mode else 200),
         seen=seen,
     )
     if len(clean_also) > _digest_also_moving_cap():
@@ -2787,13 +2790,13 @@ def _render_digest_layout(
     if headline_mode:
         story_headlines = _clean_digest_support_items(
             _split_digest_sentences(clean_story),
-            max_chars=180,
+            max_chars=0,
             seen=seen,
         )
         if story_headlines:
             clean_highlights = [*story_headlines, *clean_highlights]
         if not clean_highlights:
-            clean_highlights = _clean_digest_support_items([clean_story], max_chars=180, seen=seen)
+            clean_highlights = _clean_digest_support_items([clean_story], max_chars=0, seen=seen)
         clean_highlights, clean_also = _cap_headline_rail_support(
             clean_highlights,
             clean_also,
@@ -3055,6 +3058,8 @@ def _build_digest_context(
 
 def _truncate_digest_fact(text: str, *, max_chars: int) -> str:
     cleaned = normalize_space(text)
+    if max_chars <= 0:
+        return cleaned
     if len(cleaned) <= max_chars:
         return cleaned
     punctuation_cut = max(cleaned.rfind(mark, 0, max_chars) for mark in ".!?;:")

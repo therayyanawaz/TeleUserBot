@@ -284,6 +284,40 @@ def test_json_digest_to_html_caps_headline_rail_lines_for_short_window():
     assert "Also moving" not in plain
 
 
+def test_json_digest_to_html_keeps_long_headline_rail_line_intact():
+    line = (
+        "Joint Chiefs detail a 45-hour CSAR that retrieved the F-15E crew, using 155 aircraft, "
+        "while an A-10 was hit but its pilot landed safely and the recovery package completed the extraction."
+    )
+
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "headline": "Top headlines from the last 30 minutes",
+            "headlines": [line],
+        },
+        interval_minutes=30,
+        max_lines=12,
+    )
+
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert line in plain
+    assert "but its." not in plain
+
+
+
+def test_clean_digest_support_items_drops_incomplete_possessive_tail():
+    cleaned = ai_filter._clean_digest_support_items(
+        [
+            "Joint Chiefs detail a 45-hour CSAR that retrieved the F-15E crew while an A-10 was hit but its.",
+        ],
+        max_chars=0,
+    )
+
+    assert cleaned == []
+
+
 def test_json_digest_to_html_renders_narrative_digest():
     html = ai_filter._json_digest_to_html(
         {
