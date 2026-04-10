@@ -273,6 +273,56 @@ def test_query_prefers_direct_answer_for_conflict_trend_question():
 
 
 @pytest.mark.asyncio
+async def test_call_with_floodwait_retries_short_wait(monkeypatch):
+    class _FakeFloodWaitError(Exception):
+        def __init__(self, seconds: int) -> None:
+            self.seconds = seconds
+
+    sleeps: list[int] = []
+    calls = {"count": 0}
+
+    async def fake_sleep(seconds: int) -> None:
+        sleeps.append(seconds)
+
+    async def flaky_call():
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise _FakeFloodWaitError(2)
+        return "ok"
+
+    monkeypatch.setattr(main, "FloodWaitError", _FakeFloodWaitError)
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main.config, "TELEGRAM_MAX_FLOODWAIT_SECONDS", 90, raising=False)
+
+    result = await main._call_with_floodwait(flaky_call)
+
+    assert result == "ok"
+    assert sleeps == [3]
+
+
+@pytest.mark.asyncio
+async def test_call_with_floodwait_aborts_long_wait(monkeypatch):
+    class _FakeFloodWaitError(Exception):
+        def __init__(self, seconds: int) -> None:
+            self.seconds = seconds
+
+    async def fake_sleep(_seconds: int) -> None:
+        raise AssertionError("long floodwait should not sleep")
+
+    async def blocked_call():
+        raise _FakeFloodWaitError(602)
+
+    monkeypatch.setattr(main, "FloodWaitError", _FakeFloodWaitError)
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main.config, "TELEGRAM_MAX_FLOODWAIT_SECONDS", 90, raising=False)
+
+    with pytest.raises(main.LongFloodWaitError) as exc:
+        await main._call_with_floodwait(blocked_call)
+
+    assert exc.value.wait_seconds == 603
+
+
+@pytest.mark.asyncio
 async def test_search_recent_messages_scans_chats_in_parallel():
     class _FakeClient:
         def __init__(self) -> None:

@@ -3048,6 +3048,24 @@ def _is_retryable_network_error(exc: BaseException) -> bool:
     return False
 
 
+class LongFloodWaitError(RuntimeError):
+    def __init__(self, wait_seconds: int, operation: str) -> None:
+        self.wait_seconds = int(wait_seconds)
+        self.operation = str(operation or "telegram_call")
+        super().__init__(
+            f"Telegram FloodWait too long for {self.operation}: {self.wait_seconds}s"
+        )
+
+
+def _telegram_max_floodwait_seconds() -> int:
+    raw = getattr(config, "TELEGRAM_MAX_FLOODWAIT_SECONDS", 90)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 90
+    return max(10, min(value, 3600))
+
+
 async def _call_with_floodwait(func, *args, **kwargs):
     network_attempt = 0
     while True:
@@ -3055,6 +3073,15 @@ async def _call_with_floodwait(func, *args, **kwargs):
             return await func(*args, **kwargs)
         except FloodWaitError as exc:
             wait_seconds = int(exc.seconds) + 1
+            operation = getattr(func, "__name__", repr(func))
+            max_wait = _telegram_max_floodwait_seconds()
+            if wait_seconds > max_wait:
+                LOGGER.error(
+                    "FloodWaitError too long for %s: %s second(s). Aborting call.",
+                    operation,
+                    wait_seconds,
+                )
+                raise LongFloodWaitError(wait_seconds, operation) from exc
             LOGGER.error("FloodWaitError: sleeping %s second(s).", wait_seconds)
             await asyncio.sleep(wait_seconds)
         except Exception as exc:

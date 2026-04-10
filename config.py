@@ -125,6 +125,7 @@ _load_dotenv(ENV_PATH)
 # Telegram API credentials from https://my.telegram.org
 TELEGRAM_API_ID = _env_int("TELEGRAM_API_ID", 0)  # type: int
 TELEGRAM_API_HASH = _env_str("TELEGRAM_API_HASH", "")  # type: str
+TELEGRAM_MAX_FLOODWAIT_SECONDS = _env_int("TELEGRAM_MAX_FLOODWAIT_SECONDS", 90)  # type: int
 
 # Shared Telegram folder invite link (addlist).
 FOLDER_INVITE_LINK = _env_str("FOLDER_INVITE_LINK", "")  # type: str
