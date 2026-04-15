@@ -1150,6 +1150,31 @@ def test_render_digest_body_sections_strips_nested_markers_and_drops_fragments()
     assert "blow up..." not in plain
 
 
+def test_html_digest_cleanup_drops_quote_threads_and_keeps_real_headline():
+    raw = (
+        "Top headlines from the last 30 minutes<br>"
+        "• China is very happy that I am permanently opening the Strait of Hormuz.<br>"
+        "• I am doing it for them, also - And the World.<br>"
+        "• This situation will never happen again.<br>"
+        "• They have agreed not to send weapons to Iran.<br>"
+        "• President Xi will give me a big, fat, hug when I get there in a few weeks.<br>"
+        "• We are working together smartly, and very well!<br>"
+        "• Doesn’t that beat fighting???<br>"
+        "• BUT REMEMBER, we are very good at fighting, if we have to - far better than anyone else!!!<br>"
+        "• President DJT<br>"
+        "• Lebanese Political Analyst, Khalil Nasrallah: “Continuing the round of political communications led by Araghchi, the Khatam al-Anbiya Headquarters stated that it ‘will not allow.<br>"
+        "• Drone strike detected in Lebanon Affected areas: Deir al-Zahrani."
+    )
+
+    cleaned = ai_filter._html_digest_cleanup(raw, interval_minutes=30, max_lines=12)
+    plain = ai_filter.strip_telegram_html(cleaned)
+
+    assert "Strait of Hormuz" not in plain
+    assert "President DJT" not in plain
+    assert "Khalil Nasrallah" not in plain
+    assert "Drone strike detected in Lebanon" in plain
+
+
 @pytest.mark.asyncio
 async def test_send_media_caption_overflow_replies_to_media(monkeypatch):
     sent_calls: list[tuple[str, int | None]] = []

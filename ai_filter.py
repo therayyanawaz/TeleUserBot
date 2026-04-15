@@ -618,6 +618,8 @@ def _is_bad_feed_headline(line: str) -> bool:
     signals = detect_story_signals(cleaned)
     if len(cleaned) < 24:
         return True
+    if _digest_is_low_value_quote_or_rant(cleaned):
+        return True
     if cleaned.endswith("?") or _FEED_QUESTION_RE.search(cleaned):
         return True
     if bool(signals.get("downgrade_explainer")) and not bool(signals.get("live_event_update")):
@@ -635,6 +637,8 @@ def _is_weak_feed_context(line: str, headline: str) -> bool:
     cleaned = normalize_space(line)
     lowered = cleaned.lower()
     if not cleaned:
+        return True
+    if _digest_is_low_value_quote_or_rant(cleaned):
         return True
     if cleaned.endswith("?") or _FEED_QUESTION_RE.search(cleaned):
         return True
@@ -2142,6 +2146,15 @@ _DIGEST_INLINE_ALERT_RE = re.compile(r"\s*[🔴🟠🟡🟢🔵🟣⚫⚪🟥�
 _DIGEST_SPECIFIC_ACTION_RE = re.compile(
     r"(?i)\b(?:arrested|attack|attacked|captures?|captured|confirmed|destroyed|explosions?|fell|fired|hit|hits|intercepted|killed|launched|missile|raided|reports? of|seized|smuggler|strike|strikes|targeted)\b"
 )
+_DIGEST_FIRST_PERSON_RE = re.compile(r"(?i)\b(?:i|i'm|i am|i've|i will|we|we're|we are|we've|our|my)\b")
+_DIGEST_SIGNATURE_LINE_RE = re.compile(r"(?i)^(?:president\s+[a-z]{2,24}|[a-z]{1,4})$")
+_DIGEST_QUOTE_FRAGMENT_RE = re.compile(r"[\"“”'‘’]")
+_DIGEST_QUOTE_PREFIX_RE = re.compile(
+    r"(?i)^(?:[^:]{3,80}:\s*)?[\"“'‘].+|^[^:]{3,120}:\s*[\"“'‘]"
+)
+_DIGEST_RANT_FRAGMENT_RE = re.compile(
+    r"(?i)\b(?:to quote the bible|religious crusade|doesn.?t that beat fighting|but remember|big, fat, hug|president djt)\b"
+)
 
 
 def _digest_line_key(text: str) -> str:
@@ -2150,6 +2163,30 @@ def _digest_line_key(text: str) -> str:
     cleaned = re.sub(r"(?i)\b(?:reports?|indicate|indicates|indicated|suggest|suggests|suggested)\b", "", cleaned)
     cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned)
     return _cache_key(cleaned)
+
+
+def _digest_is_low_value_quote_or_rant(text: str) -> bool:
+    cleaned = normalize_space(strip_telegram_html(str(text or "")))
+    lowered = cleaned.lower()
+    if not cleaned:
+        return True
+    if _DIGEST_ALSO_MOVING_RE.fullmatch(cleaned):
+        return False
+    if _DIGEST_SIGNATURE_LINE_RE.fullmatch(lowered):
+        return True
+    if len(cleaned.split()) < 4 and not _DIGEST_SPECIFIC_ACTION_RE.search(cleaned):
+        return True
+    if _DIGEST_RANT_FRAGMENT_RE.search(cleaned):
+        return True
+    if _DIGEST_FIRST_PERSON_RE.search(cleaned) and not _DIGEST_SPECIFIC_ACTION_RE.search(cleaned):
+        return True
+    if _DIGEST_QUOTE_PREFIX_RE.search(cleaned) and (
+        _feed_segment_is_incomplete(cleaned) or not _DIGEST_SPECIFIC_ACTION_RE.search(cleaned)
+    ):
+        return True
+    if _DIGEST_QUOTE_FRAGMENT_RE.search(cleaned) and _feed_segment_is_incomplete(cleaned):
+        return True
+    return False
 
 
 def _looks_like_digest_citation_prefix(prefix: str) -> bool:
@@ -2262,6 +2299,8 @@ def _digest_polish_support_item(text: str, *, max_chars: int) -> str:
     cleaned = _strip_digest_display_noise(_digest_finalize_sentence(text, max_chars=max_chars))
     if not cleaned:
         return ""
+    if _digest_is_low_value_quote_or_rant(cleaned):
+        return ""
     prefix_match = _DIGEST_GENERIC_UNCERTAINTY_RE.match(cleaned)
     if prefix_match:
         candidate = normalize_space(cleaned[prefix_match.end() :]).strip(" ,;:-")
@@ -2293,6 +2332,8 @@ def _digest_clean_line(text: str, *, max_chars: int, allow_short: bool = False) 
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
     cleaned = normalize_space(cleaned.strip(" ,;:-|/[]{}()•"))
     if not cleaned or _DIGEST_PUNCT_ONLY_RE.fullmatch(cleaned):
+        return ""
+    if _digest_is_low_value_quote_or_rant(cleaned):
         return ""
     if _digest_has_citation_language(cleaned):
         return ""
