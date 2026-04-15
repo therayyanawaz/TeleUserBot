@@ -349,6 +349,8 @@ DIGEST_DAILY_TIMES=["00:00"]
 DIGEST_DAILY_WINDOW_HOURS=24
 DIGEST_MAX_POSTS=80
 OUTPUT_LANGUAGE="English"
+DIGEST_HEADLINE_CONTEXT_ENABLED=true
+DIGEST_HEADLINE_CONTEXT_MAX_ITEMS=2
 ```
 
 Notes:
@@ -356,6 +358,7 @@ Notes:
 - `TIMEZONE` controls local-time logic across the bot; for IST use `Asia/Kolkata`
 - rolling digests are clock-aligned to `:00` and `:30`
 - rolling 30-minute windows publish only the main headlines, not a full story digest
+- ambiguous 30-minute headline lines can trigger Telegram + trusted-web context search before posting
 - if stale rolling backlog falls at least 4 closed windows behind, the bot compacts it into one `Catch-up Digest` and then resumes normal cadence
 - digest windows are claimed from SQLite, not held only in memory
 - digest queue clearing is intentionally disabled; queued items are drained only by claimed digest windows

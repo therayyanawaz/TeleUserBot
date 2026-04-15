@@ -44,6 +44,7 @@ from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInv
 
 import config
 from ai_filter import (
+    _call_codex_with_auth_repair,
     create_digest_summary,
     create_digest_summary_result,
     extract_digest_narrative_parts,
@@ -1223,6 +1224,46 @@ def _digest_max_posts() -> int:
     except Exception:
         value = 80
     return max(1, min(value, 500))
+
+
+def _digest_headline_context_enabled() -> bool:
+    return _bool_flag(getattr(config, "DIGEST_HEADLINE_CONTEXT_ENABLED", True), True)
+
+
+def _digest_headline_context_max_items() -> int:
+    raw = getattr(config, "DIGEST_HEADLINE_CONTEXT_MAX_ITEMS", 2)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 2
+    return max(0, min(value, 6))
+
+
+def _digest_headline_context_hours_back() -> int:
+    raw = getattr(config, "DIGEST_HEADLINE_CONTEXT_HOURS_BACK", 168)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 168
+    return max(1, min(value, 24 * 30))
+
+
+def _digest_headline_context_telegram_max_messages() -> int:
+    raw = getattr(config, "DIGEST_HEADLINE_CONTEXT_TELEGRAM_MAX_MESSAGES", 8)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 8
+    return max(2, min(value, 20))
+
+
+def _digest_headline_context_web_max_results() -> int:
+    raw = getattr(config, "DIGEST_HEADLINE_CONTEXT_WEB_MAX_RESULTS", 6)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 6
+    return max(0, min(value, 20))
 
 
 def _digest_send_delay_seconds() -> float:
@@ -6962,6 +7003,330 @@ def _digest_line_key(text: str) -> str:
     return normalize_space(strip_telegram_html(text)).lower()
 
 
+_HEADLINE_CONTEXT_PREFIX_RE = re.compile(
+    r"^(?:he|she|they|his|her|their|this|that|these|those|it|its)\b[\s:,-]*",
+    flags=re.IGNORECASE,
+)
+_HEADLINE_CONTEXT_GENERIC_NAME_TOKENS = {
+    "also",
+    "analysis",
+    "april",
+    "august",
+    "december",
+    "february",
+    "friday",
+    "headline",
+    "headlines",
+    "initial",
+    "january",
+    "july",
+    "june",
+    "march",
+    "monday",
+    "news",
+    "november",
+    "october",
+    "official",
+    "officials",
+    "preliminary",
+    "report",
+    "reports",
+    "saturday",
+    "sunday",
+    "telegram",
+    "thursday",
+    "tuesday",
+    "update",
+    "updates",
+    "wednesday",
+    "web",
+}
+
+
+def _headline_needs_context_search(text: str) -> bool:
+    cleaned = normalize_space(strip_telegram_html(str(text or "")))
+    if not cleaned:
+        return False
+    return bool(_HEADLINE_CONTEXT_PREFIX_RE.match(cleaned))
+
+
+def _headline_context_query(text: str) -> str:
+    cleaned = normalize_space(strip_telegram_html(str(text or "")))
+    if not cleaned:
+        return ""
+    cleaned = _HEADLINE_CONTEXT_PREFIX_RE.sub("", cleaned, count=1)
+    cleaned = re.sub(
+        r"\b(?:he|she|they|his|her|their|this|that|these|those|it|its)\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[\"'“”‘’]+", " ", cleaned)
+    return normalize_space(cleaned.strip(" ,;:-|/()[]{}"))
+
+
+def _headline_context_evidence_line(row: Dict[str, object]) -> str:
+    text = normalize_space(strip_telegram_html(str(row.get("text") or "")))
+    if not text:
+        return ""
+    source = normalize_space(str(row.get("source") or ""))
+    prefix = "Web" if bool(row.get("is_web")) or source.lower().startswith("web:") else "Telegram"
+    return f"{prefix}: {text}"
+
+
+def _headline_context_candidate_names(text: str) -> list[str]:
+    cleaned = normalize_space(strip_telegram_html(str(text or "")))
+    if not cleaned:
+        return []
+
+    pattern = re.compile(r"\b(?:[A-Z][a-z]+|[A-Z]\.)(?:\s+(?:[A-Z][a-z]+|[A-Z]\.)){0,3}\b")
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for match in pattern.finditer(cleaned):
+        candidate = normalize_space(match.group(0).strip(" ,;:.!?-"))
+        if not candidate:
+            continue
+        parts = candidate.split()
+        if not parts:
+            continue
+        first = parts[0].strip(".").lower()
+        if first in _HEADLINE_CONTEXT_GENERIC_NAME_TOKENS:
+            continue
+        if len(parts) == 1 and len(parts[0]) < 5:
+            continue
+        normalized = candidate.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        candidates.append(candidate)
+    return candidates
+
+
+def _select_headline_context_subject(
+    rows: Sequence[Dict[str, object]],
+    headline: str,
+) -> str | None:
+    cleaned = normalize_space(strip_telegram_html(str(headline or "")))
+    if not cleaned:
+        return None
+
+    prefer_person = bool(re.match(r"^(?:he|she|his|her)\b", cleaned, flags=re.IGNORECASE))
+    scores: Dict[str, float] = {}
+
+    for row in rows:
+        row_weight = 1.0 + (0.35 if bool(row.get("is_web")) else 0.0)
+        row_text = normalize_space(strip_telegram_html(str(row.get("text") or "")))
+        for candidate in _headline_context_candidate_names(row_text):
+            score = row_weight
+            parts = candidate.split()
+            if len(parts) >= 2:
+                score += 0.75
+            if prefer_person and len(parts) >= 2:
+                score += 0.75
+            if prefer_person and len(parts) == 1:
+                score += 0.15
+            scores[candidate] = scores.get(candidate, 0.0) + score
+
+    if not scores:
+        return None
+
+    best_candidate, best_score = max(
+        scores.items(),
+        key=lambda item: (item[1], len(item[0].split()), len(item[0])),
+    )
+    if best_score < 1.5:
+        return None
+    return best_candidate
+
+
+def _rewrite_headline_with_subject_candidate(headline: str, subject: str) -> str:
+    cleaned = normalize_space(strip_telegram_html(str(headline or "")))
+    resolved_subject = normalize_space(subject)
+    if not cleaned or not resolved_subject:
+        return cleaned
+
+    replacements = (
+        (r"^He\b", resolved_subject),
+        (r"^She\b", resolved_subject),
+        (r"^His\b", f"{resolved_subject}'s"),
+        (r"^Her\b", f"{resolved_subject}'s"),
+        (r"^They\b", resolved_subject),
+        (r"^Their\b", f"{resolved_subject}'s"),
+        (r"^This\b", resolved_subject),
+        (r"^That\b", resolved_subject),
+        (r"^These\b", resolved_subject),
+        (r"^Those\b", resolved_subject),
+        (r"^It\b", resolved_subject),
+        (r"^Its\b", f"{resolved_subject}'s"),
+    )
+    for pattern, replacement in replacements:
+        rewritten, count = re.subn(pattern, replacement, cleaned, count=1, flags=re.IGNORECASE)
+        if count:
+            return normalize_space(rewritten)
+    return cleaned
+
+
+def _headline_context_quality_ok(original: str, rewritten: str) -> bool:
+    base = normalize_space(strip_telegram_html(str(original or "")))
+    cleaned = normalize_space(strip_telegram_html(str(rewritten or "")))
+    if not cleaned or cleaned.lower() == base.lower():
+        return False
+    if len(cleaned) > 180 or cleaned.endswith(("...", "…")):
+        return False
+    if _headline_needs_context_search(cleaned):
+        return False
+    return True
+
+
+async def _headline_context_ai_rewrite(
+    headline: str,
+    evidence_lines: Sequence[str],
+) -> str | None:
+    cleaned = normalize_space(strip_telegram_html(str(headline or "")))
+    compact_evidence = [normalize_space(line) for line in evidence_lines if normalize_space(line)]
+    if not cleaned or not compact_evidence:
+        return None
+
+    prompt = (
+        "Rewrite one rolling-digest headline into one short standalone line.\n"
+        "Rules:\n"
+        "- Resolve ambiguous pronouns or demonstratives into the explicit person or entity when evidence supports it.\n"
+        "- Keep the same factual claim as the original line.\n"
+        "- Output plain text only.\n"
+        "- Max 18 words.\n"
+        "- No source names, no quotes, no bullets, no labels.\n"
+        "- If identity stays unclear, return the original headline exactly."
+    )
+    payload = "\n".join(
+        [
+            f"Original headline: {cleaned}",
+            "Evidence:",
+            *[f"- {line}" for line in compact_evidence[:8]],
+        ]
+    )
+    try:
+        rewritten = await _call_codex_with_auth_repair(
+            payload,
+            _require_auth_manager(),
+            prompt,
+            verbosity="low",
+        )
+    except Exception:
+        LOGGER.debug("Headline context AI rewrite failed.", exc_info=True)
+        return None
+
+    candidate = normalize_space(strip_telegram_html(str(rewritten or ""))).strip(" -•")
+    return candidate or None
+
+
+async def _rewrite_headline_with_context_search(headline: str) -> str:
+    cleaned = normalize_space(strip_telegram_html(str(headline or "")))
+    if not _headline_needs_context_search(cleaned):
+        return cleaned
+
+    query = _headline_context_query(cleaned)
+    if len(query) < 8:
+        return cleaned
+
+    hours_back = _digest_headline_context_hours_back()
+    web_max_results = _digest_headline_context_web_max_results()
+    if not monitored_source_chat_ids and web_max_results <= 0:
+        return cleaned
+    try:
+        telegram_results, web_results = await asyncio.gather(
+            (
+                search_recent_messages(
+                    _require_client(),
+                    monitored_source_chat_ids,
+                    query,
+                    max_messages=_digest_headline_context_telegram_max_messages(),
+                    default_hours_back=hours_back,
+                    logger=LOGGER,
+                )
+                if monitored_source_chat_ids
+                else asyncio.sleep(0, result=[])
+            ),
+            (
+                search_recent_news_web(
+                    query,
+                    hours_back=hours_back,
+                    max_results=web_max_results,
+                    allowed_domains=_query_web_allowed_domains(),
+                    require_recent=False,
+                    logger=LOGGER,
+                )
+                if web_max_results > 0
+                else asyncio.sleep(0, result=[])
+            ),
+        )
+    except Exception:
+        LOGGER.debug("Headline context search failed.", exc_info=True)
+        return cleaned
+
+    ranked_rows = sorted(
+        [*(telegram_results or []), *(web_results or [])],
+        key=lambda row: int(row.get("timestamp", 0)),
+        reverse=True,
+    )
+    evidence_lines = [
+        _headline_context_evidence_line(row)
+        for row in ranked_rows
+        if _headline_context_evidence_line(row)
+    ]
+    if not evidence_lines:
+        return cleaned
+
+    rewritten = await _headline_context_ai_rewrite(cleaned, evidence_lines)
+    if _headline_context_quality_ok(cleaned, rewritten or ""):
+        return normalize_space(str(rewritten))
+
+    fallback_subject = _select_headline_context_subject(ranked_rows, cleaned)
+    if not fallback_subject:
+        return cleaned
+
+    heuristic = _rewrite_headline_with_subject_candidate(cleaned, fallback_subject)
+    if _headline_context_quality_ok(cleaned, heuristic):
+        return heuristic
+    return cleaned
+
+
+async def _enrich_headline_rail_items(
+    headlines: Sequence[str],
+    *,
+    interval_minutes: int,
+) -> list[str]:
+    normalized = [
+        normalize_space(strip_telegram_html(str(item or "")))
+        for item in headlines
+        if normalize_space(strip_telegram_html(str(item or "")))
+    ]
+    if (
+        not normalized
+        or digest_output_style(interval_minutes) != "headline_rail"
+        or not _digest_headline_context_enabled()
+    ):
+        return normalized
+
+    max_items = _digest_headline_context_max_items()
+    resolved: list[str] = []
+    rewrites_used = 0
+    seen: set[str] = set()
+
+    for item in normalized:
+        rewritten = item
+        if rewrites_used < max_items and _headline_needs_context_search(item):
+            candidate = await _rewrite_headline_with_context_search(item)
+            if _headline_context_quality_ok(item, candidate):
+                rewritten = candidate
+                rewrites_used += 1
+        key = _digest_line_key(rewritten)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        resolved.append(rewritten)
+    return resolved or normalized
+
+
 def _adaptive_batch_size() -> int:
     base = _digest_max_posts()
     health = get_quota_health()
@@ -7236,6 +7601,10 @@ async def _build_window_digest_messages(
     if headline_mode:
         support_limit = _digest_support_line_limit()
         capped_highlights = merged_highlights[:support_limit]
+        capped_highlights = await _enrich_headline_rail_items(
+            capped_highlights,
+            interval_minutes=interval_minutes,
+        )
         rendered_bodies = [
             _render_digest_body_sections(
                 merged_headline or _headline_rail_body_title(interval_minutes),

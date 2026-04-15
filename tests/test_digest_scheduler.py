@@ -208,6 +208,102 @@ async def test_build_window_digest_messages_merges_short_window_groups_into_one_
 
 
 @pytest.mark.asyncio
+async def test_enrich_headline_rail_items_rewrites_ambiguous_line_from_search(monkeypatch):
+    async def fake_search_recent_messages(*_args, **_kwargs):
+        return [
+            {
+                "timestamp": 20,
+                "source": "Desk",
+                "text": "John D. Rockefeller wiped out traditional and herbal healing in favor of a lab-only model.",
+            }
+        ]
+
+    async def fake_search_recent_news_web(*_args, **_kwargs):
+        return [
+            {
+                "timestamp": 30,
+                "source": "Web:History",
+                "text": "John D. Rockefeller backed the Flexner-era reforms that reshaped mainstream medicine.",
+                "is_web": True,
+            }
+        ]
+
+    async def fake_headline_context_ai_rewrite(headline, evidence_lines):
+        assert headline.startswith("He wiped out")
+        assert any("Rockefeller" in line for line in evidence_lines)
+        return "John D. Rockefeller wiped out traditional and herbal healing and redefined real medicine."
+
+    monkeypatch.setattr(main, "digest_output_style", lambda _interval: "headline_rail")
+    monkeypatch.setattr(main, "_digest_headline_context_enabled", lambda: True)
+    monkeypatch.setattr(main, "_digest_headline_context_max_items", lambda: 2)
+    monkeypatch.setattr(main, "_digest_headline_context_hours_back", lambda: 168)
+    monkeypatch.setattr(main, "_digest_headline_context_telegram_max_messages", lambda: 8)
+    monkeypatch.setattr(main, "_digest_headline_context_web_max_results", lambda: 6)
+    monkeypatch.setattr(main, "_query_web_allowed_domains", lambda: ["reuters.com"])
+    monkeypatch.setattr(main, "_require_client", lambda: object())
+    monkeypatch.setattr(main, "monitored_source_chat_ids", [12345])
+    monkeypatch.setattr(main, "search_recent_messages", fake_search_recent_messages)
+    monkeypatch.setattr(main, "search_recent_news_web", fake_search_recent_news_web)
+    monkeypatch.setattr(main, "_headline_context_ai_rewrite", fake_headline_context_ai_rewrite)
+
+    resolved = await main._enrich_headline_rail_items(
+        [
+            "He wiped out traditional and herbal healing and redefined real medicine as whatever served his interests.",
+            "Port reopened after overnight inspection.",
+        ],
+        interval_minutes=30,
+    )
+
+    assert resolved[0].startswith("John D. Rockefeller wiped out")
+    assert resolved[1] == "Port reopened after overnight inspection."
+
+
+@pytest.mark.asyncio
+async def test_enrich_headline_rail_items_falls_back_to_subject_candidate(monkeypatch):
+    async def fake_search_recent_messages(*_args, **_kwargs):
+        return [
+            {
+                "timestamp": 20,
+                "source": "Desk",
+                "text": "John D. Rockefeller used his wealth to back medical reforms and marginalize herbal healing.",
+            },
+            {
+                "timestamp": 19,
+                "source": "Desk",
+                "text": "John D. Rockefeller helped redefine mainstream medicine around institutions he funded.",
+            },
+        ]
+
+    async def fake_search_recent_news_web(*_args, **_kwargs):
+        return []
+
+    async def fake_headline_context_ai_rewrite(_headline, _evidence_lines):
+        return None
+
+    monkeypatch.setattr(main, "digest_output_style", lambda _interval: "headline_rail")
+    monkeypatch.setattr(main, "_digest_headline_context_enabled", lambda: True)
+    monkeypatch.setattr(main, "_digest_headline_context_max_items", lambda: 2)
+    monkeypatch.setattr(main, "_digest_headline_context_hours_back", lambda: 168)
+    monkeypatch.setattr(main, "_digest_headline_context_telegram_max_messages", lambda: 8)
+    monkeypatch.setattr(main, "_digest_headline_context_web_max_results", lambda: 0)
+    monkeypatch.setattr(main, "_query_web_allowed_domains", lambda: [])
+    monkeypatch.setattr(main, "_require_client", lambda: object())
+    monkeypatch.setattr(main, "monitored_source_chat_ids", [12345])
+    monkeypatch.setattr(main, "search_recent_messages", fake_search_recent_messages)
+    monkeypatch.setattr(main, "search_recent_news_web", fake_search_recent_news_web)
+    monkeypatch.setattr(main, "_headline_context_ai_rewrite", fake_headline_context_ai_rewrite)
+
+    resolved = await main._enrich_headline_rail_items(
+        ["He wiped out traditional and herbal healing and redefined real medicine as whatever served his interests."],
+        interval_minutes=30,
+    )
+
+    assert resolved == [
+        "John D. Rockefeller wiped out traditional and herbal healing and redefined real medicine as whatever served his interests."
+    ]
+
+
+@pytest.mark.asyncio
 async def test_flush_digest_queue_once_passes_computed_window_start_to_claim(monkeypatch):
     claim_args = {}
 
