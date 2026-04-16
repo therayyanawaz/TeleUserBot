@@ -106,11 +106,15 @@ def build_digest_system_prompt(
             toggles.append("Never include alert glyphs like 🔴 or copied list bullets like ● inside a headline line.")
             toggles.append("Do not start headline lines with wrappers like Context-, Initial reports indicate, or Preliminary reports suggest when the concrete fact can stand alone.")
             toggles.append("Every final headline line must be self-contained. No trailing ellipses, clipped clauses, or broken fragments.")
+            toggles.append("Reject continuation lines, dependent follow-ups, rhetorical questions, joke lines, history trivia, and soft feature chatter.")
             toggles.append("headline should be a short rail label, not a narrative sentence.")
-            toggles.append("headlines must contain only the main distinct developments as short standalone headline lines.")
+            toggles.append("headlines must contain only the main distinct hard-news developments as short standalone headline lines.")
             toggles.append("For each headline line, pick the strongest concrete fact, not the softest setup line.")
+            toggles.append("Every kept line must stand on its own with a named actor or entity plus the action and place or result when the source provides them.")
+            toggles.append("Do not pad the rail. Fewer strong lines are better than many weak lines.")
             toggles.append("Keep the rail tight enough to fit one clean Telegram message whenever possible.")
             toggles.append("Do not include a story paragraph in this mode.")
+            toggles.append("A short source tail like 'per Die Welt' is allowed only for claims, proposals, or disputed items where attribution materially changes trust.")
             toggles.append("also_moving is optional and should contain at most a few overflow headline lines.")
         else:
             toggles.append(
@@ -131,9 +135,12 @@ def build_digest_system_prompt(
             toggles.append("Keep the digest narrative-first and easy to read like a mini brief, not a stack of unrelated blocks.")
     if not include_links:
         toggles.append("Do not output links, URLs, source brackets, or citation markers.")
-    if not include_source_tags:
+    if not include_source_tags and style != "headline_rail":
         toggles.append("Do not output source names, outlet names, usernames, or any source-style attribution in any line.")
-    toggles.append("If a source label or media attribution would normally appear, rewrite it into generic uncertainty instead of naming the source.")
+    if style == "headline_rail":
+        toggles.append("Outside the narrow 'per Outlet' exception for disputed or proposal-style lines, rewrite source attribution into generic uncertainty or remove it.")
+    else:
+        toggles.append("If a source label or media attribution would normally appear, rewrite it into generic uncertainty instead of naming the source.")
     return f"{prompt}\n\n" + "\n".join(toggles)
 
 

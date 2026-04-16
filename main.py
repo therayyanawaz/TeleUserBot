@@ -45,6 +45,7 @@ from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInv
 import config
 from ai_filter import (
     _call_codex_with_auth_repair,
+    _clean_headline_rail_items,
     create_digest_summary,
     create_digest_summary_result,
     extract_digest_narrative_parts,
@@ -7604,6 +7605,11 @@ async def _build_window_digest_messages(
         capped_highlights = await _enrich_headline_rail_items(
             capped_highlights,
             interval_minutes=interval_minutes,
+        )
+        capped_highlights = _clean_headline_rail_items(
+            capped_highlights,
+            max_lines=support_limit,
+            max_chars=0,
         )
         rendered_bodies = [
             _render_digest_body_sections(

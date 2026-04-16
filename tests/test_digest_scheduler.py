@@ -146,14 +146,14 @@ async def test_build_window_digest_messages_merges_short_window_groups_into_one_
         if idx == 0:
             html = (
                 "<b>Top headlines from the last 30 minutes</b><br>"
-                "• First headline from group one.<br>"
-                "• Second headline from group one."
+                "• Officials reopened the port after a three-day shutdown.<br>"
+                "• Security checks remain in place around the eastern gate."
             )
         else:
             html = (
                 "<b>Top headlines from the last 30 minutes</b><br>"
-                "• Third headline from group two.<br>"
-                "• Fourth headline from group two."
+                "• Air defenses were activated over the northern district after a fresh barrage.<br>"
+                "• Emergency crews remained active near the ridge."
             )
         return type(
             "Result",
@@ -201,9 +201,89 @@ async def test_build_window_digest_messages_merges_short_window_groups_into_one_
     )
 
     assert len(messages) == 1
-    assert "First headline from group one." in messages[0]
-    assert "Fourth headline from group two." in messages[0]
+    assert "Officials reopened the port after a three-day shutdown." in messages[0]
+    assert "Air defenses were activated over the northern district after a fresh barrage." in messages[0]
     assert "Part 1/" not in messages[0]
+    assert stats["part_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_build_window_digest_messages_cleans_merged_headline_rail(monkeypatch):
+    async def fake_run_post_processors(text, context):
+        return text
+
+    async def fake_hydrate_digest_posts(rows):
+        return rows
+
+    async def fake_create_digest_summary_result(_posts, _auth_manager, interval_minutes):
+        idx = fake_create_digest_summary_result.calls
+        fake_create_digest_summary_result.calls += 1
+        if idx == 0:
+            html = (
+                "<b>Top headlines from the last 30 minutes</b><br>"
+                "• Zelensky has offered the United States assistance in unblocking the Strait of Hormuz, according to Die Welt.<br>"
+                "• However, the head of the Kiev regime admitted that the United States had not asked Ukraine for this.<br>"
+                "• Team Scotland has revealed its ceremony outfits for the Commonwealth Games. What do you guys think?"
+            )
+        else:
+            html = (
+                "<b>Top headlines from the last 30 minutes</b><br>"
+                "• Approximately 20 Israeli jets were seen flying over Daraa Governorate.<br>"
+                "• Zelensky has offered the United States assistance in unblocking the Strait of Hormuz, according to Die Welt.<br>"
+                "• The same battalion is responsible for the killing of the Palestinian child Hind Rajab in Gaza with 355 bullets."
+            )
+        return type(
+            "Result",
+            (),
+            {
+                "html": html,
+                "copy_origin": "ai",
+                "fallback_reason": "",
+                "major_block_count": 1,
+                "timeline_item_count": 0,
+                "noise_stripped_count": 0,
+                "translation_applied_count": 0,
+                "citation_stripped_count": 0,
+                "duplicate_collapsed_count": 0,
+            },
+        )()
+
+    fake_create_digest_summary_result.calls = 0
+
+    monkeypatch.setattr(main, "_digest_input_token_budget", lambda: 1000)
+    monkeypatch.setattr(main, "_digest_window_page_size", lambda: 100)
+    monkeypatch.setattr(main, "_digest_send_chunk_size", lambda: 3600)
+    monkeypatch.setattr(main, "_require_auth_manager", lambda: object())
+    monkeypatch.setattr(main, "_run_post_processors", fake_run_post_processors)
+    monkeypatch.setattr(
+        main,
+        "_iter_digest_row_groups",
+        lambda *_args, **_kwargs: iter([[{"id": 1}], [{"id": 2}]]),
+    )
+    monkeypatch.setattr(main, "_hydrate_digest_posts", fake_hydrate_digest_posts)
+    monkeypatch.setattr(main, "create_digest_summary_result", fake_create_digest_summary_result)
+
+    messages, stats = await main._build_window_digest_messages(
+        lambda after_id=0, limit=100: [],
+        total_updates=6,
+        interval_minutes=30,
+        title_builder=lambda part_index, part_count: main._rolling_digest_title(
+            79200,
+            81000,
+            interval_minutes=30,
+            part_index=part_index,
+            part_count=part_count,
+        ),
+        context={},
+    )
+
+    assert len(messages) == 1
+    assert "per Die Welt" in messages[0]
+    assert "Approximately 20 Israeli jets were seen flying over Daraa Governorate." in messages[0]
+    assert "However, the head of the Kiev regime admitted" not in messages[0]
+    assert "Team Scotland has revealed its ceremony outfits" not in messages[0]
+    assert "The same battalion is responsible" not in messages[0]
+    assert messages[0].count("Zelensky has offered the United States assistance") == 1
     assert stats["part_count"] == 1
 
 

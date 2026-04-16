@@ -270,8 +270,10 @@ def test_json_digest_to_html_caps_headline_rail_lines_for_short_window():
         {
             "quiet": False,
             "headline": "Top headlines from the last 30 minutes",
-            "headlines": [f"Headline {idx} carries a concrete fact." for idx in range(1, 9)],
-            "also_moving": [f"Overflow item {idx}." for idx in range(1, 4)],
+            "headlines": [
+                f"Officials confirmed site {idx} remained under security lockdown." for idx in range(1, 9)
+            ],
+            "also_moving": [f"Authorities confirmed overflow site {idx} stayed under watch." for idx in range(1, 4)],
         },
         interval_minutes=30,
         max_lines=5,
@@ -279,8 +281,8 @@ def test_json_digest_to_html_caps_headline_rail_lines_for_short_window():
 
     plain = ai_filter.strip_telegram_html(html)
 
-    assert plain.count("Headline ") == 5
-    assert "Headline 6 carries a concrete fact." not in plain
+    assert plain.count("Officials confirmed site ") == 5
+    assert "Officials confirmed site 6 remained under security lockdown." not in plain
     assert "Also moving" not in plain
 
 
@@ -304,6 +306,73 @@ def test_json_digest_to_html_keeps_long_headline_rail_line_intact():
 
     assert line in plain
     assert "but its." not in plain
+
+
+def test_clean_headline_rail_items_keeps_light_source_for_claim_lines():
+    cleaned = ai_filter._clean_headline_rail_items(
+        [
+            "Zelensky has offered the United States assistance in unblocking the Strait of Hormuz, according to Die Welt.",
+        ],
+        max_lines=12,
+        max_chars=0,
+    )
+
+    assert cleaned == [
+        "Zelensky has offered the United States assistance in unblocking the Strait of Hormuz, per Die Welt"
+    ]
+
+
+def test_clean_headline_rail_items_drops_fragments_banter_and_history():
+    cleaned = ai_filter._clean_headline_rail_items(
+        [
+            "However, the head of the Kiev regime admitted that the United States had not asked Ukraine for this.",
+            "Team Scotland has revealed its ceremony outfits for the Commonwealth Games. What do you guys think?",
+            "Russian ruled the Russian Empire from 1725 to 1727.",
+            "The same battalion is responsible for the killing of the Palestinian child Hind Rajab in Gaza with 355 bullets.",
+            "Approximately 20 Israeli jets were seen flying over Daraa Governorate.",
+        ],
+        max_lines=12,
+        max_chars=0,
+    )
+
+    assert cleaned == ["Approximately 20 Israeli jets were seen flying over Daraa Governorate."]
+
+
+def test_clean_headline_rail_items_keeps_stronger_duplicate_topic():
+    cleaned = ai_filter._clean_headline_rail_items(
+        [
+            "Port reopens after three-day shutdown.",
+            "Port reopens after a three-day shutdown as security checks remain in place around the eastern gate.",
+        ],
+        max_lines=12,
+        max_chars=0,
+    )
+
+    assert cleaned == [
+        "Port reopens after a three-day shutdown as security checks remain in place around the eastern gate."
+    ]
+
+
+def test_json_digest_to_html_drops_vague_and_dependent_rail_lines():
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "headline": "Top headlines from the last 30 minutes",
+            "headlines": [
+                "The fire was successfully extinguished.",
+                "However, the head of the Kiev regime admitted that the United States had not asked Ukraine for this.",
+                "Approximately 20 Israeli jets were seen flying over Daraa Governorate.",
+            ],
+        },
+        interval_minutes=30,
+        max_lines=12,
+    )
+
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "Approximately 20 Israeli jets were seen flying over Daraa Governorate." in plain
+    assert "The fire was successfully extinguished." not in plain
+    assert "However, the head of the Kiev regime admitted" not in plain
 
 
 
@@ -455,16 +524,17 @@ def test_local_fallback_digest_uses_headline_rail_for_short_window():
 
     assert "Top headlines from the last 30 minutes" in plain
     assert "Officials reopened the port after three days of disruption" in plain
-    assert "Cargo traffic resumes at dawn" in plain
     assert "Air defenses fired over the northern district after a fresh barrage" in plain
-    assert "Residents reported new blasts near the ridge" in plain
 
 
-def test_local_fallback_digest_headline_rail_keeps_distinct_updates_from_one_post():
+def test_local_fallback_digest_headline_rail_uses_one_standalone_line_per_post():
     html = ai_filter.local_fallback_digest(
         [
             {
-                "text": "First site was hit in Dubai. Second site was hit in Bahrain.",
+                "text": (
+                    "Sites in Dubai and Bahrain were hit overnight. "
+                    "First site was hit in Dubai. Second site was hit in Bahrain."
+                ),
                 "source_name": "Desk",
             }
         ],
@@ -473,8 +543,9 @@ def test_local_fallback_digest_headline_rail_keeps_distinct_updates_from_one_pos
     plain = ai_filter.strip_telegram_html(html)
 
     assert "Top headlines from the last 30 minutes" in plain
-    assert "First site was hit in Dubai" in plain
-    assert "Second site was hit in Bahrain" in plain
+    assert "Sites in Dubai and Bahrain were hit overnight" in plain
+    assert "First site was hit in Dubai" not in plain
+    assert "Second site was hit in Bahrain" not in plain
 
 
 def test_local_fallback_digest_headline_rail_caps_to_main_lines(monkeypatch):
@@ -482,15 +553,15 @@ def test_local_fallback_digest_headline_rail_caps_to_main_lines(monkeypatch):
 
     html = ai_filter.local_fallback_digest(
         [
-            {"text": f"Headline {idx} remains specific and concrete.", "source_name": "Desk"}
+            {"text": f"Officials confirmed site {idx} remained under security lockdown.", "source_name": "Desk"}
             for idx in range(1, 8)
         ],
         interval_minutes=30,
     )
     plain = ai_filter.strip_telegram_html(html)
 
-    assert plain.count("Headline ") == 4
-    assert "Headline 5 remains specific and concrete." not in plain
+    assert plain.count("Officials confirmed site ") == 4
+    assert "Officials confirmed site 5 remained under security lockdown." not in plain
 
 
 def test_fallback_headline_prefers_concrete_sentence_over_soft_setup():

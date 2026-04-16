@@ -1884,6 +1884,14 @@ def _filter_retry_feedback(issue: str) -> str:
         return (
             "Your last copy was too thin. Rewrite it with a concrete actor, action, and location when present in the source."
         )
+    if issue in {"continuation_line", "dependent_line"}:
+        return (
+            "Your last rail line depended on another line. Rewrite it as a standalone headline with the named actor or drop it."
+        )
+    if issue in {"question_line", "banter_line", "soft_news", "history_fragment"}:
+        return (
+            "Your last rail line was not suitable hard-news headline copy. Drop jokes, questions, soft features, and history scraps."
+        )
     if issue == "ungrounded_copy":
         return (
             "Your last copy drifted away from the source. Keep the wording sharp, but preserve the concrete names, locations, "
@@ -2155,6 +2163,76 @@ _DIGEST_QUOTE_PREFIX_RE = re.compile(
 _DIGEST_RANT_FRAGMENT_RE = re.compile(
     r"(?i)\b(?:to quote the bible|religious crusade|doesn.?t that beat fighting|but remember|big, fat, hug|president djt)\b"
 )
+_HEADLINE_RAIL_CONTINUATION_RE = re.compile(r"(?i)^(?:however|but|and|why)\b")
+_HEADLINE_RAIL_DEPENDENT_START_RE = re.compile(
+    r"(?i)^(?:he|she|they|his|her|their|this|that|these|those|it|its|the same|the offender|the commander|in honor|isn'?t this)\b"
+)
+_HEADLINE_RAIL_BANTER_RE = re.compile(
+    r"(?i)\b(?:what do you guys think|what do you think|just wanted to|taste and estimate|blue meth|"
+    r"engagement farmers?|full post with explanation|best telegram channels)\b"
+)
+_HEADLINE_RAIL_SOFT_NEWS_RE = re.compile(
+    r"(?i)\b(?:ceremony outfits?|commonwealth games|fashion|red carpet)\b"
+)
+_HEADLINE_RAIL_HISTORY_RE = re.compile(
+    r"(?i)\b(?:russian empire|empress|order of st\.?|from 17\d{2}\b|from 18\d{2}\b|from 19\d{2}\b)\b"
+)
+_HEADLINE_RAIL_VAGUE_RESULT_RE = re.compile(
+    r"(?i)^(?:the\s+)?(?:fire|situation|operation|incident|scene|work|area)\s+"
+    r"(?:was|is)\s+(?:successfully\s+)?(?:extinguished|contained|completed|resolved|stabilized)\b"
+)
+_HEADLINE_RAIL_SOURCE_TAIL_RE = re.compile(
+    r"(?i)^(?P<body>.+?)(?:,\s*|\s+)(?:according to|per)\s+"
+    r"(?P<source>[A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,3})\.?$"
+)
+_HEADLINE_RAIL_SOURCE_PREFIX_RE = re.compile(
+    r"(?i)^(?:according to|per)\s+"
+    r"(?P<source>[A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,3})[:,]?\s*(?P<body>.+)$"
+)
+_HEADLINE_RAIL_CLAIM_CONTEXT_RE = re.compile(
+    r"(?i)\b(?:offer(?:ed|s)?|proposal|propose(?:d|s)?|claim(?:ed|s)?|said|says|admit(?:ted|s)?|"
+    r"warn(?:ed|s|ing)?|suggest(?:ed|s)?|plan(?:ned|s)?|intend(?:ed|s)?|seek(?:s|ing)?|"
+    r"ask(?:ed|s)?|accuse(?:d|s)?|deny|denied|denies)\b"
+)
+_HEADLINE_RAIL_STANDALONE_ACTION_RE = re.compile(
+    r"(?i)\b(?:offer(?:ed|s)?|admit(?:ted|s)?|detain(?:ed|s)?|face(?:s|d)?|wounded|killed|"
+    r"attack(?:ed|s)?|hit|hits|launch(?:ed|es)?|strike(?:s|d)?|confirm(?:ed|s)?|order(?:ed|s)?|"
+    r"extend(?:ed|s)?|approve(?:d|s)?|block(?:ed|s)?|unblock(?:ed|s)?|reopen(?:ed|s)?|close(?:d|s)?|"
+    r"meet(?:s|ing)?|visit(?:s|ed)?|schedule(?:s|d)?|reveal(?:ed|s)?|help(?:ed|s)?|back(?:ed|s)?|"
+    r"seiz(?:ed|es)|sentence(?:d|s)?|rule(?:d|s)?|fire(?:d|s)?|open(?:ed|s)?|shut(?:s|ting)?|"
+    r"agree(?:d|s)?|reject(?:ed|s)?|refuse(?:d|s)?|remain(?:s|ed)?|continue(?:s|d)?|"
+    r"activat(?:ed|es)|fall|falls|blast|blasts|seen|spotted)\b"
+)
+_HEADLINE_RAIL_GENERIC_SOURCE_RE = re.compile(
+    r"(?i)^(?:sources?|media|channel|outlet|press)$|"
+    r"^(?:local|foreign|enemy(?:'s)?|hebrew(?:-language)?|israeli)\s+(?:media|sources?)$"
+)
+_HEADLINE_RAIL_TOKEN_RE = re.compile(r"[a-z0-9]{3,}", flags=re.IGNORECASE)
+_HEADLINE_RAIL_TOPIC_STOPWORDS = {
+    "after",
+    "again",
+    "amid",
+    "and",
+    "around",
+    "because",
+    "from",
+    "have",
+    "into",
+    "over",
+    "per",
+    "said",
+    "says",
+    "that",
+    "their",
+    "there",
+    "they",
+    "this",
+    "those",
+    "through",
+    "under",
+    "with",
+    "would",
+}
 
 
 def _digest_line_key(text: str) -> str:
@@ -2293,6 +2371,209 @@ def _digest_support_item_is_specific(text: str) -> bool:
     if len(cleaned.split()) < 5:
         return False
     return bool(_DIGEST_SPECIFIC_ACTION_RE.search(cleaned) or re.search(r"\b\d+\b", cleaned))
+
+
+def _headline_rail_source_label(source: str) -> str:
+    cleaned = normalize_space(source).strip(" ,;:.!?-")
+    if not cleaned or _HEADLINE_RAIL_GENERIC_SOURCE_RE.fullmatch(cleaned):
+        return ""
+    words = cleaned.split()
+    if len(words) > 4:
+        return ""
+    return cleaned
+
+
+def _headline_rail_split_source_attribution(text: str) -> tuple[str, str]:
+    cleaned = normalize_space(strip_telegram_html(str(text or "")))
+    if not cleaned:
+        return "", ""
+
+    for pattern in (_HEADLINE_RAIL_SOURCE_PREFIX_RE, _HEADLINE_RAIL_SOURCE_TAIL_RE):
+        match = pattern.match(cleaned)
+        if not match:
+            continue
+        body = normalize_space(match.group("body"))
+        source = _headline_rail_source_label(match.group("source"))
+        return body, source
+    return cleaned, ""
+
+
+def _headline_rail_line_issue(text: str) -> str:
+    body, _source = _headline_rail_split_source_attribution(text)
+    cleaned = normalize_space(body)
+    lowered = cleaned.lower()
+    if not cleaned:
+        return "empty_output"
+    if cleaned.endswith("?") or "?" in cleaned:
+        return "question_line"
+    if _HEADLINE_RAIL_CONTINUATION_RE.match(cleaned):
+        return "continuation_line"
+    if _HEADLINE_RAIL_DEPENDENT_START_RE.match(cleaned):
+        return "dependent_line"
+    if _HEADLINE_RAIL_BANTER_RE.search(cleaned):
+        return "banter_line"
+    if _HEADLINE_RAIL_SOFT_NEWS_RE.search(cleaned):
+        return "soft_news"
+    if _HEADLINE_RAIL_HISTORY_RE.search(cleaned):
+        return "history_fragment"
+    if _HEADLINE_RAIL_VAGUE_RESULT_RE.match(cleaned):
+        return "vague_copy"
+    if _digest_is_low_value_quote_or_rant(cleaned):
+        return "low_value"
+    if _feed_segment_is_incomplete(cleaned):
+        return "incomplete_copy"
+    if should_downgrade_explainer_urgency(cleaned) and not looks_like_live_event_update(cleaned):
+        return "soft_news"
+    if len(cleaned.split()) < 5 and not _DIGEST_SPECIFIC_ACTION_RE.search(cleaned):
+        return "headline_too_thin"
+    if not (
+        looks_like_live_event_update(cleaned)
+        or _DIGEST_SPECIFIC_ACTION_RE.search(cleaned)
+        or _HEADLINE_RAIL_STANDALONE_ACTION_RE.search(cleaned)
+        or re.search(r"\b\d+\b", cleaned)
+    ):
+        return "headline_too_thin"
+    if any(fragment in lowered for fragment in _WEAK_COPY_PATTERNS):
+        return "vague_copy"
+    return ""
+
+
+def _headline_rail_line_strength(text: str) -> float:
+    body, source = _headline_rail_split_source_attribution(text)
+    cleaned = normalize_space(body)
+    if not cleaned:
+        return 0.0
+    score = 0.0
+    if looks_like_live_event_update(cleaned):
+        score += 2.5
+    if _DIGEST_SPECIFIC_ACTION_RE.search(cleaned) or _HEADLINE_RAIL_STANDALONE_ACTION_RE.search(cleaned):
+        score += 1.5
+    score += min(2.0, float(len(re.findall(r"\b\d+\b", cleaned))))
+    score += min(2.0, float(len(_extract_candidate_named_tokens(cleaned))))
+    score += min(1.5, len(cleaned.split()) / 10.0)
+    if source:
+        score += 0.25
+    return score
+
+
+def _headline_rail_topic_tokens(text: str) -> set[str]:
+    body, _source = _headline_rail_split_source_attribution(text)
+    lowered = normalize_space(body).lower()
+    lowered = re.sub(
+        r"(?i)\b(?:initial|preliminary|early|unconfirmed)\s+reports?\s+(?:indicate|suggest|point to)\b",
+        " ",
+        lowered,
+    )
+    tokens = {
+        token
+        for token in _HEADLINE_RAIL_TOKEN_RE.findall(lowered)
+        if token not in _HEADLINE_RAIL_TOPIC_STOPWORDS
+    }
+    return tokens
+
+
+def _headline_rail_same_topic(left: str, right: str) -> bool:
+    left_numbers = set(re.findall(r"\b\d+(?:[.,:/-]\d+)*\b", normalize_space(left)))
+    right_numbers = set(re.findall(r"\b\d+(?:[.,:/-]\d+)*\b", normalize_space(right)))
+    if left_numbers and right_numbers and not (left_numbers & right_numbers):
+        return False
+
+    left_key = normalize_space(" ".join(sorted(_headline_rail_topic_tokens(left))))
+    right_key = normalize_space(" ".join(sorted(_headline_rail_topic_tokens(right))))
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    ratio = SequenceMatcher(None, left_key, right_key).ratio()
+    if ratio >= 0.86:
+        return True
+    left_tokens = set(left_key.split())
+    right_tokens = set(right_key.split())
+    overlap = left_tokens & right_tokens
+    if len(overlap) < 2:
+        return False
+    return (len(overlap) / max(1, min(len(left_tokens), len(right_tokens)))) >= 0.5
+
+
+def _headline_rail_clean_line(text: str, *, max_chars: int) -> str:
+    raw = normalize_space(strip_telegram_html(str(text or "")))
+    if not raw:
+        return ""
+    body, source = _headline_rail_split_source_attribution(raw)
+    cleaned = _digest_clean_line(body, max_chars=0, allow_short=True)
+    if not cleaned:
+        return ""
+    issue = _headline_rail_line_issue(cleaned)
+    if issue:
+        return ""
+    if source and _HEADLINE_RAIL_CLAIM_CONTEXT_RE.search(cleaned):
+        cleaned = f"{cleaned.rstrip('.!?')}, per {source}"
+    cleaned = _truncate_digest_fact(cleaned, max_chars=max_chars)
+    if not cleaned or _headline_rail_line_issue(cleaned):
+        return ""
+    return cleaned
+
+
+def _clean_headline_rail_items(
+    values: Iterable[Any],
+    *,
+    max_lines: int,
+    max_chars: int = 0,
+    seen: set[str] | None = None,
+) -> List[str]:
+    cleaned_lines: list[str] = []
+    line_keys: list[str] = []
+    local_seen = seen if seen is not None else set()
+
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            nested = _clean_headline_rail_items(
+                value,
+                max_lines=max_lines,
+                max_chars=max_chars,
+                seen=local_seen,
+            )
+            for item in nested:
+                if len(cleaned_lines) >= max(1, int(max_lines)):
+                    return cleaned_lines
+                key = _digest_line_key(item)
+                if not key or key in local_seen:
+                    continue
+                local_seen.add(key)
+                cleaned_lines.append(item)
+                line_keys.append(key)
+            continue
+
+        raw = normalize_space(strip_telegram_html(str(value or "")))
+        if not raw:
+            continue
+        for part in re.split(r"\n+", raw):
+            candidate = _headline_rail_clean_line(part, max_chars=max_chars)
+            key = _digest_line_key(candidate)
+            if not candidate or not key:
+                continue
+            duplicate_index = None
+            for idx, existing in enumerate(cleaned_lines):
+                if _headline_rail_same_topic(existing, candidate):
+                    duplicate_index = idx
+                    break
+            if duplicate_index is not None:
+                if _headline_rail_line_strength(candidate) > _headline_rail_line_strength(cleaned_lines[duplicate_index]):
+                    old_key = line_keys[duplicate_index]
+                    if old_key in local_seen:
+                        local_seen.discard(old_key)
+                    cleaned_lines[duplicate_index] = candidate
+                    line_keys[duplicate_index] = key
+                    local_seen.add(key)
+                continue
+            if key in local_seen:
+                continue
+            local_seen.add(key)
+            cleaned_lines.append(candidate)
+            line_keys.append(key)
+            if len(cleaned_lines) >= max(1, int(max_lines)):
+                return cleaned_lines
+    return cleaned_lines
 
 
 def _digest_polish_support_item(text: str, *, max_chars: int) -> str:
@@ -2601,8 +2882,19 @@ def _digest_payload_to_narrative(
         seen: set[str] = set()
         if headline_key:
             seen.add(headline_key)
-        highlights = _clean_digest_support_items(headlines_raw, max_chars=0, seen=seen)
-        also_moving = _clean_digest_support_items(also_raw, max_chars=0, seen=seen)
+        highlights = _clean_headline_rail_items(
+            headlines_raw,
+            max_lines=max_lines,
+            max_chars=0,
+            seen=seen,
+        )
+        remaining_for_also = max(0, max_lines - len(highlights))
+        also_moving = _clean_headline_rail_items(
+            also_raw,
+            max_lines=max(1, remaining_for_also or 1),
+            max_chars=0,
+            seen=seen,
+        )
 
         if not highlights:
             fallback_values: list[Any] = []
@@ -2628,7 +2920,12 @@ def _digest_payload_to_narrative(
             timeline_items = payload.get("timeline_items")
             if isinstance(timeline_items, list):
                 fallback_values.extend(timeline_items)
-            highlights = _clean_digest_support_items(fallback_values, max_chars=0, seen=seen)
+            highlights = _clean_headline_rail_items(
+                fallback_values,
+                max_lines=max_lines,
+                max_chars=0,
+                seen=seen,
+            )
 
         if len(also_moving) > _digest_also_moving_cap(max_lines):
             highlights.extend(also_moving[_digest_also_moving_cap(max_lines) :])
@@ -2842,34 +3139,41 @@ def _render_digest_layout(
         if story_key:
             seen.add(story_key)
 
-    clean_highlights = _clean_digest_support_items(
-        highlights,
-        max_chars=(0 if headline_mode else 220),
-        seen=seen,
-    )
-    clean_also = _clean_digest_support_items(
-        also_moving,
-        max_chars=(0 if headline_mode else 200),
-        seen=seen,
-    )
-    if len(clean_also) > _digest_also_moving_cap():
-        clean_highlights.extend(clean_also[_digest_also_moving_cap() :])
-        clean_also = clean_also[: _digest_also_moving_cap()]
-
     if headline_mode:
-        story_headlines = _clean_digest_support_items(
+        max_lines = _resolve_digest_max_lines()
+        clean_highlights = _clean_headline_rail_items(
+            highlights,
+            max_lines=max_lines,
+            max_chars=0,
+            seen=seen,
+        )
+        remaining_for_story = max(0, max_lines - len(clean_highlights))
+        story_headlines = _clean_headline_rail_items(
             _split_digest_sentences(clean_story),
+            max_lines=max(1, remaining_for_story or 1),
             max_chars=0,
             seen=seen,
         )
         if story_headlines:
             clean_highlights = [*story_headlines, *clean_highlights]
         if not clean_highlights:
-            clean_highlights = _clean_digest_support_items([clean_story], max_chars=0, seen=seen)
+            clean_highlights = _clean_headline_rail_items(
+                [clean_story],
+                max_lines=max_lines,
+                max_chars=0,
+                seen=seen,
+            )
+        remaining_for_also = max(0, max_lines - len(clean_highlights))
+        clean_also = _clean_headline_rail_items(
+            also_moving,
+            max_lines=max(1, remaining_for_also or 1),
+            max_chars=0,
+            seen=seen,
+        )
         clean_highlights, clean_also = _cap_headline_rail_support(
             clean_highlights,
             clean_also,
-            max_lines=_resolve_digest_max_lines(),
+            max_lines=max_lines,
         )
         if not clean_highlights and not clean_also:
             return quiet
@@ -2887,6 +3191,20 @@ def _render_digest_layout(
             also_lines.extend(f"• {sanitize_telegram_html(item)}" for item in clean_also)
             rendered_blocks.append("<br>".join(also_lines))
         return sanitize_telegram_html("<br><br>".join(rendered_blocks))
+
+    clean_highlights = _clean_digest_support_items(
+        highlights,
+        max_chars=220,
+        seen=seen,
+    )
+    clean_also = _clean_digest_support_items(
+        also_moving,
+        max_chars=200,
+        seen=seen,
+    )
+    if len(clean_also) > _digest_also_moving_cap():
+        clean_highlights.extend(clean_also[_digest_also_moving_cap() :])
+        clean_also = clean_also[: _digest_also_moving_cap()]
 
     if not clean_story:
         return quiet
@@ -3371,26 +3689,28 @@ def local_fallback_digest(posts: Sequence[Dict[str, object]], *, interval_minute
 
     if _digest_is_headline_rail(interval_minutes):
         seen: set[str] = set()
-        headlines: list[str] = []
+        headline_candidates: list[str] = []
         for post in posts:
             text = _post_text(post)
             if not text or _likely_noise(text) or _digest_needs_english_rewrite(text, "English"):
                 continue
             sentences = [_digest_finalize_sentence(part, max_chars=180) for part in _split_digest_sentences(text)]
             sentences = [sentence for sentence in sentences if sentence]
-            candidates = sentences or [
-                _digest_clean_line(
-                    _fallback_headline(text) or text,
-                    max_chars=180,
-                    allow_short=True,
-                )
-            ]
-            for candidate in candidates:
-                key = _digest_line_key(candidate)
-                if not candidate or not key or key in seen:
-                    continue
-                seen.add(key)
-                headlines.append(candidate)
+            candidate = _digest_clean_line(
+                _fallback_headline(text) or (sentences[0] if sentences else text),
+                max_chars=180,
+                allow_short=True,
+            )
+            key = _digest_line_key(candidate)
+            if not candidate or not key or key in seen:
+                continue
+            seen.add(key)
+            headline_candidates.append(candidate)
+        headlines = _clean_headline_rail_items(
+            headline_candidates,
+            max_lines=_resolve_digest_max_lines(),
+            max_chars=180,
+        )
         headlines, _ = _cap_headline_rail_support(
             headlines,
             [],
@@ -5477,6 +5797,10 @@ def _digest_quality_issue(text: str, quiet_text: str, *, interval_minutes: int) 
         if key in seen_digest_lines:
             return "duplication"
         seen_digest_lines.add(key)
+        if headline_mode:
+            rail_issue = _headline_rail_line_issue(line)
+            if rail_issue:
+                return rail_issue
         issue = _news_copy_quality_issue(line, line, allow_short=True)
         if issue in {"vague_copy", "incomplete_copy"}:
             return issue
