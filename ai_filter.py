@@ -1855,6 +1855,32 @@ def _generated_copy_has_grounding(candidate: str, source_text: str) -> bool:
     return True
 
 
+def _translated_digest_line_is_usable(source_text: str, candidate: str) -> bool:
+    candidate_clean = normalize_space(strip_telegram_html(candidate))
+    source_clean = normalize_space(strip_telegram_html(source_text))
+    if not candidate_clean or not source_clean:
+        return False
+    if _digest_needs_english_rewrite(candidate_clean, "English"):
+        return False
+    if _feed_segment_is_incomplete(candidate_clean):
+        return False
+
+    source_numbers = _extract_numeric_tokens(source_clean)
+    candidate_numbers = _extract_numeric_tokens(candidate_clean)
+    if source_numbers and candidate_numbers and not (candidate_numbers & source_numbers):
+        return False
+
+    source_named = _extract_candidate_named_tokens(source_clean)
+    candidate_named = _extract_candidate_named_tokens(candidate_clean)
+    if source_named and candidate_named and not (candidate_named & source_named):
+        return False
+
+    if any(pattern in candidate_clean.lower() for pattern in _WEAK_COPY_PATTERNS):
+        if not candidate_numbers and not candidate_named:
+            return False
+    return True
+
+
 def _news_copy_quality_issue(candidate: str, source_text: str, *, allow_short: bool = False) -> str:
     cleaned = normalize_space(strip_telegram_html(candidate))
     lowered = cleaned.lower()
@@ -2436,6 +2462,8 @@ def _headline_rail_line_issue(text: str) -> str:
     lowered = cleaned.lower()
     if not cleaned:
         return "empty_output"
+    if _digest_needs_english_rewrite(cleaned, "English"):
+        return "non_english_leftovers"
     if cleaned.endswith("?") or "?" in cleaned:
         return "question_line"
     if _HEADLINE_RAIL_CONTINUATION_RE.match(cleaned):
@@ -3322,7 +3350,55 @@ def _digest_needs_english_rewrite(text: str, output_language: str) -> bool:
     non_ascii_letters = sum(1 for ch in plain if ch.isalpha() and ord(ch) > 127)
     arabic_script = bool(re.search(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", plain))
     cyrillic_script = bool(re.search(r"[\u0400-\u04FF]", plain))
-    return arabic_script or cyrillic_script or non_ascii_letters >= 4
+    if arabic_script or cyrillic_script or non_ascii_letters >= 4:
+        return True
+
+    latin_words = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'/-]*", plain)
+    if len(latin_words) < 6:
+        return False
+
+    english_stopwords = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "after",
+        "against",
+        "amid",
+        "before",
+        "between",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "the",
+        "their",
+        "this",
+        "to",
+        "toward",
+        "towards",
+        "under",
+        "was",
+        "were",
+        "while",
+        "with",
+        "within",
+    }
+    stopword_hits = sum(1 for word in latin_words if word.lower() in english_stopwords)
+    if non_ascii_letters >= 2 and stopword_hits <= 1:
+        return True
+    if non_ascii_letters >= 1 and stopword_hits == 0 and len(latin_words) >= 8:
+        return True
+    return False
 
 
 def _digest_english_rewrite_prompt() -> str:
@@ -3578,13 +3654,15 @@ async def _translate_digest_posts_to_english(
 
     payload = "\n".join(f"{idx}. {text}" for idx, text in targets)
     instructions = (
-        "Translate each numbered digest evidence line into sharp English plain text.\n"
+        "Translate each numbered digest evidence line into plain English.\n"
         'Return ONLY one JSON object with this schema: {"items":[{"id": number, "text": string}]}.\n'
         "Rules:\n"
-        "- Keep the factual meaning and uncertainty markers.\n"
+        "- Translate only. Do not summarize, compress, interpret, or improve the news line.\n"
+        "- Keep the factual meaning, named people, places, organizations, numbers, and uncertainty markers.\n"
         "- Remove usernames, channel names, outlet labels, links, hashtags, and promo text.\n"
         "- Never write source-style attribution such as 'Hebrew sources report' or 'Channel X said'.\n"
         "- If the original line depends on unattributed media or source wording, rewrite it with generic uncertainty such as 'initial reports indicate'.\n"
+        "- If the line is too broken to translate faithfully, return an empty string for that item.\n"
         "- Do not add any new facts.\n"
         "- Keep each item as one clean English evidence line."
     )
@@ -3599,6 +3677,7 @@ async def _translate_digest_posts_to_english(
         return [dict(post) for post in posts], 0, 0
 
     translated_map: Dict[int, str] = {}
+    source_map = {idx: text for idx, text in targets}
     citation_removed_total = 0
     for item in translated_items:
         if not isinstance(item, dict):
@@ -3610,7 +3689,12 @@ async def _translate_digest_posts_to_english(
         rewritten, rewritten_count = _digest_rewrite_source_attribution(item.get("text") or "")
         citation_removed_total += rewritten_count
         cleaned = _digest_finalize_sentence(rewritten, max_chars=280)
-        if item_id > 0 and cleaned:
+        source_text = source_map.get(item_id, "")
+        if (
+            item_id > 0
+            and cleaned
+            and _translated_digest_line_is_usable(source_text, cleaned)
+        ):
             translated_map[item_id] = cleaned
 
     translated_count = 0

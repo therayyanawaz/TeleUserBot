@@ -345,6 +345,7 @@ def test_clean_headline_rail_items_drops_metrics_and_broken_tail_fragments():
             "The Syrian Foreign Ministry announced that the handover over of U.S.",
             "efforts to secure a ceasefire with Israel amid ongoing cross-border tensions.",
             "Initial reports indicate informed him that a ceasefire between Israel and Lebanon could happen tonight via X.",
+            "Napad iračkih snaga OTPORA na američki konzulat u Erbilu.",
             "Hezbollah launches two separate rocket attacks against Acre and Shlomi in Northern Israel.",
         ],
         max_lines=12,
@@ -354,6 +355,20 @@ def test_clean_headline_rail_items_drops_metrics_and_broken_tail_fragments():
     assert cleaned == [
         "Hezbollah launches two separate rocket attacks against Acre and Shlomi in Northern Israel."
     ]
+
+
+def test_digest_needs_english_rewrite_detects_latin_foreign_line():
+    assert ai_filter._digest_needs_english_rewrite(
+        "Napad iračkih snaga OTPORA na američki konzulat u Erbilu.",
+        "English",
+    )
+
+
+def test_digest_needs_english_rewrite_keeps_english_line_with_diacritic_name():
+    assert not ai_filter._digest_needs_english_rewrite(
+        "Jose Andres announced aid deliveries for Gaza overnight.",
+        "English",
+    )
 
 
 def test_clean_headline_rail_items_keeps_stronger_duplicate_topic():
@@ -661,6 +676,66 @@ async def test_prepare_digest_posts_drops_non_english_lines_when_translation_fai
         [
             {
                 "text": "إطلاق صواريخ باتجاه حيفا وتضرر منشأة قريبة.",
+                "source_name": "Desk",
+            }
+        ],
+        _FakeAuthManager(),
+    )
+
+    assert prepared == []
+    assert stats["translation_applied_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_prepare_digest_posts_drops_unguarded_guess_translation(monkeypatch):
+    async def fake_call_codex_with_auth_repair(_payload, _auth_manager, _instructions, **_kwargs):
+        return json.dumps(
+            {
+                "items": [
+                    {
+                        "id": 1,
+                        "text": "Talks happened and the situation remains tense.",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex_with_auth_repair)
+
+    prepared, stats = await ai_filter._prepare_digest_posts(
+        [
+            {
+                "text": "Napad iračkih snaga OTPORA na američki konzulat u Erbilu.",
+                "source_name": "Desk",
+            }
+        ],
+        _FakeAuthManager(),
+    )
+
+    assert prepared == []
+    assert stats["translation_applied_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_prepare_digest_posts_drops_still_non_english_translation(monkeypatch):
+    async def fake_call_codex_with_auth_repair(_payload, _auth_manager, _instructions, **_kwargs):
+        return json.dumps(
+            {
+                "items": [
+                    {
+                        "id": 1,
+                        "text": "Napad iračkih snaga OTPORA na američki konzulat u Erbilu.",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex_with_auth_repair)
+
+    prepared, stats = await ai_filter._prepare_digest_posts(
+        [
+            {
+                "text": "Napad iračkih snaga OTPORA na američki konzulat u Erbilu.",
                 "source_name": "Desk",
             }
         ],
