@@ -201,6 +201,14 @@ _FEED_LINE_PREFIX_RE = re.compile(
     r"^(?:breaking|alert|live update|update|analysis|opinion|thread|explainer)\s*[:\-–—]+\s*",
     flags=re.IGNORECASE,
 )
+_FEED_FORWARD_PREFIX_RE = re.compile(
+    r"(?i)^\s*(?:fwd from|forwarded from)\s*@?\s*"
+)
+_FEED_FORWARD_SOURCE_TITLE_RE = re.compile(
+    r"^(?P<source>(?:[A-Z][A-Za-z0-9'._-]*\s+){1,2})"
+    r"(?=(?:[A-Z][A-Za-z0-9'._-]*\s+){1,3}"
+    r"(?:called|announced|said|confirmed|reported|launched|visited|met|urged|warned)\b)"
+)
 _FEED_QUESTION_RE = re.compile(
     r"^(?:why|how|what explains|what caused|can|could|should|would|will)\b",
     flags=re.IGNORECASE,
@@ -491,7 +499,17 @@ def _truncate_feed_line(text: str, *, limit: int) -> str:
     cleaned = normalize_space(text)
     if len(cleaned) <= limit:
         return cleaned
-    return f"{cleaned[: limit - 3].rsplit(' ', 1)[0]}..."
+    candidate = cleaned[: limit - 3].rsplit(' ', 1)[0].rstrip(" ,;:-|/")
+    if re.search(
+        r"(?i)(?:,\s*|\s+)(?:chief|head|president|prime|judge|official|minister|commander|leader|spokesman|spokesperson)$",
+        candidate,
+    ):
+        comma_cut = candidate.rfind(",")
+        if comma_cut >= int(limit * 0.4):
+            candidate = candidate[:comma_cut].rstrip(" ,;:-|/")
+    if not candidate:
+        candidate = cleaned[: limit - 3].strip()
+    return f"{candidate}..."
 
 
 def _looks_like_generated_source_prefix(prefix: str) -> bool:
@@ -527,6 +545,10 @@ def _clean_generated_delivery_segment(line: str) -> str:
     cleaned = normalize_space(strip_telegram_html(str(line or "")))
     if not cleaned:
         return ""
+    original = cleaned
+    cleaned = _FEED_FORWARD_PREFIX_RE.sub("", cleaned).strip()
+    if cleaned != original:
+        cleaned = _FEED_FORWARD_SOURCE_TITLE_RE.sub("", cleaned).strip()
     cleaned = _FEED_LINE_PREFIX_RE.sub("", cleaned).strip()
     cleaned = cleaned.lstrip("/\\| ").strip()
     cleaned = _FEED_TELEGRAM_LINK_RE.sub("", cleaned)
@@ -2165,7 +2187,8 @@ _DIGEST_RANT_FRAGMENT_RE = re.compile(
 )
 _HEADLINE_RAIL_CONTINUATION_RE = re.compile(r"(?i)^(?:however|but|and|why)\b")
 _HEADLINE_RAIL_DEPENDENT_START_RE = re.compile(
-    r"(?i)^(?:he|she|they|his|her|their|this|that|these|those|it|its|the same|the offender|the commander|in honor|isn'?t this)\b"
+    r"(?i)^(?:he|she|they|his|her|their|this|that|these|those|it|its|the same|the offender|"
+    r"the commander|in honor|isn'?t this|efforts to|informed him)\b"
 )
 _HEADLINE_RAIL_BANTER_RE = re.compile(
     r"(?i)\b(?:what do you guys think|what do you think|just wanted to|taste and estimate|blue meth|"
@@ -2180,6 +2203,15 @@ _HEADLINE_RAIL_HISTORY_RE = re.compile(
 _HEADLINE_RAIL_VAGUE_RESULT_RE = re.compile(
     r"(?i)^(?:the\s+)?(?:fire|situation|operation|incident|scene|work|area)\s+"
     r"(?:was|is)\s+(?:successfully\s+)?(?:extinguished|contained|completed|resolved|stabilized)\b"
+)
+_HEADLINE_RAIL_SOCIAL_METRICS_RE = re.compile(
+    r"(?i)\b(?:retweets?|reposts?|views?|likes?|bookmarks?|followers?)\b"
+)
+_HEADLINE_RAIL_BROKEN_TAIL_RE = re.compile(
+    r"(?i)\b(?:of|for|to|with|from|about)\s+(?:the\s+)?(?:u\.s|us|u\.n|un|eu)\.?$"
+)
+_HEADLINE_RAIL_MALFORMED_CLAIM_RE = re.compile(
+    r"(?i)\b(?:informed him|informed her|told him|told her)\b"
 )
 _HEADLINE_RAIL_SOURCE_TAIL_RE = re.compile(
     r"(?i)^(?P<body>.+?)(?:,\s*|\s+)(?:according to|per)\s+"
@@ -2418,10 +2450,18 @@ def _headline_rail_line_issue(text: str) -> str:
         return "history_fragment"
     if _HEADLINE_RAIL_VAGUE_RESULT_RE.match(cleaned):
         return "vague_copy"
+    if _HEADLINE_RAIL_SOCIAL_METRICS_RE.search(cleaned) and not _HEADLINE_RAIL_STANDALONE_ACTION_RE.search(cleaned):
+        return "banter_line"
+    if _HEADLINE_RAIL_MALFORMED_CLAIM_RE.search(cleaned):
+        return "dependent_line"
     if _digest_is_low_value_quote_or_rant(cleaned):
         return "low_value"
     if _feed_segment_is_incomplete(cleaned):
         return "incomplete_copy"
+    if _HEADLINE_RAIL_BROKEN_TAIL_RE.search(cleaned):
+        return "incomplete_copy"
+    if cleaned[:1].islower():
+        return "continuation_line"
     if should_downgrade_explainer_urgency(cleaned) and not looks_like_live_event_update(cleaned):
         return "soft_news"
     if len(cleaned.split()) < 5 and not _DIGEST_SPECIFIC_ACTION_RE.search(cleaned):

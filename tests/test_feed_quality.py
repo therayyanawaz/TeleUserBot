@@ -649,6 +649,27 @@ def test_clean_generated_delivery_segment_keeps_follow_up_language():
     assert ai_filter._clean_generated_delivery_segment("Follow @DeskWire") == ""
 
 
+def test_clean_generated_delivery_segment_strips_forwarded_prefix():
+    assert (
+        ai_filter._clean_generated_delivery_segment(
+            "Fwd from @ New Impeachment Republican Eric Schmitt called on the House to begin impeachment proceedings."
+        )
+        == "Republican Eric Schmitt called on the House to begin impeachment proceedings."
+    )
+
+
+def test_truncate_feed_line_avoids_broken_title_tail():
+    text = (
+        "Republican Eric Schmitt called on the House of Representatives to begin impeachment proceedings "
+        "against James Boasberg, chief judge of the district court in Washington."
+    )
+
+    truncated = ai_filter._truncate_feed_line(text, limit=105)
+
+    assert "James Boasberg, chief..." not in truncated
+    assert truncated.endswith("...")
+
+
 def test_strip_caption_promo_noise_keeps_follow_up_language():
     assert (
         main._strip_caption_promo_noise("Follow-up explosions were reported across the district.")

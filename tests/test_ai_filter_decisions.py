@@ -338,6 +338,24 @@ def test_clean_headline_rail_items_drops_fragments_banter_and_history():
     assert cleaned == ["Approximately 20 Israeli jets were seen flying over Daraa Governorate."]
 
 
+def test_clean_headline_rail_items_drops_metrics_and_broken_tail_fragments():
+    cleaned = ai_filter._clean_headline_rail_items(
+        [
+            "62.0K retweets and only 2.4 million views.",
+            "The Syrian Foreign Ministry announced that the handover over of U.S.",
+            "efforts to secure a ceasefire with Israel amid ongoing cross-border tensions.",
+            "Initial reports indicate informed him that a ceasefire between Israel and Lebanon could happen tonight via X.",
+            "Hezbollah launches two separate rocket attacks against Acre and Shlomi in Northern Israel.",
+        ],
+        max_lines=12,
+        max_chars=0,
+    )
+
+    assert cleaned == [
+        "Hezbollah launches two separate rocket attacks against Acre and Shlomi in Northern Israel."
+    ]
+
+
 def test_clean_headline_rail_items_keeps_stronger_duplicate_topic():
     cleaned = ai_filter._clean_headline_rail_items(
         [
