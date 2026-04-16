@@ -1344,6 +1344,28 @@ async def test_queue_single_message_for_digest_skips_media_only_posts(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_on_new_message_ignores_media_posts_before_enqueue(monkeypatch):
+    marked: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(main, "is_seen", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(main, "_is_dupe_detection_enabled", lambda: False)
+    monkeypatch.setattr(main, "mark_seen", lambda channel_id, message_id: marked.append((channel_id, message_id)))
+
+    async def fail_enqueue(*_args, **_kwargs):
+        raise AssertionError("media post should never reach enqueue")
+
+    monkeypatch.setattr(main, "_enqueue_inbound_messages", fail_enqueue)
+
+    await main._on_new_message(
+        SimpleNamespace(
+            message=SimpleNamespace(chat_id=-1001, id=12, media=True, grouped_id=None)
+        )
+    )
+
+    assert marked == [("-1001", 12)]
+
+
+@pytest.mark.asyncio
 async def test_handle_delivery_inbound_job_queues_deliver_action_when_digest_mode_enabled(monkeypatch):
     archived: dict[str, object] = {}
     queued: dict[str, object] = {}
@@ -1437,7 +1459,7 @@ async def test_handle_delivery_inbound_job_skips_media_only_payload(monkeypatch)
     await main._handle_delivery_inbound_job({"id": 22})
 
     assert archived["payload"]["final_action"] == "skip"
-    assert archived["payload"]["skip_reason"] == "empty_message"
+    assert archived["payload"]["skip_reason"] == "media_unsupported"
 
 
 @pytest.mark.asyncio
@@ -1469,7 +1491,7 @@ async def test_handle_triage_inbound_job_skips_media_only_payload(monkeypatch):
     await main._handle_triage_inbound_job({"id": 23})
 
     assert archived["payload"]["final_action"] == "skip"
-    assert archived["payload"]["skip_reason"] == "empty_message"
+    assert archived["payload"]["skip_reason"] == "media_unsupported"
 
 
 @pytest.mark.asyncio

@@ -2747,6 +2747,10 @@ def _filename_for_bot_media(msg: Message, index: int) -> str:
     return f"file_{msg.id or index}.bin"
 
 
+def _message_has_media(msg: object) -> bool:
+    return bool(getattr(msg, "media", None))
+
+
 def _format_summary_text_legacy(source_title: str, summary: str) -> str:
     category_label = "Update"
     headline, context = extract_feed_summary_parts(str(summary or ""), str(summary or ""))
@@ -5558,54 +5562,19 @@ async def _process_album(messages: List[Message]) -> None:
     if not messages:
         return
 
-    messages = sorted(messages, key=lambda m: m.id)
     channel_id = str(messages[0].chat_id)
     message_ids = [m.id for m in messages]
-
-    if all(is_seen(channel_id, m_id) for m_id in message_ids):
-        return
-
-    source, link = await _source_info(messages[0])
-    captions = [(m.message or "").strip() for m in messages if (m.message or "").strip()]
-    combined_caption = "\n".join(captions).strip()
-
-    if not combined_caption:
-        mark_seen_many(channel_id, message_ids)
-        return
-
-    summary = await summarize_or_skip(combined_caption, _require_auth_manager())
-    if summary is None:
-        mark_seen_many(channel_id, message_ids)
-        return
-
-    reply_to = await _resolve_source_reply_target(messages[0])
-    summary_headline, summary_context = extract_feed_summary_parts(summary, combined_caption)
-    resolved_context = await _resolve_dynamic_delivery_context(
-        current_text=combined_caption,
-        headline=summary_headline,
-        candidate_context=summary_context,
-        source_title=source,
-    )
-    sent_ref = await _send_text_with_ref(
-        _format_summary_text(
-            source,
-            summary,
-            raw_text=combined_caption,
-            context_override=resolved_context,
-        ),
-        reply_to=reply_to,
-    )
-    _register_source_delivery_refs(
-        channel_id=channel_id,
-        source_message_ids=message_ids,
-        sent_ref=sent_ref,
-    )
     mark_seen_many(channel_id, message_ids)
+    return
 
 
 async def _queue_single_message_for_digest(msg: Message) -> None:
     channel_id = str(msg.chat_id)
     if is_seen(channel_id, msg.id):
+        return
+
+    if _message_has_media(msg):
+        mark_seen(channel_id, msg.id)
         return
 
     text = (msg.message or "").strip()
@@ -5708,104 +5677,7 @@ async def _queue_album_for_digest(messages: List[Message]) -> None:
     messages = sorted(messages, key=lambda m: m.id)
     channel_id = str(messages[0].chat_id)
     message_ids = [m.id for m in messages]
-
-    if all(is_seen(channel_id, m_id) for m_id in message_ids):
-        return
-
-    source, link = await _source_info(messages[0])
-    captions = [(m.message or "").strip() for m in messages if (m.message or "").strip()]
-    combined_caption = "\n".join(captions).strip()
-
-    if not combined_caption:
-        mark_seen_many(channel_id, message_ids)
-        return
-
-    severity = "medium"
-    severity_score = 0.0
-    severity_breakdown: dict = {}
-    if _is_severity_routing_enabled():
-        severity, severity_score, severity_breakdown = _classify_severity_with_breakdown(
-            text=combined_caption,
-            source=source,
-            channel_id=channel_id,
-            message_id=messages[0].id,
-            has_link=bool(link),
-            reply_to=_reply_to_message_id(messages[0]),
-            album_size=len(messages),
-        )
-    elif _contains_breaking_keyword(combined_caption):
-        severity = "high"
-
-    if (
-        severity != "high"
-        and _contains_breaking_keyword(combined_caption)
-        and not should_downgrade_explainer_urgency(combined_caption)
-        and looks_like_live_event_update(combined_caption)
-    ):
-        severity = "high"
-        severity_score = max(float(severity_score), _high_severity_score_floor())
-        severity_breakdown = dict(severity_breakdown or {})
-        severity_breakdown["keyword_override"] = True
-
-    if severity == "high" and _is_immediate_high_enabled():
-        headline = await summarize_breaking_headline(combined_caption, _require_auth_manager())
-        if not headline:
-            mark_seen_many(channel_id, message_ids)
-            return
-        cluster_result = await _apply_breaking_story_cluster_policy(
-            messages=messages,
-            source=source,
-            candidate_text=combined_caption,
-            headline=headline,
-        )
-        _archive_for_query_search(
-            channel_id,
-            messages[0].id,
-            combined_caption,
-            source_name=source,
-            message_link=link,
-        )
-        mark_seen_many(channel_id, message_ids)
-        log_structured(
-            LOGGER,
-            "breaking_album_sent_immediate",
-            channel_id=channel_id,
-            first_message_id=messages[0].id,
-            album_size=len(messages),
-            source=source,
-            severity=severity,
-            severity_score=severity_score,
-            final_action=str(cluster_result.get("final_action") or ""),
-            cluster_decision=str(cluster_result.get("cluster_decision") or ""),
-            reply_to=int(cluster_result.get("reply_to") or 0),
-            severity_breakdown=severity_breakdown,
-        )
-        return
-
-    # Queue one digest item for the entire album (first message ID as queue key).
-    _queue_for_digest(
-        channel_id,
-        messages[0].id,
-        combined_caption,
-        source_name=source,
-        message_link=link,
-    )
     mark_seen_many(channel_id, message_ids)
-    log_structured(
-        LOGGER,
-        "digest_album_queued",
-        channel_id=channel_id,
-        first_message_id=messages[0].id,
-        album_size=len(messages),
-        source=source,
-        severity=severity,
-        severity_score=severity_score,
-        severity_emoji=_severity_emoji(severity),
-        has_link=bool(link),
-        text_tokens=estimate_tokens_rough(combined_caption),
-        pending=count_pending(),
-        severity_breakdown=severity_breakdown,
-    )
 
 
 def _pipeline_worker_targets() -> Dict[str, int]:
@@ -6030,6 +5902,12 @@ async def _handle_triage_inbound_job(job: Dict[str, object]) -> None:
         await _advance_job_to_archive(job, payload)
         return
 
+    if any(_message_has_media(item) for item in messages):
+        payload["final_action"] = "skip"
+        payload["skip_reason"] = "media_unsupported"
+        await _advance_job_to_archive(job, payload)
+        return
+
     primary = messages[0]
     source, link = await _source_info(primary)
     combined_text = normalize_space(
@@ -6156,6 +6034,12 @@ async def _handle_delivery_inbound_job(job: Dict[str, object]) -> None:
     if not messages:
         payload["final_action"] = "skip"
         payload["skip_reason"] = "message_missing"
+        await _advance_job_to_archive(job, payload)
+        return
+
+    if any(_message_has_media(item) for item in messages):
+        payload["final_action"] = "skip"
+        payload["skip_reason"] = "media_unsupported"
         await _advance_job_to_archive(job, payload)
         return
 
@@ -10364,6 +10248,15 @@ async def _on_new_message(event: events.NewMessage.Event) -> None:
                         merged=bool(dupe_result.merged),
                     )
                 return
+
+        if _message_has_media(msg):
+            mark_seen(channel_id, msg.id)
+            LOGGER.debug(
+                "Media message ignored channel_id=%s message_id=%s",
+                channel_id,
+                msg.id,
+            )
+            return
 
         if msg.grouped_id:
             key = (channel_id, int(msg.grouped_id))
