@@ -1,0 +1,16 @@
+[Unit]
+Description=TeleUserBot
+After=network.target
+
+[Service]
+User=your-linux-user
+WorkingDirectory=/path/to/TeleUserBot
+EnvironmentFile=/path/to/TeleUserBot/.env
+ExecStart=/usr/bin/python3 /path/to/TeleUserBot/main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
