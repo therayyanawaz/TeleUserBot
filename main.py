@@ -46,6 +46,7 @@ import config
 from ai_filter import (
     _call_codex_with_auth_repair,
     _clean_headline_rail_items,
+    rank_headline_rail_items,
     create_digest_summary,
     create_digest_summary_result,
     extract_digest_narrative_parts,
@@ -7414,6 +7415,7 @@ async def _build_window_digest_messages(
     merged_headline = ""
     merged_highlights: List[str] = []
     merged_seen: set[str] = set()
+    ranking_posts: List[Dict[str, object]] = []
     total_chars = 0
     ai_parts = 0
     fallback_parts = 0
@@ -7452,6 +7454,7 @@ async def _build_window_digest_messages(
             },
         )
         if headline_mode:
+            ranking_posts.extend(posts)
             part_headline, _part_story, part_highlights, part_also = extract_digest_narrative_parts(
                 digest_body,
                 max_lines=_digest_support_line_limit(),
@@ -7494,6 +7497,10 @@ async def _build_window_digest_messages(
             capped_highlights,
             max_lines=support_limit,
             max_chars=0,
+        )
+        capped_highlights = rank_headline_rail_items(
+            capped_highlights,
+            ranking_posts,
         )
         rendered_bodies = [
             _render_digest_body_sections(

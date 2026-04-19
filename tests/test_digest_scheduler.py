@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import importlib
 from datetime import datetime
 
 import pytest
 
+import ai_filter
+import config
 import main
 
 
@@ -32,6 +35,24 @@ def test_digest_backlog_snapshot_marks_stale_recovery_due(monkeypatch):
     assert snapshot["oldest_closed_window_end"] == 1800
     assert snapshot["stale_intervals"] == 4
     assert snapshot["recovery_due"] is True
+
+
+def test_digest_source_tiers_env_parses_int_keys_and_float_values(monkeypatch):
+    monkeypatch.setenv(
+        "DIGEST_SOURCE_TIERS",
+        '{"1234567890": 1.8, "9876543210": 1.6, "1122334455": 0.4}',
+    )
+
+    reloaded = importlib.reload(config)
+    try:
+        assert reloaded.DIGEST_SOURCE_TIERS == {
+            1234567890: 1.8,
+            9876543210: 1.6,
+            1122334455: 0.4,
+        }
+    finally:
+        monkeypatch.delenv("DIGEST_SOURCE_TIERS", raising=False)
+        importlib.reload(config)
 
 
 def test_compute_next_scheduler_delay_seconds_aligns_to_next_half_hour_boundary(monkeypatch):
@@ -284,6 +305,99 @@ async def test_build_window_digest_messages_cleans_merged_headline_rail(monkeypa
     assert "Team Scotland has revealed its ceremony outfits" not in messages[0]
     assert "The same battalion is responsible" not in messages[0]
     assert messages[0].count("Zelensky has offered the United States assistance") == 1
+    assert stats["part_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_build_window_digest_messages_reranks_headline_rail_by_signal(monkeypatch):
+    async def fake_run_post_processors(text, context):
+        return text
+
+    async def fake_hydrate_digest_posts(rows):
+        return rows
+
+    async def fake_create_digest_summary_result(_posts, _auth_manager, interval_minutes):
+        return type(
+            "Result",
+            (),
+            {
+                "html": (
+                    "<b>Top headlines from the last 30 minutes</b><br>"
+                    "• Port reopened after a three-day shutdown.<br>"
+                    "• Missiles hit Haifa after sirens sounded across the city."
+                ),
+                "copy_origin": "ai",
+                "fallback_reason": "",
+                "major_block_count": 1,
+                "timeline_item_count": 0,
+                "noise_stripped_count": 0,
+                "translation_applied_count": 0,
+                "citation_stripped_count": 0,
+                "duplicate_collapsed_count": 0,
+            },
+        )()
+
+    monkeypatch.setattr(
+        ai_filter.config,
+        "DIGEST_SOURCE_TIERS",
+        {
+            "source:reuters": 0.8,
+            "source:ap news": 0.6,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(main, "_digest_input_token_budget", lambda: 1000)
+    monkeypatch.setattr(main, "_digest_window_page_size", lambda: 100)
+    monkeypatch.setattr(main, "_digest_send_chunk_size", lambda: 3600)
+    monkeypatch.setattr(main, "_require_auth_manager", lambda: object())
+    monkeypatch.setattr(main, "_run_post_processors", fake_run_post_processors)
+    monkeypatch.setattr(
+        main,
+        "_iter_digest_row_groups",
+        lambda *_args, **_kwargs: iter(
+            [[
+                {
+                    "channel_id": "desk-port",
+                    "source_name": "Desk",
+                    "raw_text": "Port reopened after a three-day shutdown and cargo traffic resumed at dawn.",
+                    "timestamp": 1000,
+                },
+                {
+                    "channel_id": "desk-haifa-1",
+                    "source_name": "Reuters",
+                    "raw_text": "Missiles hit Haifa after sirens sounded across the city.",
+                    "timestamp": 1180,
+                },
+                {
+                    "channel_id": "desk-haifa-2",
+                    "source_name": "AP News",
+                    "raw_text": "Missiles hit Haifa after fresh sirens as impacts were reported across the city.",
+                    "timestamp": 1170,
+                },
+            ]]
+        ),
+    )
+    monkeypatch.setattr(main, "_hydrate_digest_posts", fake_hydrate_digest_posts)
+    monkeypatch.setattr(main, "create_digest_summary_result", fake_create_digest_summary_result)
+
+    messages, stats = await main._build_window_digest_messages(
+        lambda after_id=0, limit=100: [],
+        total_updates=3,
+        interval_minutes=30,
+        title_builder=lambda part_index, part_count: main._rolling_digest_title(
+            79200,
+            81000,
+            interval_minutes=30,
+            part_index=part_index,
+            part_count=part_count,
+        ),
+        context={},
+    )
+
+    assert len(messages) == 1
+    assert messages[0].find("Missiles hit Haifa after sirens sounded across the city.") < messages[0].find(
+        "Port reopened after a three-day shutdown."
+    )
     assert stats["part_count"] == 1
 
 

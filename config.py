@@ -119,6 +119,32 @@ def _env_list(key: str, default: list[str] | None = None) -> list[str]:
     return _normalize_list(part for part in text.split(","))
 
 
+def _env_dict(key: str, default: dict[str, object] | None = None) -> dict[str, object]:
+    raw = os.getenv(key)
+    if raw is None:
+        return dict(default or {})
+
+    text = str(raw).strip()
+    if not text:
+        return {}
+
+    try:
+        parsed_json = json.loads(text)
+        if isinstance(parsed_json, dict):
+            return dict(parsed_json)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    try:
+        parsed_py = ast.literal_eval(text)
+        if isinstance(parsed_py, dict):
+            return dict(parsed_py)
+    except (ValueError, SyntaxError):
+        pass
+
+    return dict(default or {})
+
+
 _load_dotenv(ENV_PATH)
 
 
@@ -198,6 +224,11 @@ DIGEST_IMPORTANCE_SCORING = _env_bool("DIGEST_IMPORTANCE_SCORING", True)  # type
 
 # Allow AI to include HTML read-more links when message links are available.
 DIGEST_INCLUDE_READ_MORE_LINKS = _env_bool("DIGEST_INCLUDE_READ_MORE_LINKS", False)  # type: bool
+_raw_digest_source_tiers = os.getenv("DIGEST_SOURCE_TIERS", "{}")
+try:
+    DIGEST_SOURCE_TIERS = {int(k): float(v) for k, v in json.loads(_raw_digest_source_tiers).items()}  # type: dict[int, float]
+except Exception:
+    DIGEST_SOURCE_TIERS = {}  # type: dict[int, float]
 
 # Include source/channel tags in outbound messages.
 INCLUDE_SOURCE_TAGS = _env_bool("INCLUDE_SOURCE_TAGS", False)  # type: bool

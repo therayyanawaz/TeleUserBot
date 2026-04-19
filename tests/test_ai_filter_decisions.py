@@ -357,6 +357,26 @@ def test_clean_headline_rail_items_drops_metrics_and_broken_tail_fragments():
     ]
 
 
+def test_clean_headline_rail_items_drops_non_english_opinion_noise_and_meta():
+    cleaned = ai_filter._clean_headline_rail_items(
+        [
+            "2.0 paglus main khushi ki leher.",
+            "Kebakaran besar terjadi di sebuah desa dekat pelabuhan.",
+            "DM if you've enrolled in CDS journey new batch for CDS 2 DM.",
+            "Public service announcement: All the ads about hemorrhoid cream is directed towards MES.",
+            "You can screenshot this, but I am positive that the US will launch an attack on Iran within the week.",
+            "Nothing is officially confirmed.",
+            "Officials confirmed services resumed at the main port after the overnight shutdown.",
+        ],
+        max_lines=12,
+        max_chars=0,
+    )
+
+    assert cleaned == [
+        "Officials confirmed services resumed at the main port after the overnight shutdown."
+    ]
+
+
 def test_digest_needs_english_rewrite_detects_latin_foreign_line():
     assert ai_filter._digest_needs_english_rewrite(
         "Napad iračkih snaga OTPORA na američki konzulat u Erbilu.",
@@ -369,6 +389,11 @@ def test_digest_needs_english_rewrite_keeps_english_line_with_diacritic_name():
         "Jose Andres announced aid deliveries for Gaza overnight.",
         "English",
     )
+
+
+def test_line_looks_non_english_for_rail_catches_romanized_and_indonesian_lines():
+    assert ai_filter._line_looks_non_english_for_rail("2.0 paglus main khushi ki leher.")
+    assert ai_filter._line_looks_non_english_for_rail("Kebakaran besar terjadi di sebuah desa dekat pelabuhan.")
 
 
 def test_clean_headline_rail_items_keeps_stronger_duplicate_topic():
@@ -406,6 +431,36 @@ def test_json_digest_to_html_drops_vague_and_dependent_rail_lines():
     assert "Approximately 20 Israeli jets were seen flying over Daraa Governorate." in plain
     assert "The fire was successfully extinguished." not in plain
     assert "However, the head of the Kiev regime admitted" not in plain
+
+
+def test_is_bad_feed_headline_drops_promo_opinion_and_factually_empty_lines():
+    assert ai_filter._is_bad_feed_headline("DM if you've enrolled in CDS journey new batch for CDS 2 DM.")
+    assert ai_filter._is_bad_feed_headline(
+        "You can screenshot this, but I am positive that the US will launch an attack on Iran within the week."
+    )
+    assert ai_filter._is_bad_feed_headline("Nothing is officially confirmed.")
+
+
+def test_json_digest_to_html_drops_confirmation_only_and_unattributed_threat_lines():
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "headline": "Top headlines from the last 30 minutes",
+            "headlines": [
+                "The news is not yet confirmed.",
+                "Iran will be completely destroyed if it refuses to sign the agreement.",
+                "The Bahraini monarch orders the revocation of citizenship for anyone who sympathizes with Iran.",
+            ],
+        },
+        interval_minutes=30,
+        max_lines=12,
+    )
+
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "The news is not yet confirmed." not in plain
+    assert "Iran will be completely destroyed if it refuses to sign the agreement." not in plain
+    assert "The Bahraini monarch orders the revocation of citizenship for anyone who sympathizes with Iran." in plain
 
 
 
@@ -595,6 +650,47 @@ def test_local_fallback_digest_headline_rail_caps_to_main_lines(monkeypatch):
 
     assert plain.count("Officials confirmed site ") == 4
     assert "Officials confirmed site 5 remained under security lockdown." not in plain
+
+
+def test_rank_headline_rail_items_boosts_recent_corroborated_high_severity_line(monkeypatch):
+    monkeypatch.setattr(
+        ai_filter.config,
+        "DIGEST_SOURCE_TIERS",
+        {
+            "source:reuters": 0.8,
+            "source:ap news": 0.6,
+        },
+        raising=False,
+    )
+
+    ranked = ai_filter.rank_headline_rail_items(
+        [
+            "Port reopened after a three-day shutdown.",
+            "Missiles hit Haifa after sirens sounded across the city.",
+        ],
+        [
+            {
+                "channel_id": "desk-port",
+                "source_name": "Desk",
+                "raw_text": "Port reopened after a three-day shutdown and cargo traffic resumed at dawn.",
+                "timestamp": 1000,
+            },
+            {
+                "channel_id": "desk-haifa-1",
+                "source_name": "Reuters",
+                "raw_text": "Missiles hit Haifa after sirens sounded across the city.",
+                "timestamp": 1180,
+            },
+            {
+                "channel_id": "desk-haifa-2",
+                "source_name": "AP News",
+                "raw_text": "Missiles hit Haifa after fresh sirens as impacts were reported across the city.",
+                "timestamp": 1170,
+            },
+        ],
+    )
+
+    assert ranked[0] == "Missiles hit Haifa after sirens sounded across the city."
 
 
 def test_fallback_headline_prefers_concrete_sentence_over_soft_setup():

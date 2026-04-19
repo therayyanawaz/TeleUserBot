@@ -14,6 +14,11 @@ import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 import httpx
+try:
+    from langdetect import DetectorFactory as _LangDetectFactory, detect_langs as _detect_langs
+except Exception:  # pragma: no cover - optional dependency
+    _LangDetectFactory = None
+    _detect_langs = None
 
 import config
 from auth import AuthManager
@@ -196,6 +201,11 @@ _FEED_CONTEXT_BANNED_FRAGMENTS = (
     "livestream",
     "live stream",
     "watch here",
+    "dm if",
+    "dm for",
+    "new batch",
+    "public service announcement",
+    "enrolled in",
 )
 _FEED_LINE_PREFIX_RE = re.compile(
     r"^(?:breaking|alert|live update|update|analysis|opinion|thread|explainer)\s*[:\-–—]+\s*",
@@ -299,6 +309,8 @@ _FEED_SOURCE_PREFIX_CONNECTORS = {
 }
 
 LOGGER = logging.getLogger("tg_news_userbot.ai_filter")
+if _LangDetectFactory is not None:  # pragma: no branch
+    _LangDetectFactory.seed = 0
 _SUMMARY_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
 _SEVERITY_CACHE: "OrderedDict[str, str]" = OrderedDict()
 _HEADLINE_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -646,7 +658,21 @@ def _is_bad_feed_headline(line: str) -> bool:
         return True
     if bool(signals.get("downgrade_explainer")) and not bool(signals.get("live_event_update")):
         return True
+    if _line_looks_non_english_for_rail(cleaned):
+        return True
+    if _is_factually_empty_headline(cleaned):
+        return True
+    if _FIRST_PERSON_OPINION_RE.search(cleaned):
+        return True
+    if _EDITORIAL_OPINION_RE.search(cleaned):
+        return True
+    if _RHETORICAL_FRAME_RE.search(cleaned):
+        return True
     if any(fragment in lowered for fragment in _FEED_CONTEXT_BANNED_FRAGMENTS):
+        return True
+    word_count = len(re.findall(r"\b\w+\b", cleaned))
+    named_entity_count = len(_extract_candidate_named_tokens(cleaned))
+    if word_count <= 6 and named_entity_count == 0 and not _DIGEST_SPECIFIC_ACTION_RE.search(cleaned):
         return True
     if cleaned.count("...") or cleaned.endswith("..."):
         return True
@@ -2211,6 +2237,15 @@ _DIGEST_QUOTE_PREFIX_RE = re.compile(
 _DIGEST_RANT_FRAGMENT_RE = re.compile(
     r"(?i)\b(?:to quote the bible|religious crusade|doesn.?t that beat fighting|but remember|big, fat, hug|president djt)\b"
 )
+_FIRST_PERSON_OPINION_RE = re.compile(
+    r"(?i)^(?:i am|i'm|i think|i believe|i'm positive|in my view|you and)\b"
+)
+_EDITORIAL_OPINION_RE = re.compile(
+    r"(?i)\b(?:i am positive|i'm positive|i think|i believe|you can screenshot this)\b"
+)
+_RHETORICAL_FRAME_RE = re.compile(
+    r"(?i)^(?:when|if only|imagine|remember when|this is why)\b"
+)
 _HEADLINE_RAIL_CONTINUATION_RE = re.compile(r"(?i)^(?:however|but|and|why)\b")
 _HEADLINE_RAIL_DEPENDENT_START_RE = re.compile(
     r"(?i)^(?:he|she|they|his|her|their|this|that|these|those|it|its|the same|the offender|"
@@ -2218,6 +2253,7 @@ _HEADLINE_RAIL_DEPENDENT_START_RE = re.compile(
 )
 _HEADLINE_RAIL_BANTER_RE = re.compile(
     r"(?i)\b(?:what do you guys think|what do you think|just wanted to|taste and estimate|blue meth|"
+    r"dm if|public service announcement|you can screenshot this|"
     r"engagement farmers?|full post with explanation|best telegram channels)\b"
 )
 _HEADLINE_RAIL_SOFT_NEWS_RE = re.compile(
@@ -2230,11 +2266,21 @@ _HEADLINE_RAIL_VAGUE_RESULT_RE = re.compile(
     r"(?i)^(?:the\s+)?(?:fire|situation|operation|incident|scene|work|area)\s+"
     r"(?:was|is)\s+(?:successfully\s+)?(?:extinguished|contained|completed|resolved|stabilized)\b"
 )
+_HEADLINE_RAIL_CONFIRMATION_ONLY_RE = re.compile(
+    r"(?i)^(?:the\s+)?(?:news|report|reports?|claim|claims?|information|details?|account)\s+"
+    r"(?:is|are|was|were)\s+(?:officially\s+)?(?:(?:still|yet)\s+|not\s+|not\s+yet\s+|yet\s+not\s+)?confirmed\b"
+    r"|^(?:this|that|it|nothing)\s+(?:is|was)\s+(?:officially\s+)?(?:still\s+|yet\s+|not\s+|not\s+yet\s+)?(?:unconfirmed|not confirmed|confirmed)\b"
+)
 _HEADLINE_RAIL_SOCIAL_METRICS_RE = re.compile(
     r"(?i)\b(?:retweets?|reposts?|views?|likes?|bookmarks?|followers?)\b"
 )
 _HEADLINE_RAIL_BROKEN_TAIL_RE = re.compile(
     r"(?i)\b(?:of|for|to|with|from|about)\s+(?:the\s+)?(?:u\.s|us|u\.n|un|eu)\.?$"
+)
+_HEADLINE_RAIL_UNATTRIBUTED_THREAT_RE = re.compile(
+    r"(?i)^[A-Z][A-Za-z0-9 .,'-]{0,80}\s+will\s+be\s+"
+    r"(?:completely\s+|totally\s+|utterly\s+)?"
+    r"(?:destroyed|wiped\s+out|annihilated|eliminated|erased)\b"
 )
 _HEADLINE_RAIL_MALFORMED_CLAIM_RE = re.compile(
     r"(?i)\b(?:informed him|informed her|told him|told her)\b"
@@ -2472,14 +2518,28 @@ def _headline_rail_line_issue(text: str) -> str:
         return "dependent_line"
     if _HEADLINE_RAIL_BANTER_RE.search(cleaned):
         return "banter_line"
+    if _FIRST_PERSON_OPINION_RE.search(cleaned):
+        return "banter_line"
+    if _EDITORIAL_OPINION_RE.search(cleaned):
+        return "banter_line"
+    if _RHETORICAL_FRAME_RE.search(cleaned):
+        return "vague_copy"
     if _HEADLINE_RAIL_SOFT_NEWS_RE.search(cleaned):
         return "soft_news"
     if _HEADLINE_RAIL_HISTORY_RE.search(cleaned):
         return "history_fragment"
+    if _line_looks_non_english_for_rail(cleaned):
+        return "non_english_leftovers"
+    if _is_factually_empty_headline(cleaned):
+        return "vague_copy"
     if _HEADLINE_RAIL_VAGUE_RESULT_RE.match(cleaned):
+        return "vague_copy"
+    if _HEADLINE_RAIL_CONFIRMATION_ONLY_RE.match(cleaned):
         return "vague_copy"
     if _HEADLINE_RAIL_SOCIAL_METRICS_RE.search(cleaned) and not _HEADLINE_RAIL_STANDALONE_ACTION_RE.search(cleaned):
         return "banter_line"
+    if _HEADLINE_RAIL_UNATTRIBUTED_THREAT_RE.match(cleaned):
+        return "ungrounded_copy"
     if _HEADLINE_RAIL_MALFORMED_CLAIM_RE.search(cleaned):
         return "dependent_line"
     if _digest_is_low_value_quote_or_rant(cleaned):
@@ -2522,6 +2582,174 @@ def _headline_rail_line_strength(text: str) -> float:
     if source:
         score += 0.25
     return score
+
+
+def _headline_rail_match_score(headline: str, post_text: str) -> float:
+    line_key = _digest_line_key(headline)
+    post_key = _digest_line_key(post_text)
+    if not line_key or not post_key:
+        return 0.0
+
+    same_topic = _headline_rail_same_topic(headline, post_text)
+    ratio = SequenceMatcher(None, line_key, post_key).ratio()
+    line_tokens = _headline_rail_topic_tokens(headline)
+    post_tokens = _headline_rail_topic_tokens(post_text)
+    overlap = line_tokens & post_tokens
+    coverage = (len(overlap) / max(1, len(line_tokens))) if line_tokens else 0.0
+    density = (len(overlap) / max(1, len(post_tokens))) if post_tokens else 0.0
+    number_overlap = bool(_extract_numeric_tokens(headline) & _extract_numeric_tokens(post_text))
+    named_overlap = bool(_extract_candidate_named_tokens(headline) & _extract_candidate_named_tokens(post_text))
+
+    if not same_topic and coverage < 0.42 and len(overlap) < 3 and not (number_overlap or named_overlap):
+        return 0.0
+    if not same_topic and ratio < 0.55 and coverage < 0.58:
+        return 0.0
+
+    score = ratio + coverage + (density * 0.35)
+    if same_topic:
+        score += 1.5
+    if number_overlap:
+        score += 0.4
+    if named_overlap:
+        score += 0.35
+    return score
+
+
+def _headline_rail_source_tier_bonus(post: Dict[str, object]) -> float:
+    raw = getattr(config, "DIGEST_SOURCE_TIERS", {})
+    if not isinstance(raw, dict) or not raw:
+        return 0.0
+
+    source_name = normalize_space(str(post.get("source_name") or post.get("source") or "")).lower()
+    channel_id = normalize_space(str(post.get("channel_id") or "")).lower()
+    keys = [
+        channel_id,
+        f"channel:{channel_id}" if channel_id else "",
+        source_name,
+        f"source:{source_name}" if source_name else "",
+    ]
+    for key in keys:
+        if not key:
+            continue
+        value = raw.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except Exception:
+            continue
+    return 0.0
+
+
+def _headline_rail_source_key(post: Dict[str, object]) -> str:
+    channel_id = normalize_space(str(post.get("channel_id") or ""))
+    if channel_id:
+        return f"channel:{channel_id.lower()}"
+    source = normalize_space(str(post.get("source_name") or post.get("source") or ""))
+    if source:
+        return f"source:{source.lower()}"
+    return ""
+
+
+def _headline_rail_recency_weight(timestamp: int, freshest_ts: int) -> float:
+    if timestamp <= 0 or freshest_ts <= 0:
+        return 0.35
+    age_seconds = max(0, freshest_ts - timestamp)
+    return 1.2 / (1.0 + (age_seconds / 600.0))
+
+
+def _headline_rail_severity_weight(text: str) -> float:
+    severity = _severity_from_text_heuristic(text)
+    if severity == "high":
+        return 3.0
+    if severity == "medium":
+        return 1.5
+    return 0.5
+
+
+def rank_headline_rail_items(
+    headlines: Sequence[str],
+    posts: Sequence[Dict[str, object]],
+) -> List[str]:
+    normalized = [
+        normalize_space(strip_telegram_html(str(item or "")))
+        for item in headlines
+        if normalize_space(strip_telegram_html(str(item or "")))
+    ]
+    if len(normalized) <= 1 or not posts:
+        return normalized
+
+    freshest_ts = max(
+        (
+            int(post.get("timestamp") or 0)
+            for post in posts
+            if int(post.get("timestamp") or 0) > 0
+        ),
+        default=0,
+    )
+    ranked: list[tuple[float, int, str]] = []
+
+    for index, headline in enumerate(normalized):
+        matched_sources: set[str] = set()
+        best_match_score = 0.0
+        best_severity = _headline_rail_severity_weight(headline)
+        best_recency = 0.35
+        best_source_weight = 0.0
+
+        for post in posts:
+            post_text = normalize_space(str(post.get("raw_text") or post.get("text") or ""))
+            if not post_text:
+                continue
+            match_score = _headline_rail_match_score(headline, post_text)
+            if match_score <= 0:
+                continue
+
+            source_key = _headline_rail_source_key(post)
+            if source_key:
+                matched_sources.add(source_key)
+
+            severity_weight = _headline_rail_severity_weight(post_text)
+            recency_weight = _headline_rail_recency_weight(int(post.get("timestamp") or 0), freshest_ts)
+            source_weight = _query_source_reliability(
+                {
+                    "source": str(post.get("source_name") or post.get("source") or ""),
+                    "text": post_text,
+                    "is_web": bool(post.get("is_web")),
+                }
+            ) + _headline_rail_source_tier_bonus(post)
+
+            if (
+                match_score > best_match_score
+                or (
+                    abs(match_score - best_match_score) < 0.001
+                    and severity_weight + recency_weight + source_weight > best_severity + best_recency + best_source_weight
+                )
+            ):
+                best_match_score = match_score
+                best_severity = severity_weight
+                best_recency = recency_weight
+                best_source_weight = source_weight
+
+        corroboration_weight = min(1.2, max(0, len(matched_sources) - 1) * 0.4)
+        ai_prior = 1.0 / (1.0 + (index * 0.35))
+        line_quality = _headline_rail_line_strength(headline) * 0.15
+
+        if best_match_score <= 0:
+            final_score = line_quality + ai_prior
+        else:
+            final_score = (
+                line_quality
+                + ai_prior
+                + best_severity
+                + best_recency
+                + best_source_weight
+                + corroboration_weight
+                + (best_match_score * 0.25)
+            )
+        ranked.append((final_score, index, headline))
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [headline for _score, _index, headline in ranked]
 
 
 def _headline_rail_topic_tokens(text: str) -> set[str]:
@@ -2616,6 +2844,8 @@ def _clean_headline_rail_items(
         if not raw:
             continue
         for part in re.split(r"\n+", raw):
+            if _line_looks_non_english_for_rail(part):
+                continue
             candidate = _headline_rail_clean_line(part, max_chars=max_chars)
             key = _digest_line_key(candidate)
             if not candidate or not key:
@@ -3397,6 +3627,66 @@ def _digest_needs_english_rewrite(text: str, output_language: str) -> bool:
     if non_ascii_letters >= 2 and stopword_hits <= 1:
         return True
     if non_ascii_letters >= 1 and stopword_hits == 0 and len(latin_words) >= 8:
+        return True
+    return False
+
+
+def _line_looks_non_english_for_rail(text: str) -> bool:
+    cleaned = normalize_space(strip_telegram_html(str(text or "")))
+    if not cleaned:
+        return False
+    if _digest_needs_english_rewrite(cleaned, "English"):
+        return True
+
+    latin_words = re.findall(r"[A-Za-z][A-Za-z'/-]*", cleaned)
+    if len(latin_words) < 5:
+        return False
+
+    if _detect_langs is not None:
+        try:
+            guesses = _detect_langs(cleaned)
+            if guesses:
+                top = guesses[0]
+                if getattr(top, "lang", "") != "en" and float(getattr(top, "prob", 0.0)) >= 0.85:
+                    return True
+        except Exception as exc:
+            LOGGER.debug("langdetect failed on line %r: %s", cleaned[:60], exc)
+            return False
+
+    english_stopwords = {
+        "a", "an", "and", "are", "as", "at", "after", "against", "amid", "before", "between",
+        "by", "for", "from", "in", "into", "is", "it", "its", "of", "on", "or", "the", "their",
+        "this", "to", "toward", "towards", "under", "was", "were", "while", "with", "within",
+    }
+    foreign_cues = {
+        "kebakaran", "terjadi", "sebuah", "desa", "khushi", "leher", "paglus",
+        "serangan", "warga", "pasukan", "pemerintah",
+    }
+    lowered_words = [word.lower() for word in latin_words]
+    if sum(1 for word in lowered_words if word in english_stopwords) == 0 and any(
+        word in foreign_cues for word in lowered_words
+    ):
+        return True
+    return False
+
+
+def _is_factually_empty_headline(text: str) -> bool:
+    cleaned = normalize_space(strip_telegram_html(str(text or "")))
+    lowered = cleaned.lower()
+    if not cleaned:
+        return True
+    if _HEADLINE_RAIL_CONFIRMATION_ONLY_RE.match(cleaned):
+        return True
+    if re.match(
+        r"^(?:the\s+news|this|it|nothing)\s+(?:is|was|has\s+been)\s+(?:officially\s+)?"
+        r"(?:not\s+yet\s+|not\s+|yet\s+not\s+)?(?:confirmed|verified|announced)\b",
+        lowered,
+    ):
+        return True
+    if not _extract_candidate_named_tokens(cleaned) and re.search(
+        r"\b(?:will be destroyed|will be wiped(?:\s+out)?|will be eliminated|will be annihilated)\b",
+        lowered,
+    ):
         return True
     return False
 

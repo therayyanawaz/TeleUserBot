@@ -106,6 +106,8 @@ def build_digest_system_prompt(
             toggles.append("Never include alert glyphs like 🔴 or copied list bullets like ● inside a headline line.")
             toggles.append("Do not start headline lines with wrappers like Context-, Initial reports indicate, or Preliminary reports suggest when the concrete fact can stand alone.")
             toggles.append("Every final headline line must be self-contained. No trailing ellipses, clipped clauses, or broken fragments.")
+            toggles.append("Never output a line that only comments on confirmation status. If a claim is unconfirmed, attach the uncertainty to the event itself.")
+            toggles.append("Do not write unattributed threat or quote lines like 'X will be destroyed'; name the speaker or drop the line.")
             toggles.append("Reject continuation lines, dependent follow-ups, rhetorical questions, joke lines, history trivia, and soft feature chatter.")
             toggles.append("headline should be a short rail label, not a narrative sentence.")
             toggles.append("headlines must contain only the main distinct hard-news developments as short standalone headline lines.")
