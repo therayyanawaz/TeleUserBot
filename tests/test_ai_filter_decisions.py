@@ -861,6 +861,45 @@ def test_apply_cross_digest_headline_dedup_realllows_topic_after_window(monkeypa
     assert also == []
 
 
+def test_also_moving_gate_rejects_promo_line_after_demotion(monkeypatch):
+    memory = {}
+
+    def fake_exists(topic_key, *, within_seconds):
+        return topic_key in memory
+
+    def fake_add(topic_key, headline_text, ts, severity=None):
+        memory[topic_key] = {"ts": ts, "severity": severity or ""}
+
+    monkeypatch.setattr(ai_filter, "headlined_story_exists", fake_exists)
+    monkeypatch.setattr(ai_filter, "headlined_story_add", fake_add)
+    monkeypatch.setattr(ai_filter, "headlined_story_last_severity", lambda *args, **kwargs: "medium")
+    monkeypatch.setattr(ai_filter.config, "CROSS_DIGEST_DEDUP_SEC", 3600, raising=False)
+    monkeypatch.setattr(ai_filter.config, "ALSO_MOVING_MAX", 4, raising=False)
+    monkeypatch.setattr(ai_filter.time, "time", lambda: 1000)
+
+    topic = ai_filter._headline_rail_topic_key("Port reopened after a three-day shutdown.")
+    memory[topic] = {"ts": 900, "severity": "medium"}
+
+    highlights, also = ai_filter.apply_cross_digest_headline_dedup(
+        ["Port reopened after a three-day shutdown."],
+        max_lines=4,
+        also_moving=["DM if you've enrolled in CDS journey new batch for CDS 2 DM."],
+    )
+
+    assert highlights == ["Port reopened after a three-day shutdown."]
+    assert also == []
+
+
+def test_also_moving_gate_keeps_real_overflow_news_with_entity():
+    assert ai_filter._also_moving_line_is_acceptable(
+        "Benjamin Netanyahu announced a security cabinet meeting in Jerusalem tonight."
+    )
+
+
+def test_also_moving_gate_rejects_three_word_fragment():
+    assert not ai_filter._also_moving_line_is_acceptable("Port reopened tonight.")
+
+
 def test_fallback_headline_prefers_concrete_sentence_over_soft_setup():
     headline = ai_filter._fallback_headline(
         "Situation update after overnight military activity. Iran launched missiles at Haifa and air defenses intercepted several over the city."

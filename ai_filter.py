@@ -1675,6 +1675,51 @@ def _cap_headline_rail_support(
     return capped_highlights, capped_also
 
 
+def _also_moving_line_is_acceptable(text: str) -> bool:
+    """
+    Lighter gate than main rail but stricter than nothing.
+    also_moving should contain real overflow news, not noise demotions.
+    """
+    cleaned = normalize_space(strip_telegram_html(text))
+    if not cleaned:
+        return False
+    if _is_bad_feed_headline(cleaned):
+        return False
+    if _digest_is_low_value_quote_or_rant(cleaned):
+        return False
+    if _is_factually_empty_headline(cleaned):
+        return False
+    if _line_looks_non_english_for_rail(cleaned):
+        return False
+    word_count = len(re.findall(r"\b\w+\b", cleaned))
+    if word_count < 5:
+        return False
+    has_entity = bool(_extract_candidate_named_tokens(cleaned))
+    has_number = bool(_DIGIT_TOKEN_RE.search(cleaned))
+    if not has_entity and not has_number:
+        return False
+    return True
+
+
+def _filter_also_moving_lines(values: Sequence[str]) -> List[str]:
+    max_items = max(1, int(getattr(config, "ALSO_MOVING_MAX", 4) or 4))
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = normalize_space(strip_telegram_html(str(value or "")))
+        if not cleaned or not _also_moving_line_is_acceptable(cleaned):
+            continue
+        key = _digest_line_key(cleaned)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        filtered.append(cleaned)
+        if len(filtered) >= max_items:
+            break
+    return filtered
+
+
 def _headline_rail_topic_key(text: str) -> str:
     topic_tokens = sorted(_headline_rail_topic_tokens(text))
     if topic_tokens:
@@ -1715,9 +1760,12 @@ def apply_cross_digest_headline_dedup(
             headlined_story_add(topic_key, cleaned, now_ts, severity=severity)
         output_lines.append(cleaned)
 
+    filtered_also = _filter_also_moving_lines(also_candidates)
+    if not output_lines and filtered_also:
+        output_lines.append(filtered_also.pop(0))
     return _cap_headline_rail_support(
         output_lines,
-        also_candidates,
+        filtered_also,
         max_lines=max_lines,
     )
 
@@ -3310,6 +3358,7 @@ def _digest_payload_to_narrative(
             max_chars=0,
             seen=seen,
         )
+        also_moving = _filter_also_moving_lines(also_moving)
 
         if not highlights:
             fallback_values: list[Any] = []

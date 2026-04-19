@@ -229,6 +229,7 @@ async def test_build_window_digest_messages_merges_short_window_groups_into_one_
     monkeypatch.setattr(main, "_digest_send_chunk_size", lambda: 3600)
     monkeypatch.setattr(main, "_require_auth_manager", lambda: object())
     monkeypatch.setattr(main, "_run_post_processors", fake_run_post_processors)
+    monkeypatch.setattr(main, "apply_cross_digest_headline_dedup", lambda highlights, *, max_lines, also_moving=None: (list(highlights), list(also_moving or [])))
     monkeypatch.setattr(
         main,
         "_iter_digest_row_groups",
@@ -306,6 +307,7 @@ async def test_build_window_digest_messages_cleans_merged_headline_rail(monkeypa
     monkeypatch.setattr(main, "_digest_send_chunk_size", lambda: 3600)
     monkeypatch.setattr(main, "_require_auth_manager", lambda: object())
     monkeypatch.setattr(main, "_run_post_processors", fake_run_post_processors)
+    monkeypatch.setattr(main, "apply_cross_digest_headline_dedup", lambda highlights, *, max_lines, also_moving=None: (list(highlights), list(also_moving or [])))
     monkeypatch.setattr(
         main,
         "_iter_digest_row_groups",
@@ -381,6 +383,7 @@ async def test_build_window_digest_messages_reranks_headline_rail_by_signal(monk
     monkeypatch.setattr(main, "_digest_send_chunk_size", lambda: 3600)
     monkeypatch.setattr(main, "_require_auth_manager", lambda: object())
     monkeypatch.setattr(main, "_run_post_processors", fake_run_post_processors)
+    monkeypatch.setattr(main, "apply_cross_digest_headline_dedup", lambda highlights, *, max_lines, also_moving=None: (list(highlights), list(also_moving or [])))
     monkeypatch.setattr(
         main,
         "_iter_digest_row_groups",
