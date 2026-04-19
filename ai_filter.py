@@ -3343,11 +3343,11 @@ def _digest_is_headline_rail(interval_minutes: int) -> bool:
 def _headline_rail_title(interval_minutes: int) -> str:
     minutes = max(1, int(interval_minutes))
     if minutes == 60:
-        return "Top headlines from the last hour"
+        return "Main headlines from the last hour"
     if minutes < 60:
-        return f"Top headlines from the last {minutes} minutes"
+        return f"Main headlines from the last {minutes} minutes"
     hours = max(1, round(minutes / 60))
-    return f"Top headlines from the last {hours} hours"
+    return f"Main headlines from the last {hours} hours"
 
 
 def _digest_payload_to_narrative(
@@ -3355,6 +3355,7 @@ def _digest_payload_to_narrative(
     *,
     max_lines: int,
     interval_minutes: int,
+    posts: Sequence[Dict[str, object]] = (),
 ) -> tuple[str, str, List[str], List[str]]:
     headline_mode = _digest_is_headline_rail(interval_minutes)
     if headline_mode:
@@ -3386,6 +3387,8 @@ def _digest_payload_to_narrative(
             max_chars=0,
             seen=seen,
         )
+        if posts:
+            highlights = rank_headline_rail_items(highlights, posts)
         remaining_for_also = max(0, max_lines - len(highlights))
         also_moving = _clean_headline_rail_items(
             also_raw,
@@ -3425,6 +3428,8 @@ def _digest_payload_to_narrative(
                 max_chars=0,
                 seen=seen,
             )
+            if posts:
+                highlights = rank_headline_rail_items(highlights, posts)
 
         if len(also_moving) > _digest_also_moving_cap(max_lines):
             highlights.extend(also_moving[_digest_also_moving_cap(max_lines) :])
@@ -3618,6 +3623,7 @@ def _render_digest_layout(
     highlights: Sequence[str],
     also_moving: Sequence[str],
     interval_minutes: int,
+    posts: Sequence[Dict[str, object]] = (),
 ) -> str:
     quiet = quiet_period_message(interval_minutes)
     headline_mode = _digest_is_headline_rail(interval_minutes)
@@ -3662,6 +3668,8 @@ def _render_digest_layout(
                 max_chars=0,
                 seen=seen,
             )
+        if posts:
+            clean_highlights = rank_headline_rail_items(clean_highlights, posts)
         remaining_for_also = max(0, max_lines - len(clean_highlights))
         clean_also = _clean_headline_rail_items(
             also_moving,
@@ -3736,13 +3744,20 @@ def _render_digest_layout(
     return sanitize_telegram_html("<br><br>".join(rendered_blocks))
 
 
-def _json_digest_to_html(payload: Dict[str, Any], *, interval_minutes: int, max_lines: int) -> str:
+def _json_digest_to_html(
+    payload: Dict[str, Any],
+    *,
+    interval_minutes: int,
+    max_lines: int,
+    posts: Sequence[Dict[str, object]] = (),
+) -> str:
     if bool(payload.get("quiet")):
         return quiet_period_message(interval_minutes)
     headline, story, highlights, also_moving = _digest_payload_to_narrative(
         payload,
         max_lines=max_lines,
         interval_minutes=interval_minutes,
+        posts=posts,
     )
     return _render_digest_layout(
         headline=headline,
@@ -3750,6 +3765,7 @@ def _json_digest_to_html(payload: Dict[str, Any], *, interval_minutes: int, max_
         highlights=highlights,
         also_moving=also_moving,
         interval_minutes=interval_minutes,
+        posts=posts,
     )
 
 
@@ -6719,6 +6735,7 @@ async def create_digest_summary_result(
                 parsed,
                 interval_minutes=interval_minutes,
                 max_lines=max_lines,
+                posts=prepared_posts,
             )
         else:
             candidate = content

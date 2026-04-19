@@ -246,7 +246,7 @@ def test_json_digest_to_html_renders_headline_rail_for_short_window():
     html = ai_filter._json_digest_to_html(
         {
             "quiet": False,
-            "headline": "Top headlines from the last 30 minutes",
+            "headline": "Main headlines from the last 30 minutes",
             "headlines": [
                 "Port reopens after a three-day shutdown.",
                 "Security checks remain in place around the eastern gate.",
@@ -258,7 +258,7 @@ def test_json_digest_to_html_renders_headline_rail_for_short_window():
     )
     plain = ai_filter.strip_telegram_html(html)
 
-    assert "<b>Top headlines from the last 30 minutes</b>" in html
+    assert "<b>Main headlines from the last 30 minutes</b>" in html
     assert "Port reopens after a three-day shutdown." in plain
     assert "Security checks remain in place around the eastern gate." in plain
     assert "Air defenses were activated over the northern district after a fresh barrage." in plain
@@ -269,7 +269,7 @@ def test_json_digest_to_html_caps_headline_rail_lines_for_short_window():
     html = ai_filter._json_digest_to_html(
         {
             "quiet": False,
-            "headline": "Top headlines from the last 30 minutes",
+            "headline": "Main headlines from the last 30 minutes",
             "headlines": [
                 f"Officials confirmed site {idx} remained under security lockdown." for idx in range(1, 9)
             ],
@@ -295,7 +295,7 @@ def test_json_digest_to_html_keeps_long_headline_rail_line_intact():
     html = ai_filter._json_digest_to_html(
         {
             "quiet": False,
-            "headline": "Top headlines from the last 30 minutes",
+            "headline": "Main headlines from the last 30 minutes",
             "headlines": [line],
         },
         interval_minutes=30,
@@ -451,7 +451,7 @@ def test_json_digest_to_html_drops_vague_and_dependent_rail_lines():
     html = ai_filter._json_digest_to_html(
         {
             "quiet": False,
-            "headline": "Top headlines from the last 30 minutes",
+            "headline": "Main headlines from the last 30 minutes",
             "headlines": [
                 "The fire was successfully extinguished.",
                 "However, the head of the Kiev regime admitted that the United States had not asked Ukraine for this.",
@@ -481,7 +481,7 @@ def test_json_digest_to_html_drops_confirmation_only_and_unattributed_threat_lin
     html = ai_filter._json_digest_to_html(
         {
             "quiet": False,
-            "headline": "Top headlines from the last 30 minutes",
+            "headline": "Main headlines from the last 30 minutes",
             "headlines": [
                 "The news is not yet confirmed.",
                 "Iran will be completely destroyed if it refuses to sign the agreement.",
@@ -646,7 +646,7 @@ def test_local_fallback_digest_uses_headline_rail_for_short_window():
     )
     plain = ai_filter.strip_telegram_html(html)
 
-    assert "Top headlines from the last 30 minutes" in plain
+    assert "Main headlines from the last 30 minutes" in plain
     assert "Officials reopened the port after three days of disruption" in plain
     assert "Air defenses fired over the northern district after a fresh barrage" in plain
 
@@ -666,7 +666,7 @@ def test_local_fallback_digest_headline_rail_uses_one_standalone_line_per_post()
     )
     plain = ai_filter.strip_telegram_html(html)
 
-    assert "Top headlines from the last 30 minutes" in plain
+    assert "Main headlines from the last 30 minutes" in plain
     assert "Sites in Dubai and Bahrain were hit overnight" in plain
     assert "First site was hit in Dubai" not in plain
     assert "Second site was hit in Bahrain" not in plain

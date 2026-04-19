@@ -1154,7 +1154,7 @@ def test_caption_fragment_is_usable_rejects_dangling_possessive_tail():
 
 def test_render_digest_body_sections_strips_nested_markers_and_drops_fragments():
     rendered = main._render_digest_body_sections(
-        "Top headlines from the last 30 minutes",
+        "Main headlines from the last 30 minutes",
         "",
         [
             "Context- 🔴BSF arrested a smuggler in Karimpur with 24 kg of silver.",
@@ -1173,7 +1173,7 @@ def test_render_digest_body_sections_strips_nested_markers_and_drops_fragments()
 
 def test_html_digest_cleanup_drops_quote_threads_and_keeps_real_headline():
     raw = (
-        "Top headlines from the last 30 minutes<br>"
+        "Main headlines from the last 30 minutes<br>"
         "• China is very happy that I am permanently opening the Strait of Hormuz.<br>"
         "• I am doing it for them, also - And the World.<br>"
         "• This situation will never happen again.<br>"

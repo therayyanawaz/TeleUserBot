@@ -6884,11 +6884,11 @@ def _effective_interval_seconds() -> int:
 def _headline_rail_body_title(interval_minutes: int) -> str:
     minutes = max(1, int(interval_minutes))
     if minutes == 60:
-        return "Top headlines from the last hour"
+        return "Main headlines from the last hour"
     if minutes < 60:
-        return f"Top headlines from the last {minutes} minutes"
+        return f"Main headlines from the last {minutes} minutes"
     hours = max(1, round(minutes / 60))
-    return f"Top headlines from the last {hours} hours"
+    return f"Main headlines from the last {hours} hours"
 
 
 def _digest_line_key(text: str) -> str:

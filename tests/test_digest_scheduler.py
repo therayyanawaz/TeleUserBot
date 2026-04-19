@@ -197,13 +197,13 @@ async def test_build_window_digest_messages_merges_short_window_groups_into_one_
         fake_create_digest_summary_result.calls += 1
         if idx == 0:
             html = (
-                "<b>Top headlines from the last 30 minutes</b><br>"
+                "<b>Main headlines from the last 30 minutes</b><br>"
                 "• Officials reopened the port after a three-day shutdown.<br>"
                 "• Security checks remain in place around the eastern gate."
             )
         else:
             html = (
-                "<b>Top headlines from the last 30 minutes</b><br>"
+                "<b>Main headlines from the last 30 minutes</b><br>"
                 "• Air defenses were activated over the northern district after a fresh barrage.<br>"
                 "• Emergency crews remained active near the ridge."
             )
@@ -273,14 +273,14 @@ async def test_build_window_digest_messages_cleans_merged_headline_rail(monkeypa
         fake_create_digest_summary_result.calls += 1
         if idx == 0:
             html = (
-                "<b>Top headlines from the last 30 minutes</b><br>"
+                "<b>Main headlines from the last 30 minutes</b><br>"
                 "• Zelensky has offered the United States assistance in unblocking the Strait of Hormuz, according to Die Welt.<br>"
                 "• However, the head of the Kiev regime admitted that the United States had not asked Ukraine for this.<br>"
                 "• Team Scotland has revealed its ceremony outfits for the Commonwealth Games. What do you guys think?"
             )
         else:
             html = (
-                "<b>Top headlines from the last 30 minutes</b><br>"
+                "<b>Main headlines from the last 30 minutes</b><br>"
                 "• Approximately 20 Israeli jets were seen flying over Daraa Governorate.<br>"
                 "• Zelensky has offered the United States assistance in unblocking the Strait of Hormuz, according to Die Welt.<br>"
                 "• The same battalion is responsible for the killing of the Palestinian child Hind Rajab in Gaza with 355 bullets."
@@ -355,7 +355,7 @@ async def test_build_window_digest_messages_reranks_headline_rail_by_signal(monk
             (),
             {
                 "html": (
-                    "<b>Top headlines from the last 30 minutes</b><br>"
+                    "<b>Main headlines from the last 30 minutes</b><br>"
                     "• Port reopened after a three-day shutdown.<br>"
                     "• Missiles hit Haifa after sirens sounded across the city."
                 ),
@@ -537,7 +537,7 @@ async def test_flush_digest_queue_once_passes_computed_window_start_to_claim(mon
 
     async def fake_build_window_digest_messages(*args, **kwargs):
         return (
-            ["<b>Top headlines from the last 30 minutes</b><br>• Headline."],
+            ["<b>Main headlines from the last 30 minutes</b><br>• Headline."],
             {
                 "part_count": 1,
                 "quiet": False,
@@ -745,7 +745,7 @@ def test_split_digest_body_blocks_repeats_story_context_across_parts():
 
 def test_split_digest_body_blocks_preserves_headline_rail_across_parts():
     digest_body = (
-        "<b>Top headlines from the last 30 minutes</b><br>"
+        "<b>Main headlines from the last 30 minutes</b><br>"
         + "<br>".join(
             f"• Headline {idx} closes cleanly with a concrete fact."
             for idx in range(1, 8)
@@ -759,5 +759,5 @@ def test_split_digest_body_blocks_preserves_headline_rail_across_parts():
 
     assert len(chunks) >= 2
     assert all(len(chunk) <= 220 for chunk in chunks)
-    assert all("<b>Top headlines from the last 30 minutes</b>" in chunk for chunk in chunks)
+    assert all("<b>Main headlines from the last 30 minutes</b>" in chunk for chunk in chunks)
     assert all("Headline" in chunk for chunk in chunks)
