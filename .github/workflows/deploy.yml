@@ -1,5 +1,8 @@
 name: Deploy on push
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 on:
   push:
     branches:
@@ -11,6 +14,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -18,13 +23,21 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run tests
         run: |
-          python -m pytest tests/test_ai_filter_decisions.py -q
-          python -m pytest tests/test_digest_scheduler.py -q
-          python -m pytest tests/test_rail_order_integration.py -q
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Force Node 24 for actions
+        run: echo "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=${FORCE_JAVASCRIPT_ACTIONS_TO_NODE24}"
+
+      - name: Run filter tests
+        run: python -m pytest tests/test_ai_filter_decisions.py -q
+
+      - name: Run scheduler tests
+        run: python -m pytest tests/test_digest_scheduler.py -q
+
+      - name: Run rail order integration tests
+        run: python -m pytest tests/test_rail_order_integration.py -q
 
       - name: Trigger deploy webhook
         if: success()
