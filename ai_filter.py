@@ -2793,7 +2793,7 @@ def _headline_rail_match_score(headline: str, post_text: str) -> float:
 
 
 def _headline_rail_source_tier_bonus(post: Dict[str, object]) -> float:
-    raw = getattr(config, "DIGEST_SOURCE_TIERS", {})
+    raw = config.get_digest_source_tiers()
     if not isinstance(raw, dict) or not raw:
         return 0.0
 

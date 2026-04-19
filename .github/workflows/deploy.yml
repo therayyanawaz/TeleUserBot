@@ -31,12 +31,18 @@ jobs:
         run: echo "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=${FORCE_JAVASCRIPT_ACTIONS_TO_NODE24}"
 
       - name: Run filter tests
+        env:
+          DB_PATH: /tmp/test_teleuserbot.db
         run: python -m pytest tests/test_ai_filter_decisions.py -q
 
       - name: Run scheduler tests
+        env:
+          DB_PATH: /tmp/test_teleuserbot.db
         run: python -m pytest tests/test_digest_scheduler.py -q
 
       - name: Run rail order integration tests
+        env:
+          DB_PATH: /tmp/test_teleuserbot.db
         run: python -m pytest tests/test_rail_order_integration.py -q
 
       - name: Trigger deploy webhook

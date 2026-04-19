@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import time
@@ -9,7 +10,14 @@ import uuid
 from contextlib import contextmanager
 from typing import Dict, Iterable, Iterator, List, Tuple
 
-from auth import DB_PATH, ensure_runtime_dir
+from auth import ensure_runtime_dir
+
+
+_DEFAULT_DB = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "teleuserbot.db"
+)
+DB_PATH = os.getenv("DB_PATH", _DEFAULT_DB)
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 
 ROLLING_DIGEST_LAST_COMPLETED_KEY = "rolling_digest_last_completed_window_end_ts"

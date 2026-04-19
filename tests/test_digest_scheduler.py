@@ -77,9 +77,10 @@ def test_digest_source_tiers_static_env_overrides_dynamic(monkeypatch):
 
     reloaded = importlib.reload(config)
     try:
-        assert reloaded.DIGEST_SOURCE_TIERS[1234567890] == 1.8
-        assert reloaded.DIGEST_SOURCE_TIERS[9876543210] == 1.4
-        assert reloaded.DIGEST_SOURCE_TIERS[5555555555] == 0.4
+        merged = reloaded.get_digest_source_tiers()
+        assert merged[1234567890] == 1.8
+        assert merged[9876543210] == 1.4
+        assert merged[5555555555] == 0.4
     finally:
         monkeypatch.delenv("DIGEST_SOURCE_TIERS", raising=False)
         importlib.reload(config)
