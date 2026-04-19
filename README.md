@@ -171,13 +171,13 @@ python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 ```
 
-### 4. Install optional extras
+### 4. Install dev + optional extras
 
 ```bash
-pip install -r requirements.optional.txt
+pip install -r requirements-dev.txt
 ```
 
-Optional extras enable heavier features like `sentence-transformers` support if you explicitly choose to use them.
+`requirements-dev.txt` now bundles both test tools and optional extras such as `sentence-transformers` and `langdetect`.
 
 ### 5. Copy the environment template
 
@@ -211,7 +211,7 @@ This script:
 
 - selects the newest installed Python 3.11+ interpreter, or installs the newest available Python 3 package if needed
 - creates `.venv`
-- installs `requirements.txt` and `requirements.optional.txt`
+- installs `requirements.txt` and `requirements-dev.txt`
 - warms the `sentence-transformers` cache
 
 ### Ubuntu
@@ -491,7 +491,7 @@ Health endpoints:
 Suggested hosted commands:
 
 - install: `pip install -r requirements.txt`
-- optional extras: `pip install -r requirements.optional.txt`
+- optional extras: `pip install -r requirements-dev.txt`
 - run: `python main.py`
 
 ## 🛠️ Running the Bot
@@ -527,7 +527,7 @@ pytest
 Or install dev requirements first:
 
 ```bash
-pip install -r requirements.dev.txt
+pip install -r requirements-dev.txt
 pytest
 ```
 
@@ -550,7 +550,7 @@ Not a problem if you intentionally run without Hugging Face support.
 Install optional extras only if you want that backend:
 
 ```bash
-pip install -r requirements.optional.txt
+pip install -r requirements-dev.txt
 ```
 
 ### `database is locked`
@@ -627,7 +627,7 @@ If you still want a manual upgrade path:
 git pull origin main
 source .venv/bin/activate
 pip install -r requirements.txt --upgrade
-pip install -r requirements.optional.txt --upgrade
+pip install -r requirements-dev.txt --upgrade
 python main.py
 ```
 

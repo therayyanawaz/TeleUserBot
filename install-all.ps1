@@ -180,7 +180,7 @@ Write-Step "Upgrading pip tooling"
 & $venvPython -m pip install --upgrade pip setuptools wheel
 
 Write-Step "Installing Python dependencies"
-& $venvPython -m pip install -r requirements.txt -r requirements.optional.txt
+& $venvPython -m pip install -r requirements.txt -r requirements-dev.txt
 
 Write-Step "Warming sentence-transformers model cache"
 $env:PYTHONIOENCODING = "utf-8"

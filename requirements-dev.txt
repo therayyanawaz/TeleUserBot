@@ -1,2 +1,7 @@
-pytest>=8.0.0
-pytest-asyncio>=0.23.0
+# Test runner
+pytest>=8.3,<9
+pytest-asyncio>=0.24,<1
+
+# Optional extras
+sentence-transformers>=3.0.1
+langdetect>=1.0.9

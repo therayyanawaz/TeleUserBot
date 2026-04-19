@@ -143,7 +143,7 @@ log "Upgrading pip tooling"
 "$venv_python" -m pip install --upgrade pip setuptools wheel
 
 log "Installing Python dependencies"
-"$venv_python" -m pip install -r requirements.txt -r requirements.optional.txt
+"$venv_python" -m pip install -r requirements.txt -r requirements-dev.txt
 
 log "Warming sentence-transformers model cache"
 PYTHONIOENCODING="utf-8" "$venv_python" -c \
