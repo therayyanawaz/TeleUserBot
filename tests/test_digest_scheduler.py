@@ -7,6 +7,7 @@ import pytest
 
 import ai_filter
 import config
+import db
 import main
 
 
@@ -38,6 +39,7 @@ def test_digest_backlog_snapshot_marks_stale_recovery_due(monkeypatch):
 
 
 def test_digest_source_tiers_env_parses_int_keys_and_float_values(monkeypatch):
+    monkeypatch.setattr(db, "source_tier_get_all", lambda: {})
     monkeypatch.setenv(
         "DIGEST_SOURCE_TIERS",
         '{"1234567890": 1.8, "9876543210": 1.6, "1122334455": 0.4}',
@@ -50,6 +52,34 @@ def test_digest_source_tiers_env_parses_int_keys_and_float_values(monkeypatch):
             9876543210: 1.6,
             1122334455: 0.4,
         }
+    finally:
+        monkeypatch.delenv("DIGEST_SOURCE_TIERS", raising=False)
+        importlib.reload(config)
+
+
+def test_build_dynamic_source_tiers_returns_floats_in_expected_range(monkeypatch):
+    monkeypatch.setattr(db, "source_tier_get_all", lambda: {111: 2, 222: 5, 333: 10})
+
+    tiers = config.build_dynamic_source_tiers()
+
+    assert set(tiers) == {111, 222, 333}
+    assert all(isinstance(value, float) for value in tiers.values())
+    assert all(0.8 <= value <= 2.0 for value in tiers.values())
+    assert tiers[333] == 2.0
+
+
+def test_digest_source_tiers_static_env_overrides_dynamic(monkeypatch):
+    monkeypatch.setattr(db, "source_tier_get_all", lambda: {1234567890: 10, 9876543210: 5})
+    monkeypatch.setenv(
+        "DIGEST_SOURCE_TIERS",
+        '{"1234567890": 1.8, "5555555555": 0.4}',
+    )
+
+    reloaded = importlib.reload(config)
+    try:
+        assert reloaded.DIGEST_SOURCE_TIERS[1234567890] == 1.8
+        assert reloaded.DIGEST_SOURCE_TIERS[9876543210] == 1.4
+        assert reloaded.DIGEST_SOURCE_TIERS[5555555555] == 0.4
     finally:
         monkeypatch.delenv("DIGEST_SOURCE_TIERS", raising=False)
         importlib.reload(config)

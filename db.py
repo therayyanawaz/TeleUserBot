@@ -146,6 +146,17 @@ def _to_breaking_story_event_rows(rows: Iterable[sqlite3.Row]) -> List[Dict[str,
     return result
 
 
+def _ensure_source_corroboration_hits_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_corroboration_hits (
+            channel_id INTEGER PRIMARY KEY,
+            hits INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+
+
 def init_db() -> None:
     ensure_runtime_dir()
     with _transaction() as conn:
@@ -327,6 +338,7 @@ def init_db() -> None:
             )
             """
         )
+        _ensure_source_corroboration_hits_table(conn)
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_digest_queue_pending "
@@ -1523,6 +1535,46 @@ def get_last_digest_timestamp() -> int | None:
     if value <= 0:
         return None
     return value
+
+
+def source_tier_increment(channel_id: int) -> None:
+    """Increment corroboration hit count for a channel."""
+    resolved_channel_id = int(channel_id)
+    with _transaction() as conn:
+        _ensure_source_corroboration_hits_table(conn)
+        conn.execute(
+            """
+            INSERT INTO source_corroboration_hits (channel_id, hits)
+            VALUES (?, 1)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                hits = source_corroboration_hits.hits + 1
+            """,
+            (resolved_channel_id,),
+        )
+
+
+def source_tier_get_all() -> dict[int, int]:
+    """Return {channel_id: corroboration_hit_count} for all tracked channels."""
+    with _transaction() as conn:
+        _ensure_source_corroboration_hits_table(conn)
+        rows = conn.execute(
+            "SELECT channel_id, hits FROM source_corroboration_hits"
+        ).fetchall()
+    return {int(row["channel_id"]): int(row["hits"] or 0) for row in rows}
+
+
+def source_tier_decay(factor: float = 0.85) -> None:
+    """Multiply all hit counts by factor to decay old reputation."""
+    resolved_factor = max(0.0, float(factor))
+    with _transaction() as conn:
+        _ensure_source_corroboration_hits_table(conn)
+        conn.execute(
+            """
+            UPDATE source_corroboration_hits
+            SET hits = MAX(0, CAST(ROUND(hits * ?) AS INTEGER))
+            """,
+            (resolved_factor,),
+        )
 
 
 def _normalize_text_for_dupe(text: str) -> str:

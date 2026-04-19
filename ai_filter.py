@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover - optional dependency
 import config
 from auth import AuthManager
 from breaking_story import ContextEvidence
-from db import ai_decision_cache_get, ai_decision_cache_set
+from db import ai_decision_cache_get, ai_decision_cache_set, source_tier_increment
 from news_taxonomy import match_news_category, normalize_taxonomy_text
 from news_signals import detect_story_signals, looks_like_live_event_update, should_downgrade_explainer_urgency
 from prompts import (
@@ -2622,7 +2622,12 @@ def _headline_rail_source_tier_bonus(post: Dict[str, object]) -> float:
 
     source_name = normalize_space(str(post.get("source_name") or post.get("source") or "")).lower()
     channel_id = normalize_space(str(post.get("channel_id") or "")).lower()
+    try:
+        channel_id_int = int(channel_id) if channel_id else None
+    except Exception:
+        channel_id_int = None
     keys = [
+        channel_id_int,
         channel_id,
         f"channel:{channel_id}" if channel_id else "",
         source_name,
@@ -3901,8 +3906,23 @@ def _dedupe_prepared_digest_posts(posts: Sequence[Dict[str, object]]) -> tuple[L
         text = _post_text(post)
         if not text:
             continue
-        if any(_digest_posts_are_near_duplicates(text, _post_text(existing)) for existing in unique_posts):
+        duplicate_index = None
+        for idx, existing in enumerate(unique_posts):
+            if _digest_posts_are_near_duplicates(text, _post_text(existing)):
+                duplicate_index = idx
+                break
+        if duplicate_index is not None:
             removed += 1
+            existing = unique_posts[duplicate_index]
+            candidate_score = _headline_rail_line_strength(text)
+            existing_score = _headline_rail_line_strength(_post_text(existing))
+            winner = dict(post) if candidate_score > existing_score else existing
+            if winner is not existing:
+                unique_posts[duplicate_index] = winner
+            try:
+                source_tier_increment(int(str(winner.get("channel_id") or "").strip()))
+            except Exception:
+                pass
             continue
         unique_posts.append(dict(post))
     return unique_posts, removed

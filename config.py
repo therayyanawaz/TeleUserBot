@@ -148,6 +148,20 @@ def _env_dict(key: str, default: dict[str, object] | None = None) -> dict[str, o
 _load_dotenv(ENV_PATH)
 
 
+def build_dynamic_source_tiers() -> dict[int, float]:
+    from db import source_tier_get_all
+
+    hits = source_tier_get_all()
+    if not hits:
+        return {}
+    max_hits = max(hits.values()) or 1
+    return {
+        int(channel_id): round(0.8 + (int(count) / max_hits) * 1.2, 3)
+        for channel_id, count in hits.items()
+        if int(count) > 0
+    }
+
+
 # Telegram API credentials from https://my.telegram.org
 TELEGRAM_API_ID = _env_int("TELEGRAM_API_ID", 0)  # type: int
 TELEGRAM_API_HASH = _env_str("TELEGRAM_API_HASH", "")  # type: str
@@ -229,6 +243,8 @@ try:
     DIGEST_SOURCE_TIERS = {int(k): float(v) for k, v in json.loads(_raw_digest_source_tiers).items()}  # type: dict[int, float]
 except Exception:
     DIGEST_SOURCE_TIERS = {}  # type: dict[int, float]
+_dynamic_digest_source_tiers = build_dynamic_source_tiers()
+DIGEST_SOURCE_TIERS = {**_dynamic_digest_source_tiers, **DIGEST_SOURCE_TIERS}
 
 # Include source/channel tags in outbound messages.
 INCLUDE_SOURCE_TAGS = _env_bool("INCLUDE_SOURCE_TAGS", False)  # type: bool

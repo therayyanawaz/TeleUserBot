@@ -130,6 +130,7 @@ from db import (
     save_to_digest_queue,
     set_last_digest_timestamp,
     set_meta,
+    source_tier_decay,
     count_archive_window_rows,
     purge_breaking_story_history,
 )
@@ -491,6 +492,8 @@ digest_next_run_ts: float | None = None
 digest_retry_backoff_seconds: int = 0
 digest_loop_lock = asyncio.Lock()
 ROLLING_DIGEST_LAST_COMPLETED_META_KEY = "rolling_digest_last_completed_window_end_ts"
+SOURCE_TIER_DECAY_META_KEY = "source_tier_decay_last_ts"
+SOURCE_TIER_DECAY_INTERVAL_SECONDS = 7 * 24 * 3600
 _DIGEST_BACKLOG_RECOVERY_STALE_INTERVALS = 4
 digest_recovery_state: Dict[str, object] = {
     "active": False,
@@ -8028,6 +8031,20 @@ def _compute_next_scheduler_delay_seconds() -> int:
     return max(1, next_boundary_ts - int(time.time()))
 
 
+def _maybe_decay_source_tiers(now_ts: int | None = None) -> bool:
+    current_ts = int(time.time() if now_ts is None else now_ts)
+    raw = get_meta(SOURCE_TIER_DECAY_META_KEY) or ""
+    try:
+        last_decay_ts = int(raw) if raw else 0
+    except Exception:
+        last_decay_ts = 0
+    if last_decay_ts > 0 and (current_ts - last_decay_ts) < SOURCE_TIER_DECAY_INTERVAL_SECONDS:
+        return False
+    source_tier_decay()
+    set_meta(SOURCE_TIER_DECAY_META_KEY, str(current_ts))
+    return True
+
+
 async def run_digest_scheduler() -> None:
     global digest_next_run_ts
 
@@ -8044,6 +8061,7 @@ async def run_digest_scheduler() -> None:
 
     try:
         while True:
+            _maybe_decay_source_tiers()
             delay = _compute_next_scheduler_delay_seconds()
             digest_next_run_ts = time.time() + delay
             if delay > 0:
