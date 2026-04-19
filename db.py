@@ -157,6 +157,25 @@ def _ensure_source_corroboration_hits_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_headlined_stories_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS headlined_stories (
+            topic_key TEXT NOT NULL,
+            headline_text TEXT,
+            severity TEXT,
+            headlined_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_headlined_topic
+        ON headlined_stories(topic_key, headlined_at)
+        """
+    )
+
+
 def init_db() -> None:
     ensure_runtime_dir()
     with _transaction() as conn:
@@ -339,6 +358,7 @@ def init_db() -> None:
             """
         )
         _ensure_source_corroboration_hits_table(conn)
+        _ensure_headlined_stories_table(conn)
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_digest_queue_pending "
@@ -1574,6 +1594,79 @@ def source_tier_decay(factor: float = 0.85) -> None:
             SET hits = MAX(0, CAST(ROUND(hits * ?) AS INTEGER))
             """,
             (resolved_factor,),
+        )
+
+
+def headlined_story_add(topic_key: str, headline_text: str, ts: int, severity: str | None = None) -> None:
+    """Record a story topic that was headlined in a digest."""
+    cleaned_topic = str(topic_key or "").strip()
+    if not cleaned_topic:
+        return
+    with _transaction() as conn:
+        _ensure_headlined_stories_table(conn)
+        conn.execute(
+            """
+            INSERT INTO headlined_stories (topic_key, headline_text, severity, headlined_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                cleaned_topic,
+                str(headline_text or "").strip(),
+                str(severity or "").strip() or None,
+                int(ts),
+            ),
+        )
+
+
+def headlined_story_exists(topic_key: str, *, within_seconds: int) -> bool:
+    """Return True if this topic was already headlined within the window."""
+    cleaned_topic = str(topic_key or "").strip()
+    if not cleaned_topic:
+        return False
+    cutoff_ts = int(time.time()) - max(1, int(within_seconds))
+    with _transaction() as conn:
+        _ensure_headlined_stories_table(conn)
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM headlined_stories
+            WHERE topic_key = ? AND headlined_at >= ?
+            ORDER BY headlined_at DESC
+            LIMIT 1
+            """,
+            (cleaned_topic, cutoff_ts),
+        ).fetchone()
+    return row is not None
+
+
+def headlined_story_last_severity(topic_key: str, *, within_seconds: int) -> str:
+    cleaned_topic = str(topic_key or "").strip()
+    if not cleaned_topic:
+        return ""
+    cutoff_ts = int(time.time()) - max(1, int(within_seconds))
+    with _transaction() as conn:
+        _ensure_headlined_stories_table(conn)
+        row = conn.execute(
+            """
+            SELECT severity
+            FROM headlined_stories
+            WHERE topic_key = ? AND headlined_at >= ?
+            ORDER BY headlined_at DESC
+            LIMIT 1
+            """,
+            (cleaned_topic, cutoff_ts),
+        ).fetchone()
+    return str(row["severity"] or "") if row is not None else ""
+
+
+def headlined_story_prune(older_than_seconds: int = 7200) -> None:
+    """Delete records older than 2 hours to keep the table small."""
+    cutoff_ts = int(time.time()) - max(1, int(older_than_seconds))
+    with _transaction() as conn:
+        _ensure_headlined_stories_table(conn)
+        conn.execute(
+            "DELETE FROM headlined_stories WHERE headlined_at < ?",
+            (cutoff_ts,),
         )
 
 

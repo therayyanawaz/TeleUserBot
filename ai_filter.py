@@ -23,7 +23,14 @@ except Exception:  # pragma: no cover - optional dependency
 import config
 from auth import AuthManager
 from breaking_story import ContextEvidence
-from db import ai_decision_cache_get, ai_decision_cache_set, source_tier_increment
+from db import (
+    ai_decision_cache_get,
+    ai_decision_cache_set,
+    headlined_story_add,
+    headlined_story_exists,
+    headlined_story_last_severity,
+    source_tier_increment,
+)
 from news_taxonomy import match_news_category, normalize_taxonomy_text
 from news_signals import detect_story_signals, looks_like_live_event_update, should_downgrade_explainer_urgency
 from prompts import (
@@ -1668,6 +1675,53 @@ def _cap_headline_rail_support(
     return capped_highlights, capped_also
 
 
+def _headline_rail_topic_key(text: str) -> str:
+    topic_tokens = sorted(_headline_rail_topic_tokens(text))
+    if topic_tokens:
+        return normalize_space(" ".join(topic_tokens))
+    return _digest_line_key(text)
+
+
+def apply_cross_digest_headline_dedup(
+    highlights: Sequence[str],
+    *,
+    max_lines: int,
+    also_moving: Sequence[str] | None = None,
+) -> tuple[List[str], List[str]]:
+    window_seconds = max(60, int(getattr(config, "CROSS_DIGEST_DEDUP_SEC", 3600) or 3600))
+    now_ts = int(time.time())
+    output_lines: list[str] = []
+    also_candidates: list[str] = [
+        normalize_space(strip_telegram_html(str(item or "")))
+        for item in (also_moving or [])
+        if normalize_space(strip_telegram_html(str(item or "")))
+    ]
+
+    for line in highlights:
+        cleaned = normalize_space(strip_telegram_html(str(line or "")))
+        if not cleaned:
+            continue
+        topic_key = _headline_rail_topic_key(cleaned)
+        severity = _severity_from_text_heuristic(cleaned)
+        if topic_key and headlined_story_exists(topic_key, within_seconds=window_seconds):
+            previous_severity = headlined_story_last_severity(topic_key, within_seconds=window_seconds).lower()
+            if severity == "high" and previous_severity != "high":
+                headlined_story_add(topic_key, cleaned, now_ts, severity=severity)
+                output_lines.append(cleaned)
+                continue
+            also_candidates.append(cleaned)
+            continue
+        if topic_key:
+            headlined_story_add(topic_key, cleaned, now_ts, severity=severity)
+        output_lines.append(cleaned)
+
+    return _cap_headline_rail_support(
+        output_lines,
+        also_candidates,
+        max_lines=max_lines,
+    )
+
+
 def _resolve_digest_token_budget() -> int:
     raw_max = getattr(config, "DIGEST_MAX_TOKENS", DEFAULT_DIGEST_MAX_TOKENS)
     raw_context = getattr(config, "CODEX_MODEL_CONTEXT_TOKENS", 200000)
@@ -2237,6 +2291,35 @@ _DIGEST_QUOTE_PREFIX_RE = re.compile(
 _DIGEST_RANT_FRAGMENT_RE = re.compile(
     r"(?i)\b(?:to quote the bible|religious crusade|doesn.?t that beat fighting|but remember|big, fat, hug|president djt)\b"
 )
+_SARCASM_MARKERS = re.compile(
+    r"\b(?:will likely|probably will|no doubt|of course he will|as expected|"
+    r"surprise surprise|shocking nobody|once again proves|yet again shows|"
+    r"how surprising|what a shock|kiss the|bow before|grovel)\b",
+    flags=re.IGNORECASE,
+)
+_EDITORIAL_OPINION_MARKERS = re.compile(
+    r"\b(?:true meaning of justice|unconscionable|war crimes? in the name of|"
+    r"undermine(?:s)? (?:the|true)|crimes? against humanity as usual|"
+    r"never forgets?|history will judge|blood(?:y)? hands?|puppet(s)? of|"
+    r"doing the bidding of|lap dog|doing israel'?s? dirty)\b",
+    flags=re.IGNORECASE,
+)
+_UNATTRIBUTED_PREDICTION_RE = re.compile(
+    r"^(?:i am positive|i'?m positive|mark my words|"
+    r"you can (?:screenshot|quote) (?:me|this)|"
+    r"bet (?:on it|you|everything)|this will (?:definitely|certainly|100%))\b",
+    flags=re.IGNORECASE,
+)
+_SLOGAN_CHANT_RE = re.compile(
+    r"^(?:people chanted|chants? of|crowds? shouted|"
+    r"protesters? (?:held signs?|chanted|screamed)|"
+    r"we (?:are|will) (?:not|never)|no to the|stop the (?:genocide|war|killing))\b",
+    flags=re.IGNORECASE,
+)
+_OFFICIAL_VERB_RE = re.compile(
+    r"\b(?:confirmed|announced|declared|ruled|charged|indicted|sentenced|said)\b",
+    flags=re.IGNORECASE,
+)
 _FIRST_PERSON_OPINION_RE = re.compile(
     r"(?i)^(?:i am|i'm|i think|i believe|i'm positive|in my view|you and)\b"
 )
@@ -2367,6 +2450,17 @@ def _digest_is_low_value_quote_or_rant(text: str) -> bool:
     ):
         return True
     if _DIGEST_QUOTE_FRAGMENT_RE.search(cleaned) and _feed_segment_is_incomplete(cleaned):
+        return True
+    named = _extract_candidate_named_tokens(cleaned)
+    if len(named) >= 2 and _OFFICIAL_VERB_RE.search(cleaned):
+        return False
+    if _SARCASM_MARKERS.search(cleaned):
+        return True
+    if _EDITORIAL_OPINION_MARKERS.search(cleaned):
+        return True
+    if _UNATTRIBUTED_PREDICTION_RE.match(cleaned):
+        return True
+    if _SLOGAN_CHANT_RE.match(cleaned):
         return True
     return False
 

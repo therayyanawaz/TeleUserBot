@@ -396,6 +396,42 @@ def test_line_looks_non_english_for_rail_catches_romanized_and_indonesian_lines(
     assert ai_filter._line_looks_non_english_for_rail("Kebakaran besar terjadi di sebuah desa dekat pelabuhan.")
 
 
+def test_digest_is_low_value_quote_or_rant_catches_sarcasm_marker():
+    assert ai_filter._digest_is_low_value_quote_or_rant(
+        "Milei will likely kiss the Western Wall again during the visit."
+    )
+
+
+def test_digest_is_low_value_quote_or_rant_catches_editorial_opinion_marker():
+    assert ai_filter._digest_is_low_value_quote_or_rant(
+        "You and Benjamin Netanyahu undermine the true meaning of justice every day."
+    )
+
+
+def test_digest_is_low_value_quote_or_rant_catches_unattributed_prediction():
+    assert ai_filter._digest_is_low_value_quote_or_rant(
+        "Mark my words, this will definitely happen before dawn."
+    )
+
+
+def test_digest_is_low_value_quote_or_rant_catches_slogan_or_chant_line():
+    assert ai_filter._digest_is_low_value_quote_or_rant(
+        "People chanted stop the genocide outside the embassy gates."
+    )
+
+
+def test_digest_is_low_value_quote_or_rant_keeps_official_war_crimes_news():
+    assert not ai_filter._digest_is_low_value_quote_or_rant(
+        "ICC judges charged Benjamin Netanyahu and Yoav Gallant with war crimes and crimes against humanity."
+    )
+
+
+def test_digest_is_low_value_quote_or_rant_keeps_official_statement_despite_flagged_words():
+    assert not ai_filter._digest_is_low_value_quote_or_rant(
+        "UN officials said Vladimir Putin and Sergei Lavrov never forget the treaty terms in the latest statement."
+    )
+
+
 def test_clean_headline_rail_items_keeps_stronger_duplicate_topic():
     cleaned = ai_filter._clean_headline_rail_items(
         [
@@ -722,6 +758,107 @@ def test_rank_headline_rail_items_keeps_older_high_severity_above_fresher_low_se
     )
 
     assert ranked[0] == "Missiles hit Haifa after sirens sounded across the city."
+
+
+def test_apply_cross_digest_headline_dedup_demotes_recent_topic_to_also_moving(monkeypatch):
+    memory = {}
+
+    def fake_exists(topic_key, *, within_seconds):
+        row = memory.get(topic_key)
+        return bool(row and (1000 - row["ts"]) <= within_seconds)
+
+    def fake_add(topic_key, headline_text, ts, severity=None):
+        memory[topic_key] = {"ts": ts, "severity": severity or ""}
+
+    def fake_last_severity(topic_key, *, within_seconds):
+        row = memory.get(topic_key)
+        return str(row["severity"] if row and (1000 - row["ts"]) <= within_seconds else "")
+
+    existing_topic = ai_filter._headline_rail_topic_key("Port reopened after a three-day shutdown.")
+    memory[existing_topic] = {"ts": 900, "severity": "medium"}
+
+    monkeypatch.setattr(ai_filter, "headlined_story_exists", fake_exists)
+    monkeypatch.setattr(ai_filter, "headlined_story_add", fake_add)
+    monkeypatch.setattr(ai_filter, "headlined_story_last_severity", fake_last_severity)
+    monkeypatch.setattr(ai_filter.config, "CROSS_DIGEST_DEDUP_SEC", 3600, raising=False)
+    monkeypatch.setattr(ai_filter.time, "time", lambda: 1000)
+
+    highlights, also = ai_filter.apply_cross_digest_headline_dedup(
+        [
+            "Port reopened after a three-day shutdown.",
+            "Air defenses were activated over the northern district after a fresh barrage.",
+        ],
+        max_lines=4,
+    )
+
+    assert "Port reopened after a three-day shutdown." not in highlights
+    assert "Port reopened after a three-day shutdown." in also
+    assert "Air defenses were activated over the northern district after a fresh barrage." in highlights
+
+
+def test_apply_cross_digest_headline_dedup_allows_high_severity_escalation(monkeypatch):
+    memory = {}
+
+    def fake_exists(topic_key, *, within_seconds):
+        row = memory.get(topic_key)
+        return bool(row and (1000 - row["ts"]) <= within_seconds)
+
+    def fake_add(topic_key, headline_text, ts, severity=None):
+        memory[topic_key] = {"ts": ts, "severity": severity or ""}
+
+    def fake_last_severity(topic_key, *, within_seconds):
+        row = memory.get(topic_key)
+        return str(row["severity"] if row and (1000 - row["ts"]) <= within_seconds else "")
+
+    topic = ai_filter._headline_rail_topic_key("Missiles hit Haifa after sirens sounded across the city.")
+    memory[topic] = {"ts": 900, "severity": "medium"}
+
+    monkeypatch.setattr(ai_filter, "headlined_story_exists", fake_exists)
+    monkeypatch.setattr(ai_filter, "headlined_story_add", fake_add)
+    monkeypatch.setattr(ai_filter, "headlined_story_last_severity", fake_last_severity)
+    monkeypatch.setattr(ai_filter.config, "CROSS_DIGEST_DEDUP_SEC", 3600, raising=False)
+    monkeypatch.setattr(ai_filter.time, "time", lambda: 1000)
+
+    highlights, also = ai_filter.apply_cross_digest_headline_dedup(
+        ["Missiles hit Haifa after sirens sounded across the city."],
+        max_lines=4,
+    )
+
+    assert highlights == ["Missiles hit Haifa after sirens sounded across the city."]
+    assert also == []
+    assert memory[topic]["severity"] == "high"
+
+
+def test_apply_cross_digest_headline_dedup_realllows_topic_after_window(monkeypatch):
+    memory = {}
+
+    def fake_exists(topic_key, *, within_seconds):
+        row = memory.get(topic_key)
+        return bool(row and (5000 - row["ts"]) <= within_seconds)
+
+    def fake_add(topic_key, headline_text, ts, severity=None):
+        memory[topic_key] = {"ts": ts, "severity": severity or ""}
+
+    def fake_last_severity(topic_key, *, within_seconds):
+        row = memory.get(topic_key)
+        return str(row["severity"] if row and (5000 - row["ts"]) <= within_seconds else "")
+
+    topic = ai_filter._headline_rail_topic_key("Port reopened after a three-day shutdown.")
+    memory[topic] = {"ts": 1000, "severity": "medium"}
+
+    monkeypatch.setattr(ai_filter, "headlined_story_exists", fake_exists)
+    monkeypatch.setattr(ai_filter, "headlined_story_add", fake_add)
+    monkeypatch.setattr(ai_filter, "headlined_story_last_severity", fake_last_severity)
+    monkeypatch.setattr(ai_filter.config, "CROSS_DIGEST_DEDUP_SEC", 3600, raising=False)
+    monkeypatch.setattr(ai_filter.time, "time", lambda: 5000)
+
+    highlights, also = ai_filter.apply_cross_digest_headline_dedup(
+        ["Port reopened after a three-day shutdown."],
+        max_lines=4,
+    )
+
+    assert highlights == ["Port reopened after a three-day shutdown."]
+    assert also == []
 
 
 def test_fallback_headline_prefers_concrete_sentence_over_soft_setup():

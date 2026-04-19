@@ -46,6 +46,7 @@ import config
 from ai_filter import (
     _call_codex_with_auth_repair,
     _clean_headline_rail_items,
+    apply_cross_digest_headline_dedup,
     rank_headline_rail_items,
     create_digest_summary,
     create_digest_summary_result,
@@ -99,6 +100,7 @@ from db import (
     enqueue_inbound_job,
     get_last_digest_timestamp,
     get_meta,
+    headlined_story_prune,
     init_db,
     is_seen,
     load_active_digest_window_claim,
@@ -7505,12 +7507,16 @@ async def _build_window_digest_messages(
             capped_highlights,
             ranking_posts,
         )
+        capped_highlights, capped_also_moving = apply_cross_digest_headline_dedup(
+            capped_highlights,
+            max_lines=support_limit,
+        )
         rendered_bodies = [
             _render_digest_body_sections(
                 merged_headline or _headline_rail_body_title(interval_minutes),
                 "",
                 capped_highlights,
-                [],
+                capped_also_moving,
             )
         ] if capped_highlights else [quiet_period_message(interval_minutes)]
 
@@ -8119,6 +8125,7 @@ async def run_digest_queue_clear_scheduler() -> None:
             await asyncio.sleep(interval)
             async with digest_loop_lock:
                 deleted = clear_digest_queue_scoped(scope)
+                headlined_story_prune(older_than_seconds=7200)
             log_structured(
                 LOGGER,
                 "digest_queue_cleared",
