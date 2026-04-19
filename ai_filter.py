@@ -1720,6 +1720,41 @@ def _filter_also_moving_lines(values: Sequence[str]) -> List[str]:
     return filtered
 
 
+def scrub_rail_lines(
+    lines: list[str],
+    *,
+    mode: Literal["main", "also_moving", "catchup"] = "main",
+) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        cleaned = normalize_space(strip_telegram_html(line))
+        if not cleaned:
+            continue
+        if _line_looks_non_english_for_rail(cleaned):
+            continue
+        if _is_bad_feed_headline(cleaned):
+            continue
+        if _digest_is_low_value_quote_or_rant(cleaned):
+            continue
+        if _is_factually_empty_headline(cleaned):
+            continue
+        if mode == "also_moving" and not _also_moving_line_is_acceptable(cleaned):
+            continue
+        if mode == "catchup":
+            word_count = len(re.findall(r"\b\w+\b", cleaned))
+            named = _extract_candidate_named_tokens(cleaned)
+            if word_count < 8 or not named:
+                continue
+        key = _digest_line_key(cleaned)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        out.append(cleaned)
+    return out
+
+
 def _headline_rail_topic_key(text: str) -> str:
     topic_tokens = sorted(_headline_rail_topic_tokens(text))
     if topic_tokens:

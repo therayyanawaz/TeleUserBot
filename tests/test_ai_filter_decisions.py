@@ -900,6 +900,29 @@ def test_also_moving_gate_rejects_three_word_fragment():
     assert not ai_filter._also_moving_line_is_acceptable("Port reopened tonight.")
 
 
+def test_scrub_rail_lines_catchup_rejects_promo_line():
+    assert ai_filter.scrub_rail_lines(
+        ["DM if you've enrolled in CDS journey new batch for CDS 2 DM."],
+        mode="catchup",
+    ) == []
+
+
+def test_scrub_rail_lines_catchup_rejects_short_fragment_under_eight_words():
+    assert ai_filter.scrub_rail_lines(
+        ["Port reopened after shutdown."],
+        mode="catchup",
+    ) == []
+
+
+def test_scrub_rail_lines_catchup_keeps_real_news_line_with_named_entity():
+    assert ai_filter.scrub_rail_lines(
+        ["Benjamin Netanyahu announced a security cabinet meeting in Jerusalem after overnight strikes."],
+        mode="catchup",
+    ) == [
+        "Benjamin Netanyahu announced a security cabinet meeting in Jerusalem after overnight strikes."
+    ]
+
+
 def test_fallback_headline_prefers_concrete_sentence_over_soft_setup():
     headline = ai_filter._fallback_headline(
         "Situation update after overnight military activity. Iran launched missiles at Haifa and air defenses intercepted several over the city."

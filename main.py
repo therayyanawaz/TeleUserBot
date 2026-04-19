@@ -48,6 +48,7 @@ from ai_filter import (
     _clean_headline_rail_items,
     apply_cross_digest_headline_dedup,
     rank_headline_rail_items,
+    scrub_rail_lines,
     create_digest_summary,
     create_digest_summary_result,
     extract_digest_narrative_parts,
@@ -7556,6 +7557,8 @@ def _flatten_digest_body_for_catchup(digest_body: str) -> str:
         digest_body,
         max_lines=_digest_support_line_limit(),
     )
+    highlights = scrub_rail_lines(list(highlights), mode="catchup")
+    also_moving = scrub_rail_lines(list(also_moving), mode="also_moving")
     parts: List[str] = []
     for value in (headline, story):
         cleaned = normalize_space(strip_telegram_html(value))
@@ -7700,6 +7703,23 @@ async def _build_catchup_digest_messages(
             "copy_origin": final_result.copy_origin,
             "fallback_reason": final_result.fallback_reason,
         },
+    )
+    final_headline, final_story, final_highlights, final_also_moving = extract_digest_narrative_parts(
+        final_body,
+        max_lines=_digest_support_line_limit(),
+    )
+    final_highlights = scrub_rail_lines(list(final_highlights), mode="catchup")
+    final_also_moving = scrub_rail_lines(list(final_also_moving), mode="also_moving")
+    final_highlights, final_also_moving = apply_cross_digest_headline_dedup(
+        final_highlights,
+        max_lines=_digest_support_line_limit(),
+        also_moving=final_also_moving,
+    )
+    final_body = _render_digest_body_sections(
+        final_headline,
+        final_story,
+        final_highlights,
+        final_also_moving,
     )
 
     if final_result.copy_origin == "ai":
