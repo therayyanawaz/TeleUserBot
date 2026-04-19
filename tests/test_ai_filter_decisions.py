@@ -693,6 +693,37 @@ def test_rank_headline_rail_items_boosts_recent_corroborated_high_severity_line(
     assert ranked[0] == "Missiles hit Haifa after sirens sounded across the city."
 
 
+def test_rank_headline_rail_items_keeps_older_high_severity_above_fresher_low_severity(monkeypatch):
+    monkeypatch.setattr(ai_filter.config, "DIGEST_SOURCE_TIERS", {}, raising=False)
+    monkeypatch.setattr(ai_filter.config, "RECENCY_HALF_LIFE_SEC", 900.0, raising=False)
+    monkeypatch.setattr(ai_filter.time, "time", lambda: 2000)
+
+    ranked = ai_filter.rank_headline_rail_items(
+        [
+            "Missiles hit Haifa after sirens sounded across the city.",
+            "Mayor visited a local cultural fair near the river.",
+        ],
+        [
+            {
+                "channel_id": "1001",
+                "source_name": "Desk",
+                "raw_text": "Missiles hit Haifa after sirens sounded across the city.",
+                "timestamp": 500,
+                "severity": "high",
+            },
+            {
+                "channel_id": "1002",
+                "source_name": "Desk",
+                "raw_text": "Mayor visited a local cultural fair near the river.",
+                "timestamp": 1940,
+                "severity": "low",
+            },
+        ],
+    )
+
+    assert ranked[0] == "Missiles hit Haifa after sirens sounded across the city."
+
+
 def test_fallback_headline_prefers_concrete_sentence_over_soft_setup():
     headline = ai_filter._fallback_headline(
         "Situation update after overnight military activity. Iran launched missiles at Haifa and air defenses intercepted several over the city."

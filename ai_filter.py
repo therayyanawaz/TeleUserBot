@@ -2656,11 +2656,12 @@ def _headline_rail_source_key(post: Dict[str, object]) -> str:
     return ""
 
 
-def _headline_rail_recency_weight(timestamp: int, freshest_ts: int) -> float:
-    if timestamp <= 0 or freshest_ts <= 0:
+def _headline_rail_recency_weight(timestamp: int, now_ts: int) -> float:
+    if timestamp <= 0 or now_ts <= 0:
         return 0.35
-    age_seconds = max(0, freshest_ts - timestamp)
-    return 1.2 / (1.0 + (age_seconds / 600.0))
+    age_seconds = max(0, now_ts - timestamp)
+    half_life_seconds = max(60.0, float(getattr(config, "RECENCY_HALF_LIFE_SEC", 900.0) or 900.0))
+    return 0.5 ** (age_seconds / half_life_seconds)
 
 
 def _headline_rail_severity_weight(text: str) -> float:
@@ -2684,22 +2685,19 @@ def rank_headline_rail_items(
     if len(normalized) <= 1 or not posts:
         return normalized
 
-    freshest_ts = max(
-        (
-            int(post.get("timestamp") or 0)
-            for post in posts
-            if int(post.get("timestamp") or 0) > 0
-        ),
-        default=0,
-    )
+    now_ts = int(time.time())
     ranked: list[tuple[float, int, str]] = []
 
     for index, headline in enumerate(normalized):
         matched_sources: set[str] = set()
         best_match_score = 0.0
-        best_severity = _headline_rail_severity_weight(headline)
-        best_recency = 0.35
-        best_source_weight = 0.0
+        headline_severity = _severity_from_text_heuristic(headline)
+        severity_component = _headline_rail_severity_weight(headline)
+        if headline_severity == "high":
+            severity_component = max(severity_component, 2.0)
+        recency_component = 0.35
+        source_component = 0.0
+        best_post: Dict[str, object] | None = None
 
         for post in posts:
             post_text = normalize_space(str(post.get("raw_text") or post.get("text") or ""))
@@ -2713,8 +2711,11 @@ def rank_headline_rail_items(
             if source_key:
                 matched_sources.add(source_key)
 
+            post_severity = str(post.get("severity") or _severity_from_text_heuristic(post_text) or "low").lower()
             severity_weight = _headline_rail_severity_weight(post_text)
-            recency_weight = _headline_rail_recency_weight(int(post.get("timestamp") or 0), freshest_ts)
+            if post_severity == "high":
+                severity_weight = max(severity_weight, 2.0)
+            recency_weight = _headline_rail_recency_weight(int(post.get("timestamp") or 0), now_ts)
             source_weight = _query_source_reliability(
                 {
                     "source": str(post.get("source_name") or post.get("source") or ""),
@@ -2727,30 +2728,47 @@ def rank_headline_rail_items(
                 match_score > best_match_score
                 or (
                     abs(match_score - best_match_score) < 0.001
-                    and severity_weight + recency_weight + source_weight > best_severity + best_recency + best_source_weight
+                    and severity_weight + recency_weight + source_weight > severity_component + recency_component + source_component
                 )
             ):
                 best_match_score = match_score
-                best_severity = severity_weight
-                best_recency = recency_weight
-                best_source_weight = source_weight
+                severity_component = severity_weight
+                recency_component = recency_weight
+                source_component = source_weight
+                headline_severity = post_severity
+                best_post = post
 
-        corroboration_weight = min(1.2, max(0, len(matched_sources) - 1) * 0.4)
-        ai_prior = 1.0 / (1.0 + (index * 0.35))
-        line_quality = _headline_rail_line_strength(headline) * 0.15
+        corroboration_component = min(1.2, max(0, len(matched_sources) - 1) * 0.4)
+        ai_prior_component = 1.0 / (1.0 + (index * 0.35))
+        quality_component = _headline_rail_line_strength(headline) * 0.15
 
         if best_match_score <= 0:
-            final_score = line_quality + ai_prior
+            final_score = quality_component + ai_prior_component
         else:
             final_score = (
-                line_quality
-                + ai_prior
-                + best_severity
-                + best_recency
-                + best_source_weight
-                + corroboration_weight
+                quality_component
+                + ai_prior_component
+                + severity_component
+                + recency_component
+                + source_component
+                + corroboration_component
                 + (best_match_score * 0.25)
             )
+        age_seconds = max(0, now_ts - int((best_post or {}).get("timestamp") or 0)) if best_post else 0
+        channel_value = str((best_post or {}).get("channel_id") or "")
+        LOGGER.debug(
+            "RAIL_SCORE channel=%s age_sec=%d severity=%s score=%.3f components=severity:%.2f recency:%.2f source:%.2f corroboration:%.2f ai_prior:%.2f quality:%.2f",
+            channel_value,
+            age_seconds,
+            headline_severity,
+            final_score,
+            severity_component,
+            recency_component,
+            source_component,
+            corroboration_component,
+            ai_prior_component,
+            quality_component,
+        )
         ranked.append((final_score, index, headline))
 
     ranked.sort(key=lambda item: (-item[0], item[1]))
