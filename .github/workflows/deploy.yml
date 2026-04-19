@@ -29,10 +29,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install core dependencies
         run: |
           pip install -r requirements.txt
-          pip install -r requirements-dev.txt
+          pip install pytest>=8.3,<9 pytest-asyncio>=0.24,<1 ruff>=0.8,<1 langdetect>=1.0.9
 
       - name: Force Node 24 for actions
         run: echo "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=${FORCE_JAVASCRIPT_ACTIONS_TO_NODE24}"
