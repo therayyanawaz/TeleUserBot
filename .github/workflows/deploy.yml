@@ -7,6 +7,13 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "**/*.py"
+      - "requirements*.txt"
+      - "pytest.ini"
+      - ".github/workflows/*.yml"
+      - "install-all.ps1"
+      - "install-all-ubuntu.sh"
 
 jobs:
   test-and-deploy:
@@ -30,20 +37,19 @@ jobs:
       - name: Force Node 24 for actions
         run: echo "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=${FORCE_JAVASCRIPT_ACTIONS_TO_NODE24}"
 
-      - name: Run filter tests
+      - name: Lint
         env:
           DB_PATH: /tmp/test_teleuserbot.db
-        run: python -m pytest tests/test_ai_filter_decisions.py -q
+        run: >
+          python -m ruff check .
+          --select E,F,W
+          --ignore E501
+          --exclude main.py,ai_filter.py,utils.py,breaking_story.py,severity_classifier.py,tests/test_ai_filter_decisions.py
 
-      - name: Run scheduler tests
+      - name: Run tests
         env:
           DB_PATH: /tmp/test_teleuserbot.db
-        run: python -m pytest tests/test_digest_scheduler.py -q
-
-      - name: Run rail order integration tests
-        env:
-          DB_PATH: /tmp/test_teleuserbot.db
-        run: python -m pytest tests/test_rail_order_integration.py -q
+        run: python -m pytest tests/ -q
 
       - name: Trigger deploy webhook
         if: success() && env.DEPLOY_WEBHOOK_URL != ''
@@ -51,7 +57,7 @@ jobs:
           DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
           DEPLOY_WEBHOOK_SECRET: ${{ secrets.DEPLOY_WEBHOOK_SECRET }}
         run: |
-          curl -s -X POST "$DEPLOY_WEBHOOK_URL" \
+          curl -s --fail --max-time 10 -X POST "$DEPLOY_WEBHOOK_URL" \
             -H "Authorization: Bearer $DEPLOY_WEBHOOK_SECRET" \
             -H "Content-Type: application/json" \
             -d '{"ref": "${{ github.ref }}", "sha": "${{ github.sha }}"}'

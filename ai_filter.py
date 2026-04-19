@@ -679,7 +679,14 @@ def _is_bad_feed_headline(line: str) -> bool:
         return True
     word_count = len(re.findall(r"\b\w+\b", cleaned))
     named_entity_count = len(_extract_candidate_named_tokens(cleaned))
-    if word_count <= 6 and named_entity_count == 0 and not _DIGEST_SPECIFIC_ACTION_RE.search(cleaned):
+    has_actor_token = any(token in lowered for token in _ACTOR_TOKENS)
+    if (
+        word_count <= 6
+        and named_entity_count == 0
+        and not _DIGEST_SPECIFIC_ACTION_RE.search(cleaned)
+        and not _HEADLINE_RAIL_STANDALONE_ACTION_RE.search(cleaned)
+        and not has_actor_token
+    ):
         return True
     if cleaned.count("...") or cleaned.endswith("..."):
         return True

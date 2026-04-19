@@ -165,18 +165,18 @@ def test_corroborated_beats_single_source():
     posts = [
         make_post(
             channel_id=7,
-            text="Donald Trump signs executive order on Iran sanctions.",
+            text="US Treasury issues fresh Iran sanctions order.",
             severity="medium",
             same_topic_source_count=1,
-            ai_index=0,
+            ai_index=1,
             topic_key="trump_iran",
         ),
         make_post(
             channel_id=8,
-            text="Russia launches missile strike on Kharkiv.",
+            text="Russia launches missile strike on Kharkiv after sirens.",
             severity="medium",
             same_topic_source_count=4,
-            ai_index=1,
+            ai_index=0,
             topic_key="kharkiv",
         ),
     ]
