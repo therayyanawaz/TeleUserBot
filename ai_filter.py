@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 import json
@@ -65,6 +65,7 @@ DEFAULT_DIGEST_MAX_POSTS = 80
 DEFAULT_DIGEST_MAX_TOKENS = 18000
 FILTER_DECISION_PROMPT_VERSION = "v6"
 VITAL_VIEW_PROMPT_VERSION = "v3"
+USE_LOCAL_NLP = bool(getattr(config, "USE_LOCAL_NLP", False))
 
 _DIGIT_TOKEN_RE = re.compile(r"\b\d+(?:[.,:/-]\d+)*\b")
 _LATIN_TOKEN_RE = re.compile(r"[a-z][a-z0-9'-]{1,}", flags=re.IGNORECASE)
@@ -1903,6 +1904,7 @@ _ALLOWED_FILTER_FALLBACK_REASONS = {
     "timeout",
     "transport_error",
     "api_error",
+    "local_nlp",
     "invalid_payload",
     "empty_output",
     "quality_rejected_after_retry",
@@ -2203,6 +2205,20 @@ def _fallback_filter_decision(
         fallback_reason=_normalize_filter_fallback_reason(fallback_reason),
         ai_attempt_count=max(1, ai_attempt_count),
         ai_quality_retry_used=ai_quality_retry_used,
+    )
+
+
+def _use_local_nlp_filter() -> bool:
+    return bool(getattr(config, "USE_LOCAL_NLP", USE_LOCAL_NLP))
+
+
+def _local_nlp_filter_decision(text: str) -> FilterDecision:
+    # Offline replacement for filter triage: taxonomy/signals/regex summary only.
+    return _fallback_filter_decision(
+        text,
+        fallback_reason="local_nlp",
+        ai_attempt_count=0,
+        ai_quality_retry_used=False,
     )
 
 
@@ -4905,7 +4921,6 @@ def _build_strategic_trend_summary(
 
     escalating_score = sum(item.score for item in escalating)
     deescalating_score = sum(item.score for item in deescalating)
-    mixed_score = sum(item.score for item in mixed)
     escalating_sources = {item.source.lower() for item in escalating}
     deescalating_sources = {item.source.lower() for item in deescalating}
     timestamps = [item.timestamp for item in evidence if item.timestamp > 0]
@@ -5413,6 +5428,10 @@ async def decide_filter_action(text: str, auth_manager: AuthManager) -> FilterDe
     cleaned = normalize_space(text)
     if len(cleaned) < 10:
         return _fallback_filter_decision(cleaned)
+    if _use_local_nlp_filter():
+        LOGGER.debug("decide_filter_action using local NLP path")
+        return _local_nlp_filter_decision(cleaned)
+    LOGGER.debug("decide_filter_action using API path")
 
     normalized_hash = _cache_key(cleaned)
     model = _resolve_codex_model()
@@ -6410,7 +6429,6 @@ def _digest_quality_issue(text: str, quiet_text: str, *, interval_minutes: int) 
         return ""
     if _digest_needs_english_rewrite(text, "English"):
         return "non_english_leftovers"
-    lowered = cleaned.lower()
     if _digest_has_citation_language(cleaned):
         return "citation_leak"
     if _DIGEST_HASHTAG_RE.search(cleaned) or _DIGEST_PROMO_FRAGMENT_RE.search(cleaned):

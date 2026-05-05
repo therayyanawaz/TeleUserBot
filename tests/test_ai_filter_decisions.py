@@ -7,7 +7,6 @@ import httpx
 import pytest
 
 import ai_filter
-import db
 
 
 class _FakeAuthManager:
@@ -57,6 +56,28 @@ async def test_decide_filter_action_uses_persistent_cache(isolated_db, monkeypat
     assert first.copy_origin == "ai"
     assert second.cached is True
     assert calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_decide_filter_action_local_nlp_toggle_avoids_api(isolated_db, monkeypatch):
+    importlib.reload(ai_filter)
+
+    async def fail_call_codex(*args, **kwargs):
+        raise AssertionError("API path should not run when USE_LOCAL_NLP is enabled")
+
+    monkeypatch.setattr(ai_filter.config, "USE_LOCAL_NLP", True)
+    monkeypatch.setattr(ai_filter, "_call_codex", fail_call_codex)
+
+    text = (
+        "Iranian officials announced a new airspace restriction over Tehran "
+        "after regional security warnings."
+    )
+    decision = await ai_filter.decide_filter_action(text, _FakeAuthManager())
+
+    assert decision.action in {"deliver", "digest"}
+    assert decision.summary_html
+    assert decision.copy_origin == "fallback"
+    assert decision.fallback_reason == "local_nlp"
 
 
 def test_validate_filter_decision_sanitizes_and_clamps():
