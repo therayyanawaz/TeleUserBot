@@ -688,6 +688,18 @@ def test_truncate_feed_line_avoids_broken_title_tail():
     assert truncated.endswith("...")
 
 
+def test_clean_generated_delivery_segment_keeps_hyphenated_group_name():
+    text = (
+        "Several Jaish-e-Mohammed terrorists have reportedly joined the deadly TTP "
+        "to fight against the Pak Army, with several involved in su#c!de attacks."
+    )
+
+    cleaned = ai_filter._clean_generated_delivery_segment(text)
+
+    assert cleaned.startswith("Several Jaish-e-Mohammed terrorists")
+    assert "Mohammed terrorists" in cleaned
+
+
 def test_strip_caption_promo_noise_keeps_follow_up_language():
     assert (
         main._strip_caption_promo_noise("Follow-up explosions were reported across the district.")

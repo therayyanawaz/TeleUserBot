@@ -539,6 +539,8 @@ def _looks_like_generated_source_prefix(prefix: str) -> bool:
         return False
     if lowered.startswith(("why it matters", "what", "where", "when", "status", "location")):
         return False
+    if lowered.startswith(("several ", "multiple ", "many ", "some ")):
+        return False
     tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9&'._/-]*", cleaned)
     if not tokens or len(tokens) > 5:
         return False
@@ -583,7 +585,15 @@ def _clean_generated_delivery_segment(line: str) -> str:
     if prefix_match and _looks_like_generated_source_prefix(prefix_match.group("prefix")):
         separator = normalize_space(prefix_match.group("sep"))
         rest = normalize_space(prefix_match.group("rest"))
-        if not (separator == "-" and re.match(r"^[a-z][A-Za-z0-9-]*\b", rest)):
+        prefix = normalize_space(prefix_match.group("prefix"))
+        hyphen_tail = prefix.rsplit("-", 1)[-1].lower() if "-" in prefix else ""
+        if not (
+            separator == "-"
+            and (
+                re.match(r"^[a-z][A-Za-z0-9-]*\b", rest)
+                or (hyphen_tail and len(hyphen_tail) <= 3 and re.match(r"^[A-Z][A-Za-z0-9-]*\b", rest))
+            )
+        ):
             cleaned = rest
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
     return normalize_space(cleaned.strip(" ,;:-|/[](){}"))
