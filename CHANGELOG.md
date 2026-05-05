@@ -4,19 +4,21 @@
 
 ## 2026-05-05
 
+### Fixes
+
+- `b894cd6` fix: search local query memory before telegram
+- `9539123` fix: route confident query answers through local NLP
+
+### Docs
+
+- `5ff276f` docs: update changelog [skip ci]
+- `02488e8` docs: update changelog [skip ci]
+- `9b25382` docs: update changelog [skip ci]
+
 ### Features
 
 - `6bb97ab` feat: strengthen local NLP query router
 - `b7a7dcb` feat: add local NLP filter toggle
-
-### Docs
-
-- `02488e8` docs: update changelog [skip ci]
-- `9b25382` docs: update changelog [skip ci]
-
-### Fixes
-
-- `9539123` fix: route confident query answers through local NLP
 
 ## 2026-04-19
 
