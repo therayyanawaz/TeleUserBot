@@ -703,6 +703,37 @@ def test_fallback_query_answer_extracts_relevant_sentences_from_noisy_blob():
     assert "Support us" not in plain
 
 
+def test_local_query_answer_uses_exact_person_subject_not_substring_noise():
+    query = "Who is Youssouf Daba Diawara"
+    context = [
+        {
+            "text": (
+                "The IDF issued this morning a targeted evacuation warning for villages in southern Lebanon - "
+                "Qana, Dabaal (Tyre District), Qaqaiyat al-Jisr, Srifa. "
+                "The arrest of Youssouf Daba Diawara was confirmed this morning."
+            ),
+            "source": "War & News Alert",
+            "timestamp": 1700000000,
+        },
+        {
+            "text": (
+                "Libya's current situation is a managed stalemate between the Tripoli-based government "
+                "led by Abdulhamid Dabaiba and the eastern bloc controlled by Khalifa Haftar."
+            ),
+            "source": "Analysis Desk",
+            "timestamp": 1700000001,
+        },
+    ]
+
+    answer = ai_filter._fallback_query_answer(query, context, detailed=False)
+    plain = ai_filter.strip_telegram_html(answer)
+
+    assert "Youssouf Daba Diawara" in plain
+    assert "arrest" in plain.lower()
+    assert "Dabaiba" not in plain
+    assert "Libya" not in plain
+
+
 def test_query_quality_issue_rejects_verbose_source_dump():
     html = (
         "<b>Direct answer</b><br>"

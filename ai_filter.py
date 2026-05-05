@@ -4441,6 +4441,8 @@ def _query_is_identity_question(query: str) -> bool:
     lowered = normalize_space(query).lower()
     if not lowered:
         return False
+    if re.match(r"^(?:who|whom)\s+(?:is|was|are|were)\b", lowered):
+        return True
     markers = (
         "who died",
         "who was killed",
@@ -4454,6 +4456,54 @@ def _query_is_identity_question(query: str) -> bool:
         "identify the dead",
     )
     return any(marker in lowered for marker in markers)
+
+
+def _query_subject_phrase(query: str) -> str:
+    cleaned = normalize_space(query)
+    if not cleaned:
+        return ""
+    patterns = (
+        r"^(?:who|whom)\s+(?:is|was|are|were)\s+(.+?)\??$",
+        r"^(?:tell me about|identify|explain who)\s+(.+?)\??$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, cleaned, flags=re.IGNORECASE)
+        if match:
+            subject = normalize_space(match.group(1)).strip(" ?.,;:!\"'")
+            return subject
+    return ""
+
+
+def _query_subject_tokens(query: str) -> list[str]:
+    subject = _query_subject_phrase(query)
+    if not subject:
+        return []
+    return [
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]{1,}", subject)
+        if token.lower() not in {"the", "this", "that", "person", "man", "woman"}
+    ]
+
+
+def _query_term_in_text(term: str, text: str) -> bool:
+    cleaned_term = normalize_space(term).lower()
+    lowered_text = normalize_space(text).lower()
+    if not cleaned_term or not lowered_text:
+        return False
+    if " " in cleaned_term:
+        return re.search(rf"(?<![a-z0-9]){re.escape(cleaned_term)}(?![a-z0-9])", lowered_text) is not None
+    return re.search(rf"(?<![a-z0-9]){re.escape(cleaned_term)}(?![a-z0-9])", lowered_text) is not None
+
+
+def _query_text_has_subject(query: str, text: str) -> bool:
+    subject = _query_subject_phrase(query)
+    if subject and _query_term_in_text(subject, text):
+        return True
+    tokens = _query_subject_tokens(query)
+    if not tokens:
+        return False
+    lowered_text = normalize_space(text).lower()
+    return all(_query_term_in_text(token, lowered_text) for token in tokens)
 
 
 def _query_is_casualty_question(query: str) -> bool:
@@ -5031,7 +5081,7 @@ def _score_query_context_row(
         if query_keyword_set
         else 0.0
     )
-    alias_hits = sum(1 for term in expanded_terms if term and term in lowered_text)
+    alias_hits = sum(1 for term in expanded_terms if term and _query_term_in_text(term, lowered_text))
     alias_score = (
         (alias_hits / max(1, len(expanded_terms))) * 4.0
         if expanded_terms
@@ -5051,6 +5101,12 @@ def _score_query_context_row(
     intent_score = 0.0
     if _query_is_identity_question(question) and _query_text_has_identity_markers(text):
         intent_score += 1.4
+    subject_tokens = _query_subject_tokens(question)
+    if subject_tokens:
+        if _query_text_has_subject(question, text):
+            intent_score += 5.0
+        else:
+            intent_score -= 6.0
     if _query_is_casualty_question(question) and _query_text_has_casualty_markers(text):
         intent_score += 1.2
 
@@ -5193,7 +5249,7 @@ def _query_collect_fallback_candidates(
             if not cleaned:
                 continue
             lowered = cleaned.lower()
-            term_hits = sum(1 for term in query_terms if term in lowered)
+            term_hits = sum(1 for term in query_terms if _query_term_in_text(term, lowered))
             sentence_item = dict(item)
             sentence_item["text"] = cleaned
             score = _score_query_context_row(query, sentence_item, now_ts=now_ts) + min(3.0, term_hits * 1.15)
@@ -5420,6 +5476,30 @@ def _fallback_query_answer(
 
     parts.extend(support[: (4 if detailed else 2)])
     return "<br>".join(parts)
+
+
+def _query_nlp_first_enabled() -> bool:
+    return bool(getattr(config, "QUERY_NLP_FIRST", True))
+
+
+def _local_nlp_query_answer(
+    query: str,
+    context_messages: Sequence[Dict[str, object]],
+    *,
+    detailed: bool,
+) -> str:
+    return _fallback_query_answer(query, context_messages, detailed=detailed)
+
+
+def _local_nlp_query_answer_is_confident(
+    query: str,
+    context_messages: Sequence[Dict[str, object]],
+) -> bool:
+    if query_prefers_direct_answer(query):
+        return True
+    if _query_subject_tokens(query):
+        return any(_query_text_has_subject(query, str(item.get("text") or "")) for item in context_messages[:6])
+    return False
 
 
 async def decide_filter_action(text: str, auth_manager: AuthManager) -> FilterDecision:
@@ -6969,6 +7049,33 @@ async def generate_answer_from_context_result(
     )
     if not context_lines:
         return _make_generated_text_result(QUERY_NO_MATCH_TEXT, copy_origin="fallback")
+
+    if _query_nlp_first_enabled():
+        local_answer = _local_nlp_query_answer(question, ranked_context, detailed=detailed)
+        quality_issue = _query_quality_issue(local_answer, question)
+        if (
+            local_answer != QUERY_NO_MATCH_TEXT
+            and not quality_issue
+            and _local_nlp_query_answer_is_confident(question, ranked_context)
+        ):
+            result = _make_generated_text_result(
+                local_answer,
+                copy_origin="fallback",
+                fallback_reason="local_nlp",
+            )
+            LOGGER.debug("generate_answer_from_context using local NLP path")
+            log_structured(
+                LOGGER,
+                "query_generation_result",
+                copy_origin=result.copy_origin,
+                fallback_reason=result.fallback_reason,
+                ai_attempt_count=result.ai_attempt_count,
+                ai_quality_retry_used=result.ai_quality_retry_used,
+                output_chars=len(result.html),
+            )
+            return result
+        LOGGER.debug("local NLP query answer rejected (%s); using API path", quality_issue or "empty")
+    LOGGER.debug("generate_answer_from_context using API path")
 
     history_lines: list[str] = []
     if conversation_history:

@@ -203,6 +203,7 @@ CODEX_BASE_URL = _env_str("CODEX_BASE_URL", "https://chatgpt.com/backend-api")  
 CODEX_MODEL = _env_str("CODEX_MODEL", "gpt-5.1-codex-mini")  # type: str
 CODEX_ORIGINATOR = _env_str("CODEX_ORIGINATOR", "pi")  # type: str
 USE_LOCAL_NLP = _env_bool("USE_LOCAL_NLP", False)  # type: bool
+QUERY_NLP_FIRST = _env_bool("QUERY_NLP_FIRST", True)  # type: bool
 OPENAI_AUTH_STARTUP_MODE = _env_str("OPENAI_AUTH_STARTUP_MODE", "auto").lower()  # type: str
 
 # -----------------------------------------------------------------------------
