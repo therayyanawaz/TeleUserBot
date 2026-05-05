@@ -1757,6 +1757,78 @@ async def test_stream_query_answer_uses_threaded_final_delivery(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_handle_query_request_checks_local_db_before_live_telegram(monkeypatch):
+    main.query_last_request_ts.clear()
+    order: list[str] = []
+    answer_contexts: list[list[dict[str, object]]] = []
+
+    async def fake_safe_reply_markdown(_event, text, *, edit_message=None, reply_to=None, prefer_bot_identity=False, bot_chat_id=None):
+        return edit_message or {"message_id": 710}
+
+    def fake_load_queue_query_context(**_kwargs):
+        order.append("queue")
+        return [
+            {
+                "text": "Local queue says Youssouf Daba Diawara arrest was confirmed this morning.",
+                "source": "Queue",
+                "timestamp": 1700000000,
+            }
+        ]
+
+    def fake_load_archive_query_context(**_kwargs):
+        order.append("archive")
+        return [
+            {
+                "text": "Archive says Youssouf Daba Diawara is linked to a confirmed arrest notice.",
+                "source": "Archive",
+                "timestamp": 1699999900,
+            }
+        ]
+
+    async def fake_search_recent_messages(_client, _monitored, _query, *, max_messages=50, default_hours_back=24, progress_cb=None, logger=None):
+        order.append("telegram")
+        return [
+            {
+                "text": "Live Telegram says the arrest of Youssouf Daba Diawara was confirmed this morning.",
+                "source": "Live",
+                "timestamp": 1700000100,
+            }
+        ]
+
+    async def fake_generate_answer_from_context(*, query, context_messages, auth_manager=None, conversation_history=None):
+        answer_contexts.append(list(context_messages))
+        return "<b>Best available identity match</b><br>Youssouf Daba Diawara arrest was confirmed this morning."
+
+    monkeypatch.setattr(main, "_is_query_runtime_available", lambda: True)
+    monkeypatch.setattr(main, "_safe_reply_markdown", fake_safe_reply_markdown)
+    monkeypatch.setattr(main, "_require_client", lambda: object())
+    monkeypatch.setattr(main, "_require_auth_manager", lambda: object())
+    monkeypatch.setattr(main, "_is_streaming_enabled", lambda: False)
+    monkeypatch.setattr(main, "_is_query_web_crosscheck_required", lambda: False)
+    monkeypatch.setattr(main, "_load_queue_query_context", fake_load_queue_query_context)
+    monkeypatch.setattr(main, "_load_archive_query_context", fake_load_archive_query_context)
+    monkeypatch.setattr(main, "search_recent_messages", fake_search_recent_messages)
+    monkeypatch.setattr(main, "generate_answer_from_context", fake_generate_answer_from_context)
+    monkeypatch.setattr(main, "_append_query_history", lambda *_args, **_kwargs: None)
+
+    await main._handle_query_request(
+        event_ref=SimpleNamespace(chat_id=780),
+        text="Who is Youssouf Daba Diawara",
+        sender_id=80,
+        chat_id="chat-80",
+        reply_to=None,
+        prefer_bot_identity=False,
+        bot_chat_id=None,
+    )
+
+    assert order[:3] == ["queue", "archive", "telegram"]
+    assert answer_contexts
+    assert any(row["source"] == "Queue" for row in answer_contexts[0])
+    assert any(row["source"] == "Archive" for row in answer_contexts[0])
+    assert any(row["source"] == "Live" for row in answer_contexts[0])
+
+
+@pytest.mark.asyncio
 async def test_handle_query_request_expands_to_seven_days_before_web_crosscheck(monkeypatch):
     main.query_last_request_ts.clear()
     progress_texts: list[str] = []

@@ -9820,7 +9820,6 @@ async def _handle_query_request(
         broad_query = plan.broad_query
         direct_answer_query = query_prefers_direct_answer(effective_query)
         query_keywords = list(plan.keywords)
-        query_numbers = list(plan.numbers)
         high_risk_query = _is_high_risk_news_query(effective_query)
         context_limit = _query_max_messages() * (2 if broad_query or len(query_keywords) <= 2 else 1)
         active_hours = primary_hours
@@ -9839,25 +9838,56 @@ async def _handle_query_request(
             force=True,
         )
 
-        telegram_task = asyncio.create_task(
-            search_recent_messages(
-                _require_client(),
-                monitored_source_chat_ids,
-                cleaned_query,
-                max_messages=context_limit,
-                default_hours_back=primary_hours,
-                progress_cb=progress_tracker.handle_search_progress,
-                logger=LOGGER,
-            )
+        queue_results: list[dict[str, object]] = []
+        archive_results: list[dict[str, object]] = []
+
+        await progress_tracker.note_memory("queue memory")
+        queue_results = _load_queue_query_context(
+            query_text=effective_query,
+            hours_back=active_hours,
+            limit=max(context_limit * 3, 80),
+            broad_query=broad_query,
+            start_ts=getattr(plan, "start_ts", None),
+            end_ts=getattr(plan, "end_ts", None),
         )
 
-        telegram_results = await telegram_task
+        await progress_tracker.note_memory("archive history")
+        archive_results = _load_archive_query_context(
+            query_text=effective_query,
+            hours_back=active_hours,
+            limit=max(context_limit * 3, 80),
+            broad_query=broad_query,
+            start_ts=getattr(plan, "start_ts", None),
+            end_ts=getattr(plan, "end_ts", None),
+        )
+
+        local_results = _merge_query_context(
+            queue_results,
+            archive_results,
+            limit=max(context_limit, 40),
+        )
+
+        telegram_results = await search_recent_messages(
+            _require_client(),
+            monitored_source_chat_ids,
+            cleaned_query,
+            max_messages=context_limit,
+            default_hours_back=primary_hours,
+            progress_cb=progress_tracker.handle_search_progress,
+            logger=LOGGER,
+        )
+
+        pre_web_results = _merge_query_context(
+            local_results,
+            telegram_results,
+            limit=max(context_limit, 40),
+        )
 
         if (
             expanded_hours > primary_hours
             and _query_needs_expanded_window(
                 effective_query,
-                telegram_results,
+                pre_web_results,
                 broad_query=broad_query,
             )
         ):
@@ -9880,44 +9910,13 @@ async def _handle_query_request(
                 expanded_results,
                 limit=max(context_limit, 40),
             )
+            pre_web_results = _merge_query_context(
+                local_results,
+                telegram_results,
+                limit=max(context_limit, 40),
+            )
             active_hours = expanded_hours
             expanded_window_used = True
-
-        queue_results: list[dict[str, object]] = []
-        archive_results: list[dict[str, object]] = []
-        if broad_query or len(telegram_results) < _query_web_min_telegram_results():
-            await progress_tracker.note_memory("queue memory")
-            queue_results = _load_queue_query_context(
-                query_text=effective_query,
-                hours_back=active_hours,
-                limit=max(context_limit * 3, 80),
-                broad_query=broad_query,
-                start_ts=getattr(plan, "start_ts", None),
-                end_ts=getattr(plan, "end_ts", None),
-            )
-            if queue_results:
-                telegram_results = _merge_query_context(
-                    telegram_results,
-                    queue_results,
-                    limit=max(context_limit, 40),
-                )
-
-        if broad_query or len(telegram_results) < _query_web_min_telegram_results():
-            await progress_tracker.note_memory("archive history")
-            archive_results = _load_archive_query_context(
-                query_text=effective_query,
-                hours_back=active_hours,
-                limit=max(context_limit * 3, 80),
-                broad_query=broad_query,
-                start_ts=getattr(plan, "start_ts", None),
-                end_ts=getattr(plan, "end_ts", None),
-            )
-            if archive_results:
-                telegram_results = _merge_query_context(
-                    telegram_results,
-                    archive_results,
-                    limit=max(context_limit, 40),
-                )
 
         web_results: list[dict[str, object]] = []
         web_fallback_used = False
@@ -9964,13 +9963,13 @@ async def _handle_query_request(
         web_fallback_used = bool(web_results)
 
         results = _merge_query_context(
-            telegram_results,
+            pre_web_results,
             web_results,
             limit=max(context_limit, _query_max_messages()),
         )
 
         await progress_tracker.set_stage(
-            _query_analysis_status(len(telegram_results), len(web_results)),
+            _query_analysis_status(len(pre_web_results), len(web_results)),
             window_hours=active_hours,
             telegram_count=len(telegram_results),
             web_count=len(web_results),
