@@ -4,25 +4,27 @@
 
 ## 2026-05-05
 
-### Features
+### Fixes
 
-- `37c1e15` feat: add telegram takeout history exporter
-- `a09139a` feat: enable query web crosscheck by default
-- `6bb97ab` feat: strengthen local NLP query router
-- `b7a7dcb` feat: add local NLP filter toggle
+- `d4de93e` fix: preserve hyphenated names in feed cleanup
+- `b894cd6` fix: search local query memory before telegram
+- `9539123` fix: route confident query answers through local NLP
 
 ### Docs
 
+- `ac2103e` docs: update changelog [skip ci]
 - `2f83445` docs: update changelog [skip ci]
 - `5e0fb9d` docs: update changelog [skip ci]
 - `5ff276f` docs: update changelog [skip ci]
 - `02488e8` docs: update changelog [skip ci]
 - `9b25382` docs: update changelog [skip ci]
 
-### Fixes
+### Features
 
-- `b894cd6` fix: search local query memory before telegram
-- `9539123` fix: route confident query answers through local NLP
+- `37c1e15` feat: add telegram takeout history exporter
+- `a09139a` feat: enable query web crosscheck by default
+- `6bb97ab` feat: strengthen local NLP query router
+- `b7a7dcb` feat: add local NLP filter toggle
 
 ## 2026-04-19
 
