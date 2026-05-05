@@ -1453,9 +1453,7 @@ def _query_default_hours_back() -> int:
 
 
 def _is_query_web_crosscheck_required() -> bool:
-    # Query answers always require a trusted web cross-check after Telegram
-    # evidence gathering.
-    return True
+    return _bool_flag(getattr(config, "QUERY_WEB_CROSSCHECK_REQUIRED", True), True)
 
 
 def _query_web_min_telegram_results() -> int:

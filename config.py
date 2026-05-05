@@ -333,6 +333,7 @@ TIMEZONE = _env_str("TIMEZONE", "UTC")  # type: str
 QUERY_MODE_ENABLED = _env_bool("QUERY_MODE_ENABLED", True)  # type: bool
 QUERY_MAX_MESSAGES = _env_int("QUERY_MAX_MESSAGES", 50)  # type: int
 QUERY_DEFAULT_HOURS_BACK = _env_int("QUERY_DEFAULT_HOURS_BACK", 24)  # type: int
+QUERY_WEB_CROSSCHECK_REQUIRED = _env_bool("QUERY_WEB_CROSSCHECK_REQUIRED", True)  # type: bool
 # Expand Telegram search to the last 7 days when recent coverage is too thin
 # before the mandatory trusted web cross-check runs.
 # Trigger web verification when Telegram matches are below this count.

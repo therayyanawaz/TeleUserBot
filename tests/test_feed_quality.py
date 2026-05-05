@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -12,6 +13,23 @@ import main
 import prompts
 import severity_classifier
 import utils
+
+
+def test_query_web_crosscheck_enabled_by_default_and_toggleable(monkeypatch):
+    monkeypatch.setattr(main.config, "QUERY_WEB_CROSSCHECK_REQUIRED", True)
+    assert main._is_query_web_crosscheck_required() is True
+
+    monkeypatch.setattr(main.config, "QUERY_WEB_CROSSCHECK_REQUIRED", False)
+    assert main._is_query_web_crosscheck_required() is False
+
+    import config
+
+    monkeypatch.setenv("QUERY_WEB_CROSSCHECK_REQUIRED", "true")
+    reloaded = importlib.reload(config)
+    try:
+        assert reloaded.QUERY_WEB_CROSSCHECK_REQUIRED is True
+    finally:
+        importlib.reload(config)
 
 
 def _severity_payload(
