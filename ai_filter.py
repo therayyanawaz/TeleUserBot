@@ -4464,6 +4464,11 @@ def _query_subject_phrase(query: str) -> str:
         return ""
     patterns = (
         r"^(?:who|whom)\s+(?:is|was|are|were)\s+(.+?)\??$",
+        r"^(?:where)\s+(?:is|was|are|were|did|does|do|has|have)\s+(.+?)\??$",
+        r"^(?:when)\s+(?:is|was|are|were|did|does|do|has|have)\s+(.+?)\??$",
+        r"^(?:which)\s+(.+?)\??$",
+        r"^(?:what happened(?: to| with| in| at| near)?|what is happening(?: to| with| in| at| near)?)\s+(.+?)\??$",
+        r"^(?:why)\s+(?:is|was|are|were|did|does|do|has|have)\s+(.+?)\??$",
         r"^(?:tell me about|identify|explain who)\s+(.+?)\??$",
     )
     for pattern in patterns:
@@ -4504,6 +4509,58 @@ def _query_text_has_subject(query: str, text: str) -> bool:
         return False
     lowered_text = normalize_space(text).lower()
     return all(_query_term_in_text(token, lowered_text) for token in tokens)
+
+
+def _query_intent(query: str) -> Literal["who", "where", "when", "which", "what", "why", "strategic", "general"]:
+    lowered = normalize_space(query).lower()
+    if query_prefers_direct_answer(query):
+        return "strategic"
+    if re.match(r"^(?:who|whom)\b", lowered):
+        return "who"
+    if re.match(r"^where\b", lowered):
+        return "where"
+    if re.match(r"^when\b", lowered):
+        return "when"
+    if re.match(r"^which\b", lowered):
+        return "which"
+    if re.match(r"^why\b", lowered):
+        return "why"
+    if re.match(r"^what\s+(?:happened|is happening)\b", lowered):
+        return "what"
+    return "general"
+
+
+def _query_has_causal_signal(text: str) -> bool:
+    lowered = normalize_space(text).lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "because",
+            "after",
+            "amid",
+            "following",
+            "due to",
+            "as a result",
+            "in response to",
+            "over",
+            "triggered by",
+        )
+    )
+
+
+_QUERY_TIME_RE = re.compile(
+    r"\b(?:today|tonight|this morning|this evening|yesterday|tomorrow|"
+    r"\d{1,2}:\d{2}\s?(?:am|pm)?|\d{1,2}\s?(?:am|pm)|"
+    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}|"
+    r"\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?)\b",
+    flags=re.IGNORECASE,
+)
+
+
+_QUERY_LOCATION_RE = re.compile(
+    r"\b(?:in|at|near|around|over|from|to|across|inside|outside)\s+"
+    r"([A-Z][A-Za-z'’.-]*(?:\s+(?:al-|Al-|of|the|[A-Z][A-Za-z'’.-]*)){0,5})"
+)
 
 
 def _query_is_casualty_question(query: str) -> bool:
@@ -5482,12 +5539,130 @@ def _query_nlp_first_enabled() -> bool:
     return bool(getattr(config, "QUERY_NLP_FIRST", True))
 
 
+def _local_nlp_query_sentences(
+    query: str,
+    context_messages: Sequence[Dict[str, object]],
+    *,
+    limit: int = 6,
+) -> list[str]:
+    now_ts = int(time.time())
+    scored: list[tuple[float, str]] = []
+    subject_tokens = _query_subject_tokens(query)
+    intent = _query_intent(query)
+    query_terms = {
+        normalize_space(term).lower()
+        for term in [*expand_query_terms(query), *extract_query_keywords(query), *extract_query_numbers(query)]
+        if len(normalize_space(term)) >= 2
+    }
+    for item in _rank_query_context(query, context_messages, limit=18):
+        raw_text = normalize_space(str(item.get("text") or ""))
+        if not raw_text:
+            continue
+        for sentence in _split_digest_sentences(raw_text):
+            cleaned = _digest_finalize_sentence(sentence, max_chars=260)
+            if not cleaned or _is_bad_feed_headline(cleaned) or _digest_is_low_value_quote_or_rant(cleaned):
+                continue
+            sentence_item = dict(item)
+            sentence_item["text"] = cleaned
+            score = _score_query_context_row(query, sentence_item, now_ts=now_ts)
+            if subject_tokens and intent == "who":
+                if _query_text_has_subject(query, cleaned):
+                    score += 5.0
+                else:
+                    continue
+            term_hits = sum(1 for term in query_terms if _query_term_in_text(term, cleaned))
+            score += min(4.0, term_hits * 0.9)
+            if intent == "when" and _QUERY_TIME_RE.search(cleaned):
+                score += 2.0
+            if intent == "where" and _QUERY_LOCATION_RE.search(cleaned):
+                score += 2.0
+            if intent == "why" and _query_has_causal_signal(cleaned):
+                score += 2.5
+            if score > 0:
+                scored.append((score, cleaned))
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for _score, sentence in sorted(scored, key=lambda item: (item[0], len(item[1])), reverse=True):
+        key = _digest_line_key(sentence)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(sentence)
+        if len(out) >= max(1, limit):
+            break
+    return out
+
+
+def _local_nlp_query_title(intent: str) -> str:
+    if intent == "who":
+        return "Best available identity match"
+    if intent == "where":
+        return "Best available location match"
+    if intent == "when":
+        return "Best available timing match"
+    if intent == "which":
+        return "Best available option match"
+    if intent == "why":
+        return "Best available reason"
+    if intent == "what":
+        return "What happened"
+    return "Best available answer"
+
+
+def _render_local_nlp_query_answer(
+    query: str,
+    sentences: Sequence[str],
+    *,
+    detailed: bool,
+) -> str:
+    if not sentences:
+        return QUERY_NO_MATCH_TEXT
+    intent = _query_intent(query)
+    lead = _build_digest_story_from_fragments(
+        sentences[:2],
+        total_max_chars=360 if detailed else 260,
+        max_sentences=2 if detailed else 1,
+    )
+    if intent == "when":
+        time_match = next((_QUERY_TIME_RE.search(line) for line in sentences if _QUERY_TIME_RE.search(line)), None)
+        if time_match:
+            lead = f"{time_match.group(0).strip()}: {lead}"
+    if intent == "where":
+        location_match = next((_QUERY_LOCATION_RE.search(line) for line in sentences if _QUERY_LOCATION_RE.search(line)), None)
+        if location_match and location_match.group(1):
+            lead = f"{location_match.group(1).strip()}: {lead}"
+
+    parts = [f"<b>{sanitize_telegram_html(_local_nlp_query_title(intent))}</b>"]
+    if lead:
+        parts.append(sanitize_telegram_html(lead))
+    seen = {_digest_line_key(lead)}
+    max_bullets = 4 if detailed else 2
+    for sentence in sentences[1:]:
+        key = _digest_line_key(sentence)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        parts.append(f"• {sanitize_telegram_html(sentence)}")
+        if len(parts) >= 2 + max_bullets:
+            break
+    return "<br>".join(parts)
+
+
 def _local_nlp_query_answer(
     query: str,
     context_messages: Sequence[Dict[str, object]],
     *,
     detailed: bool,
 ) -> str:
+    intent = _query_intent(query)
+    if intent == "strategic":
+        return _fallback_query_answer(query, context_messages, detailed=detailed)
+    if intent in {"who", "where", "when", "which", "what", "why"}:
+        sentences = _local_nlp_query_sentences(query, context_messages, limit=(8 if detailed else 5))
+        if intent == "why":
+            sentences = [sentence for sentence in sentences if _query_has_causal_signal(sentence)]
+        return _render_local_nlp_query_answer(query, sentences, detailed=detailed)
     return _fallback_query_answer(query, context_messages, detailed=detailed)
 
 
@@ -5495,10 +5670,15 @@ def _local_nlp_query_answer_is_confident(
     query: str,
     context_messages: Sequence[Dict[str, object]],
 ) -> bool:
+    intent = _query_intent(query)
     if query_prefers_direct_answer(query):
         return True
     if _query_subject_tokens(query):
         return any(_query_text_has_subject(query, str(item.get("text") or "")) for item in context_messages[:6])
+    if intent in {"where", "when", "which", "what"}:
+        return bool(_local_nlp_query_sentences(query, context_messages, limit=1))
+    if intent == "why":
+        return any(_query_has_causal_signal(sentence) for sentence in _local_nlp_query_sentences(query, context_messages, limit=3))
     return False
 
 

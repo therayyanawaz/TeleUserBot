@@ -734,6 +734,61 @@ def test_local_query_answer_uses_exact_person_subject_not_substring_noise():
     assert "Libya" not in plain
 
 
+def test_local_query_answer_handles_where_query_with_location_anchor():
+    answer = ai_filter._local_nlp_query_answer(
+        "Where did the IDF issue evacuation warnings?",
+        [
+            {
+                "text": (
+                    "The IDF issued targeted evacuation warnings for villages in southern Lebanon, "
+                    "including Qana, Dabaal, Qaqaiyat al-Jisr and Srifa."
+                ),
+                "source": "War & News Alert",
+                "timestamp": 1700000000,
+            }
+        ],
+        detailed=False,
+    )
+    plain = ai_filter.strip_telegram_html(answer)
+
+    assert "southern Lebanon" in plain
+    assert "Qana" in plain
+
+
+def test_local_query_answer_handles_when_query_with_time_anchor():
+    answer = ai_filter._local_nlp_query_answer(
+        "When was Youssouf Daba Diawara arrested?",
+        [
+            {
+                "text": "The arrest of Youssouf Daba Diawara was confirmed this morning by officials.",
+                "source": "War & News Alert",
+                "timestamp": 1700000000,
+            }
+        ],
+        detailed=False,
+    )
+    plain = ai_filter.strip_telegram_html(answer)
+
+    assert "this morning" in plain.lower()
+    assert "Youssouf Daba Diawara" in plain
+
+
+def test_local_query_answer_requires_causal_signal_for_why():
+    weak = ai_filter._local_nlp_query_answer(
+        "Why did the army close the roads?",
+        [{"text": "The army closed roads in the northern district.", "timestamp": 1700000000}],
+        detailed=False,
+    )
+    strong = ai_filter._local_nlp_query_answer(
+        "Why did the army close the roads?",
+        [{"text": "The army closed roads after a security alert near the border.", "timestamp": 1700000000}],
+        detailed=False,
+    )
+
+    assert weak == ai_filter.QUERY_NO_MATCH_TEXT
+    assert "after a security alert" in ai_filter.strip_telegram_html(strong)
+
+
 def test_query_quality_issue_rejects_verbose_source_dump():
     html = (
         "<b>Direct answer</b><br>"
