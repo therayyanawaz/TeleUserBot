@@ -4,17 +4,19 @@
 
 ## 2026-05-05
 
-### Fixes
+### Features
 
-- `9539123` fix: route confident query answers through local NLP
+- `6bb97ab` feat: strengthen local NLP query router
+- `b7a7dcb` feat: add local NLP filter toggle
 
 ### Docs
 
+- `02488e8` docs: update changelog [skip ci]
 - `9b25382` docs: update changelog [skip ci]
 
-### Features
+### Fixes
 
-- `b7a7dcb` feat: add local NLP filter toggle
+- `9539123` fix: route confident query answers through local NLP
 
 ## 2026-04-19
 
