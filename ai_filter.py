@@ -42,6 +42,7 @@ from prompts import (
     digest_output_style,
     quiet_period_message,
 )
+from severity_classifier import moderation_scan_text
 from shared_http import get_codex_http_client, reset_shared_http_client
 from utils import estimate_tokens_rough as _estimate_tokens_rough
 from utils import (
@@ -2176,7 +2177,8 @@ def _fallback_filter_decision(
     ai_quality_retry_used: bool = False,
 ) -> FilterDecision:
     cleaned = normalize_space(text)
-    if not cleaned or _likely_noise(cleaned):
+    moderation = moderation_scan_text(cleaned)
+    if not cleaned or _likely_noise(cleaned) or bool(moderation.get("hard_blocked")):
         return FilterDecision(
             action="skip",
             severity="low",
@@ -2184,7 +2186,7 @@ def _fallback_filter_decision(
             headline_html="",
             story_bridge_html="",
             confidence=0.2,
-            reason_code="likely_noise",
+            reason_code="moderation_block" if bool(moderation.get("hard_blocked")) else "likely_noise",
             topic_key=_sanitize_topic_key("", cleaned),
             copy_origin="fallback",
             routing_origin="fallback",
@@ -2195,6 +2197,8 @@ def _fallback_filter_decision(
 
     summary = _fallback_summary(cleaned) or ""
     severity = _severity_from_text_heuristic(cleaned)
+    if int(moderation.get("frequency") or 0) >= 2 and severity == "low":
+        severity = "medium"
     if should_downgrade_explainer_urgency(cleaned):
         severity = "medium" if summary else "low"
         action: Literal["skip", "deliver", "digest"] = "digest" if summary else "skip"
@@ -5698,6 +5702,10 @@ async def decide_filter_action(text: str, auth_manager: AuthManager) -> FilterDe
     cleaned = normalize_space(text)
     if len(cleaned) < 10:
         return _fallback_filter_decision(cleaned)
+    moderation = moderation_scan_text(cleaned)
+    if bool(moderation.get("hard_blocked")):
+        LOGGER.debug("decide_filter_action blocked by deterministic moderation policy")
+        return _fallback_filter_decision(cleaned, fallback_reason="local_nlp")
     if _use_local_nlp_filter():
         LOGGER.debug("decide_filter_action using local NLP path")
         return _local_nlp_filter_decision(cleaned)

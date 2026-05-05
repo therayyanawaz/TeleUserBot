@@ -11,6 +11,7 @@ import pytest
 import ai_filter
 import main
 import prompts
+import runtime_presenter
 import severity_classifier
 import utils
 
@@ -67,6 +68,53 @@ def test_fallback_filter_decision_downgrades_explainer_with_urgent_keywords():
 
     assert decision.action in {"digest", "skip"}
     assert decision.severity != "high"
+
+
+def test_moderation_scan_allows_neutral_news_with_isolated_security_terms():
+    scan = severity_classifier.moderation_scan_text(
+        "Police said three militants were arrested after an investigation into a recruitment cell."
+    )
+
+    assert scan["blocked"] is False
+    assert scan["hard_matches"] == []
+    assert scan["frequency"] >= 1
+
+
+def test_moderation_scan_detects_obfuscated_radical_news_terms_without_blocking_report():
+    scan = severity_classifier.moderation_scan_text(
+        "Several Jaish-e-Mohammed terrorists reportedly joined TTP, with several involved in su#c!de attacks."
+    )
+
+    assert scan["blocked"] is False
+    assert "terrorists" in scan["soft_matches"]
+    assert any("suicide" in key for key in scan["soft_matches"])
+
+
+def test_moderation_scan_hard_blocks_extremist_rhetoric():
+    scan = severity_classifier.moderation_scan_text(
+        "Supporters called to join the jihad and attack civilians tonight."
+    )
+
+    assert scan["blocked"] is True
+    assert scan["hard_blocked"] is True
+
+
+def test_filter_decision_skips_hard_blocked_extremist_rhetoric():
+    decision = ai_filter._fallback_filter_decision(
+        "Supporters called to join the jihad and attack civilians tonight."
+    )
+
+    assert decision.action == "skip"
+    assert decision.reason_code == "moderation_block"
+
+
+def test_neutral_replacements_for_biased_adjectives():
+    text = runtime_presenter.neutralize_biased_adjectives("Deadly fanatical fighters launched a savage attack.")
+
+    assert "Deadly" not in text
+    assert "fanatical" not in text
+    assert "savage" not in text
+    assert "reported armed fighters launched a violent attack" in text
 
 
 def test_normalize_feed_summary_rewrites_question_led_title():

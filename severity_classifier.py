@@ -6,9 +6,9 @@ import re
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Any, Deque, Dict, Tuple
+from typing import Any, Deque, Dict
 
-from news_taxonomy import find_news_category_matches, match_news_category
+from news_taxonomy import find_news_category_matches, get_moderation_policy, match_news_category
 from news_signals import detect_story_signals
 
 
@@ -216,6 +216,21 @@ _EMOJI_RE = re.compile(
     flags=re.UNICODE,
 )
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+_OBFUSCATION_TRANSLATION = str.maketrans(
+    {
+        "@": "a",
+        "4": "a",
+        "3": "e",
+        "!": "i",
+        "1": "i",
+        "|": "i",
+        "0": "o",
+        "$": "s",
+        "5": "s",
+        "7": "t",
+        "#": "i",
+    }
+)
 
 _HIGH_SEVERITY_HISTORY: Dict[str, Deque[float]] = defaultdict(deque)
 _COOLDOWN_LOCK = threading.Lock()
@@ -362,6 +377,95 @@ def _find_matches(normalized_text: str, phrases: list[str]) -> list[str]:
         if _contains_phrase(normalized_text, phrase):
             matches.append(phrase)
     return matches
+
+
+def _moderation_terms(section: dict[str, Any], key: str) -> list[str]:
+    raw = section.get(key, [])
+    if not isinstance(raw, list):
+        return []
+    return [_normalize_space(str(item)) for item in raw if _normalize_space(str(item))]
+
+
+def _normalize_moderation_text(text: str) -> str:
+    lowered = _normalize_space(text).casefold().translate(_OBFUSCATION_TRANSLATION)
+    return re.sub(r"[^a-z0-9\s]+", " ", lowered)
+
+
+def _term_frequency(normalized_text: str, term: str) -> int:
+    key = _normalize_moderation_text(term)
+    if not key:
+        return 0
+    pattern = rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])"
+    return len(re.findall(pattern, normalized_text))
+
+
+def _simple_sentiment_polarity(text: str, hard_matches: list[str], inflammatory_matches: list[str]) -> float:
+    normalized = _normalize_moderation_text(text)
+    polarity = 0.0
+    polarity += min(3.0, len(hard_matches) * 1.5)
+    polarity += min(2.0, len(inflammatory_matches) * 0.45)
+    polarity += min(1.5, len(re.findall(r"\b(?:hate|revenge|blood|slaughter|crush|erase|traitor|enemy)\b", normalized)) * 0.3)
+    polarity -= min(1.2, len(re.findall(r"\b(?:reported|alleged|officials said|police said|court|trial|arrested|charged)\b", normalized)) * 0.2)
+    return max(0.0, round(polarity, 4))
+
+
+def moderation_scan_text(text: str) -> dict[str, Any]:
+    """
+    Deterministic radicalized-news moderation scan.
+
+    Formula:
+        (KeywordWeight * Frequency) + SentimentPolarity > Threshold
+
+    Conservative by design: neutral reports with isolated terms stay allowed.
+    """
+    policy = get_moderation_policy()
+    hard = policy.get("hard_block", {}) if isinstance(policy.get("hard_block"), dict) else {}
+    soft = policy.get("soft_flag", {}) if isinstance(policy.get("soft_flag"), dict) else {}
+    regex_cfg = policy.get("regex_patterns", {}) if isinstance(policy.get("regex_patterns"), dict) else {}
+    threshold = float(policy.get("score_threshold", 7.5) or 7.5)
+    keyword_weight = float(soft.get("keyword_weight", 1.15) or 1.15)
+
+    normalized = _normalize_moderation_text(text)
+    hard_terms = [*_moderation_terms(hard, "keywords"), *_moderation_terms(hard, "inflammatory_phrases")]
+    soft_terms = [*_moderation_terms(soft, "keywords")]
+    inflammatory_terms = _moderation_terms(soft, "inflammatory_phrases")
+
+    hard_matches = [term for term in hard_terms if _term_frequency(normalized, term) > 0]
+    soft_counts = {
+        term: _term_frequency(normalized, term)
+        for term in soft_terms
+        if _term_frequency(normalized, term) > 0
+    }
+    inflammatory_matches = [term for term in inflammatory_terms if _term_frequency(normalized, term) > 0]
+
+    regex_matches: dict[str, bool] = {}
+    for name, pattern in regex_cfg.items():
+        try:
+            regex_matches[str(name)] = bool(re.search(str(pattern), text, flags=re.IGNORECASE))
+        except re.error:
+            regex_matches[str(name)] = False
+
+    frequency = sum(soft_counts.values()) + (len(inflammatory_matches) * 2)
+    sentiment_polarity = _simple_sentiment_polarity(text, hard_matches, inflammatory_matches)
+    regex_bonus = sum(0.35 for matched in regex_matches.values() if matched)
+    score = (keyword_weight * frequency) + sentiment_polarity + regex_bonus
+    hard_blocked = bool(hard_matches)
+    score_blocked = score > threshold and frequency >= 3
+
+    return {
+        "blocked": bool(hard_blocked or score_blocked),
+        "hard_blocked": hard_blocked,
+        "score_blocked": bool(score_blocked),
+        "score": round(score, 4),
+        "threshold": round(threshold, 4),
+        "keyword_weight": round(keyword_weight, 4),
+        "frequency": int(frequency),
+        "sentiment_polarity": sentiment_polarity,
+        "hard_matches": hard_matches[:12],
+        "soft_matches": soft_counts,
+        "inflammatory_matches": inflammatory_matches[:12],
+        "regex_matches": regex_matches,
+    }
 
 
 def _count_emoji(text: str) -> int:
@@ -667,6 +771,19 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
     now_ts = float(msg.get("timestamp") or time.time())
     channel_id = str(msg.get("channel_id") or "").strip()
     story_signals = detect_story_signals(text)
+    moderation = moderation_scan_text(text)
+
+    if bool(moderation.get("blocked")):
+        breakdown: Dict[str, Any] = {
+            "source": source_name,
+            "raw_score": 0.0,
+            "final_score": 0.0,
+            "score_band": "low",
+            "moderation": moderation,
+            "moderation_blocked": True,
+            "normalized_text_preview": normalized[:220],
+        }
+        return "low", 0.0, breakdown
 
     tier, source_score = _detect_source_tier(source_name)
     urgency_score, urgency_hits, urgency_hit_count = _calc_urgency_score(text, story_signals=story_signals)
@@ -698,6 +815,8 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
         + temporal_score
         + penalty_score
     )
+    if int(moderation.get("frequency") or 0) > 0:
+        raw_score += min(0.12, float(moderation.get("score") or 0.0) / 100.0)
     raw_score = max(0.0, min(1.0, raw_score))
 
     thresholds = severity_thresholds()
@@ -777,6 +896,8 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
         "temporal": temporal_details,
         "penalty_score": round(penalty_score, 4),
         "penalties": penalty_details,
+        "moderation": moderation,
+        "moderation_blocked": False,
         "story_signals": {
             "explainer_hits": list(story_signals.get("explainer_hits") or []),
             "question_led": bool(story_signals.get("question_led")),

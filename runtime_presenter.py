@@ -8,11 +8,14 @@ from datetime import datetime
 from html import escape
 import json
 import logging
+import re
 import shutil
 import textwrap
 import traceback
 from threading import Lock
 from typing import Any, Callable, Deque, List, Mapping, Sequence, Tuple
+
+from news_taxonomy import get_moderation_policy
 
 
 SanitizeFn = Callable[[str], str]
@@ -122,6 +125,26 @@ _DETAIL_PRIORITY = (
     "error",
     "failure_reason",
 )
+
+
+def neutral_replacements() -> Mapping[str, str]:
+    policy = get_moderation_policy()
+    replacements = policy.get("neutral_replacements", {}) if isinstance(policy, dict) else {}
+    return replacements if isinstance(replacements, dict) else {}
+
+
+def neutralize_biased_adjectives(text: str) -> str:
+    output = str(text or "")
+    for biased, neutral in neutral_replacements().items():
+        if not str(biased).strip() or not str(neutral).strip():
+            continue
+        output = re.sub(
+            rf"(?<![A-Za-z0-9]){re.escape(str(biased))}(?![A-Za-z0-9])",
+            str(neutral),
+            output,
+            flags=re.IGNORECASE,
+        )
+    return output
 
 
 @dataclass(frozen=True)

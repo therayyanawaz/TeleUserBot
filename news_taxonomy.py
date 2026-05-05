@@ -484,6 +484,7 @@ class NewsTaxonomy:
     path: Path
     categories: tuple[NewsCategory, ...]
     compiler: OntologyCompilerConfig
+    moderation: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -874,7 +875,17 @@ def load_news_taxonomy(
         seen_keys.add(category.key)
         categories.append(category)
 
-    taxonomy = NewsTaxonomy(version=version, path=taxonomy_path, categories=tuple(categories), compiler=compiler)
+    moderation = payload.get("moderation")
+    if not isinstance(moderation, dict):
+        moderation = {}
+
+    taxonomy = NewsTaxonomy(
+        version=version,
+        path=taxonomy_path,
+        categories=tuple(categories),
+        compiler=compiler,
+        moderation=moderation,
+    )
     if path is None:
         _TAXONOMY_CACHE = taxonomy
     return taxonomy
@@ -882,6 +893,11 @@ def load_news_taxonomy(
 
 def get_news_taxonomy() -> NewsTaxonomy:
     return load_news_taxonomy()
+
+
+def get_moderation_policy() -> dict[str, object]:
+    policy = get_news_taxonomy().moderation
+    return dict(policy) if isinstance(policy, dict) else {}
 
 
 def _match_phrase_field(
