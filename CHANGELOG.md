@@ -6,12 +6,14 @@
 
 ### Features
 
+- `37c1e15` feat: add telegram takeout history exporter
 - `a09139a` feat: enable query web crosscheck by default
 - `6bb97ab` feat: strengthen local NLP query router
 - `b7a7dcb` feat: add local NLP filter toggle
 
 ### Docs
 
+- `2f83445` docs: update changelog [skip ci]
 - `5e0fb9d` docs: update changelog [skip ci]
 - `5ff276f` docs: update changelog [skip ci]
 - `02488e8` docs: update changelog [skip ci]
