@@ -4,14 +4,19 @@
 
 ## 2026-05-07
 
+### Fixes
+
+- `d3f09b8` fix: reject report leads as entity definitions
+
+### Docs
+
+- `4d36573` docs: update changelog [skip ci]
+- `7ef3a9b` docs: update changelog [skip ci]
+
 ### Features
 
 - `32a7053` feat: fetch article pages for query web context
 - `ac99e77` feat: add web entity summaries for query answers
-
-### Docs
-
-- `7ef3a9b` docs: update changelog [skip ci]
 
 ## 2026-05-05
 
