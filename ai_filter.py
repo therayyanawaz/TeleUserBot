@@ -62,6 +62,8 @@ CACHE_MAX_ITEMS = 2048
 DEFAULT_CODEX_MODEL = "gpt-5.1-codex-mini"
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 DEFAULT_CODEX_ORIGINATOR = "pi"
+DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 DEFAULT_DIGEST_MAX_POSTS = 80
 DEFAULT_DIGEST_MAX_TOKENS = 18000
 FILTER_DECISION_PROMPT_VERSION = "v6"
@@ -968,6 +970,110 @@ def _resolve_codex_url() -> str:
     return f"{normalized}/codex/responses"
 
 
+def _resolve_llm_provider() -> str:
+    provider = str(getattr(config, "LLM_PROVIDER", "auto") or "").strip().lower()
+    if provider in {"codex", "chatgpt"}:
+        return "codex"
+    if provider in {"openrouter", "router", "api"}:
+        return "openrouter"
+    if str(getattr(config, "OPENROUTER_API_KEY", "") or "").strip():
+        return "openrouter"
+    return "codex"
+
+
+def _using_openrouter() -> bool:
+    return _resolve_llm_provider() == "openrouter"
+
+
+def _resolve_openrouter_url() -> str:
+    url = str(getattr(config, "OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL) or "").strip()
+    return url or DEFAULT_OPENROUTER_BASE_URL
+
+
+def _resolve_openrouter_model() -> str:
+    model = str(getattr(config, "LLM_MODEL", DEFAULT_OPENROUTER_MODEL) or "").strip()
+    return model or DEFAULT_OPENROUTER_MODEL
+
+
+def _build_openrouter_payload(
+    text: str,
+    instructions: str,
+    *,
+    stream: bool = False,
+    image_data_urls: Sequence[str] | None = None,
+) -> dict:
+    user_content: str | list[dict[str, object]]
+    if image_data_urls:
+        parts: list[dict[str, object]] = [{"type": "text", "text": text}]
+        for data_url in image_data_urls:
+            value = str(data_url or "").strip()
+            if value:
+                parts.append({"type": "image_url", "image_url": {"url": value}})
+        user_content = parts
+    else:
+        user_content = text
+
+    return {
+        "model": _resolve_openrouter_model(),
+        "messages": [
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": user_content},
+        ],
+        "stream": bool(stream),
+        "temperature": 0.2,
+    }
+
+
+def _get_openrouter_headers() -> dict[str, str]:
+    api_key = str(getattr(config, "OPENROUTER_API_KEY", "") or "").strip()
+    if not api_key:
+        raise _CodexAuthError("OPENROUTER_API_KEY is missing from configuration.")
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": str(getattr(config, "OPENROUTER_HTTP_REFERER", "") or "").strip(),
+        "X-Title": str(getattr(config, "OPENROUTER_APP_TITLE", "TeleUserBot News Aggregator") or "").strip(),
+    }
+
+
+def _extract_openrouter_content(payload: dict) -> str:
+    try:
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        first = choices[0]
+        if not isinstance(first, dict):
+            return ""
+        message = first.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str):
+                return content.strip()
+        text = first.get("text")
+        if isinstance(text, str):
+            return text.strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _raise_openrouter_http_error(response: httpx.Response) -> None:
+    message = response.text or response.reason_phrase or "OpenRouter request failed"
+    try:
+        payload = response.json()
+        err = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(err, dict):
+            message = str(err.get("message") or message).strip()
+    except Exception:
+        pass
+    if response.status_code in (401, 403):
+        raise _CodexAuthError(message or f"OpenRouter HTTP {response.status_code}")
+    if response.status_code == 429:
+        _record_quota_429()
+        raise _CodexRateLimitError(message or "OpenRouter rate limit reached.")
+    raise _CodexApiError(message or f"OpenRouter API error: HTTP {response.status_code}")
+
+
 def _resolve_output_language() -> str:
     language = normalize_space(str(getattr(config, "OUTPUT_LANGUAGE", "English") or ""))
     return language or "English"
@@ -1542,12 +1648,182 @@ def streaming_codex_response(
     )
 
 
+class _StreamingOpenRouterResponse:
+    def __init__(
+        self,
+        *,
+        cleaned: str,
+        instructions: str,
+        image_data_urls: Sequence[str] | None = None,
+    ) -> None:
+        self._cleaned = cleaned
+        self._instructions = instructions
+        self._image_data_urls = list(image_data_urls or [])
+        self._stream_ctx = None
+        self._response: httpx.Response | None = None
+        self.full_text = ""
+        self.metrics = CodexStreamMetrics()
+        self._iterated = False
+
+    async def __aenter__(self) -> "_StreamingOpenRouterResponse":
+        headers = _get_openrouter_headers()
+        payload = _build_openrouter_payload(
+            self._cleaned,
+            self._instructions,
+            stream=True,
+            image_data_urls=self._image_data_urls,
+        )
+        client = await get_codex_http_client()
+        self._stream_ctx = client.stream(
+            "POST",
+            _resolve_openrouter_url(),
+            headers=headers,
+            json=payload,
+            timeout=60.0,
+        )
+        self._response = await self._stream_ctx.__aenter__()
+        if self._response.status_code >= 400:
+            body = await self._response.aread()
+            error_response = httpx.Response(
+                status_code=self._response.status_code,
+                headers=self._response.headers,
+                content=body,
+                request=self._response.request,
+            )
+            await self.__aexit__(None, None, None)
+            _raise_openrouter_http_error(error_response)
+        self.metrics.started_at = time.time()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.metrics.ended_at = time.time()
+        if self._stream_ctx is not None:
+            await self._stream_ctx.__aexit__(exc_type, exc, tb)
+            self._stream_ctx = None
+        self._response = None
+
+    async def __aiter__(self) -> AsyncIterator[str]:
+        if self._iterated:
+            return
+        self._iterated = True
+        if self._response is None:
+            return
+
+        async for line in self._response.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if not data_str or data_str == "[DONE]":
+                if data_str == "[DONE]":
+                    break
+                continue
+            try:
+                event = json.loads(data_str)
+                choices = event.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    continue
+                delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+                content = delta.get("content") if isinstance(delta, dict) else ""
+            except (json.JSONDecodeError, AttributeError, KeyError, IndexError):
+                continue
+            if isinstance(content, str) and content:
+                self.full_text += content
+                self.metrics.total_chars += len(content)
+                self.metrics.delta_events += 1
+                yield content
+
+
 def _extract_response_text_from_json(payload: dict) -> str:
     if not isinstance(payload, dict):
         return ""
     if payload.get("response") and isinstance(payload.get("response"), dict):
         return _extract_response_output_text(payload["response"])
     return _extract_response_output_text(payload)
+
+
+async def _call_openrouter_non_stream(
+    cleaned: str,
+    instructions: str,
+    *,
+    verbosity: str = "medium",
+    image_data_urls: Sequence[str] | None = None,
+) -> str:
+    del verbosity
+    headers = _get_openrouter_headers()
+    payload = _build_openrouter_payload(
+        cleaned,
+        instructions,
+        stream=False,
+        image_data_urls=image_data_urls,
+    )
+    response: httpx.Response | None = None
+    LOGGER.debug("LLM provider=openrouter model=%s stream=false", _resolve_openrouter_model())
+    for attempt in range(3):
+        http = await get_codex_http_client()
+        try:
+            response = await http.post(
+                _resolve_openrouter_url(),
+                headers=headers,
+                json=payload,
+                timeout=45.0,
+            )
+            break
+        except httpx.TransportError as exc:
+            await reset_shared_http_client("codex")
+            if attempt < 2:
+                LOGGER.warning(
+                    "OpenRouter transport error on attempt %s/3: %s",
+                    attempt + 1,
+                    exc,
+                )
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+            raise _CodexApiError(f"OpenRouter request failed after retries: {exc}") from exc
+    if response is None:
+        raise _CodexApiError("OpenRouter request failed before receiving a response.")
+    if response.status_code >= 400:
+        _raise_openrouter_http_error(response)
+    try:
+        data = response.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        LOGGER.debug("Failed to parse OpenRouter JSON response: %s", exc)
+        return ""
+    return _extract_openrouter_content(data)
+
+
+async def _call_openrouter(
+    cleaned: str,
+    instructions: str,
+    *,
+    verbosity: str = "medium",
+    on_token: Callable[[str], Awaitable[None]] | None = None,
+    image_data_urls: Sequence[str] | None = None,
+) -> str:
+    if _streaming_enabled() and on_token is not None:
+        try:
+            fragments: list[str] = []
+            LOGGER.debug("LLM provider=openrouter model=%s stream=true", _resolve_openrouter_model())
+            async with _StreamingOpenRouterResponse(
+                cleaned=cleaned,
+                instructions=instructions,
+                image_data_urls=image_data_urls,
+            ) as stream:
+                async for delta in stream:
+                    fragments.append(delta)
+                    await on_token(delta)
+                parsed = "".join(fragments).strip() or stream.full_text.strip()
+                if parsed:
+                    return parsed
+        except (_CodexAuthError, _CodexRateLimitError):
+            raise
+        except Exception as exc:
+            LOGGER.debug("OpenRouter streaming failed, falling back to non-stream: %s", exc)
+    return await _call_openrouter_non_stream(
+        cleaned,
+        instructions,
+        verbosity=verbosity,
+        image_data_urls=image_data_urls,
+    )
 
 
 async def _call_codex_non_stream(
@@ -1614,6 +1890,15 @@ async def _call_codex(
     on_token: Callable[[str], Awaitable[None]] | None = None,
     image_data_urls: Sequence[str] | None = None,
 ) -> str:
+    if _using_openrouter():
+        return await _call_openrouter(
+            cleaned,
+            instructions,
+            verbosity=verbosity,
+            on_token=on_token,
+            image_data_urls=image_data_urls,
+        )
+
     if _streaming_enabled():
         try:
             fragments: list[str] = []
@@ -2146,6 +2431,14 @@ async def _call_codex_with_auth_repair(
     verbosity: str = "medium",
     on_token: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
+    if _using_openrouter():
+        return await _call_openrouter(
+            cleaned,
+            instructions,
+            verbosity=verbosity,
+            on_token=on_token,
+        )
+
     try:
         auth_context = await auth_manager.get_auth_context()
         return await _call_codex(
@@ -3976,24 +4269,12 @@ async def _normalize_digest_output(
         return cleaned
 
     try:
-        auth_context = await auth_manager.get_auth_context()
-        rewritten = await _call_codex(
+        rewritten = await _call_codex_with_auth_repair(
             cleaned,
-            auth_context,
-            instructions=_digest_english_rewrite_prompt(),
+            auth_manager,
+            _digest_english_rewrite_prompt(),
             verbosity="low",
         )
-    except _CodexAuthError:
-        try:
-            auth_context = await auth_manager.refresh_auth_context()
-            rewritten = await _call_codex(
-                cleaned,
-                auth_context,
-                instructions=_digest_english_rewrite_prompt(),
-                verbosity="low",
-            )
-        except Exception:
-            return cleaned
     except Exception:
         return cleaned
 
@@ -6069,25 +6350,12 @@ async def classify_severity(
     compact = cleaned if len(cleaned) <= 1800 else f"{cleaned[:1797].rsplit(' ', 1)[0]}..."
 
     try:
-        auth_context = await auth_manager.get_auth_context()
-        raw = await _call_codex(
+        raw = await _call_codex_with_auth_repair(
             compact,
-            auth_context,
-            instructions=_severity_system_prompt(),
+            auth_manager,
+            _severity_system_prompt(),
             verbosity="low",
         )
-    except _CodexAuthError:
-        try:
-            auth_context = await auth_manager.refresh_auth_context()
-            raw = await _call_codex(
-                compact,
-                auth_context,
-                instructions=_severity_system_prompt(),
-                verbosity="low",
-            )
-        except Exception:
-            _severity_cache_set(key, heuristic)
-            return heuristic
     except (_CodexRateLimitError, httpx.HTTPError, _CodexApiError, ValueError):
         _severity_cache_set(key, heuristic)
         return heuristic
@@ -6695,25 +6963,12 @@ async def summarize_vital_rational_view(
     compact = _context_evidence_prompt_input(cleaned, evidence)
 
     try:
-        auth_context = await auth_manager.get_auth_context()
-        raw = await _call_codex(
+        raw = await _call_codex_with_auth_repair(
             compact,
-            auth_context,
-            instructions=_vital_rational_view_prompt(),
+            auth_manager,
+            _vital_rational_view_prompt(),
             verbosity="low",
         )
-    except _CodexAuthError:
-        try:
-            auth_context = await auth_manager.refresh_auth_context()
-            raw = await _call_codex(
-                compact,
-                auth_context,
-                instructions=_vital_rational_view_prompt(),
-                verbosity="low",
-            )
-        except Exception:
-            _vital_view_cache_set(key, None)
-            return None
     except (_CodexRateLimitError, httpx.HTTPError, _CodexApiError, ValueError):
         _vital_view_cache_set(key, None)
         return None

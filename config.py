@@ -198,6 +198,20 @@ DESTINATION = _env_str("DESTINATION", "")  # type: str
 BOT_DESTINATION_TOKEN = _env_str("BOT_DESTINATION_TOKEN", "")  # type: str
 BOT_DESTINATION_CHAT_ID = _env_str("BOT_DESTINATION_CHAT_ID", "")  # type: str
 
+# LLM provider settings.
+LLM_PROVIDER = _env_str("LLM_PROVIDER", "auto").lower()  # type: str
+OPENROUTER_API_KEY = _env_str("OPENROUTER_API_KEY", "")  # type: str
+OPENROUTER_BASE_URL = _env_str(
+    "OPENROUTER_BASE_URL",
+    "https://openrouter.ai/api/v1/chat/completions",
+)  # type: str
+OPENROUTER_HTTP_REFERER = _env_str(
+    "OPENROUTER_HTTP_REFERER",
+    "https://github.com/therayyanawaz/TeleUserBot",
+)  # type: str
+OPENROUTER_APP_TITLE = _env_str("OPENROUTER_APP_TITLE", "TeleUserBot News Aggregator")  # type: str
+LLM_MODEL = _env_str("LLM_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")  # type: str
+
 # Codex OAuth subscription backend settings.
 CODEX_BASE_URL = _env_str("CODEX_BASE_URL", "https://chatgpt.com/backend-api")  # type: str
 CODEX_MODEL = _env_str("CODEX_MODEL", "gpt-5.1-codex-mini")  # type: str

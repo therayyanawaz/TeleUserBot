@@ -1849,6 +1849,11 @@ async def search_recent_messages(
     # Stage 1: server-side fuzzy search using multiple variants. Long natural
     # language questions often perform poorly as a single literal search string.
     search_variants = list(plan.search_variants)
+    if sparse_subject_query:
+        # Short entity-style queries can generate many near-equivalent variants.
+        # Cap server-side passes so latency stays bounded; fallback scanning still
+        # covers recent history when exact search is weak.
+        search_variants = search_variants[:3]
 
     for search_text in search_variants:
         await _emit_progress(

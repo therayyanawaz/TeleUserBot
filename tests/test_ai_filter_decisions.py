@@ -231,6 +231,69 @@ async def test_call_codex_non_stream_retries_transport_errors(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_openrouter_non_stream_uses_openai_compatible_response(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _FakeClient:
+        async def post(self, url, headers=None, json=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = headers or {}
+            captured["json"] = json or {}
+            captured["timeout"] = timeout
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "OpenRouter response"}}]},
+            )
+
+    async def fake_get_codex_http_client():
+        return _FakeClient()
+
+    monkeypatch.setattr(ai_filter.config, "OPENROUTER_API_KEY", "sk-or-test", raising=False)
+    monkeypatch.setattr(ai_filter.config, "LLM_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
+    monkeypatch.setattr(ai_filter.config, "OPENROUTER_BASE_URL", "https://openrouter.test/chat", raising=False)
+    monkeypatch.setattr(ai_filter, "get_codex_http_client", fake_get_codex_http_client)
+
+    result = await ai_filter._call_openrouter_non_stream("hello", "system")
+
+    assert result == "OpenRouter response"
+    assert captured["url"] == "https://openrouter.test/chat"
+    assert captured["headers"]["Authorization"] == "Bearer sk-or-test"
+    assert captured["json"]["model"] == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert captured["json"]["messages"][0] == {"role": "system", "content": "system"}
+    assert captured["json"]["messages"][1] == {"role": "user", "content": "hello"}
+    assert captured["json"]["stream"] is False
+
+
+@pytest.mark.asyncio
+async def test_openrouter_provider_bypasses_auth_manager(monkeypatch):
+    class _ExplodingAuthManager:
+        async def get_auth_context(self):
+            raise AssertionError("auth manager should not be used")
+
+        async def refresh_auth_context(self):
+            raise AssertionError("auth manager should not be used")
+
+    async def fake_call_openrouter(cleaned, instructions, **kwargs):
+        assert cleaned == "headline"
+        assert instructions == "instructions"
+        assert kwargs["verbosity"] == "low"
+        return "routed through openrouter"
+
+    monkeypatch.setattr(ai_filter.config, "LLM_PROVIDER", "openrouter", raising=False)
+    monkeypatch.setattr(ai_filter.config, "OPENROUTER_API_KEY", "sk-or-test", raising=False)
+    monkeypatch.setattr(ai_filter, "_call_openrouter", fake_call_openrouter)
+
+    result = await ai_filter._call_codex_with_auth_repair(
+        "headline",
+        _ExplodingAuthManager(),
+        "instructions",
+        verbosity="low",
+    )
+
+    assert result == "routed through openrouter"
+
+
+@pytest.mark.asyncio
 async def test_create_digest_summary_result_falls_back_after_weak_ai_retry(monkeypatch):
     calls = {"count": 0}
 
