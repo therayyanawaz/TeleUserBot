@@ -6,7 +6,12 @@
 
 ### Features
 
+- `32a7053` feat: fetch article pages for query web context
 - `ac99e77` feat: add web entity summaries for query answers
+
+### Docs
+
+- `7ef3a9b` docs: update changelog [skip ci]
 
 ## 2026-05-05
 
