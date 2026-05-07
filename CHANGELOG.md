@@ -2,7 +2,24 @@
 
 > Auto-generated from git history. Prefer conventional commits.
 
+## 2026-05-07
+
+### Features
+
+- `ac99e77` feat: add web entity summaries for query answers
+
 ## 2026-05-05
+
+### Docs
+
+- `f75efc5` docs: update changelog [skip ci]
+- `cffef4b` docs: update changelog [skip ci]
+- `ac2103e` docs: update changelog [skip ci]
+- `2f83445` docs: update changelog [skip ci]
+- `5e0fb9d` docs: update changelog [skip ci]
+- `5ff276f` docs: update changelog [skip ci]
+- `02488e8` docs: update changelog [skip ci]
+- `9b25382` docs: update changelog [skip ci]
 
 ### Features
 
@@ -11,16 +28,6 @@
 - `a09139a` feat: enable query web crosscheck by default
 - `6bb97ab` feat: strengthen local NLP query router
 - `b7a7dcb` feat: add local NLP filter toggle
-
-### Docs
-
-- `cffef4b` docs: update changelog [skip ci]
-- `ac2103e` docs: update changelog [skip ci]
-- `2f83445` docs: update changelog [skip ci]
-- `5e0fb9d` docs: update changelog [skip ci]
-- `5ff276f` docs: update changelog [skip ci]
-- `02488e8` docs: update changelog [skip ci]
-- `9b25382` docs: update changelog [skip ci]
 
 ### Fixes
 
