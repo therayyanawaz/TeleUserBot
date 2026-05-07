@@ -6,10 +6,12 @@
 
 ### Fixes
 
+- `c32ad3a` fix: harden identity query retrieval
 - `d3f09b8` fix: reject report leads as entity definitions
 
 ### Docs
 
+- `e33aeb9` docs: update changelog [skip ci]
 - `4d36573` docs: update changelog [skip ci]
 - `7ef3a9b` docs: update changelog [skip ci]
 
