@@ -4455,7 +4455,7 @@ def _query_is_identity_question(query: str) -> bool:
     lowered = normalize_space(query).lower()
     if not lowered:
         return False
-    if re.match(r"^(?:who|whom)\s+(?:is|was|are|were)\b", lowered):
+    if re.match(r"^(?:(?:what|who)\s+or\s+who|(?:who|whom|what))\s+(?:is|was|are|were)\b", lowered):
         return True
     markers = (
         "who died",
@@ -4477,6 +4477,8 @@ def _query_subject_phrase(query: str) -> str:
     if not cleaned:
         return ""
     patterns = (
+        r"^(?:(?:what|who)\s+or\s+who)\s+(?:is|was|are|were)\s+(.+?)\??$",
+        r"^(?:what)\s+(?:is|was|are|were)\s+(.+?)\??$",
         r"^(?:who|whom)\s+(?:is|was|are|were)\s+(.+?)\??$",
         r"^(?:where)\s+(?:is|was|are|were|did|does|do|has|have)\s+(.+?)\??$",
         r"^(?:when)\s+(?:is|was|are|were|did|does|do|has|have)\s+(.+?)\??$",
@@ -4529,7 +4531,7 @@ def _query_intent(query: str) -> Literal["who", "where", "when", "which", "what"
     lowered = normalize_space(query).lower()
     if query_prefers_direct_answer(query):
         return "strategic"
-    if re.match(r"^(?:who|whom)\b", lowered):
+    if re.match(r"^(?:(?:what|who)\s+or\s+who|(?:who|whom|what)\s+(?:is|was|are|were))\b", lowered):
         return "who"
     if re.match(r"^where\b", lowered):
         return "where"
@@ -5173,7 +5175,7 @@ def _score_query_context_row(
     if _query_is_identity_question(question) and _query_text_has_identity_markers(text):
         intent_score += 1.4
     subject_tokens = _query_subject_tokens(question)
-    if subject_tokens:
+    if subject_tokens and _query_intent(question) == "who":
         if _query_text_has_subject(question, text):
             intent_score += 5.0
         else:
@@ -5574,6 +5576,15 @@ def _local_nlp_query_sentences(
             continue
         for sentence in _split_digest_sentences(raw_text):
             cleaned = _digest_finalize_sentence(sentence, max_chars=260)
+            subject = _query_subject_phrase(query)
+            if (
+                intent == "who"
+                and subject
+                and re.match(rf"^\s*{re.escape(subject)}\s*:", sentence, flags=re.IGNORECASE)
+            ):
+                cleaned = normalize_space(sentence)
+                if len(cleaned) > 260:
+                    cleaned = f"{cleaned[:257].rsplit(' ', 1)[0]}..."
             if not cleaned or _is_bad_feed_headline(cleaned) or _digest_is_low_value_quote_or_rant(cleaned):
                 continue
             sentence_item = dict(item)
@@ -5592,6 +5603,14 @@ def _local_nlp_query_sentences(
                 score += 2.0
             if intent == "why" and _query_has_causal_signal(cleaned):
                 score += 2.5
+            if (
+                intent == "who"
+                and subject
+                and re.match(rf"^\s*{re.escape(subject)}\s*:", cleaned, flags=re.IGNORECASE)
+            ):
+                score += 6.0
+            if bool(item.get("is_web")):
+                score += 1.0
             if score > 0:
                 scored.append((score, cleaned))
 
@@ -5624,6 +5643,30 @@ def _local_nlp_query_title(intent: str) -> str:
     return "Best available answer"
 
 
+def _entity_definition_from_sentence(query: str, sentence: str) -> str:
+    subject = _query_subject_phrase(query)
+    if not subject:
+        return ""
+    escaped = re.escape(subject)
+    patterns = (
+        rf"\b{escaped}\s*:\s*(?P<definition>[^.;:]+)",
+        rf"\b{escaped}\s+(?:is|was|are|were)\s+(?P<definition>[^.;:]+)",
+        rf"(?P<definition>[A-Z][^.;:,\n]{{4,120}}?)\s+{escaped}\b",
+        rf"\b{escaped},\s+(?P<definition>[^.;:]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, sentence, flags=re.IGNORECASE)
+        if not match:
+            continue
+        definition = normalize_space(match.group("definition")).strip(" ,.-")
+        if not definition:
+            continue
+        if len(definition.split()) > 18:
+            definition = " ".join(definition.split()[:18]).rstrip(" ,.-")
+        return f"{subject} is {definition}."
+    return ""
+
+
 def _render_local_nlp_query_answer(
     query: str,
     sentences: Sequence[str],
@@ -5633,11 +5676,14 @@ def _render_local_nlp_query_answer(
     if not sentences:
         return QUERY_NO_MATCH_TEXT
     intent = _query_intent(query)
+    definition = _entity_definition_from_sentence(query, sentences[0]) if intent == "who" else ""
     lead = _build_digest_story_from_fragments(
         sentences[:2],
         total_max_chars=360 if detailed else 260,
         max_sentences=2 if detailed else 1,
     )
+    if definition:
+        lead = definition
     if intent == "when":
         time_match = next((_QUERY_TIME_RE.search(line) for line in sentences if _QUERY_TIME_RE.search(line)), None)
         if time_match:

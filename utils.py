@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter, deque
-import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 from email.utils import parsedate_to_datetime
@@ -18,7 +17,7 @@ import re
 import threading
 import time
 from typing import Any, Awaitable, Callable, Iterable, List, Sequence, Tuple
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote, quote_plus, urlparse
 import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -32,7 +31,7 @@ from db import (
     save_recent_media_signature,
 )
 from news_taxonomy import match_news_category, record_ontology_label_resolution
-from news_signals import looks_like_live_event_update, should_downgrade_explainer_urgency
+from news_signals import should_downgrade_explainer_urgency
 from shared_http import get_web_http_client
 
 
@@ -2186,6 +2185,78 @@ async def search_recent_news_web(
 
     rows.sort(key=lambda row: int(row.get("timestamp", 0)), reverse=True)
     return rows[:resolved_max]
+
+
+def query_entity_title(query: str) -> str:
+    cleaned = normalize_space(query)
+    patterns = (
+        r"^(?:(?:what|who)\s+or\s+who)\s+(?:is|was|are|were)\s+(.+?)\??$",
+        r"^(?:what|who|whom)\s+(?:is|was|are|were)\s+(.+?)\??$",
+        r"^(?:tell me about|identify|explain who)\s+(.+?)\??$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, cleaned, flags=re.IGNORECASE)
+        if match:
+            return normalize_space(match.group(1)).strip(" ?.,;:!\"'")
+    return ""
+
+
+async def search_entity_web_summary(
+    query: str,
+    *,
+    logger: logging.Logger | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch one lightweight encyclopedic web row for identity queries."""
+    title = query_entity_title(query)
+    if len(title) < 2:
+        return []
+
+    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(title.replace(' ', '_'), safe='')}"
+    try:
+        http = await get_web_http_client()
+        response = await http.get(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "TeleUserBot/1.0 query-entity-summary",
+            },
+        )
+    except Exception:
+        if logger:
+            logger.debug("Entity web summary search failed.", exc_info=True)
+        return []
+
+    if response.status_code != 200:
+        return []
+    try:
+        payload = response.json()
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+
+    page_title = normalize_space(str(payload.get("title") or title))
+    extract = normalize_space(str(payload.get("extract") or ""))
+    page_url = normalize_space(str((payload.get("content_urls") or {}).get("desktop", {}).get("page") or ""))
+    if not extract:
+        return []
+    if len(extract) > 700:
+        extract = f"{extract[:697].rsplit(' ', 1)[0]}..."
+
+    now = datetime.now(timezone.utc)
+    return [
+        {
+            "chat_id": "web",
+            "message_id": 0,
+            "timestamp": int(now.timestamp()),
+            "date": now.isoformat(),
+            "source": "Web:Wikipedia",
+            "text": f"{page_title}: {extract}",
+            "link": page_url or url,
+            "provider": "wikipedia_summary",
+            "is_web": True,
+        }
+    ]
 
 
 @dataclass

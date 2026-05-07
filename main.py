@@ -173,6 +173,7 @@ from utils import (
     extract_query_keywords,
     extract_query_numbers,
     sanitize_telegram_html,
+    search_entity_web_summary,
     search_recent_news_web,
     search_recent_messages,
     query_prefers_direct_answer,
@@ -9761,6 +9762,13 @@ async def _search_recent_news_web_bounded(*args, **kwargs) -> list[dict[str, obj
         return await search_recent_news_web(*args, **kwargs)
 
 
+async def _search_entity_web_summary_bounded(*args, **kwargs) -> list[dict[str, object]]:
+    if pipeline_query_web_semaphore is None:
+        return await search_entity_web_summary(*args, **kwargs)
+    async with pipeline_query_web_semaphore:
+        return await search_entity_web_summary(*args, **kwargs)
+
+
 async def _handle_query_request(
     *,
     event_ref: object,
@@ -9919,6 +9927,7 @@ async def _handle_query_request(
         web_results: list[dict[str, object]] = []
         web_fallback_used = False
         ran_web_search = False
+        entity_web_summary_used = False
 
         should_run_web_search = bool(_is_query_web_crosscheck_required())
 
@@ -9942,8 +9951,19 @@ async def _handle_query_request(
                 progress_cb=progress_tracker.handle_search_progress,
                 logger=LOGGER,
             )
+            entity_rows = await _search_entity_web_summary_bounded(
+                effective_query,
+                logger=LOGGER,
+            )
+            if entity_rows:
+                entity_web_summary_used = True
+                web_results = _merge_query_context(
+                    entity_rows,
+                    web_results,
+                    limit=max(_query_web_max_results(), 3),
+                )
 
-        if should_run_web_search and web_results:
+        if should_run_web_search and web_results and not entity_web_summary_used:
             required_sources = _query_web_require_min_sources()
             if web_results and required_sources > 1:
                 source_hosts = {

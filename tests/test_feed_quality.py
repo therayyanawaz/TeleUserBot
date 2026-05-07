@@ -812,6 +812,54 @@ def test_local_query_answer_uses_exact_person_subject_not_substring_noise():
     assert "Libya" not in plain
 
 
+def test_local_query_answer_defines_what_or_who_entity_from_web_context():
+    answer = ai_filter._local_nlp_query_answer(
+        "what or who is Lufthansa?",
+        [
+            {
+                "text": "On May 6, Germany's largest airline Lufthansa announced losses of €1.7 billion due to rising fuel prices.",
+                "source": "Web:Reuters",
+                "timestamp": 1778150000,
+                "is_web": True,
+            },
+            {
+                "text": "Initial reports indicate Lufthansa has lost €1.7 billion due to rising jet fuel prices caused by the war with Iran.",
+                "source": "War & News Alert",
+                "timestamp": 1778149000,
+            },
+        ],
+        detailed=False,
+    )
+    plain = ai_filter.strip_telegram_html(answer)
+
+    assert "Lufthansa is Germany's largest airline" in plain
+    assert "€1.7 billion" in plain
+
+
+def test_local_query_answer_defines_entity_from_wikipedia_style_context():
+    answer = ai_filter._local_nlp_query_answer(
+        "what or who is Lufthansa?",
+        [
+            {
+                "text": "Lufthansa: Deutsche Lufthansa AG, commonly shortened to Lufthansa, is Germany's flag carrier airline.",
+                "source": "Web:Wikipedia",
+                "timestamp": 1778150000,
+                "is_web": True,
+            },
+            {
+                "text": "Initial reports indicate Lufthansa has lost €1.7 billion due to rising jet fuel prices.",
+                "source": "War & News Alert",
+                "timestamp": 1778149000,
+            },
+        ],
+        detailed=False,
+    )
+    plain = ai_filter.strip_telegram_html(answer)
+
+    assert "Lufthansa is Deutsche Lufthansa AG" in plain
+    assert "€1.7 billion" in plain
+
+
 def test_local_query_answer_handles_where_query_with_location_anchor():
     answer = ai_filter._local_nlp_query_answer(
         "Where did the IDF issue evacuation warnings?",
@@ -1904,6 +1952,68 @@ async def test_handle_query_request_checks_local_db_before_live_telegram(monkeyp
     assert any(row["source"] == "Queue" for row in answer_contexts[0])
     assert any(row["source"] == "Archive" for row in answer_contexts[0])
     assert any(row["source"] == "Live" for row in answer_contexts[0])
+
+
+@pytest.mark.asyncio
+async def test_handle_query_request_adds_entity_web_summary_for_identity_query(monkeypatch):
+    main.query_last_request_ts.clear()
+    answer_contexts: list[list[dict[str, object]]] = []
+
+    async def fake_safe_reply_markdown(_event, text, *, edit_message=None, reply_to=None, prefer_bot_identity=False, bot_chat_id=None):
+        return edit_message or {"message_id": 711}
+
+    async def fake_search_recent_messages(*_args, **_kwargs):
+        return [
+            {
+                "text": "Initial reports indicate Lufthansa has lost €1.7 billion due to rising jet fuel prices.",
+                "source": "War & News Alert",
+                "timestamp": 1778149000,
+            }
+        ]
+
+    async def fake_search_recent_news_web(*_args, **_kwargs):
+        return []
+
+    async def fake_search_entity_web_summary(query, *, logger=None):
+        assert "Lufthansa" in query
+        return [
+            {
+                "text": "Lufthansa: Deutsche Lufthansa AG, commonly shortened to Lufthansa, is Germany's flag carrier airline.",
+                "source": "Web:Wikipedia",
+                "timestamp": 1778150000,
+                "is_web": True,
+            }
+        ]
+
+    async def fake_generate_answer_from_context(*, query, context_messages, auth_manager=None, conversation_history=None):
+        answer_contexts.append(list(context_messages))
+        return "<b>Best available identity match</b><br>Lufthansa is Deutsche Lufthansa AG."
+
+    monkeypatch.setattr(main, "_is_query_runtime_available", lambda: True)
+    monkeypatch.setattr(main, "_safe_reply_markdown", fake_safe_reply_markdown)
+    monkeypatch.setattr(main, "_require_client", lambda: object())
+    monkeypatch.setattr(main, "_require_auth_manager", lambda: object())
+    monkeypatch.setattr(main, "_is_streaming_enabled", lambda: False)
+    monkeypatch.setattr(main, "_load_queue_query_context", lambda **_kwargs: [])
+    monkeypatch.setattr(main, "_load_archive_query_context", lambda **_kwargs: [])
+    monkeypatch.setattr(main, "search_recent_messages", fake_search_recent_messages)
+    monkeypatch.setattr(main, "_search_recent_news_web_bounded", fake_search_recent_news_web)
+    monkeypatch.setattr(main, "_search_entity_web_summary_bounded", fake_search_entity_web_summary)
+    monkeypatch.setattr(main, "generate_answer_from_context", fake_generate_answer_from_context)
+    monkeypatch.setattr(main, "_append_query_history", lambda *_args, **_kwargs: None)
+
+    await main._handle_query_request(
+        event_ref=SimpleNamespace(chat_id=781),
+        text="what or who is Lufthansa?",
+        sender_id=81,
+        chat_id="chat-81",
+        reply_to=None,
+        prefer_bot_identity=False,
+        bot_chat_id=None,
+    )
+
+    assert answer_contexts
+    assert any(row["source"] == "Web:Wikipedia" for row in answer_contexts[0])
 
 
 @pytest.mark.asyncio
