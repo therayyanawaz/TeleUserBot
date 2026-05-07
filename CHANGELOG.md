@@ -4,21 +4,23 @@
 
 ## 2026-05-07
 
-### Fixes
+### Features
 
-- `c32ad3a` fix: harden identity query retrieval
-- `d3f09b8` fix: reject report leads as entity definitions
+- `2e9e89a` feat: support openrouter llm provider
+- `32a7053` feat: fetch article pages for query web context
+- `ac99e77` feat: add web entity summaries for query answers
 
 ### Docs
 
+- `1e0a257` docs: update changelog [skip ci]
 - `e33aeb9` docs: update changelog [skip ci]
 - `4d36573` docs: update changelog [skip ci]
 - `7ef3a9b` docs: update changelog [skip ci]
 
-### Features
+### Fixes
 
-- `32a7053` feat: fetch article pages for query web context
-- `ac99e77` feat: add web entity summaries for query answers
+- `c32ad3a` fix: harden identity query retrieval
+- `d3f09b8` fix: reject report leads as entity definitions
 
 ## 2026-05-05
 
