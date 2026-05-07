@@ -902,6 +902,31 @@ def test_local_query_answer_does_not_define_entity_from_report_lead():
     assert "€1.7 billion" in plain
 
 
+def test_local_query_answer_handles_appositive_identity_and_dedupes_support():
+    answer = ai_filter._local_nlp_query_answer(
+        "what is Lufthansa?",
+        [
+            {
+                "text": "Lufthansa, the German flag carrier airline, announced losses after fuel prices rose.",
+                "source": "Web:Article",
+                "timestamp": 1778150000,
+                "is_web": True,
+            },
+            {
+                "text": "Lufthansa, the German flag carrier airline, announced losses after fuel prices rose.",
+                "source": "Web:Article",
+                "timestamp": 1778150000,
+                "is_web": True,
+            },
+        ],
+        detailed=False,
+    )
+    plain = ai_filter.strip_telegram_html(answer)
+
+    assert "Lufthansa is German flag carrier airline" in plain
+    assert plain.count("German flag carrier airline") == 1
+
+
 def test_local_query_answer_defines_entity_from_wikipedia_style_context():
     answer = ai_filter._local_nlp_query_answer(
         "what or who is Lufthansa?",
@@ -2024,11 +2049,13 @@ async def test_handle_query_request_checks_local_db_before_live_telegram(monkeyp
 async def test_handle_query_request_adds_entity_web_summary_for_identity_query(monkeypatch):
     main.query_last_request_ts.clear()
     answer_contexts: list[list[dict[str, object]]] = []
+    search_hours: list[int] = []
 
     async def fake_safe_reply_markdown(_event, text, *, edit_message=None, reply_to=None, prefer_bot_identity=False, bot_chat_id=None):
         return edit_message or {"message_id": 711}
 
     async def fake_search_recent_messages(*_args, **_kwargs):
+        search_hours.append(int(_kwargs.get("default_hours_back") or 0))
         return [
             {
                 "text": "Initial reports indicate Lufthansa has lost €1.7 billion due to rising jet fuel prices.",
@@ -2079,6 +2106,8 @@ async def test_handle_query_request_adds_entity_web_summary_for_identity_query(m
     )
 
     assert answer_contexts
+    assert search_hours == [24 * 14]
+    assert answer_contexts[0][0]["source"] == "Web:Wikipedia"
     assert any(row["source"] == "Web:Wikipedia" for row in answer_contexts[0])
 
 

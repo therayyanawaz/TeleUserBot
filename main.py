@@ -174,6 +174,7 @@ from utils import (
     extract_query_numbers,
     sanitize_telegram_html,
     search_entity_web_summary,
+    query_entity_title,
     search_recent_news_web,
     search_recent_messages,
     query_prefers_direct_answer,
@@ -1732,6 +1733,10 @@ def _query_window_strategy(*, requested_hours: int, explicit_time_filter: bool) 
     if explicit_time_filter:
         return primary_hours, primary_hours
     return min(primary_hours, 24), max(primary_hours, _query_expanded_window_hours())
+
+
+def _query_identity_window_hours() -> int:
+    return 24 * 14
 
 
 def _query_needs_expanded_window(
@@ -9805,10 +9810,15 @@ async def _handle_query_request(
 
     plan = build_query_plan(text, default_hours=_query_default_hours_back())
     parsed_hours = plan.hours_back
+    explicit_time_filter = bool(getattr(plan, "explicit_time_filter", False))
     primary_hours, expanded_hours = _query_window_strategy(
         requested_hours=parsed_hours,
-        explicit_time_filter=bool(getattr(plan, "explicit_time_filter", False)),
+        explicit_time_filter=explicit_time_filter,
     )
+    identity_query = bool(query_entity_title(plan.original_query or text))
+    if identity_query and not explicit_time_filter:
+        primary_hours = max(primary_hours, _query_identity_window_hours())
+        expanded_hours = max(expanded_hours, primary_hours)
 
     progress = await _safe_reply_markdown(
         event_ref,  # type: ignore[arg-type]
@@ -9843,6 +9853,16 @@ async def _handle_query_request(
             window_hours=primary_hours,
             force=True,
         )
+
+        entity_web_results: list[dict[str, object]] = []
+        entity_web_summary_used = False
+        should_run_web_search = bool(_is_query_web_crosscheck_required())
+        if should_run_web_search and identity_query:
+            entity_web_results = await _search_entity_web_summary_bounded(
+                effective_query,
+                logger=LOGGER,
+            )
+            entity_web_summary_used = bool(entity_web_results)
 
         queue_results: list[dict[str, object]] = []
         archive_results: list[dict[str, object]] = []
@@ -9927,9 +9947,7 @@ async def _handle_query_request(
         web_results: list[dict[str, object]] = []
         web_fallback_used = False
         ran_web_search = False
-        entity_web_summary_used = False
-
-        should_run_web_search = bool(_is_query_web_crosscheck_required())
+        web_results = list(entity_web_results)
 
         if should_run_web_search:
             ran_web_search = True
@@ -9951,17 +9969,11 @@ async def _handle_query_request(
                 progress_cb=progress_tracker.handle_search_progress,
                 logger=LOGGER,
             )
-            entity_rows = await _search_entity_web_summary_bounded(
-                effective_query,
-                logger=LOGGER,
+            web_results = _merge_query_context(
+                entity_web_results,
+                web_results,
+                limit=max(_query_web_max_results(), 3),
             )
-            if entity_rows:
-                entity_web_summary_used = True
-                web_results = _merge_query_context(
-                    entity_rows,
-                    web_results,
-                    limit=max(_query_web_max_results(), 3),
-                )
 
         if should_run_web_search and web_results and not entity_web_summary_used:
             required_sources = _query_web_require_min_sources()
@@ -9981,8 +9993,8 @@ async def _handle_query_request(
         web_fallback_used = bool(web_results)
 
         results = _merge_query_context(
-            pre_web_results,
             web_results,
+            pre_web_results,
             limit=max(context_limit, _query_max_messages()),
         )
 

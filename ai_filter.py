@@ -5687,6 +5687,8 @@ def _entity_definition_from_sentence(query: str, sentence: str) -> str:
     forward_patterns = (
         rf"\b{escaped}\s*:\s*(?P<definition>[^.;:]+)",
         rf"\b{escaped}\s+(?:is|was|are|were)\s+(?P<definition>[^.;:]+)",
+        rf"\b{escaped},\s+(?:which|who)\s+(?:is|was|are|were)\s+(?P<definition>[^.;:]+)",
+        rf"\b{escaped},\s+(?:the|a|an)\s+(?P<definition>[^,.;:]+)",
         rf"\b{escaped},\s+(?P<definition>[^.;:]+)",
     )
     for pattern in forward_patterns:
@@ -5739,10 +5741,14 @@ def _render_local_nlp_query_answer(
     if lead:
         parts.append(sanitize_telegram_html(lead))
     seen = {_digest_line_key(lead)}
+    lead_plain = normalize_space(strip_telegram_html(lead)).lower()
     max_bullets = 4 if detailed else 2
     for sentence in sentences[1:]:
         key = _digest_line_key(sentence)
         if not key or key in seen:
+            continue
+        sentence_plain = normalize_space(strip_telegram_html(sentence)).lower()
+        if lead_plain and SequenceMatcher(None, lead_plain, sentence_plain).ratio() > 0.85:
             continue
         seen.add(key)
         parts.append(f"• {sanitize_telegram_html(sentence)}")
@@ -7396,6 +7402,7 @@ async def generate_answer_from_context_result(
         output_language=output_language,
         detailed=detailed,
         strategic_trend=strategic_trend_query,
+        identity_query=_query_is_identity_question(question),
     )
     retry_issue = ""
 

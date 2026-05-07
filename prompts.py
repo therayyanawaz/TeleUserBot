@@ -220,6 +220,7 @@ def build_query_system_prompt(
     output_language: str,
     detailed: bool,
     strategic_trend: bool = False,
+    identity_query: bool = False,
 ) -> str:
     mode_line = (
         "Detail mode enabled: still lead with a sharp direct answer, then use no more than 4 short support bullets."
@@ -231,6 +232,11 @@ def build_query_system_prompt(
         if strategic_trend
         else ""
     )
+    identity_line = (
+        "Identity query: use an Anchor + Delta structure. Line 1 must define the entity as 'X is [entity type] from/connected to [place/org]'. Line 2 must say why it is in the news now. Bullets may add numbers or official claims. Never define X from a report lead like 'initial reports indicate'."
+        if identity_query
+        else ""
+    )
     base = QUERY_SYSTEM_PROMPT.replace("NO_MATCH_SENTINEL", QUERY_NO_MATCH_TEXT)
     return (
         f"{base}\n\n"
@@ -238,5 +244,6 @@ def build_query_system_prompt(
         f"{HUMAN_NEWSROOM_VOICE}\n"
         f"{HTML_RULES}\n"
         f"{mode_line}\n"
-        f"{strategic_line}".rstrip()
+        f"{strategic_line}\n"
+        f"{identity_line}".rstrip()
     )
