@@ -692,6 +692,54 @@ async def test_search_recent_news_web_honors_explicit_thirty_day_window(monkeypa
     assert all("168h" not in url for url in urls)
 
 
+@pytest.mark.asyncio
+async def test_search_recent_news_web_fetches_article_context_by_default(monkeypatch):
+    class _FakeResponse:
+        status_code = 200
+
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    class _FakeHTTP:
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+
+        async def get(self, url: str, **_kwargs):
+            if "example.com/report" in url:
+                return _FakeResponse(
+                    "<html><body><article>"
+                    "<p>Deutsche Lufthansa AG is Germany's largest airline and operates major passenger and cargo services.</p>"
+                    "<p>The company said fuel costs and Middle East disruption weighed on its latest results.</p>"
+                    "</article></body></html>"
+                )
+            return _FakeResponse(
+                "<rss><channel><item>"
+                "<title>Lufthansa reports pressure from fuel prices</title>"
+                "<link>https://example.com/report</link>"
+                "<description>The airline cited higher jet fuel costs.</description>"
+                "</item></channel></rss>"
+            )
+
+    async def fake_get_web_http_client():
+        return _FakeHTTP()
+
+    monkeypatch.setattr(utils, "get_web_http_client", fake_get_web_http_client)
+    monkeypatch.setattr(utils.config, "QUERY_WEB_FETCH_ARTICLES", True)
+    monkeypatch.setattr(utils.config, "QUERY_WEB_ARTICLE_MAX_PAGES", 2)
+
+    results = await utils.search_recent_news_web(
+        "what or who is Lufthansa?",
+        hours_back=24 * 7,
+        max_results=3,
+        allowed_domains=[],
+        require_recent=False,
+    )
+
+    assert results
+    assert results[0].get("article_fetched") is True
+    assert "Germany's largest airline" in str(results[0]["text"])
+
+
 def test_strip_query_answer_citations_keeps_follow_up_language_while_removing_follow_promos():
     cleaned = main._strip_query_answer_citations(
         "NBC News confirmed follow-up explosions after the strike.<br>"

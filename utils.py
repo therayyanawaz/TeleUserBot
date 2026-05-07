@@ -1893,6 +1893,25 @@ def _strip_html_tags(value: str) -> str:
     return normalize_space(_unescape_html(text))
 
 
+def _extract_article_text(html: str, *, max_chars: int) -> str:
+    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", html or "", flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<nav\b[^>]*>.*?</nav>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<footer\b[^>]*>.*?</footer>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    paragraphs = [
+        _strip_html_tags(part)
+        for part in re.findall(r"<p\b[^>]*>(.*?)</p>", text, flags=re.IGNORECASE | re.DOTALL)
+        if len(_strip_html_tags(part).split()) >= 8
+    ]
+    if not paragraphs:
+        paragraphs = [_strip_html_tags(text)]
+    article = normalize_space(" ".join(paragraphs))
+    limit = max(120, int(max_chars))
+    if len(article) > limit:
+        article = f"{article[: limit - 3].rsplit(' ', 1)[0]}..."
+    return article
+
+
 def _domain_allowed(hostname: str, allowed_domains: Sequence[str]) -> bool:
     host = normalize_space(hostname).lower().lstrip(".")
     if not host:
@@ -2184,6 +2203,43 @@ async def search_recent_news_web(
             rows.append(row)
 
     rows.sort(key=lambda row: int(row.get("timestamp", 0)), reverse=True)
+    if bool(getattr(config, "QUERY_WEB_FETCH_ARTICLES", True)) and rows:
+        max_pages = max(0, min(int(getattr(config, "QUERY_WEB_ARTICLE_MAX_PAGES", 4) or 4), 8))
+        max_chars = max(240, min(int(getattr(config, "QUERY_WEB_ARTICLE_MAX_CHARS", 900) or 900), 2400))
+
+        async def _enrich_article(row: dict[str, Any]) -> dict[str, Any]:
+            link = normalize_space(str(row.get("link") or ""))
+            if not link.startswith("http"):
+                return row
+            try:
+                response = await http.get(
+                    link,
+                    headers={
+                        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+                        "User-Agent": headers["User-Agent"],
+                    },
+                    follow_redirects=True,
+                )
+            except Exception:
+                return row
+            if response.status_code != 200:
+                return row
+            article_text = _extract_article_text(str(response.text or ""), max_chars=max_chars)
+            if len(article_text.split()) < 20:
+                return row
+            enriched = dict(row)
+            base_text = normalize_space(str(enriched.get("text") or ""))
+            if article_text and article_text.lower() not in base_text.lower():
+                enriched["text"] = normalize_space(f"{base_text}. Article context: {article_text}")
+                enriched["article_fetched"] = True
+            return enriched
+
+        try:
+            enriched_rows = await asyncio.gather(*[_enrich_article(row) for row in rows[:max_pages]])
+            rows = [*enriched_rows, *rows[max_pages:]]
+        except Exception:
+            if logger:
+                logger.debug("Article fetch enrichment failed.", exc_info=True)
     return rows[:resolved_max]
 
 

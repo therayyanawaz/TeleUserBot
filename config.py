@@ -340,6 +340,9 @@ QUERY_WEB_CROSSCHECK_REQUIRED = _env_bool("QUERY_WEB_CROSSCHECK_REQUIRED", True)
 QUERY_WEB_MIN_TELEGRAM_RESULTS = _env_int("QUERY_WEB_MIN_TELEGRAM_RESULTS", 3)  # type: int
 # Maximum web evidence items to attach in query context.
 QUERY_WEB_MAX_RESULTS = _env_int("QUERY_WEB_MAX_RESULTS", 12)  # type: int
+QUERY_WEB_FETCH_ARTICLES = _env_bool("QUERY_WEB_FETCH_ARTICLES", True)  # type: bool
+QUERY_WEB_ARTICLE_MAX_PAGES = _env_int("QUERY_WEB_ARTICLE_MAX_PAGES", 4)  # type: int
+QUERY_WEB_ARTICLE_MAX_CHARS = _env_int("QUERY_WEB_ARTICLE_MAX_CHARS", 900)  # type: int
 # Enforce recency filter on web evidence timestamps.
 QUERY_WEB_REQUIRE_RECENT = _env_bool("QUERY_WEB_REQUIRE_RECENT", True)  # type: bool
 # Require at least this many unique web sources before using web evidence.
