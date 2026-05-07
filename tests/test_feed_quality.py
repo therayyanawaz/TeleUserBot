@@ -884,6 +884,24 @@ def test_local_query_answer_defines_what_or_who_entity_from_web_context():
     assert "€1.7 billion" in plain
 
 
+def test_local_query_answer_does_not_define_entity_from_report_lead():
+    answer = ai_filter._local_nlp_query_answer(
+        "what or who is Lufthansa?",
+        [
+            {
+                "text": "Initial reports indicate Lufthansa has lost €1.7 billion due to rising jet fuel prices caused by the war with Iran.",
+                "source": "War & News Alert",
+                "timestamp": 1778149000,
+            }
+        ],
+        detailed=False,
+    )
+    plain = ai_filter.strip_telegram_html(answer)
+
+    assert "Lufthansa is Initial reports indicate" not in plain
+    assert "€1.7 billion" in plain
+
+
 def test_local_query_answer_defines_entity_from_wikipedia_style_context():
     answer = ai_filter._local_nlp_query_answer(
         "what or who is Lufthansa?",

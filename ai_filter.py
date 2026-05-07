@@ -5648,22 +5648,64 @@ def _entity_definition_from_sentence(query: str, sentence: str) -> str:
     if not subject:
         return ""
     escaped = re.escape(subject)
-    patterns = (
+    report_leads = (
+        "initial reports indicate",
+        "reports indicate",
+        "reports say",
+        "according to reports",
+        "on ",
+    )
+    descriptor_terms = (
+        "airline",
+        "company",
+        "carrier",
+        "group",
+        "organization",
+        "manufacturer",
+        "bank",
+        "agency",
+        "party",
+        "leader",
+        "official",
+        "militant",
+        "commander",
+    )
+
+    def _valid(definition: str, *, reverse: bool = False) -> str:
+        cleaned = normalize_space(definition).strip(" ,.-")
+        if reverse and cleaned.lower().startswith("on ") and "," in cleaned:
+            cleaned = normalize_space(cleaned.split(",", 1)[1]).strip(" ,.-")
+        lowered = cleaned.lower()
+        if not cleaned or any(lowered.startswith(lead) for lead in report_leads):
+            return ""
+        if reverse and not any(term in lowered for term in descriptor_terms):
+            return ""
+        if len(cleaned.split()) > 18:
+            cleaned = " ".join(cleaned.split()[:18]).rstrip(" ,.-")
+        return cleaned
+
+    forward_patterns = (
         rf"\b{escaped}\s*:\s*(?P<definition>[^.;:]+)",
         rf"\b{escaped}\s+(?:is|was|are|were)\s+(?P<definition>[^.;:]+)",
-        rf"(?P<definition>[A-Z][^.;:,\n]{{4,120}}?)\s+{escaped}\b",
         rf"\b{escaped},\s+(?P<definition>[^.;:]+)",
     )
-    for pattern in patterns:
+    for pattern in forward_patterns:
         match = re.search(pattern, sentence, flags=re.IGNORECASE)
         if not match:
             continue
-        definition = normalize_space(match.group("definition")).strip(" ,.-")
-        if not definition:
-            continue
-        if len(definition.split()) > 18:
-            definition = " ".join(definition.split()[:18]).rstrip(" ,.-")
-        return f"{subject} is {definition}."
+        definition = _valid(match.group("definition"))
+        if definition:
+            return f"{subject} is {definition}."
+
+    reverse_match = re.search(
+        rf"(?P<definition>[A-Z][^.;:\n]{{4,120}}?)\s+{escaped}\b",
+        sentence,
+        flags=re.IGNORECASE,
+    )
+    if reverse_match:
+        definition = _valid(reverse_match.group("definition"), reverse=True)
+        if definition:
+            return f"{subject} is {definition}."
     return ""
 
 
