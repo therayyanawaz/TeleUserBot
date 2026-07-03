@@ -1,0 +1,14 @@
+[Unit]
+Description=TeleUserBot Deploy Webhook
+After=network.target
+
+[Service]
+User=your-linux-user
+WorkingDirectory=/path/to/TeleUserBot
+EnvironmentFile=/path/to/TeleUserBot/.env
+ExecStart=/usr/bin/python3 /path/to/TeleUserBot/deploy_hook.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

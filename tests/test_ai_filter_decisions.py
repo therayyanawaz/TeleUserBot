@@ -1,0 +1,1281 @@
+from __future__ import annotations
+
+import importlib
+import json
+
+import httpx
+import pytest
+
+import ai_filter
+
+
+class _FakeAuthManager:
+    async def get_auth_context(self):
+        return {"token": "fake"}
+
+    async def refresh_auth_context(self):
+        return {"token": "fake"}
+
+
+@pytest.mark.asyncio
+async def test_decide_filter_action_uses_persistent_cache(isolated_db, monkeypatch):
+    importlib.reload(ai_filter)
+    ai_filter._FILTER_DECISION_CACHE_HITS = 0
+    ai_filter._FILTER_DECISION_CACHE_MISSES = 0
+
+    calls = {"count": 0}
+
+    async def fake_call_codex(*args, **kwargs):
+        calls["count"] += 1
+        return json.dumps(
+            {
+                "action": "deliver",
+                "severity": "high",
+                "summary_html": (
+                    "<b>Officials confirmed new power-grid restrictions across three districts</b><br>"
+                    "Authorities said the order takes effect tonight after the latest outage."
+                ),
+                "headline_html": "Officials confirmed new power-grid restrictions across three districts",
+                "story_bridge_html": "Why it matters: context",
+                "confidence": 0.92,
+                "reason_code": "newsworthy_update",
+                "topic_key": "power_grid",
+            }
+        )
+
+    monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
+
+    text = (
+        "Officials confirmed new power-grid restrictions across three districts, "
+        "and authorities said the order takes effect tonight after the latest outage."
+    )
+    first = await ai_filter.decide_filter_action(text, _FakeAuthManager())
+    second = await ai_filter.decide_filter_action(text, _FakeAuthManager())
+
+    assert first.action == "deliver"
+    assert first.copy_origin == "ai"
+    assert second.cached is True
+    assert calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_decide_filter_action_local_nlp_toggle_avoids_api(isolated_db, monkeypatch):
+    importlib.reload(ai_filter)
+
+    async def fail_call_codex(*args, **kwargs):
+        raise AssertionError("API path should not run when USE_LOCAL_NLP is enabled")
+
+    monkeypatch.setattr(ai_filter.config, "USE_LOCAL_NLP", True)
+    monkeypatch.setattr(ai_filter, "_call_codex", fail_call_codex)
+
+    text = (
+        "Iranian officials announced a new airspace restriction over Tehran "
+        "after regional security warnings."
+    )
+    decision = await ai_filter.decide_filter_action(text, _FakeAuthManager())
+
+    assert decision.action in {"deliver", "digest"}
+    assert decision.summary_html
+    assert decision.copy_origin == "fallback"
+    assert decision.fallback_reason == "local_nlp"
+
+
+def test_validate_filter_decision_sanitizes_and_clamps():
+    decision = ai_filter._validate_filter_decision(
+        {
+            "action": "deliver",
+            "severity": "critical",
+            "summary_html": "<script>alert(1)</script><b>Keep</b>",
+            "headline_html": "<i>Headline</i>",
+            "story_bridge_html": "<div>Bridge</div>",
+            "confidence": 9.0,
+            "reason_code": "bad value !!!",
+            "topic_key": "Topic Key / 123",
+        },
+        "A long enough news text that should not be treated as noise.",
+    )
+
+    assert decision.action == "deliver"
+    assert decision.severity in {"high", "medium", "low"}
+    assert "<script>" not in decision.summary_html
+    assert decision.confidence == 1.0
+    assert decision.reason_code == "bad_value"
+    assert " " not in decision.topic_key
+    assert decision.topic_key.lower() == decision.topic_key
+
+
+@pytest.mark.asyncio
+async def test_decide_filter_action_falls_back_on_invalid_json(isolated_db, monkeypatch):
+    importlib.reload(ai_filter)
+    calls = {"count": 0}
+
+    async def fake_call_codex(*args, **kwargs):
+        calls["count"] += 1
+        return "this is not valid json"
+
+    monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
+
+    text = "Regional authorities issued a late-night statement on transport disruptions."
+    decision = await ai_filter.decide_filter_action(text, _FakeAuthManager())
+
+    assert decision.action in {"deliver", "digest"}
+    assert decision.summary_html
+    assert decision.copy_origin == "fallback"
+    assert decision.fallback_reason == "invalid_payload"
+    assert decision.ai_attempt_count == 2
+    assert decision.ai_quality_retry_used is True
+    assert calls["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_decide_filter_action_retries_weak_ai_copy_before_accepting(isolated_db, monkeypatch):
+    importlib.reload(ai_filter)
+    calls = {"count": 0}
+
+    async def fake_call_codex(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return json.dumps(
+                {
+                    "action": "deliver",
+                    "severity": "high",
+                    "summary_html": "<b>Situation update in Tehran</b>",
+                    "headline_html": "Situation update in Tehran",
+                    "story_bridge_html": "",
+                    "confidence": 0.88,
+                    "reason_code": "breaking_update",
+                    "topic_key": "tehran_update",
+                    }
+            )
+        return json.dumps(
+            {
+                "action": "deliver",
+                "severity": "high",
+                "summary_html": (
+                    "<b>Iranian officials ordered a new airspace restriction over Tehran</b><br>"
+                    "Authorities said the measure takes effect immediately after the latest warning."
+                ),
+                "headline_html": "Iranian officials ordered a new airspace restriction over Tehran",
+                "story_bridge_html": "",
+                "confidence": 0.91,
+                "reason_code": "breaking_update",
+                "topic_key": "tehran_airspace",
+            }
+        )
+
+    monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
+
+    text = (
+        "Iranian officials ordered a new airspace restriction over Tehran, "
+        "and authorities said the measure takes effect immediately after the latest warning."
+    )
+    decision = await ai_filter.decide_filter_action(text, _FakeAuthManager())
+
+    assert decision.copy_origin == "ai"
+    assert decision.ai_attempt_count == 2
+    assert decision.ai_quality_retry_used is True
+    assert "airspace restriction over Tehran" in decision.summary_html
+    assert calls["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_call_codex_non_stream_retries_transport_errors(monkeypatch):
+    attempts = {"count": 0}
+    reset_calls: list[str] = []
+
+    class _FakeClient:
+        async def post(self, _url, headers=None, json=None):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise httpx.TransportError(
+                    "Server closed the connection: [Errno 104] Connection reset by peer"
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Recovered response",
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )
+
+    async def fake_get_codex_http_client():
+        return _FakeClient()
+
+    async def fake_reset_shared_http_client(name: str):
+        reset_calls.append(name)
+
+    monkeypatch.setattr(ai_filter, "get_codex_http_client", fake_get_codex_http_client)
+    monkeypatch.setattr(ai_filter, "reset_shared_http_client", fake_reset_shared_http_client)
+
+    result = await ai_filter._call_codex_non_stream(
+        "headline",
+        {
+            "access_token": "token",
+            "account_id": "acct-123",
+        },
+        "instructions",
+    )
+
+    assert result == "Recovered response"
+    assert attempts["count"] == 2
+    assert reset_calls == ["codex"]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_non_stream_uses_openai_compatible_response(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _FakeClient:
+        async def post(self, url, headers=None, json=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = headers or {}
+            captured["json"] = json or {}
+            captured["timeout"] = timeout
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "OpenRouter response"}}]},
+            )
+
+    async def fake_get_codex_http_client():
+        return _FakeClient()
+
+    monkeypatch.setattr(ai_filter.config, "OPENROUTER_API_KEY", "sk-or-test", raising=False)
+    monkeypatch.setattr(ai_filter.config, "LLM_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free", raising=False)
+    monkeypatch.setattr(ai_filter.config, "OPENROUTER_BASE_URL", "https://openrouter.test/chat", raising=False)
+    monkeypatch.setattr(ai_filter, "get_codex_http_client", fake_get_codex_http_client)
+
+    result = await ai_filter._call_openrouter_non_stream("hello", "system")
+
+    assert result == "OpenRouter response"
+    assert captured["url"] == "https://openrouter.test/chat"
+    assert captured["headers"]["Authorization"] == "Bearer sk-or-test"
+    assert captured["json"]["model"] == "nvidia/nemotron-3-ultra-550b-a55b:free"
+    assert captured["json"]["messages"][0] == {"role": "system", "content": "system"}
+    assert captured["json"]["messages"][1] == {"role": "user", "content": "hello"}
+    assert captured["json"]["stream"] is False
+
+
+@pytest.mark.asyncio
+async def test_openrouter_provider_bypasses_auth_manager(monkeypatch):
+    class _ExplodingAuthManager:
+        async def get_auth_context(self):
+            raise AssertionError("auth manager should not be used")
+
+        async def refresh_auth_context(self):
+            raise AssertionError("auth manager should not be used")
+
+    async def fake_call_openrouter(cleaned, instructions, **kwargs):
+        assert cleaned == "headline"
+        assert instructions == "instructions"
+        assert kwargs["verbosity"] == "low"
+        return "routed through openrouter"
+
+    monkeypatch.setattr(ai_filter.config, "LLM_PROVIDER", "openrouter", raising=False)
+    monkeypatch.setattr(ai_filter.config, "OPENROUTER_API_KEY", "sk-or-test", raising=False)
+    monkeypatch.setattr(ai_filter, "_call_openrouter", fake_call_openrouter)
+
+    result = await ai_filter._call_codex_with_auth_repair(
+        "headline",
+        _ExplodingAuthManager(),
+        "instructions",
+        verbosity="low",
+    )
+
+    assert result == "routed through openrouter"
+
+
+@pytest.mark.asyncio
+async def test_create_digest_summary_result_falls_back_after_weak_ai_retry(monkeypatch):
+    calls = {"count": 0}
+
+    async def fake_call_codex(*args, **kwargs):
+        calls["count"] += 1
+        return "⚠️ Situation update in Tehran"
+
+    async def fake_normalize_digest_output(content, *_args, **_kwargs):
+        return content
+
+    monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "_normalize_digest_output", fake_normalize_digest_output)
+    monkeypatch.setattr(ai_filter.config, "DIGEST_PREFER_JSON_OUTPUT", False, raising=False)
+
+    result = await ai_filter.create_digest_summary_result(
+        [
+            {
+                "text": "Iranian officials ordered a new airspace restriction over Tehran.",
+                "source_name": "Desk",
+            }
+        ],
+        auth_manager=_FakeAuthManager(),
+        interval_minutes=60,
+    )
+
+    assert result.copy_origin == "fallback"
+    assert result.fallback_reason == "quality_rejected_after_retry"
+    assert result.ai_attempt_count == 2
+    assert result.ai_quality_retry_used is True
+    assert calls["count"] == 2
+
+
+def test_json_digest_to_html_renders_headline_rail_for_short_window():
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "headline": "Main headlines from the last 30 minutes",
+            "headlines": [
+                "Port reopens after a three-day shutdown.",
+                "Security checks remain in place around the eastern gate.",
+                "Air defenses were activated over the northern district after a fresh barrage.",
+            ],
+        },
+        interval_minutes=30,
+        max_lines=12,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "<b>Main headlines from the last 30 minutes</b>" in html
+    assert "Port reopens after a three-day shutdown." in plain
+    assert "Security checks remain in place around the eastern gate." in plain
+    assert "Air defenses were activated over the northern district after a fresh barrage." in plain
+    assert "Officials said cargo traffic resumes at dawn" not in plain
+
+
+def test_json_digest_to_html_caps_headline_rail_lines_for_short_window():
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "headline": "Main headlines from the last 30 minutes",
+            "headlines": [
+                f"Officials confirmed site {idx} remained under security lockdown." for idx in range(1, 9)
+            ],
+            "also_moving": [f"Authorities confirmed overflow site {idx} stayed under watch." for idx in range(1, 4)],
+        },
+        interval_minutes=30,
+        max_lines=5,
+    )
+
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert plain.count("Officials confirmed site ") == 5
+    assert "Officials confirmed site 6 remained under security lockdown." not in plain
+    assert "Also moving" not in plain
+
+
+def test_json_digest_to_html_keeps_long_headline_rail_line_intact():
+    line = (
+        "Joint Chiefs detail a 45-hour CSAR that retrieved the F-15E crew, using 155 aircraft, "
+        "while an A-10 was hit but its pilot landed safely and the recovery package completed the extraction."
+    )
+
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "headline": "Main headlines from the last 30 minutes",
+            "headlines": [line],
+        },
+        interval_minutes=30,
+        max_lines=12,
+    )
+
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert line in plain
+    assert "but its." not in plain
+
+
+def test_clean_headline_rail_items_keeps_light_source_for_claim_lines():
+    cleaned = ai_filter._clean_headline_rail_items(
+        [
+            "Zelensky has offered the United States assistance in unblocking the Strait of Hormuz, according to Die Welt.",
+        ],
+        max_lines=12,
+        max_chars=0,
+    )
+
+    assert cleaned == [
+        "Zelensky has offered the United States assistance in unblocking the Strait of Hormuz, per Die Welt"
+    ]
+
+
+def test_clean_headline_rail_items_drops_fragments_banter_and_history():
+    cleaned = ai_filter._clean_headline_rail_items(
+        [
+            "However, the head of the Kiev regime admitted that the United States had not asked Ukraine for this.",
+            "Team Scotland has revealed its ceremony outfits for the Commonwealth Games. What do you guys think?",
+            "Russian ruled the Russian Empire from 1725 to 1727.",
+            "The same battalion is responsible for the killing of the Palestinian child Hind Rajab in Gaza with 355 bullets.",
+            "Approximately 20 Israeli jets were seen flying over Daraa Governorate.",
+        ],
+        max_lines=12,
+        max_chars=0,
+    )
+
+    assert cleaned == ["Approximately 20 Israeli jets were seen flying over Daraa Governorate."]
+
+
+def test_clean_headline_rail_items_drops_metrics_and_broken_tail_fragments():
+    cleaned = ai_filter._clean_headline_rail_items(
+        [
+            "62.0K retweets and only 2.4 million views.",
+            "The Syrian Foreign Ministry announced that the handover over of U.S.",
+            "efforts to secure a ceasefire with Israel amid ongoing cross-border tensions.",
+            "Initial reports indicate informed him that a ceasefire between Israel and Lebanon could happen tonight via X.",
+            "Napad iračkih snaga OTPORA na američki konzulat u Erbilu.",
+            "Hezbollah launches two separate rocket attacks against Acre and Shlomi in Northern Israel.",
+        ],
+        max_lines=12,
+        max_chars=0,
+    )
+
+    assert cleaned == [
+        "Hezbollah launches two separate rocket attacks against Acre and Shlomi in Northern Israel."
+    ]
+
+
+def test_clean_headline_rail_items_drops_non_english_opinion_noise_and_meta():
+    cleaned = ai_filter._clean_headline_rail_items(
+        [
+            "2.0 paglus main khushi ki leher.",
+            "Kebakaran besar terjadi di sebuah desa dekat pelabuhan.",
+            "DM if you've enrolled in CDS journey new batch for CDS 2 DM.",
+            "Public service announcement: All the ads about hemorrhoid cream is directed towards MES.",
+            "You can screenshot this, but I am positive that the US will launch an attack on Iran within the week.",
+            "Nothing is officially confirmed.",
+            "Officials confirmed services resumed at the main port after the overnight shutdown.",
+        ],
+        max_lines=12,
+        max_chars=0,
+    )
+
+    assert cleaned == [
+        "Officials confirmed services resumed at the main port after the overnight shutdown."
+    ]
+
+
+def test_digest_needs_english_rewrite_detects_latin_foreign_line():
+    assert ai_filter._digest_needs_english_rewrite(
+        "Napad iračkih snaga OTPORA na američki konzulat u Erbilu.",
+        "English",
+    )
+
+
+def test_digest_needs_english_rewrite_keeps_english_line_with_diacritic_name():
+    assert not ai_filter._digest_needs_english_rewrite(
+        "Jose Andres announced aid deliveries for Gaza overnight.",
+        "English",
+    )
+
+
+def test_line_looks_non_english_for_rail_catches_romanized_and_indonesian_lines():
+    assert ai_filter._line_looks_non_english_for_rail("2.0 paglus main khushi ki leher.")
+    assert ai_filter._line_looks_non_english_for_rail("Kebakaran besar terjadi di sebuah desa dekat pelabuhan.")
+
+
+def test_digest_is_low_value_quote_or_rant_catches_sarcasm_marker():
+    assert ai_filter._digest_is_low_value_quote_or_rant(
+        "Milei will likely kiss the Western Wall again during the visit."
+    )
+
+
+def test_digest_is_low_value_quote_or_rant_catches_editorial_opinion_marker():
+    assert ai_filter._digest_is_low_value_quote_or_rant(
+        "You and Benjamin Netanyahu undermine the true meaning of justice every day."
+    )
+
+
+def test_digest_is_low_value_quote_or_rant_catches_unattributed_prediction():
+    assert ai_filter._digest_is_low_value_quote_or_rant(
+        "Mark my words, this will definitely happen before dawn."
+    )
+
+
+def test_digest_is_low_value_quote_or_rant_catches_slogan_or_chant_line():
+    assert ai_filter._digest_is_low_value_quote_or_rant(
+        "People chanted stop the genocide outside the embassy gates."
+    )
+
+
+def test_digest_is_low_value_quote_or_rant_keeps_official_war_crimes_news():
+    assert not ai_filter._digest_is_low_value_quote_or_rant(
+        "ICC judges charged Benjamin Netanyahu and Yoav Gallant with war crimes and crimes against humanity."
+    )
+
+
+def test_digest_is_low_value_quote_or_rant_keeps_official_statement_despite_flagged_words():
+    assert not ai_filter._digest_is_low_value_quote_or_rant(
+        "UN officials said Vladimir Putin and Sergei Lavrov never forget the treaty terms in the latest statement."
+    )
+
+
+def test_clean_headline_rail_items_keeps_stronger_duplicate_topic():
+    cleaned = ai_filter._clean_headline_rail_items(
+        [
+            "Port reopens after three-day shutdown.",
+            "Port reopens after a three-day shutdown as security checks remain in place around the eastern gate.",
+        ],
+        max_lines=12,
+        max_chars=0,
+    )
+
+    assert cleaned == [
+        "Port reopens after a three-day shutdown as security checks remain in place around the eastern gate."
+    ]
+
+
+def test_json_digest_to_html_drops_vague_and_dependent_rail_lines():
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "headline": "Main headlines from the last 30 minutes",
+            "headlines": [
+                "The fire was successfully extinguished.",
+                "However, the head of the Kiev regime admitted that the United States had not asked Ukraine for this.",
+                "Approximately 20 Israeli jets were seen flying over Daraa Governorate.",
+            ],
+        },
+        interval_minutes=30,
+        max_lines=12,
+    )
+
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "Approximately 20 Israeli jets were seen flying over Daraa Governorate." in plain
+    assert "The fire was successfully extinguished." not in plain
+    assert "However, the head of the Kiev regime admitted" not in plain
+
+
+def test_is_bad_feed_headline_drops_promo_opinion_and_factually_empty_lines():
+    assert ai_filter._is_bad_feed_headline("DM if you've enrolled in CDS journey new batch for CDS 2 DM.")
+    assert ai_filter._is_bad_feed_headline(
+        "You can screenshot this, but I am positive that the US will launch an attack on Iran within the week."
+    )
+    assert ai_filter._is_bad_feed_headline("Nothing is officially confirmed.")
+
+
+def test_json_digest_to_html_drops_confirmation_only_and_unattributed_threat_lines():
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "headline": "Main headlines from the last 30 minutes",
+            "headlines": [
+                "The news is not yet confirmed.",
+                "Iran will be completely destroyed if it refuses to sign the agreement.",
+                "The Bahraini monarch orders the revocation of citizenship for anyone who sympathizes with Iran.",
+            ],
+        },
+        interval_minutes=30,
+        max_lines=12,
+    )
+
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "The news is not yet confirmed." not in plain
+    assert "Iran will be completely destroyed if it refuses to sign the agreement." not in plain
+    assert "The Bahraini monarch orders the revocation of citizenship for anyone who sympathizes with Iran." in plain
+
+
+
+def test_clean_digest_support_items_drops_incomplete_possessive_tail():
+    cleaned = ai_filter._clean_digest_support_items(
+        [
+            "Joint Chiefs detail a 45-hour CSAR that retrieved the F-15E crew while an A-10 was hit but its.",
+        ],
+        max_chars=0,
+    )
+
+    assert cleaned == []
+
+
+
+def test_feed_segment_is_incomplete_rejects_dangling_possessive_tail():
+    assert ai_filter._feed_segment_is_incomplete(
+        "Joint Chiefs detail a 45-hour CSAR while an A-10 was hit but its."
+    )
+
+
+def test_json_digest_to_html_renders_narrative_digest():
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "headline": "Port reopens after a three-day shutdown",
+            "story": (
+                "Officials said cargo traffic resumes at dawn while security checks remain in place "
+                "around the eastern gate and nearby movement stayed under watch."
+            ),
+            "highlights": [
+                "Truck traffic resumed before sunrise.",
+                "Security checks remain in place around the eastern gate.",
+            ],
+            "also_moving": [
+                "Air defenses were activated over the northern district after a fresh barrage."
+            ],
+        },
+        interval_minutes=24 * 60,
+        max_lines=12,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "<b>Port reopens after a three-day shutdown</b>" in html
+    assert "Officials said cargo traffic resumes at dawn" in plain
+    assert "Truck traffic resumed before sunrise." in plain
+    assert "• Security checks remain in place around the eastern gate." in html
+    assert "<i>Also moving</i>" in html
+    assert "• Air defenses were activated over the northern district after a fresh barrage." in html
+
+
+def test_json_digest_to_html_normalizes_legacy_payload_to_narrative_shape():
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "scene_setter": "Port operations and nearby security activity drove the window.",
+            "major_blocks": [
+                {
+                    "headline": "Port reopens after a three-day shutdown",
+                    "lede": "Officials said cargo traffic resumes at dawn.",
+                    "priority": "medium",
+                    "facts": [
+                        "Security checks remain in place around the eastern gate.",
+                    ],
+                }
+            ],
+            "timeline_items": [
+                "Air defenses were activated over the northern district after a fresh barrage."
+            ],
+        },
+        interval_minutes=24 * 60,
+        max_lines=12,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "<b>Port reopens after a three-day shutdown</b>" in html
+    assert "Port operations and nearby security activity drove the window." in plain
+    assert "Officials said cargo traffic resumes at dawn." in plain
+    assert "Security checks remain in place around the eastern gate." in plain
+    assert "Also moving" in plain
+
+
+def test_json_digest_to_html_dedupes_story_highlights_and_also_moving():
+    html = ai_filter._json_digest_to_html(
+        {
+            "quiet": False,
+            "headline": "Port reopens after a three-day shutdown",
+            "story": (
+                "Port reopens after a three-day shutdown. Officials said cargo traffic resumes at dawn."
+            ),
+            "highlights": [
+                "Officials said cargo traffic resumes at dawn.",
+                "Security checks remain in place around the eastern gate.",
+            ],
+            "also_moving": [
+                "Security checks remain in place around the eastern gate.",
+                "Air defenses were activated over the northern district after a fresh barrage.",
+            ],
+        },
+        interval_minutes=24 * 60,
+        max_lines=12,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert plain.count("Port reopens after a three-day shutdown") == 1
+    assert plain.count("Officials said cargo traffic resumes at dawn") == 1
+    assert plain.count("Security checks remain in place around the eastern gate") == 1
+
+
+def test_local_fallback_digest_keeps_all_distinct_updates():
+    html = ai_filter.local_fallback_digest(
+        [
+            {
+                "text": "Officials reopened the port after three days of disruption. Cargo traffic resumes at dawn.",
+                "source_name": "Desk",
+            },
+            {
+                "text": "Air defenses fired over the northern district after a fresh barrage. Residents reported new blasts near the ridge.",
+                "source_name": "Desk",
+            },
+        ],
+        interval_minutes=24 * 60,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "Officials reopened the port after three days of disruption" in plain
+    assert "Cargo traffic resumes at dawn" in plain
+    assert "Air defenses fired over the northern district after a fresh barrage" in plain
+    assert "Residents reported new blasts near the ridge" in plain
+    assert plain.count("Officials reopened the port after three days of disruption") == 1
+    assert plain.count("Air defenses fired over the northern district after a fresh barrage") == 1
+
+
+def test_local_fallback_digest_uses_headline_rail_for_short_window():
+    html = ai_filter.local_fallback_digest(
+        [
+            {
+                "text": "Officials reopened the port after three days of disruption. Cargo traffic resumes at dawn.",
+                "source_name": "Desk",
+            },
+            {
+                "text": "Air defenses fired over the northern district after a fresh barrage. Residents reported new blasts near the ridge.",
+                "source_name": "Desk",
+            },
+        ],
+        interval_minutes=30,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "Main headlines from the last 30 minutes" in plain
+    assert "Officials reopened the port after three days of disruption" in plain
+    assert "Air defenses fired over the northern district after a fresh barrage" in plain
+
+
+def test_local_fallback_digest_headline_rail_uses_one_standalone_line_per_post():
+    html = ai_filter.local_fallback_digest(
+        [
+            {
+                "text": (
+                    "Sites in Dubai and Bahrain were hit overnight. "
+                    "First site was hit in Dubai. Second site was hit in Bahrain."
+                ),
+                "source_name": "Desk",
+            }
+        ],
+        interval_minutes=30,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "Main headlines from the last 30 minutes" in plain
+    assert "Sites in Dubai and Bahrain were hit overnight" in plain
+    assert "First site was hit in Dubai" not in plain
+    assert "Second site was hit in Bahrain" not in plain
+
+
+def test_local_fallback_digest_headline_rail_caps_to_main_lines(monkeypatch):
+    monkeypatch.setattr(ai_filter.config, "DIGEST_MAX_LINES", 4, raising=False)
+
+    html = ai_filter.local_fallback_digest(
+        [
+            {"text": f"Officials confirmed site {idx} remained under security lockdown.", "source_name": "Desk"}
+            for idx in range(1, 8)
+        ],
+        interval_minutes=30,
+    )
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert plain.count("Officials confirmed site ") == 4
+    assert "Officials confirmed site 5 remained under security lockdown." not in plain
+
+
+def test_rank_headline_rail_items_boosts_recent_corroborated_high_severity_line(monkeypatch):
+    monkeypatch.setattr(
+        ai_filter.config,
+        "DIGEST_SOURCE_TIERS",
+        {
+            "source:reuters": 0.8,
+            "source:ap news": 0.6,
+        },
+        raising=False,
+    )
+
+    ranked = ai_filter.rank_headline_rail_items(
+        [
+            "Port reopened after a three-day shutdown.",
+            "Missiles hit Haifa after sirens sounded across the city.",
+        ],
+        [
+            {
+                "channel_id": "desk-port",
+                "source_name": "Desk",
+                "raw_text": "Port reopened after a three-day shutdown and cargo traffic resumed at dawn.",
+                "timestamp": 1000,
+            },
+            {
+                "channel_id": "desk-haifa-1",
+                "source_name": "Reuters",
+                "raw_text": "Missiles hit Haifa after sirens sounded across the city.",
+                "timestamp": 1180,
+            },
+            {
+                "channel_id": "desk-haifa-2",
+                "source_name": "AP News",
+                "raw_text": "Missiles hit Haifa after fresh sirens as impacts were reported across the city.",
+                "timestamp": 1170,
+            },
+        ],
+    )
+
+    assert ranked[0] == "Missiles hit Haifa after sirens sounded across the city."
+
+
+def test_rank_headline_rail_items_keeps_older_high_severity_above_fresher_low_severity(monkeypatch):
+    monkeypatch.setattr(ai_filter.config, "DIGEST_SOURCE_TIERS", {}, raising=False)
+    monkeypatch.setattr(ai_filter.config, "RECENCY_HALF_LIFE_SEC", 900.0, raising=False)
+    monkeypatch.setattr(ai_filter.time, "time", lambda: 2000)
+
+    ranked = ai_filter.rank_headline_rail_items(
+        [
+            "Missiles hit Haifa after sirens sounded across the city.",
+            "Mayor visited a local cultural fair near the river.",
+        ],
+        [
+            {
+                "channel_id": "1001",
+                "source_name": "Desk",
+                "raw_text": "Missiles hit Haifa after sirens sounded across the city.",
+                "timestamp": 500,
+                "severity": "high",
+            },
+            {
+                "channel_id": "1002",
+                "source_name": "Desk",
+                "raw_text": "Mayor visited a local cultural fair near the river.",
+                "timestamp": 1940,
+                "severity": "low",
+            },
+        ],
+    )
+
+    assert ranked[0] == "Missiles hit Haifa after sirens sounded across the city."
+
+
+def test_apply_cross_digest_headline_dedup_demotes_recent_topic_to_also_moving(monkeypatch):
+    memory = {}
+
+    def fake_exists(topic_key, *, within_seconds):
+        row = memory.get(topic_key)
+        return bool(row and (1000 - row["ts"]) <= within_seconds)
+
+    def fake_add(topic_key, headline_text, ts, severity=None):
+        memory[topic_key] = {"ts": ts, "severity": severity or ""}
+
+    def fake_last_severity(topic_key, *, within_seconds):
+        row = memory.get(topic_key)
+        return str(row["severity"] if row and (1000 - row["ts"]) <= within_seconds else "")
+
+    existing_topic = ai_filter._headline_rail_topic_key("Port reopened after a three-day shutdown.")
+    memory[existing_topic] = {"ts": 900, "severity": "medium"}
+
+    monkeypatch.setattr(ai_filter, "headlined_story_exists", fake_exists)
+    monkeypatch.setattr(ai_filter, "headlined_story_add", fake_add)
+    monkeypatch.setattr(ai_filter, "headlined_story_last_severity", fake_last_severity)
+    monkeypatch.setattr(ai_filter.config, "CROSS_DIGEST_DEDUP_SEC", 3600, raising=False)
+    monkeypatch.setattr(ai_filter.time, "time", lambda: 1000)
+
+    highlights, also = ai_filter.apply_cross_digest_headline_dedup(
+        [
+            "Port reopened after a three-day shutdown.",
+            "Air defenses were activated over the northern district after a fresh barrage.",
+        ],
+        max_lines=4,
+    )
+
+    assert "Port reopened after a three-day shutdown." not in highlights
+    assert "Port reopened after a three-day shutdown." in also
+    assert "Air defenses were activated over the northern district after a fresh barrage." in highlights
+
+
+def test_apply_cross_digest_headline_dedup_allows_high_severity_escalation(monkeypatch):
+    memory = {}
+
+    def fake_exists(topic_key, *, within_seconds):
+        row = memory.get(topic_key)
+        return bool(row and (1000 - row["ts"]) <= within_seconds)
+
+    def fake_add(topic_key, headline_text, ts, severity=None):
+        memory[topic_key] = {"ts": ts, "severity": severity or ""}
+
+    def fake_last_severity(topic_key, *, within_seconds):
+        row = memory.get(topic_key)
+        return str(row["severity"] if row and (1000 - row["ts"]) <= within_seconds else "")
+
+    topic = ai_filter._headline_rail_topic_key("Missiles hit Haifa after sirens sounded across the city.")
+    memory[topic] = {"ts": 900, "severity": "medium"}
+
+    monkeypatch.setattr(ai_filter, "headlined_story_exists", fake_exists)
+    monkeypatch.setattr(ai_filter, "headlined_story_add", fake_add)
+    monkeypatch.setattr(ai_filter, "headlined_story_last_severity", fake_last_severity)
+    monkeypatch.setattr(ai_filter.config, "CROSS_DIGEST_DEDUP_SEC", 3600, raising=False)
+    monkeypatch.setattr(ai_filter.time, "time", lambda: 1000)
+
+    highlights, also = ai_filter.apply_cross_digest_headline_dedup(
+        ["Missiles hit Haifa after sirens sounded across the city."],
+        max_lines=4,
+    )
+
+    assert highlights == ["Missiles hit Haifa after sirens sounded across the city."]
+    assert also == []
+    assert memory[topic]["severity"] == "high"
+
+
+def test_apply_cross_digest_headline_dedup_realllows_topic_after_window(monkeypatch):
+    memory = {}
+
+    def fake_exists(topic_key, *, within_seconds):
+        row = memory.get(topic_key)
+        return bool(row and (5000 - row["ts"]) <= within_seconds)
+
+    def fake_add(topic_key, headline_text, ts, severity=None):
+        memory[topic_key] = {"ts": ts, "severity": severity or ""}
+
+    def fake_last_severity(topic_key, *, within_seconds):
+        row = memory.get(topic_key)
+        return str(row["severity"] if row and (5000 - row["ts"]) <= within_seconds else "")
+
+    topic = ai_filter._headline_rail_topic_key("Port reopened after a three-day shutdown.")
+    memory[topic] = {"ts": 1000, "severity": "medium"}
+
+    monkeypatch.setattr(ai_filter, "headlined_story_exists", fake_exists)
+    monkeypatch.setattr(ai_filter, "headlined_story_add", fake_add)
+    monkeypatch.setattr(ai_filter, "headlined_story_last_severity", fake_last_severity)
+    monkeypatch.setattr(ai_filter.config, "CROSS_DIGEST_DEDUP_SEC", 3600, raising=False)
+    monkeypatch.setattr(ai_filter.time, "time", lambda: 5000)
+
+    highlights, also = ai_filter.apply_cross_digest_headline_dedup(
+        ["Port reopened after a three-day shutdown."],
+        max_lines=4,
+    )
+
+    assert highlights == ["Port reopened after a three-day shutdown."]
+    assert also == []
+
+
+def test_also_moving_gate_rejects_promo_line_after_demotion(monkeypatch):
+    memory = {}
+
+    def fake_exists(topic_key, *, within_seconds):
+        return topic_key in memory
+
+    def fake_add(topic_key, headline_text, ts, severity=None):
+        memory[topic_key] = {"ts": ts, "severity": severity or ""}
+
+    monkeypatch.setattr(ai_filter, "headlined_story_exists", fake_exists)
+    monkeypatch.setattr(ai_filter, "headlined_story_add", fake_add)
+    monkeypatch.setattr(ai_filter, "headlined_story_last_severity", lambda *args, **kwargs: "medium")
+    monkeypatch.setattr(ai_filter.config, "CROSS_DIGEST_DEDUP_SEC", 3600, raising=False)
+    monkeypatch.setattr(ai_filter.config, "ALSO_MOVING_MAX", 4, raising=False)
+    monkeypatch.setattr(ai_filter.time, "time", lambda: 1000)
+
+    topic = ai_filter._headline_rail_topic_key("Port reopened after a three-day shutdown.")
+    memory[topic] = {"ts": 900, "severity": "medium"}
+
+    highlights, also = ai_filter.apply_cross_digest_headline_dedup(
+        ["Port reopened after a three-day shutdown."],
+        max_lines=4,
+        also_moving=["DM if you've enrolled in CDS journey new batch for CDS 2 DM."],
+    )
+
+    assert highlights == ["Port reopened after a three-day shutdown."]
+    assert also == []
+
+
+def test_also_moving_gate_keeps_real_overflow_news_with_entity():
+    assert ai_filter._also_moving_line_is_acceptable(
+        "Benjamin Netanyahu announced a security cabinet meeting in Jerusalem tonight."
+    )
+
+
+def test_also_moving_gate_rejects_three_word_fragment():
+    assert not ai_filter._also_moving_line_is_acceptable("Port reopened tonight.")
+
+
+def test_scrub_rail_lines_catchup_rejects_promo_line():
+    assert ai_filter.scrub_rail_lines(
+        ["DM if you've enrolled in CDS journey new batch for CDS 2 DM."],
+        mode="catchup",
+    ) == []
+
+
+def test_scrub_rail_lines_catchup_rejects_short_fragment_under_eight_words():
+    assert ai_filter.scrub_rail_lines(
+        ["Port reopened after shutdown."],
+        mode="catchup",
+    ) == []
+
+
+def test_scrub_rail_lines_catchup_keeps_real_news_line_with_named_entity():
+    assert ai_filter.scrub_rail_lines(
+        ["Benjamin Netanyahu announced a security cabinet meeting in Jerusalem after overnight strikes."],
+        mode="catchup",
+    ) == [
+        "Benjamin Netanyahu announced a security cabinet meeting in Jerusalem after overnight strikes."
+    ]
+
+
+def test_fallback_headline_prefers_concrete_sentence_over_soft_setup():
+    headline = ai_filter._fallback_headline(
+        "Situation update after overnight military activity. Iran launched missiles at Haifa and air defenses intercepted several over the city."
+    )
+
+    assert headline == "Iran launched missiles at Haifa and air defenses intercepted several over the city."
+
+
+def test_html_digest_cleanup_strips_promo_handles_and_duplicate_blocks():
+    raw = """
+There is a confirmed fall of fission fragments in a number of locations in the middle of the entity.
+• 🌟🌟Follow Us | Discussion | 🤔 Boost the Channel 💚
+
+🇮🇷🇮🇷⚔️🏴‍☠️🇺🇸 Enemy media: Preliminary reports of a direct hit in Petah Tikva.
+• @stayfreeworld
+
+A fall in Beit She'an 🌟🌟Follow Us | Discussion | 🤔 Boost the Channel 💚
+• A fall in Beit She'an 🌟🌟Follow Us | Discussion | 🤔 Boost the Channel 💚
+
+<i>Also moving</i>
+• Report of more launches towards Israel @AlHaqNews
+• #Paylaş
+""".strip()
+
+    html = ai_filter._html_digest_cleanup(raw, interval_minutes=30, max_lines=12)
+    plain = ai_filter.strip_telegram_html(html)
+
+    assert "Follow Us" not in plain
+    assert "Boost the Channel" not in plain
+    assert "@stayfreeworld" not in plain
+    assert "@AlHaqNews" not in plain
+    assert "#Paylaş" not in plain
+    assert "Enemy media:" not in plain
+    assert plain.count("A fall in Beit She'an") == 1
+    assert "Also moving" in plain
+
+
+@pytest.mark.asyncio
+async def test_prepare_digest_posts_translates_non_english_lines(monkeypatch):
+    async def fake_call_codex_with_auth_repair(_payload, _auth_manager, _instructions, **_kwargs):
+        return json.dumps(
+            {
+                "items": [
+                    {
+                        "id": 1,
+                        "text": "Hebrew-language sources reported continuous unusual explosions in Tel Aviv.",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex_with_auth_repair)
+
+    prepared, stats = await ai_filter._prepare_digest_posts(
+        [
+            {
+                "text": "☄️ İvrit mənbələri: Tel-Əvivdə fasiləsiz qeyri-adi partlayış səsləri eşidilir #Şərh_yaz.",
+                "source_name": "Desk",
+            }
+        ],
+        _FakeAuthManager(),
+    )
+
+    assert prepared[0]["raw_text"] == "Initial reports indicate continuous unusual explosions in Tel Aviv."
+    assert stats["translation_applied_count"] == 1
+    assert stats["citation_stripped_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_prepare_digest_posts_drops_non_english_lines_when_translation_fails(monkeypatch):
+    async def fake_call_codex_with_auth_repair(*_args, **_kwargs):
+        raise RuntimeError("translation unavailable")
+
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex_with_auth_repair)
+
+    prepared, stats = await ai_filter._prepare_digest_posts(
+        [
+            {
+                "text": "إطلاق صواريخ باتجاه حيفا وتضرر منشأة قريبة.",
+                "source_name": "Desk",
+            }
+        ],
+        _FakeAuthManager(),
+    )
+
+    assert prepared == []
+    assert stats["translation_applied_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_prepare_digest_posts_drops_unguarded_guess_translation(monkeypatch):
+    async def fake_call_codex_with_auth_repair(_payload, _auth_manager, _instructions, **_kwargs):
+        return json.dumps(
+            {
+                "items": [
+                    {
+                        "id": 1,
+                        "text": "Talks happened and the situation remains tense.",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex_with_auth_repair)
+
+    prepared, stats = await ai_filter._prepare_digest_posts(
+        [
+            {
+                "text": "Napad iračkih snaga OTPORA na američki konzulat u Erbilu.",
+                "source_name": "Desk",
+            }
+        ],
+        _FakeAuthManager(),
+    )
+
+    assert prepared == []
+    assert stats["translation_applied_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_prepare_digest_posts_drops_still_non_english_translation(monkeypatch):
+    async def fake_call_codex_with_auth_repair(_payload, _auth_manager, _instructions, **_kwargs):
+        return json.dumps(
+            {
+                "items": [
+                    {
+                        "id": 1,
+                        "text": "Napad iračkih snaga OTPORA na američki konzulat u Erbilu.",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex_with_auth_repair)
+
+    prepared, stats = await ai_filter._prepare_digest_posts(
+        [
+            {
+                "text": "Napad iračkih snaga OTPORA na američki konzulat u Erbilu.",
+                "source_name": "Desk",
+            }
+        ],
+        _FakeAuthManager(),
+    )
+
+    assert prepared == []
+    assert stats["translation_applied_count"] == 0
+
+
+def test_digest_clean_line_rewrites_citation_style_attribution_to_generic_uncertainty():
+    cleaned = ai_filter._digest_clean_line(
+        "Hebrew-language sources reported continuous unusual explosions in Tel Aviv.",
+        max_chars=220,
+        allow_short=True,
+    )
+
+    assert cleaned == "Initial reports indicate continuous unusual explosions in Tel Aviv."
+
+
+def test_clean_digest_support_items_strips_markers_and_context_prefixes():
+    cleaned = ai_filter._clean_digest_support_items(
+        [
+            "Context- 🔴BSF arrested a smuggler in Karimpur with 24 kg of silver.",
+            'Initial reports indicate An Iranian missile fell in "Ramat Gan".',
+            "The targeted assassination wave hit 3 vehicles: ● a pickup in Meifdoun ● a Rapid on the coastal road.",
+        ],
+        max_chars=220,
+    )
+
+    assert cleaned[0] == "BSF arrested a smuggler in Karimpur with 24 kg of silver."
+    assert cleaned[1] == 'An Iranian missile fell in "Ramat Gan".'
+    assert "●" not in cleaned[2]
+    assert "🔴" not in cleaned[2]
+
+
+
+def test_truncate_digest_fact_prefers_complete_output_without_ellipsis():
+    truncated = ai_filter._truncate_digest_fact(
+        "The targeted assassination wave in the south targeted 3 vehicles and a motorcycle since this morning and left investigators tracking follow-on movement across multiple roads in the district.",
+        max_chars=110,
+    )
+
+    assert truncated
+    assert not truncated.endswith("...")
+    assert not truncated.endswith("…")
+    assert truncated.endswith((".", "!", "?"))
+
+
+@pytest.mark.asyncio
+async def test_prepare_digest_posts_collapses_duplicate_citation_variants():
+    prepared, stats = await ai_filter._prepare_digest_posts(
+        [
+            {
+                "text": "Enemy media: Preliminary reports of a direct hit in Petah Tikva.",
+                "source_name": "Desk",
+            },
+            {
+                "text": "Fox: Preliminary reports of a direct hit in Petah Tikva.",
+                "source_name": "Desk",
+            },
+        ],
+        _FakeAuthManager(),
+    )
+
+    assert len(prepared) == 1
+    assert prepared[0]["raw_text"] == "Preliminary reports indicate a direct hit in Petah Tikva."
+    assert stats["citation_stripped_count"] >= 2
+    assert stats["duplicate_collapsed_count"] == 1
+
+
+def test_digest_quality_issue_rejects_direct_citation_language():
+    html = (
+        "<b>Central Israel Impact Reports</b><br>"
+        "Hebrew-language sources reported continuous unusual explosions in Tel Aviv."
+    )
+
+    assert (
+        ai_filter._digest_quality_issue(
+            html,
+            ai_filter.quiet_period_message(30),
+            interval_minutes=30,
+        )
+        == "citation_leak"
+    )
+
+
+def test_digest_quality_issue_rejects_source_leaks_and_messy_layout():
+    html = (
+        "<b>Central Israel Impact Reports</b><br>"
+        "Central Israel Impact Reports<br>"
+        "• @stayfreeworld"
+    )
+
+    assert ai_filter._digest_quality_issue(
+        html,
+        ai_filter.quiet_period_message(30),
+        interval_minutes=30,
+    ) in {
+        "citation_leak",
+        "source_leak",
+        "messy_layout",
+    }
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_from_context_result_uses_ai_after_quality_retry(monkeypatch):
+    calls = {"count": 0}
+
+    async def fake_call_codex(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return "<b>There are developments</b><br>• ⚠️ Situation update in Tehran"
+        return (
+            "<b>Tehran Airspace Restriction</b><br>"
+            "• ⚠️ Iranian officials ordered a new airspace restriction over Tehran.<br>"
+            "• ⚠️ Authorities said it takes effect immediately after the latest warning."
+        )
+
+    monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "_query_confidence_allows_answer", lambda *_args, **_kwargs: True)
+
+    result = await ai_filter.generate_answer_from_context_result(
+        "What's the latest out of Tehran?",
+        [{"text": "Iranian officials ordered a new airspace restriction over Tehran."}],
+        auth_manager=_FakeAuthManager(),
+    )
+
+    assert result.copy_origin == "ai"
+    assert result.ai_attempt_count == 2
+    assert result.ai_quality_retry_used is True
+    assert "airspace restriction over Tehran" in result.html
+    assert calls["count"] == 2

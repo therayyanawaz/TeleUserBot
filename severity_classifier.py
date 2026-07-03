@@ -1,0 +1,919 @@
+"""Deterministic multi-factor severity classifier for breaking vs digest routing."""
+
+from __future__ import annotations
+
+import re
+import threading
+import time
+from collections import defaultdict, deque
+from typing import Any, Deque, Dict
+
+from news_taxonomy import find_news_category_matches, get_moderation_policy, match_news_category
+from news_signals import detect_story_signals
+
+
+# -----------------------------------------------------------------------------
+# SEVERITY_CONFIG
+# -----------------------------------------------------------------------------
+# This is the single place to tune severity behavior.
+# Keep this dictionary explicit and readable so operators can adjust policy
+# without rewriting classifier logic.
+SEVERITY_CONFIG: Dict[str, Any] = {
+    # -------------------------------------------------------------------------
+    # Source trust tiers
+    # -------------------------------------------------------------------------
+    # S-tier should be reserved for high-confidence, rapid war/OSINT channels.
+    # A/B/C should be expanded over time based on observed precision.
+    "source_tiers": {
+        "S": [
+            "The War Reporter",
+            "OsintTV 📺️",
+            "Bellum Acta - Intel, Urgent News and Archives",
+            "Frontline Report",
+            "RNN Alerts",
+            "𝕳𝖔𝖔𝖕𝖔𝖊 𝕰𝖓",
+        ],
+        "A": [
+            # Add trusted but slightly slower/noisier sources here.
+        ],
+        "B": [
+            # Add normal mixed-signal sources here.
+        ],
+        "C": [
+            # Add low-confidence / noisy channels here.
+        ],
+    },
+    # Tier weight contribution (max 0.35 by requirement).
+    "source_tier_bonus": {
+        "S": 0.35,
+        "A": 0.24,
+        "B": 0.14,
+        "C": 0.06,
+        "UNKNOWN": 0.04,
+    },
+    # Optional source-name patterns that should be penalized as noisy.
+    "noisy_source_patterns": [
+        "recap",
+        "digest",
+        "roundup",
+        "analysis",
+        "opinion",
+        "thread",
+    ],
+    # -------------------------------------------------------------------------
+    # Strong urgency signals (max 0.30)
+    # -------------------------------------------------------------------------
+    "strong_urgency_signals": [
+        "breaking",
+        "just in",
+        "moments ago",
+        "happening now",
+        "live update",
+        "urgent",
+        "alert",
+        "confirmed",
+    ],
+    # Emoji/symbol urgency triggers.
+    "strong_urgency_emoji_signals": [
+        "🚨",
+        "⚡",
+        "❗❗",
+        "🔴",
+        "🔥",
+    ],
+    # Raw per-signal score for urgency.
+    "urgency_per_signal": 0.08,
+    "urgency_max_score": 0.30,
+    # -------------------------------------------------------------------------
+    # Style/format signals (max 0.15)
+    # -------------------------------------------------------------------------
+    "style": {
+        "short_text_threshold_chars": 220,
+        "short_with_link_or_media_bonus": 0.08,
+        "emoji_density_min_count": 4,
+        "emoji_density_bonus": 0.04,
+        "alert_emoji_extra_bonus": 0.02,
+        "caps_ratio_threshold": 0.45,
+        "caps_bonus": 0.03,
+        "punctuation_spike_bonus": 0.03,
+        "max_score": 0.15,
+    },
+    # -------------------------------------------------------------------------
+    # Humanized vital opinion integration (max 0.15)
+    # -------------------------------------------------------------------------
+    # This score is multiplied by existing humanized_vital_probability.
+    "humanized": {
+        "max_score": 0.15,
+        "vital_keywords": [],
+    },
+    # -------------------------------------------------------------------------
+    # Taxonomy-derived event signals
+    # -------------------------------------------------------------------------
+    "taxonomy": {
+        "bias_bonus": {
+            "high": 0.16,
+            "medium": 0.09,
+            "low": 0.03,
+        },
+    },
+    # -------------------------------------------------------------------------
+    # Temporal/context signals (max 0.05)
+    # -------------------------------------------------------------------------
+    "temporal_context": {
+        "max_score": 0.05,
+        "city_bonus": 0.02,
+        "right_now_bonus": 0.02,
+        "root_post_bonus": 0.01,
+        "cities": [
+            "gaza",
+            "rafah",
+            "beirut",
+            "tel aviv",
+            "tehran",
+            "damascus",
+            "aleppo",
+            "kyiv",
+            "odessa",
+            "moscow",
+            "baghdad",
+            "basra",
+            "hormuz",
+            "tripoli",
+            "sanaa",
+            "kharkiv",
+            "jerusalem",
+            "haifa",
+            "ismailia",
+            "bushehr",
+        ],
+        "right_now_phrases": [
+            "right now",
+            "happening now",
+            "just now",
+            "moments ago",
+            "currently",
+            "live now",
+            "الآن",
+            "الان",
+            "همین الان",
+        ],
+    },
+    # -------------------------------------------------------------------------
+    # Negative penalties (down to -0.30)
+    # -------------------------------------------------------------------------
+    "negative_penalties": {
+        "max_penalty_abs": 0.30,
+        "recap_keywords": [
+            "daily recap",
+            "summary",
+            "overview",
+            "what we know",
+            "analysis",
+            "thread",
+            "opinion",
+            "what happened today",
+        ],
+        "recap_penalty": 0.24,
+        "analysis_penalty": 0.08,
+        "long_text_tokens_threshold": 400,
+        "long_text_penalty": 0.08,
+        "noisy_source_penalty": 0.06,
+    },
+    # -------------------------------------------------------------------------
+    # Decision thresholds
+    # -------------------------------------------------------------------------
+    "thresholds": {
+        "high": 0.82,
+        "medium": 0.55,
+    },
+    "score_calibration": {
+        "band_epsilon": 0.015,
+    },
+    # -------------------------------------------------------------------------
+    # Hard rules
+    # -------------------------------------------------------------------------
+    "hard_rules": {
+        # Non-S source must have at least N urgency signals unless
+        # humanized probability is very high.
+        "non_s_min_urgency_signals_for_high": 2,
+        "non_s_humanized_override_prob": 0.80,
+        # Never allow recap/summary style messages to become high.
+        "never_high_if_recap": True,
+    },
+    # -------------------------------------------------------------------------
+    # Per-source high-severity cooldown
+    # -------------------------------------------------------------------------
+    "source_cooldown": {
+        "window_seconds": 3600,
+        "max_high_per_window": 3,
+    },
+}
+
+
+_URL_RE = re.compile(r"https?://|t\.me/", re.IGNORECASE)
+_EMOJI_RE = re.compile(
+    r"[\U0001F300-\U0001FAFF\u2600-\u26FF\u2700-\u27BF]",
+    flags=re.UNICODE,
+)
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+_OBFUSCATION_TRANSLATION = str.maketrans(
+    {
+        "@": "a",
+        "4": "a",
+        "3": "e",
+        "!": "i",
+        "1": "i",
+        "|": "i",
+        "0": "o",
+        "$": "s",
+        "5": "s",
+        "7": "t",
+        "#": "i",
+    }
+)
+
+_HIGH_SEVERITY_HISTORY: Dict[str, Deque[float]] = defaultdict(deque)
+_COOLDOWN_LOCK = threading.Lock()
+
+
+def severity_thresholds() -> Dict[str, float]:
+    raw = SEVERITY_CONFIG.get("thresholds", {})
+    medium = float(raw.get("medium", 0.55) or 0.55)
+    high = float(raw.get("high", 0.82) or 0.82)
+    medium = max(0.0, min(medium, 0.95))
+    high = max(medium + 0.01, min(high, 0.99))
+    return {
+        "medium": round(medium, 4),
+        "high": round(high, 4),
+    }
+
+
+def severity_score_floor(severity: str) -> float:
+    thresholds = severity_thresholds()
+    normalized = _normalize_key(severity)
+    if normalized == "high":
+        return float(thresholds["high"])
+    if normalized == "medium":
+        return float(thresholds["medium"])
+    return 0.0
+
+
+def _score_calibration_epsilon(thresholds: Dict[str, float]) -> float:
+    raw = float(SEVERITY_CONFIG.get("score_calibration", {}).get("band_epsilon", 0.015) or 0.015)
+    medium = float(thresholds["medium"])
+    high = float(thresholds["high"])
+    max_allowed = min(0.05, medium * 0.45 if medium > 0 else raw, (high - medium) * 0.45)
+    return max(0.001, min(raw, max_allowed if max_allowed > 0 else raw))
+
+
+def _score_band(score: float, thresholds: Dict[str, float]) -> str:
+    high = float(thresholds["high"])
+    medium = float(thresholds["medium"])
+    if score >= high:
+        return "high"
+    if score >= medium:
+        return "medium"
+    return "low"
+
+
+def _map_score_to_band(
+    raw_score: float,
+    *,
+    source_floor: float,
+    source_ceiling: float,
+    target_floor: float,
+    target_ceiling: float,
+) -> float:
+    if target_ceiling <= target_floor:
+        return target_floor
+    clipped = max(source_floor, min(source_ceiling, raw_score))
+    if source_ceiling <= source_floor:
+        return target_floor
+    ratio = (clipped - source_floor) / (source_ceiling - source_floor)
+    return target_floor + (ratio * (target_ceiling - target_floor))
+
+
+def _calibrate_severity_score(
+    raw_score: float,
+    *,
+    severity: str,
+    thresholds: Dict[str, float],
+) -> tuple[float, str]:
+    medium = float(thresholds["medium"])
+    high = float(thresholds["high"])
+    epsilon = _score_calibration_epsilon(thresholds)
+    low_ceiling = max(0.0, medium - epsilon)
+    medium_floor = medium
+    medium_ceiling = max(medium_floor, high - epsilon)
+    high_floor = high
+    normalized = _normalize_key(severity)
+
+    if normalized == "high":
+        score = _map_score_to_band(
+            raw_score,
+            source_floor=high,
+            source_ceiling=1.0,
+            target_floor=high_floor,
+            target_ceiling=1.0,
+        )
+        return min(1.0, max(high_floor, score)), "high"
+
+    if normalized == "medium":
+        score = _map_score_to_band(
+            raw_score,
+            source_floor=medium,
+            source_ceiling=1.0,
+            target_floor=medium_floor,
+            target_ceiling=medium_ceiling,
+        )
+        return min(medium_ceiling, max(medium_floor, score)), "medium"
+
+    score = _map_score_to_band(
+        raw_score,
+        source_floor=0.0,
+        source_ceiling=medium,
+        target_floor=0.0,
+        target_ceiling=low_ceiling,
+    )
+    return min(low_ceiling, max(0.0, score)), "low"
+
+
+def _normalize_space(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _normalize_key(text: str) -> str:
+    return _normalize_space(text).casefold()
+
+
+def _extract_source_name(msg: Dict[str, Any]) -> str:
+    value = (
+        msg.get("source")
+        or msg.get("source_name")
+        or msg.get("channel_title")
+        or msg.get("channel")
+        or "unknown"
+    )
+    return _normalize_space(str(value))
+
+
+def _extract_text(msg: Dict[str, Any]) -> str:
+    value = msg.get("text") or msg.get("raw_text") or msg.get("caption") or ""
+    return _normalize_space(str(value))
+
+
+def _extract_tokens(text: str) -> list[str]:
+    return [token.casefold() for token in _TOKEN_RE.findall(text)]
+
+
+def _contains_phrase(normalized_text: str, phrase: str) -> bool:
+    key = _normalize_key(phrase)
+    return bool(key and key in normalized_text)
+
+
+def _find_matches(normalized_text: str, phrases: list[str]) -> list[str]:
+    matches: list[str] = []
+    for phrase in phrases:
+        if _contains_phrase(normalized_text, phrase):
+            matches.append(phrase)
+    return matches
+
+
+def _moderation_terms(section: dict[str, Any], key: str) -> list[str]:
+    raw = section.get(key, [])
+    if not isinstance(raw, list):
+        return []
+    return [_normalize_space(str(item)) for item in raw if _normalize_space(str(item))]
+
+
+def _normalize_moderation_text(text: str) -> str:
+    lowered = _normalize_space(text).casefold().translate(_OBFUSCATION_TRANSLATION)
+    return re.sub(r"[^a-z0-9\s]+", " ", lowered)
+
+
+def _term_frequency(normalized_text: str, term: str) -> int:
+    key = _normalize_moderation_text(term)
+    if not key:
+        return 0
+    pattern = rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])"
+    return len(re.findall(pattern, normalized_text))
+
+
+def _simple_sentiment_polarity(text: str, hard_matches: list[str], inflammatory_matches: list[str]) -> float:
+    normalized = _normalize_moderation_text(text)
+    polarity = 0.0
+    polarity += min(3.0, len(hard_matches) * 1.5)
+    polarity += min(2.0, len(inflammatory_matches) * 0.45)
+    polarity += min(1.5, len(re.findall(r"\b(?:hate|revenge|blood|slaughter|crush|erase|traitor|enemy)\b", normalized)) * 0.3)
+    polarity -= min(1.2, len(re.findall(r"\b(?:reported|alleged|officials said|police said|court|trial|arrested|charged)\b", normalized)) * 0.2)
+    return max(0.0, round(polarity, 4))
+
+
+def moderation_scan_text(text: str) -> dict[str, Any]:
+    """
+    Deterministic radicalized-news moderation scan.
+
+    Formula:
+        (KeywordWeight * Frequency) + SentimentPolarity > Threshold
+
+    Conservative by design: neutral reports with isolated terms stay allowed.
+    """
+    policy = get_moderation_policy()
+    hard = policy.get("hard_block", {}) if isinstance(policy.get("hard_block"), dict) else {}
+    soft = policy.get("soft_flag", {}) if isinstance(policy.get("soft_flag"), dict) else {}
+    regex_cfg = policy.get("regex_patterns", {}) if isinstance(policy.get("regex_patterns"), dict) else {}
+    threshold = float(policy.get("score_threshold", 7.5) or 7.5)
+    keyword_weight = float(soft.get("keyword_weight", 1.15) or 1.15)
+
+    normalized = _normalize_moderation_text(text)
+    hard_terms = [*_moderation_terms(hard, "keywords"), *_moderation_terms(hard, "inflammatory_phrases")]
+    soft_terms = [*_moderation_terms(soft, "keywords")]
+    inflammatory_terms = _moderation_terms(soft, "inflammatory_phrases")
+
+    hard_matches = [term for term in hard_terms if _term_frequency(normalized, term) > 0]
+    soft_counts = {
+        term: _term_frequency(normalized, term)
+        for term in soft_terms
+        if _term_frequency(normalized, term) > 0
+    }
+    inflammatory_matches = [term for term in inflammatory_terms if _term_frequency(normalized, term) > 0]
+
+    regex_matches: dict[str, bool] = {}
+    for name, pattern in regex_cfg.items():
+        try:
+            regex_matches[str(name)] = bool(re.search(str(pattern), text, flags=re.IGNORECASE))
+        except re.error:
+            regex_matches[str(name)] = False
+
+    frequency = sum(soft_counts.values()) + (len(inflammatory_matches) * 2)
+    sentiment_polarity = _simple_sentiment_polarity(text, hard_matches, inflammatory_matches)
+    regex_bonus = sum(0.35 for matched in regex_matches.values() if matched)
+    score = (keyword_weight * frequency) + sentiment_polarity + regex_bonus
+    hard_blocked = bool(hard_matches)
+    score_blocked = score > threshold and frequency >= 3
+
+    return {
+        "blocked": bool(hard_blocked or score_blocked),
+        "hard_blocked": hard_blocked,
+        "score_blocked": bool(score_blocked),
+        "score": round(score, 4),
+        "threshold": round(threshold, 4),
+        "keyword_weight": round(keyword_weight, 4),
+        "frequency": int(frequency),
+        "sentiment_polarity": sentiment_polarity,
+        "hard_matches": hard_matches[:12],
+        "soft_matches": soft_counts,
+        "inflammatory_matches": inflammatory_matches[:12],
+        "regex_matches": regex_matches,
+    }
+
+
+def _count_emoji(text: str) -> int:
+    return len(_EMOJI_RE.findall(text or ""))
+
+
+def _alert_emoji_hits(text: str) -> list[str]:
+    matches: list[str] = []
+    for emoji in SEVERITY_CONFIG["strong_urgency_emoji_signals"]:
+        if emoji in text:
+            matches.append(emoji)
+    return matches
+
+
+def _caps_ratio(text: str) -> float:
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
+        return 0.0
+    upper = [ch for ch in letters if ch.isupper()]
+    return len(upper) / len(letters)
+
+
+def _punctuation_spike(text: str) -> bool:
+    return bool(re.search(r"[!?]{2,}|[‼️]{1,}", text))
+
+
+def _detect_source_tier(source_name: str) -> tuple[str, float]:
+    normalized_source = _normalize_key(source_name)
+    tier_map = SEVERITY_CONFIG["source_tiers"]
+    tier_bonus = SEVERITY_CONFIG["source_tier_bonus"]
+
+    for tier in ("S", "A", "B", "C"):
+        candidates = tier_map.get(tier, [])
+        for candidate in candidates:
+            key = _normalize_key(str(candidate))
+            if not key:
+                continue
+            if normalized_source == key or key in normalized_source:
+                return tier, float(tier_bonus.get(tier, 0.0))
+    # Default unknown sources to C-tier for strictness.
+    return "C", float(tier_bonus.get("C", tier_bonus.get("UNKNOWN", 0.0)))
+
+
+def _calc_urgency_score(text: str, *, story_signals: Dict[str, Any]) -> tuple[float, list[str], int]:
+    ontology = story_signals.get("ontology") or {}
+    signal_breakdown = ontology.get("signal_breakdown") or {}
+    frame = ontology.get("event_frame") or {}
+
+    action_hits = [str(item) for item in frame.get("actions") or []]
+    target_hits = [str(item) for item in frame.get("targets") or []]
+    recency_hits = [str(item) for item in frame.get("recency_hits") or []]
+    official_hits = [str(item) for item in frame.get("official_hits") or []]
+    emoji_hits = _alert_emoji_hits(text)
+
+    weighted_hits: list[str] = []
+    weighted_hits.extend(action_hits[:3])
+    weighted_hits.extend(target_hits[:2])
+    weighted_hits.extend(recency_hits[:2])
+    weighted_hits.extend(official_hits[:2])
+    weighted_hits.extend(emoji_hits)
+    if bool(ontology.get("breaking_eligible")):
+        weighted_hits.append("breaking_eligible")
+
+    score = 0.0
+    score += min(0.12, 0.04 * len(set(action_hits[:3])))
+    score += min(0.06, 0.03 * len(set(target_hits[:2])))
+    if recency_hits:
+        score += 0.08
+    if official_hits:
+        score += 0.06
+    if bool(ontology.get("breaking_eligible")):
+        score += 0.05
+    score += min(0.04, 0.02 * len(set(emoji_hits)))
+
+    live_event_score = float(signal_breakdown.get("live_event_score") or 0.0)
+    if live_event_score >= 1.6:
+        score += 0.05
+
+    score = min(float(SEVERITY_CONFIG["urgency_max_score"]), score)
+    unique_hits = list(dict.fromkeys(weighted_hits))
+    return score, unique_hits, len(unique_hits)
+
+
+def _calc_taxonomy_score(text: str) -> tuple[float, Dict[str, Any], list[str]]:
+    match = match_news_category(text)
+    if match is None:
+        return 0.0, {"category_key": "", "label": "", "confidence_score": 0.0, "severity_bias": ""}, []
+
+    bias_bonus = SEVERITY_CONFIG["taxonomy"]["bias_bonus"]
+    score = float(bias_bonus.get(match.severity_bias, 0.0))
+    matched_terms = list(match.matched_primary + match.matched_aliases)
+    details = {
+        "category_key": match.category_key,
+        "label": match.label,
+        "confidence_score": round(match.confidence_score, 4),
+        "severity_bias": match.severity_bias,
+        "breaking_eligible": match.breaking_eligible,
+        "matched_primary": list(match.matched_primary),
+        "matched_aliases": list(match.matched_aliases),
+        "matched_required": list(match.matched_required),
+        "score": round(score, 4),
+    }
+    return score, details, matched_terms
+
+
+def _calc_style_score(text: str, *, has_link: bool) -> tuple[float, Dict[str, Any]]:
+    style_cfg = SEVERITY_CONFIG["style"]
+    score = 0.0
+
+    details: Dict[str, Any] = {
+        "short_with_link": False,
+        "emoji_density_count": 0,
+        "caps_ratio": 0.0,
+        "punctuation_spike": False,
+    }
+
+    char_len = len(text)
+    if char_len <= int(style_cfg["short_text_threshold_chars"]) and has_link:
+        score += float(style_cfg["short_with_link_or_media_bonus"])
+        details["short_with_link"] = True
+
+    emoji_count = _count_emoji(text)
+    details["emoji_density_count"] = emoji_count
+    if emoji_count >= int(style_cfg["emoji_density_min_count"]):
+        score += float(style_cfg["emoji_density_bonus"])
+        alert_hits = len(_alert_emoji_hits(text))
+        if alert_hits >= 2:
+            score += float(style_cfg["alert_emoji_extra_bonus"])
+
+    caps_ratio = _caps_ratio(text)
+    details["caps_ratio"] = round(caps_ratio, 4)
+    if caps_ratio >= float(style_cfg["caps_ratio_threshold"]) and len(text) >= 40:
+        score += float(style_cfg["caps_bonus"])
+
+    punct_spike = _punctuation_spike(text)
+    details["punctuation_spike"] = punct_spike
+    if punct_spike:
+        score += float(style_cfg["punctuation_spike_bonus"])
+
+    score = min(float(style_cfg["max_score"]), score)
+    details["score"] = round(score, 4)
+    return score, details
+
+
+def _calc_humanized_score(
+    text: str,
+    *,
+    humanized_probability: float,
+    urgency_hits: int,
+) -> tuple[float, Dict[str, Any]]:
+    cfg = SEVERITY_CONFIG["humanized"]
+    taxonomy_matches = find_news_category_matches(text)
+    vital_hits: list[str] = []
+    seen: set[str] = set()
+    for match in taxonomy_matches:
+        if not match.breaking_eligible and match.severity_bias == "low":
+            continue
+        for phrase in (*match.matched_primary, *match.matched_aliases):
+            if phrase in seen:
+                continue
+            seen.add(phrase)
+            vital_hits.append(phrase)
+    vital_density = min(1.0, len(vital_hits) / 3.0)
+    if vital_density <= 0 and urgency_hits >= 3:
+        vital_density = 0.5
+
+    probability = max(0.0, min(1.0, float(humanized_probability)))
+    score = float(cfg["max_score"]) * probability * vital_density
+
+    details = {
+        "probability": round(probability, 4),
+        "vital_hit_count": len(vital_hits),
+        "vital_hits": vital_hits[:8],
+        "vital_density": round(vital_density, 4),
+        "score": round(score, 4),
+    }
+    return score, details
+
+
+def _calc_temporal_context_score(
+    text: str,
+    *,
+    reply_to: int,
+    story_signals: Dict[str, Any],
+) -> tuple[float, Dict[str, Any]]:
+    cfg = SEVERITY_CONFIG["temporal_context"]
+    score = 0.0
+    ontology = story_signals.get("ontology") or {}
+    frame = ontology.get("event_frame") or {}
+
+    city_hits = [str(item) for item in frame.get("places") or []]
+    if city_hits:
+        score += float(cfg["city_bonus"])
+
+    right_now_hits = [str(item) for item in frame.get("recency_hits") or []]
+    if right_now_hits:
+        score += float(cfg["right_now_bonus"])
+
+    is_root_post = int(reply_to or 0) == 0
+    if is_root_post:
+        score += float(cfg["root_post_bonus"])
+
+    score = min(float(cfg["max_score"]), score)
+    details = {
+        "city_hits": city_hits[:6],
+        "right_now_hits": right_now_hits[:6],
+        "is_root_post": is_root_post,
+        "score": round(score, 4),
+    }
+    return score, details
+
+
+def _calc_negative_penalty(
+    text: str,
+    *,
+    source_name: str,
+    text_tokens: int,
+    story_signals: Dict[str, Any],
+) -> tuple[float, Dict[str, Any]]:
+    cfg = SEVERITY_CONFIG["negative_penalties"]
+    penalty = 0.0
+
+    recap_hits = [str(item) for item in story_signals.get("explainer_hits") or []]
+    if recap_hits:
+        penalty -= float(cfg["recap_penalty"])
+
+    analysis_hits = [
+        hit
+        for hit in recap_hits
+        if hit in {"analysis", "thread", "opinion", "overview", "what we know", "recap", "roundup"}
+    ]
+    if analysis_hits:
+        penalty -= float(cfg["analysis_penalty"])
+
+    if int(text_tokens) > int(cfg["long_text_tokens_threshold"]):
+        penalty -= float(cfg["long_text_penalty"])
+
+    source_key = _normalize_key(source_name)
+    noisy_patterns = SEVERITY_CONFIG["noisy_source_patterns"]
+    noisy_source_matches = [pat for pat in noisy_patterns if _normalize_key(pat) in source_key]
+    if noisy_source_matches:
+        penalty -= float(cfg["noisy_source_penalty"])
+
+    if bool(story_signals.get("explainer_like")):
+        penalty -= 0.14
+    if bool(story_signals.get("question_led")):
+        penalty -= 0.06
+
+    max_abs = float(cfg["max_penalty_abs"])
+    penalty = max(-max_abs, min(0.0, penalty))
+
+    details = {
+        "recap_hits": recap_hits[:8],
+        "analysis_hits": analysis_hits[:8],
+        "long_text": int(text_tokens) > int(cfg["long_text_tokens_threshold"]),
+        "noisy_source_matches": noisy_source_matches[:6],
+        "explainer_like": bool(story_signals.get("explainer_like")),
+        "question_led": bool(story_signals.get("question_led")),
+        "downgrade_explainer": bool(story_signals.get("downgrade_explainer")),
+        "penalty": round(penalty, 4),
+    }
+    return penalty, details
+
+
+def _cooldown_state(source_key: str, now_ts: float) -> dict[str, Any]:
+    cfg = SEVERITY_CONFIG["source_cooldown"]
+    window = int(cfg["window_seconds"])
+    max_high = int(cfg["max_high_per_window"])
+
+    with _COOLDOWN_LOCK:
+        bucket = _HIGH_SEVERITY_HISTORY[source_key]
+        while bucket and (now_ts - bucket[0]) > window:
+            bucket.popleft()
+        allowed = len(bucket) < max_high
+        return {
+            "allowed": allowed,
+            "in_window": len(bucket),
+            "max_per_window": max_high,
+            "window_seconds": window,
+        }
+
+
+def _register_high(source_key: str, now_ts: float) -> None:
+    with _COOLDOWN_LOCK:
+        _HIGH_SEVERITY_HISTORY[source_key].append(now_ts)
+
+
+def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
+    """
+    Returns (severity, total_score, breakdown)
+
+    severity: "high" | "medium" | "low"
+    breakdown: full explainable dict for logging
+    """
+
+    text = _extract_text(msg)
+    source_name = _extract_source_name(msg)
+    normalized = _normalize_key(text)
+    has_link = bool(msg.get("has_link", False)) or bool(_URL_RE.search(text))
+    text_tokens = int(msg.get("text_tokens") or max(1, len(_extract_tokens(text))))
+    reply_to = int(msg.get("reply_to") or 0)
+    humanized_probability = float(msg.get("humanized_vital_probability") or 0.0)
+    now_ts = float(msg.get("timestamp") or time.time())
+    channel_id = str(msg.get("channel_id") or "").strip()
+    story_signals = detect_story_signals(text)
+    moderation = moderation_scan_text(text)
+
+    if bool(moderation.get("blocked")):
+        breakdown: Dict[str, Any] = {
+            "source": source_name,
+            "raw_score": 0.0,
+            "final_score": 0.0,
+            "score_band": "low",
+            "moderation": moderation,
+            "moderation_blocked": True,
+            "normalized_text_preview": normalized[:220],
+        }
+        return "low", 0.0, breakdown
+
+    tier, source_score = _detect_source_tier(source_name)
+    urgency_score, urgency_hits, urgency_hit_count = _calc_urgency_score(text, story_signals=story_signals)
+    taxonomy_score, taxonomy_details, taxonomy_hits = _calc_taxonomy_score(text)
+    style_score, style_details = _calc_style_score(text, has_link=has_link)
+    humanized_score, humanized_details = _calc_humanized_score(
+        text,
+        humanized_probability=humanized_probability,
+        urgency_hits=urgency_hit_count,
+    )
+    temporal_score, temporal_details = _calc_temporal_context_score(
+        text,
+        reply_to=reply_to,
+        story_signals=story_signals,
+    )
+    penalty_score, penalty_details = _calc_negative_penalty(
+        text,
+        source_name=source_name,
+        text_tokens=text_tokens,
+        story_signals=story_signals,
+    )
+
+    raw_score = (
+        source_score
+        + urgency_score
+        + taxonomy_score
+        + style_score
+        + humanized_score
+        + temporal_score
+        + penalty_score
+    )
+    if int(moderation.get("frequency") or 0) > 0:
+        raw_score += min(0.12, float(moderation.get("score") or 0.0) / 100.0)
+    raw_score = max(0.0, min(1.0, raw_score))
+
+    thresholds = severity_thresholds()
+    if raw_score >= float(thresholds["high"]):
+        severity = "high"
+    elif raw_score >= float(thresholds["medium"]):
+        severity = "medium"
+    else:
+        severity = "low"
+
+    hard_rules = SEVERITY_CONFIG["hard_rules"]
+    recap_present = bool(penalty_details["recap_hits"])
+    forced_reasons: list[str] = []
+
+    # Hard rule 1: recap/summary-like posts cannot be high.
+    if severity == "high" and hard_rules.get("never_high_if_recap", True) and recap_present:
+        severity = "medium"
+        forced_reasons.append("downgrade_recap_guard")
+
+    # Hard rule 2: non-S sources need at least 2 urgency hits OR very high humanized probability.
+    effective_urgency_hit_count = urgency_hit_count + (1 if bool(taxonomy_details.get("breaking_eligible")) else 0)
+
+    if severity == "high" and tier != "S":
+        min_hits = int(hard_rules["non_s_min_urgency_signals_for_high"])
+        override_prob = float(hard_rules["non_s_humanized_override_prob"])
+        if effective_urgency_hit_count < min_hits and humanized_probability <= override_prob:
+            severity = "medium"
+            forced_reasons.append("downgrade_non_s_insufficient_urgency")
+
+    if severity == "high" and bool(story_signals.get("downgrade_explainer")):
+        severity = "medium"
+        forced_reasons.append("downgrade_explainer_guard")
+
+    # Hard rule 3: per-source cooldown for high severity.
+    source_key = channel_id or _normalize_key(source_name) or "unknown-source"
+    cooldown_info = _cooldown_state(source_key, now_ts)
+    if severity == "high":
+        if cooldown_info["allowed"]:
+            _register_high(source_key, now_ts)
+            cooldown_info["in_window"] = int(cooldown_info["in_window"]) + 1
+        else:
+            severity = "medium"
+            forced_reasons.append("downgrade_source_high_cooldown")
+
+    final_score, score_band = _calibrate_severity_score(
+        raw_score,
+        severity=severity,
+        thresholds=thresholds,
+    )
+    calibration_reason = None
+    if score_band != _score_band(raw_score, thresholds):
+        if forced_reasons:
+            calibration_reason = ",".join(forced_reasons)
+        else:
+            calibration_reason = "score_band_alignment"
+
+    breakdown: Dict[str, Any] = {
+        "source": source_name,
+        "source_tier": tier,
+        "raw_score": round(raw_score, 4),
+        "final_score": round(final_score, 4),
+        "score_band": score_band,
+        "thresholds": thresholds,
+        "source_score": round(source_score, 4),
+        "urgency_score": round(urgency_score, 4),
+        "urgency_hits": urgency_hits[:12],
+        "urgency_hit_count": urgency_hit_count,
+        "effective_urgency_hit_count": effective_urgency_hit_count,
+        "taxonomy_score": round(taxonomy_score, 4),
+        "taxonomy": taxonomy_details,
+        "taxonomy_hits": taxonomy_hits[:12],
+        "style_score": round(style_score, 4),
+        "style": style_details,
+        "humanized_score": round(humanized_score, 4),
+        "humanized": humanized_details,
+        "temporal_score": round(temporal_score, 4),
+        "temporal": temporal_details,
+        "penalty_score": round(penalty_score, 4),
+        "penalties": penalty_details,
+        "moderation": moderation,
+        "moderation_blocked": False,
+        "story_signals": {
+            "explainer_hits": list(story_signals.get("explainer_hits") or []),
+            "question_led": bool(story_signals.get("question_led")),
+            "concrete_event": bool(story_signals.get("concrete_event")),
+            "official_development": bool(story_signals.get("official_development")),
+            "recency": bool(story_signals.get("recency")),
+            "downgrade_explainer": bool(story_signals.get("downgrade_explainer")),
+            "live_event_update": bool(story_signals.get("live_event_update")),
+        },
+        "has_link": has_link,
+        "text_tokens": text_tokens,
+        "text_chars": len(text),
+        "normalized_text_preview": normalized[:220],
+        "cooldown": cooldown_info,
+        "forced_reasons": forced_reasons,
+    }
+    if calibration_reason:
+        breakdown["calibration_reason"] = calibration_reason
+    return severity, round(final_score, 4), breakdown
