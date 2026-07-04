@@ -26,6 +26,7 @@ import importlib
 from typing import Deque, Dict, List, Sequence, Tuple
 import uuid
 
+from _terminal import _COLOR_ON
 import httpx
 from telethon import TelegramClient, events, functions, utils
 from telethon.errors import (
@@ -198,74 +199,19 @@ except Exception:  # pragma: no cover - non-Unix fallback
     resource = None  # type: ignore[assignment]
 
 
-def _supports_color() -> bool:
-    forced = str(os.getenv("CLI_COLOR", "") or "").strip().lower()
-    if forced in {"1", "true", "yes", "on"}:
-        return True
-    if forced in {"0", "false", "no", "off"}:
-        return False
-    if os.getenv("NO_COLOR"):
-        return False
-    if not sys.stderr.isatty():
-        return False
-    return str(os.getenv("TERM", "") or "").strip().lower() not in {"", "dumb"}
-
-
-_COLOR_ON = _supports_color()
-_C_RESET = "\033[0m"
-_C_BOLD = "\033[1m"
-_C_DIM = "\033[2m"
-_C_CYAN = "\033[36m"
-_C_GREEN = "\033[32m"
-_C_YELLOW = "\033[33m"
-_C_RED = "\033[31m"
 _last_cli_status_signature: tuple[str, str] | None = None
 _last_cli_status_at: float = 0.0
 
 
-def _c(text: str, color: str, *, bold: bool = False, dim: bool = False) -> str:
-    if not _COLOR_ON:
-        return text
-    style = ""
-    if bold:
-        style += _C_BOLD
-    if dim:
-        style += _C_DIM
-    return f"{style}{color}{text}{_C_RESET}"
-
-
 def _print_cli_banner() -> None:
-    if not sys.stdin.isatty():
-        return
-    line = "═" * 64
-    print(_c(line, _C_CYAN, bold=True))
-    print(_c("Telegram News Intelligence Userbot", _C_CYAN, bold=True))
-    print(_c("Single entrypoint: python main.py", _C_CYAN, dim=True))
-    print(_c(line, _C_CYAN, bold=True))
+    from _terminal import print_banner
+    print_banner()
 
 
 def _print_cli_status(symbol: str, text: str, *, level: str = "info") -> None:
     global _last_cli_status_signature, _last_cli_status_at
-
-    if not sys.stdin.isatty():
-        return
-    normalized_text = str(text or "").strip()
-    if normalized_text == "OpenAI auth ready" and (not auth_ready or auth_degraded):
-        return
-    now = time.time()
-    signature = (level, normalized_text)
-    if _last_cli_status_signature == signature and (now - _last_cli_status_at) < 0.5:
-        return
-    _last_cli_status_signature = signature
-    _last_cli_status_at = now
-    color = _C_CYAN
-    if level == "ok":
-        color = _C_GREEN
-    elif level == "warn":
-        color = _C_YELLOW
-    elif level == "error":
-        color = _C_RED
-    print(f"{_c(symbol, color, bold=True)} {text}")
+    from _terminal import print_status
+    print_status(symbol, text, level=level)
 
 
 def _pull_latest_repo_version_on_startup() -> bool:
@@ -10402,8 +10348,8 @@ async def _phase_initialize() -> None:
     _print_cli_status("✓", "Database and runtime state ready", level="ok")
 
     _set_startup_phase("auth", reason="auth_preparation_started")
-    _print_cli_status("•", "Preparing OpenAI auth context...", level="info")
-    await _prepare_auth_runtime_for_startup()
+    async with spinner("Preparing AI auth context..."):
+        await _prepare_auth_runtime_for_startup()
     _log_memory_snapshot("auth_runtime_prepared", phase=startup_phase, auth_ready=auth_ready, auth_degraded=auth_degraded, auth_mode=auth_startup_mode_effective)
     log_structured(
         LOGGER, "auth_startup_state",
@@ -10426,21 +10372,21 @@ async def _phase_login() -> List[int]:
     global client, destination_peer, bot_destination_token, bot_destination_chat_id
 
     _set_startup_phase("telegram_login", reason="telegram_session_connect_started")
-    _print_cli_status("•", "Connecting Telegram user session...", level="info")
-    client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
-    await _ensure_user_account_session()
+    async with spinner("Connecting Telegram user session..."):
+        client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
+        await _ensure_user_account_session()
     _log_memory_snapshot("telegram_session_ready", phase=startup_phase)
     _print_cli_status("✓", "Telegram session authorized", level="ok")
 
     _set_startup_phase("destination_setup", reason="destination_validation_started")
-    _print_cli_status("•", "Validating destination...", level="info")
-    await _ensure_destination_peer()
+    async with spinner("Validating destination..."):
+        await _ensure_destination_peer()
     _log_memory_snapshot("destination_ready", phase=startup_phase)
     _print_cli_status("✓", "Destination ready", level="ok")
 
     _set_startup_phase("source_setup", reason="source_resolution_started")
-    _print_cli_status("•", "Resolving source channels...", level="info")
-    resolved_sources = await setup_sources()
+    async with spinner("Resolving source channels..."):
+        resolved_sources = await setup_sources()
     while not resolved_sources:
         if not _is_interactive_runtime():
             raise RuntimeError("No source channels resolved. Set valid FOLDER_INVITE_LINK or EXTRA_SOURCES in environment.")
@@ -10471,7 +10417,8 @@ async def _phase_start_core(resolved_sources: List[int]) -> None:
     global digest_scheduler_task, daily_digest_scheduler_task, queue_clear_scheduler_task, query_bot_poll_task
 
     _set_startup_phase("pipeline", reason="pipeline_worker_start_started")
-    await _start_pipeline_workers()
+    async with spinner("Starting pipeline workers..."):
+        await _start_pipeline_workers()
     _print_cli_status("✓", "Inbound pipeline workers started", level="ok")
 
     _set_startup_phase("handlers", reason="handler_registration_started")
