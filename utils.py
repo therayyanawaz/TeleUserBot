@@ -2071,7 +2071,15 @@ async def search_recent_news_web(
             window_hours=resolved_hours,
         )
         url = build_url(search_query)
-        response = await http.get(url)
+        try:
+            response = await http.get(url)
+        except Exception:
+            if logger:
+                logger.debug("Web cross-check HTTP error provider=%s variant=%s", provider_name, variant, exc_info=True)
+            return []
+            if logger:
+                logger.debug("Web cross-check HTTP error %s provider=%s variant=%s", url, provider_name, variant, exc_info=True)
+            return []
         if response.status_code != 200:
             if logger:
                 logger.debug(
