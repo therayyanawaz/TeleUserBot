@@ -11,7 +11,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
-WEBHOOK_SECRET = os.environ["DEPLOY_WEBHOOK_SECRET"]
+WEBHOOK_SECRET = os.environ.get("DEPLOY_WEBHOOK_SECRET", "")
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESTART_CMD = os.getenv("DEPLOY_RESTART_CMD", "systemctl restart teleuserbot").split()
 PORT = int(os.getenv("DEPLOY_WEBHOOK_PORT", "9876"))
@@ -60,8 +60,8 @@ class DeployHandler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(body)
             sha = str(payload.get("sha") or "unknown")
-        except Exception:
-            pass
+        except json.JSONDecodeError:
+            LOGGER.warning("Deploy webhook body not valid JSON")
 
         LOGGER.info("Deploy trigger accepted. SHA=%s", sha)
         self.send_response(200)
