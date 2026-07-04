@@ -8544,30 +8544,37 @@ def _web_status_payload() -> Dict[str, object]:
     try:
         last_ts = get_last_digest_timestamp()
     except Exception:
+        LOGGER.warning("Health status: get_last_digest_timestamp failed")
         last_ts = None
     try:
         pending = count_pending()
     except Exception:
+        LOGGER.warning("Health status: count_pending failed")
         pending = 0
     try:
         inflight = count_inflight()
     except Exception:
+        LOGGER.warning("Health status: count_inflight failed")
         inflight = 0
     try:
         inbound_counts = load_inbound_job_counts()
     except Exception:
+        LOGGER.warning("Health status: load_inbound_job_counts failed")
         inbound_counts = {}
     try:
         inbound_oldest = oldest_pending_inbound_job_age_seconds()
     except Exception:
+        LOGGER.warning("Health status: oldest_pending_inbound_job_age_seconds failed")
         inbound_oldest = None
     try:
         ai_cache_stats = get_filter_decision_cache_stats()
     except Exception:
+        LOGGER.warning("Health status: get_filter_decision_cache_stats failed")
         ai_cache_stats = {"hits": 0.0, "misses": 0.0, "hit_rate": 0.0}
     try:
         ontology_health = get_ontology_health_snapshot()
     except Exception:
+        LOGGER.warning("Health status: get_ontology_health_snapshot failed")
         ontology_health = {
             "version": 0,
             "compiled_category_count": 0,
@@ -8578,22 +8585,26 @@ def _web_status_payload() -> Dict[str, object]:
     try:
         ai_cache_entries = count_ai_decision_cache_entries()
     except Exception:
+        LOGGER.warning("Health status: count_ai_decision_cache_entries failed")
         ai_cache_entries = 0
     try:
         recent_failures = load_recent_inbound_job_failures(limit=5)
     except Exception:
+        LOGGER.warning("Health status: load_recent_inbound_job_failures failed")
         recent_failures = []
     try:
         active_story_clusters = count_active_breaking_story_clusters(
             since_ts=int(now) - _breaking_story_window_seconds()
         )
     except Exception:
+        LOGGER.warning("Health status: count_active_breaking_story_clusters failed")
         active_story_clusters = 0
     try:
         recent_story_decisions = load_breaking_story_decision_counts(
             since_ts=int(now) - 3600
         )
     except Exception:
+        LOGGER.warning("Health status: load_breaking_story_decision_counts failed")
         recent_story_decisions = {}
     context_stats = _delivery_context_stats_snapshot()
     digest_recovery = _digest_recovery_status_snapshot(now_ts=int(now))
