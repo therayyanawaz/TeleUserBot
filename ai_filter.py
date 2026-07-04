@@ -348,6 +348,67 @@ class _CodexApiError(RuntimeError):
     """Raised for non-auth Codex backend errors."""
 
 
+class _CircuitBreakerError(_CodexApiError):
+    """Raised when the LLM circuit breaker is open (too many recent failures)."""
+
+
+class _LlmCircuitBreaker:
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0):
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout = recovery_timeout
+        self._failure_count = 0
+        self._last_failure_time = 0.0
+        self._state = "closed"
+
+    def _now(self) -> float:
+        return time.monotonic()
+
+    def _transition(self) -> str:
+        if self._state == "open" and self._now() - self._last_failure_time >= self._recovery_timeout:
+            self._state = "half_open"
+        return self._state
+
+    @property
+    def state(self) -> str:
+        return self._transition()
+
+    def record_success(self) -> None:
+        self._failure_count = 0
+        self._state = "closed"
+
+    def record_failure(self) -> None:
+        self._failure_count += 1
+        self._last_failure_time = self._now()
+        if self._failure_count >= self._failure_threshold:
+            self._state = "open"
+            LOGGER.warning(
+                "LLM circuit breaker OPEN after %s consecutive failures (timeout=%ss)",
+                self._failure_count,
+                self._recovery_timeout,
+            )
+
+    async def _check(self) -> None:
+        if self._transition() == "open":
+            raise _CircuitBreakerError(
+                f"LLM circuit breaker open ({self._failure_count} consecutive failures)"
+            )
+
+    async def call(self, coro: Awaitable[str]) -> str:
+        await self._check()
+        try:
+            result = await coro
+            self.record_success()
+            return result
+        except (_CodexAuthError, _CodexRateLimitError, _CircuitBreakerError):
+            raise
+        except Exception:
+            self.record_failure()
+            raise
+
+
+_LLM_CIRCUIT_BREAKER = _LlmCircuitBreaker()
+
+
 @dataclass
 class FilterDecision:
     action: Literal["skip", "deliver", "digest"]
@@ -2673,38 +2734,46 @@ async def _call_codex_with_auth_repair(
     on_token: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     if _using_openrouter():
-        return await _call_openrouter(
-            cleaned,
-            instructions,
-            verbosity=verbosity,
-            on_token=on_token,
+        return await _LLM_CIRCUIT_BREAKER.call(
+            _call_openrouter(
+                cleaned,
+                instructions,
+                verbosity=verbosity,
+                on_token=on_token,
+            )
         )
     if _using_groq():
-        return await _call_groq(
-            cleaned,
-            instructions,
-            verbosity=verbosity,
-            on_token=on_token,
+        return await _LLM_CIRCUIT_BREAKER.call(
+            _call_groq(
+                cleaned,
+                instructions,
+                verbosity=verbosity,
+                on_token=on_token,
+            )
         )
 
     try:
         auth_context = await auth_manager.get_auth_context()
-        return await _call_codex(
-            cleaned,
-            auth_context,
-            instructions=instructions,
-            verbosity=verbosity,
-            on_token=on_token,
-        )
-    except _CodexAuthError as exc:
-        auth_context = await auth_manager.refresh_auth_context()
-        try:
-            return await _call_codex(
+        return await _LLM_CIRCUIT_BREAKER.call(
+            _call_codex(
                 cleaned,
                 auth_context,
                 instructions=instructions,
                 verbosity=verbosity,
                 on_token=on_token,
+            )
+        )
+    except _CodexAuthError as exc:
+        auth_context = await auth_manager.refresh_auth_context()
+        try:
+            return await _LLM_CIRCUIT_BREAKER.call(
+                _call_codex(
+                    cleaned,
+                    auth_context,
+                    instructions=instructions,
+                    verbosity=verbosity,
+                    on_token=on_token,
+                )
             )
         except Exception as refresh_exc:
             raise refresh_exc from exc
