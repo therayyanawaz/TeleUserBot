@@ -3144,6 +3144,7 @@ async def _source_title_from_channel_id(channel_id: str) -> str:
                 title = username.strip()
                 break
         except Exception:
+            LOGGER.debug("Failed to resolve entity for source candidate %s", candidate)
             continue
 
     source_title_cache[channel_id] = title
