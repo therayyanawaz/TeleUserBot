@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Dict
 
 import httpx
@@ -10,6 +11,16 @@ import httpx
 
 _CLIENT_LOCK = asyncio.Lock()
 _CLIENTS: Dict[str, httpx.AsyncClient] = {}
+
+
+def _default_limits() -> httpx.Limits:
+    """Return sensible connection pool limits from env or defaults."""
+    max_connections = int(os.getenv("HTTP_MAX_CONNECTIONS", "50"))
+    max_keepalive = int(os.getenv("HTTP_MAX_KEEPALIVE", "10"))
+    return httpx.Limits(
+        max_connections=max_connections,
+        max_keepalive_connections=max_keepalive,
+    )
 
 
 async def _get_or_create(
@@ -25,6 +36,7 @@ async def _get_or_create(
         created = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=follow_redirects,
+            limits=_default_limits(),
         )
         _CLIENTS[name] = created
         return created
