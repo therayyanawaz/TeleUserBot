@@ -5249,9 +5249,9 @@ def _acquire_instance_lock():
         handle.write(str(os.getpid()))
         handle.flush()
         os.fsync(handle.fileno())
-    except Exception:
-        # Lock is held; metadata write failure is non-fatal.
-        pass
+    except Exception as exc:
+        handle.close()
+        raise RuntimeError("Failed to write instance lock metadata") from exc
 
     return handle
 
