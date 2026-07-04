@@ -23,13 +23,12 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 import importlib
-from typing import Any, Deque, Dict, List, Sequence, Tuple
+from typing import Deque, Dict, List, Sequence, Tuple
 import uuid
 
 import httpx
 from telethon import TelegramClient, events, functions, utils
 from telethon.errors import (
-    ChatForwardsRestrictedError,
     FloodWaitError,
     MessageNotModifiedError,
     PhoneNumberInvalidError,
@@ -64,7 +63,6 @@ from ai_filter import (
     resolve_vital_rational_view_for_delivery,
     summarize_breaking_headline,
     summarize_vital_rational_view,
-    summarize_or_skip,
 )
 from prompts import QUERY_NO_MATCH_TEXT, digest_output_style
 from auth import (
@@ -170,7 +168,6 @@ from utils import (
     log_structured,
     normalize_space,
     parse_daily_times,
-    parse_time_filter_from_query,
     expand_query_terms,
     extract_query_keywords,
     extract_query_numbers,
