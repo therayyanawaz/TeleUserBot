@@ -509,6 +509,9 @@ class RuntimeActivityBufferHandler(logging.Handler):
         try:
             view = build_runtime_event_view(record, sanitize=self._sanitize)
         except Exception:
+            logging.getLogger("runtime_presenter").warning(
+                "Failed to build runtime event view: %s", record.msg
+            )
             return
         with self._lock:
             self._events.appendleft(view)
