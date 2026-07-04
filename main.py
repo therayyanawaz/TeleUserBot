@@ -20,9 +20,10 @@ import time
 from types import SimpleNamespace
 import urllib.parse
 from collections import defaultdict, deque
+from dataclasses import dataclass, field
 from datetime import datetime
 import importlib
-from typing import Deque, Dict, List, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Sequence, Tuple
 import uuid
 
 import httpx
@@ -478,6 +479,78 @@ def _configure_runtime_logging() -> None:
     _log_memory_snapshot("logger_bootstrap_complete", phase=startup_phase)
 
 
+@dataclass
+class RuntimeState:
+    client: TelegramClient | None = None
+    auth_manager: AuthManager | None = None
+    destination_peer: object = None
+    bot_destination_token: str | None = None
+    bot_destination_chat_id: str | None = None
+    premium_emoji_map: Dict[str, str] = field(default_factory=dict)
+
+    album_buffers: Dict[Tuple[str, int], List[Message]] = field(default_factory=lambda: defaultdict(list))
+    album_tasks: Dict[Tuple[str, int], asyncio.Task] = field(default_factory=dict)
+    digest_scheduler_task: asyncio.Task | None = None
+    daily_digest_scheduler_task: asyncio.Task | None = None
+    queue_clear_scheduler_task: asyncio.Task | None = None
+    query_bot_poll_task: asyncio.Task | None = None
+
+    source_title_cache: Dict[str, str] = field(default_factory=dict)
+    source_alias_cache: Dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
+    digest_next_run_ts: float | None = None
+    digest_retry_backoff_seconds: int = 0
+    digest_loop_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    digest_recovery_state: Dict[str, object] = field(default_factory=lambda: {
+        "active": False,
+        "mode": "normal",
+        "window_start_ts": None,
+        "window_end_ts": None,
+        "claimed_rows": 0,
+    })
+    dupe_detector: HybridDuplicateEngine | None = None
+    monitored_source_chat_ids: List[int] = field(default_factory=list)
+
+    query_last_request_ts: Dict[int, float] = field(default_factory=dict)
+    query_conversation_history: Dict[int, Deque[Dict[str, str]]] = field(default_factory=lambda: defaultdict(lambda: deque(maxlen=20)))
+    query_bot_updates_offset: int = 0
+    query_bot_poll_started_at: int = 0
+
+    breaking_delivery_refs: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    breaking_story_ref_cache: Dict[str, object] = field(default_factory=dict)
+    breaking_topic_threads: List[Dict[str, object]] = field(default_factory=list)
+    breaking_topic_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    delivery_context_stats: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    query_allowed_bot_user_id: int | None = None
+    query_bot_user_id_checked: bool = False
+    instance_lock_handle: object = None
+    web_status_server: WebStatusServer | None = None
+
+    started_as_username: str = "unknown"
+    started_as_user_id: int = 0
+    startup_phase: str = "booting"
+    startup_ready: bool = False
+    startup_error: str = ""
+
+    auth_startup_mode_configured: str = "auto"
+    auth_startup_mode_effective: str = "auto"
+    auth_ready: bool = False
+    auth_degraded: bool = False
+    auth_failure_reason: str = ""
+    auth_features_disabled: List[str] = field(default_factory=list)
+    startup_auth_repair_status: str = "not_needed"
+    startup_auth_repair_message: str = ""
+    startup_git_updated: bool = False
+
+    pipeline_worker_tasks: List[asyncio.Task] = field(default_factory=list)
+    pipeline_sentence_transformer_warm_task: asyncio.Task | None = None
+    pipeline_query_web_semaphore: asyncio.Semaphore | None = None
+    _shutdown_initiated: bool = False
+    pipeline_stage_latency_seconds: Dict[str, Deque[float]] = field(default_factory=lambda: defaultdict(lambda: deque(maxlen=200)))
+    pipeline_stage_runs: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    runtime_memory_warning_logged: bool = False
+
+
 client: TelegramClient | None = None
 auth_manager: AuthManager | None = None
 destination_peer = None
@@ -546,6 +619,9 @@ _shutdown_initiated: bool = False
 pipeline_stage_latency_seconds: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=200))
 pipeline_stage_runs: Dict[str, int] = defaultdict(int)
 runtime_memory_warning_logged: bool = False
+
+# RuntimeState dataclass for structured state. Used by phase-split functions.
+# Individual globals above remain for backward compatibility with existing code.
 
 INBOUND_STAGE_TRIAGE = "triage"
 INBOUND_STAGE_AI_DECISION = "ai_decision"
@@ -10545,68 +10621,198 @@ def _startup_health_check() -> None:
     )
 
 
+async def _phase_boot() -> bool:
+    global web_status_server, startup_error, startup_ready, startup_git_updated, startup_phase
+
+    _configure_runtime_logging()
+    startup_ready = False
+    startup_error = ""
+    _set_startup_phase("booting", reason="startup_entered")
+    _print_cli_banner()
+    _register_signal_handlers(asyncio.get_event_loop())
+    _print_cli_status("•", "Pulling latest code from origin/main...", level="info")
+    startup_git_updated = _pull_latest_repo_version_on_startup()
+    if startup_git_updated:
+        _print_cli_status("↻", "Repository updated. Restarting to load latest code...", level="warn")
+        _restart_process_after_startup_update()
+
+    if _is_web_server_enabled():
+        try:
+            web_status_server = WebStatusServer(
+                host=_web_server_host(),
+                port=_web_server_port(),
+                get_status=_web_status_payload,
+                get_recent_events=_recent_runtime_activity,
+                logger=LOGGER,
+            )
+            web_status_server.start()
+            _log_memory_snapshot("web_status_server_started", phase=startup_phase, web_server_host=_web_server_host(), web_server_port=_web_server_port())
+        except Exception:
+            LOGGER.exception("Failed starting web status server.")
+            web_status_server = None
+
+    _set_startup_phase("config", reason="config_validation_started")
+    _print_cli_status("•", "Validating configuration...", level="info")
+    try:
+        _prompt_for_missing_config()
+        _validate_config()
+        load_news_taxonomy(force_reload=True)
+        _log_memory_snapshot("config_validated", phase=startup_phase)
+        _print_cli_status("✓", "Configuration validated", level="ok")
+    except (RuntimeError, ValueError) as exc:
+        startup_error = str(exc)
+        startup_ready = False
+        _set_startup_phase("error", reason="config_validation_failed")
+        _log_memory_snapshot("startup_failure", phase=startup_phase, failure_reason=startup_error, failure_stage="config")
+        LOGGER.error("%s", exc)
+        _print_cli_status("✗", "Configuration invalid. Fix values and re-run.", level="error")
+        if _is_web_server_enabled() and _should_hold_on_startup_error():
+            LOGGER.warning("Holding process alive after config validation error for health visibility.")
+            while True:
+                await asyncio.sleep(3600)
+        return False
+
+    return True
+
+
+async def _phase_initialize() -> None:
+    global premium_emoji_map, dupe_detector
+
+    _set_startup_phase("initializing", reason="runtime_initialization_started")
+    _load_premium_emoji_map()
+    _log_memory_snapshot("premium_emoji_map_loaded", phase=startup_phase, premium_emoji_count=len(premium_emoji_map))
+    init_db()
+    _log_memory_snapshot("database_initialized", phase=startup_phase)
+    await _init_dupe_detector()
+    _log_memory_snapshot("dupe_detector_initialized", phase=startup_phase)
+    _startup_health_check()
+    _log_memory_snapshot("runtime_state_ready", phase=startup_phase)
+    _print_cli_status("✓", "Database and runtime state ready", level="ok")
+
+    _set_startup_phase("auth", reason="auth_preparation_started")
+    _print_cli_status("•", "Preparing OpenAI auth context...", level="info")
+    await _prepare_auth_runtime_for_startup()
+    _log_memory_snapshot("auth_runtime_prepared", phase=startup_phase, auth_ready=auth_ready, auth_degraded=auth_degraded, auth_mode=auth_startup_mode_effective)
+    log_structured(
+        LOGGER, "auth_startup_state",
+        mode_configured=auth_startup_mode_configured,
+        mode_effective=auth_startup_mode_effective,
+        ready=auth_ready, degraded=auth_degraded,
+        failure_reason=auth_failure_reason or None,
+        features_disabled=list(auth_features_disabled),
+        startup_repair_status=startup_auth_repair_status,
+        startup_repair_message=startup_auth_repair_message or None,
+    )
+    if auth_ready and not auth_degraded:
+        _print_cli_status("+", "OpenAI auth ready", level="ok")
+    else:
+        summary = _trim_runtime_reason(auth_failure_reason or "OpenAI auth unavailable.", limit=96)
+        _print_cli_status("!", f"OpenAI auth degraded; disabled: {', '.join(auth_features_disabled) or 'none'} ({summary})", level="warn")
+
+
+async def _phase_login() -> List[int]:
+    global client, destination_peer, bot_destination_token, bot_destination_chat_id
+
+    _set_startup_phase("telegram_login", reason="telegram_session_connect_started")
+    _print_cli_status("•", "Connecting Telegram user session...", level="info")
+    client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
+    await _ensure_user_account_session()
+    _log_memory_snapshot("telegram_session_ready", phase=startup_phase)
+    _print_cli_status("✓", "Telegram session authorized", level="ok")
+
+    _set_startup_phase("destination_setup", reason="destination_validation_started")
+    _print_cli_status("•", "Validating destination...", level="info")
+    await _ensure_destination_peer()
+    _log_memory_snapshot("destination_ready", phase=startup_phase)
+    _print_cli_status("✓", "Destination ready", level="ok")
+
+    _set_startup_phase("source_setup", reason="source_resolution_started")
+    _print_cli_status("•", "Resolving source channels...", level="info")
+    resolved_sources = await setup_sources()
+    while not resolved_sources:
+        if not _is_interactive_runtime():
+            raise RuntimeError("No source channels resolved. Set valid FOLDER_INVITE_LINK or EXTRA_SOURCES in environment.")
+        print("No channels resolved from folder. Add manual sources (username/public/private invite links).")
+        new_sources = _prompt_sources()
+        current = getattr(config, "EXTRA_SOURCES", [])
+        if not isinstance(current, list):
+            current = []
+        current.extend(new_sources)
+        deduped: List[str] = []
+        seen = set()
+        for item in current:
+            normalized = str(item).strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        config.EXTRA_SOURCES = deduped
+        _persist_config_updates({"EXTRA_SOURCES": config.EXTRA_SOURCES})
+        resolved_sources = await setup_sources()
+    _log_memory_snapshot("source_resolution_completed", phase=startup_phase, resolved_source_count=len(resolved_sources))
+    _print_cli_status("✓", f"Sources ready ({len(resolved_sources)} total)", level="ok")
+    return resolved_sources
+
+
+async def _phase_start_core(resolved_sources: List[int]) -> None:
+    global started_as_username, started_as_user_id
+    global digest_scheduler_task, daily_digest_scheduler_task, queue_clear_scheduler_task, query_bot_poll_task
+
+    _set_startup_phase("pipeline", reason="pipeline_worker_start_started")
+    await _start_pipeline_workers()
+    _print_cli_status("✓", "Inbound pipeline workers started", level="ok")
+
+    _set_startup_phase("handlers", reason="handler_registration_started")
+    client.add_event_handler(_on_new_message, events.NewMessage(chats=resolved_sources))
+    status_pattern = rf"^{re.escape(_digest_status_command())}(?:\\s+.*)?$"
+    client.add_event_handler(_on_digest_status_command, events.NewMessage(outgoing=True, pattern=status_pattern))
+    if _is_query_mode_enabled():
+        client.add_event_handler(_on_query_message, events.NewMessage(outgoing=True))
+    _log_memory_snapshot("handlers_registered", phase=startup_phase, query_mode_enabled=_is_query_mode_enabled(), resolved_source_count=len(resolved_sources))
+
+    me = await client.get_me()
+    started_as_username = str(getattr(me, "username", "") or "unknown")
+    started_as_user_id = int(getattr(me, "id", 0) or 0)
+    LOGGER.info("Userbot started as @%s", started_as_username)
+    _print_cli_status("🚀", f"Running as @{started_as_username} — monitoring {len(resolved_sources)} source(s)", level="ok")
+
+    if _is_query_mode_enabled() and _looks_like_bot_token(_bot_destination_token_from_config()):
+        query_bot_poll_task = asyncio.create_task(run_query_bot_poll_loop(), name="query-bot-poll")
+    if _is_missing_folder_invite_link():
+        LOGGER.info("Listening to %s manually configured channels.", len(resolved_sources))
+    if _is_digest_mode_enabled():
+        digest_scheduler_task = asyncio.create_task(run_digest_scheduler(), name="digest-scheduler")
+        if _digest_daily_times():
+            daily_digest_scheduler_task = asyncio.create_task(run_daily_digest_scheduler(), name="daily-digest-scheduler")
+        if _digest_queue_clear_interval_seconds() > 0:
+            queue_clear_scheduler_task = asyncio.create_task(run_digest_queue_clear_scheduler(), name="digest-queue-clear-scheduler")
+            _print_cli_status("✓", "Schedulers started (30m rolling + daily + queue clear)", level="ok")
+        else:
+            queue_clear_scheduler_task = None
+            _print_cli_status("✓", "Schedulers started (30m rolling + daily; queue clear disabled)", level="ok")
+
+
+async def _phase_run(resolved_sources: List[int]) -> None:
+    global startup_ready, startup_error, startup_phase
+
+    _set_startup_phase("running", reason="startup_runtime_ready")
+    startup_ready = True
+    startup_error = ""
+    _log_memory_snapshot("runtime_ready", phase=startup_phase, resolved_source_count=len(resolved_sources), started_as_user_id=started_as_user_id, digest_mode_enabled=_is_digest_mode_enabled(), query_mode_enabled=_is_query_mode_enabled())
+    await _maybe_start_duplicate_backend_warmup()
+    try:
+        await client.run_until_disconnected()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        LOGGER.info("Shutdown requested. Stopping userbot...")
+        _print_cli_status("•", "Shutdown requested, stopping...", level="warn")
+
+
 async def main() -> None:
-    global client, auth_manager, digest_scheduler_task
-    global daily_digest_scheduler_task, queue_clear_scheduler_task, query_bot_poll_task
-    global instance_lock_handle, web_status_server, started_as_username, started_as_user_id
-    global startup_phase, startup_ready, startup_error, startup_git_updated
+    global instance_lock_handle, startup_phase, startup_ready, startup_error, startup_git_updated
 
     try:
-        _configure_runtime_logging()
-        startup_ready = False
-        startup_error = ""
-        _set_startup_phase("booting", reason="startup_entered")
-        _print_cli_banner()
-        _register_signal_handlers(asyncio.get_event_loop())
-        _print_cli_status("•", "Pulling latest code from origin/main...", level="info")
-        startup_git_updated = _pull_latest_repo_version_on_startup()
-        if startup_git_updated:
-            _print_cli_status("↻", "Repository updated. Restarting to load latest code...", level="warn")
-            _restart_process_after_startup_update()
-        if _is_web_server_enabled():
-            try:
-                web_status_server = WebStatusServer(
-                    host=_web_server_host(),
-                    port=_web_server_port(),
-                    get_status=_web_status_payload,
-                    get_recent_events=_recent_runtime_activity,
-                    logger=LOGGER,
-                )
-                web_status_server.start()
-                _log_memory_snapshot(
-                    "web_status_server_started",
-                    phase=startup_phase,
-                    web_server_host=_web_server_host(),
-                    web_server_port=_web_server_port(),
-                )
-            except Exception:
-                LOGGER.exception("Failed starting web status server.")
-                web_status_server = None
-
-        _set_startup_phase("config", reason="config_validation_started")
-        _print_cli_status("•", "Validating configuration...", level="info")
-        try:
-            _prompt_for_missing_config()
-            _validate_config()
-            load_news_taxonomy(force_reload=True)
-            _log_memory_snapshot("config_validated", phase=startup_phase)
-            _print_cli_status("✓", "Configuration validated", level="ok")
-        except (RuntimeError, ValueError) as exc:
-            startup_error = str(exc)
-            startup_ready = False
-            _set_startup_phase("error", reason="config_validation_failed")
-            _log_memory_snapshot(
-                "startup_failure",
-                phase=startup_phase,
-                failure_reason=startup_error,
-                failure_stage="config",
-            )
-            LOGGER.error("%s", exc)
-            _print_cli_status("✗", "Configuration invalid. Fix values and re-run.", level="error")
-            if _is_web_server_enabled() and _should_hold_on_startup_error():
-                LOGGER.warning("Holding process alive after config validation error for health visibility.")
-                while True:
-                    await asyncio.sleep(3600)
+        boot_ok = await _phase_boot()
+        if not boot_ok:
             return
 
         _set_startup_phase("lock", reason="instance_lock_started")
@@ -10619,12 +10825,7 @@ async def main() -> None:
             startup_error = str(exc)
             startup_ready = False
             _set_startup_phase("error", reason="instance_lock_failed")
-            _log_memory_snapshot(
-                "startup_failure",
-                phase=startup_phase,
-                failure_reason=startup_error,
-                failure_stage="lock",
-            )
+            _log_memory_snapshot("startup_failure", phase=startup_phase, failure_reason=startup_error, failure_stage="lock")
             LOGGER.error("%s", exc)
             _print_cli_status("✗", "Another instance is already running", level="error")
             if _is_web_server_enabled() and _should_hold_on_startup_error():
@@ -10634,196 +10835,15 @@ async def main() -> None:
             return
 
         try:
-            _set_startup_phase("initializing", reason="runtime_initialization_started")
-            _load_premium_emoji_map()
-            _log_memory_snapshot(
-                "premium_emoji_map_loaded",
-                phase=startup_phase,
-                premium_emoji_count=len(premium_emoji_map),
-            )
-            init_db()
-            _log_memory_snapshot("database_initialized", phase=startup_phase)
-            await _init_dupe_detector()
-            _log_memory_snapshot("dupe_detector_initialized", phase=startup_phase)
-            _startup_health_check()
-            _log_memory_snapshot("runtime_state_ready", phase=startup_phase)
-            _print_cli_status("✓", "Database and runtime state ready", level="ok")
-
-            _set_startup_phase("auth", reason="auth_preparation_started")
-            _print_cli_status("•", "Preparing OpenAI auth context...", level="info")
-            await _prepare_auth_runtime_for_startup()
-            _log_memory_snapshot(
-                "auth_runtime_prepared",
-                phase=startup_phase,
-                auth_ready=auth_ready,
-                auth_degraded=auth_degraded,
-                auth_mode=auth_startup_mode_effective,
-            )
-            log_structured(
-                LOGGER,
-                "auth_startup_state",
-                mode_configured=auth_startup_mode_configured,
-                mode_effective=auth_startup_mode_effective,
-                ready=auth_ready,
-                degraded=auth_degraded,
-                failure_reason=auth_failure_reason or None,
-                features_disabled=list(auth_features_disabled),
-                startup_repair_status=startup_auth_repair_status,
-                startup_repair_message=startup_auth_repair_message or None,
-            )
-            if auth_ready and not auth_degraded:
-                _print_cli_status("+", "OpenAI auth ready", level="ok")
-            else:
-                summary = _trim_runtime_reason(auth_failure_reason or "OpenAI auth unavailable.", limit=96)
-                _print_cli_status(
-                    "!",
-                    f"OpenAI auth degraded; disabled: {', '.join(auth_features_disabled) or 'none'} ({summary})",
-                    level="warn",
-                )
-
-            _set_startup_phase("telegram_login", reason="telegram_session_connect_started")
-            _print_cli_status("•", "Connecting Telegram user session...", level="info")
-            client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
-            await _ensure_user_account_session()
-            _log_memory_snapshot("telegram_session_ready", phase=startup_phase)
-            _print_cli_status("✓", "Telegram session authorized", level="ok")
-            _set_startup_phase("destination_setup", reason="destination_validation_started")
-            _print_cli_status("•", "Validating destination...", level="info")
-            await _ensure_destination_peer()
-            _log_memory_snapshot("destination_ready", phase=startup_phase)
-            _print_cli_status("✓", "Destination ready", level="ok")
-
-            _set_startup_phase("source_setup", reason="source_resolution_started")
-            _print_cli_status("•", "Resolving source channels...", level="info")
-            resolved_sources = await setup_sources()
-            while not resolved_sources:
-                if not _is_interactive_runtime():
-                    raise RuntimeError(
-                        "No source channels resolved. Set valid FOLDER_INVITE_LINK "
-                        "or EXTRA_SOURCES in environment."
-                    )
-                print(
-                    "No channels resolved from folder. Add manual sources "
-                    "(username/public/private invite links)."
-                )
-                new_sources = _prompt_sources()
-                current = getattr(config, "EXTRA_SOURCES", [])
-                if not isinstance(current, list):
-                    current = []
-                current.extend(new_sources)
-                # Preserve order while deduplicating newly added manual sources.
-                deduped: List[str] = []
-                seen = set()
-                for item in current:
-                    normalized = str(item).strip()
-                    if not normalized or normalized in seen:
-                        continue
-                    seen.add(normalized)
-                    deduped.append(normalized)
-                config.EXTRA_SOURCES = deduped
-                _persist_config_updates({"EXTRA_SOURCES": config.EXTRA_SOURCES})
-                resolved_sources = await setup_sources()
-            _log_memory_snapshot(
-                "source_resolution_completed",
-                phase=startup_phase,
-                resolved_source_count=len(resolved_sources),
-            )
-            _print_cli_status("✓", f"Sources ready ({len(resolved_sources)} total)", level="ok")
-
-            _set_startup_phase("pipeline", reason="pipeline_worker_start_started")
-            await _start_pipeline_workers()
-            _print_cli_status("✓", "Inbound pipeline workers started", level="ok")
-
-            _set_startup_phase("handlers", reason="handler_registration_started")
-            client.add_event_handler(_on_new_message, events.NewMessage(chats=resolved_sources))
-            status_pattern = rf"^{re.escape(_digest_status_command())}(?:\\s+.*)?$"
-            client.add_event_handler(
-                _on_digest_status_command,
-                events.NewMessage(outgoing=True, pattern=status_pattern),
-            )
-            if _is_query_mode_enabled():
-                client.add_event_handler(
-                    _on_query_message,
-                    events.NewMessage(outgoing=True),
-                )
-            _log_memory_snapshot(
-                "handlers_registered",
-                phase=startup_phase,
-                query_mode_enabled=_is_query_mode_enabled(),
-                resolved_source_count=len(resolved_sources),
-            )
-
-            me = await client.get_me()
-            started_as_username = str(getattr(me, "username", "") or "unknown")
-            started_as_user_id = int(getattr(me, "id", 0) or 0)
-            LOGGER.info("Userbot started as @%s", started_as_username)
-            _print_cli_status(
-                "🚀",
-                f"Running as @{started_as_username} — monitoring {len(resolved_sources)} source(s)",
-                level="ok",
-            )
-            if _is_query_mode_enabled() and _looks_like_bot_token(_bot_destination_token_from_config()):
-                query_bot_poll_task = asyncio.create_task(
-                    run_query_bot_poll_loop(),
-                    name="query-bot-poll",
-                )
-            if _is_missing_folder_invite_link():
-                LOGGER.info("Listening to %s manually configured channels.", len(resolved_sources))
-            if _is_digest_mode_enabled():
-                digest_scheduler_task = asyncio.create_task(
-                    run_digest_scheduler(),
-                    name="digest-scheduler",
-                )
-                if _digest_daily_times():
-                    daily_digest_scheduler_task = asyncio.create_task(
-                        run_daily_digest_scheduler(),
-                        name="daily-digest-scheduler",
-                    )
-                if _digest_queue_clear_interval_seconds() > 0:
-                    queue_clear_scheduler_task = asyncio.create_task(
-                        run_digest_queue_clear_scheduler(),
-                        name="digest-queue-clear-scheduler",
-                    )
-                    _print_cli_status(
-                        "✓",
-                        "Schedulers started (30m rolling + daily + queue clear)",
-                        level="ok",
-                    )
-                else:
-                    queue_clear_scheduler_task = None
-                    _print_cli_status(
-                        "✓",
-                        "Schedulers started (30m rolling + daily; queue clear disabled)",
-                        level="ok",
-                    )
-
-            _set_startup_phase("running", reason="startup_runtime_ready")
-            startup_ready = True
-            startup_error = ""
-            _log_memory_snapshot(
-                "runtime_ready",
-                phase=startup_phase,
-                resolved_source_count=len(resolved_sources),
-                started_as_user_id=started_as_user_id,
-                digest_mode_enabled=_is_digest_mode_enabled(),
-                query_mode_enabled=_is_query_mode_enabled(),
-            )
-            await _maybe_start_duplicate_backend_warmup()
-            try:
-                await client.run_until_disconnected()
-            except (asyncio.CancelledError, KeyboardInterrupt):
-                LOGGER.info("Shutdown requested. Stopping userbot...")
-                _print_cli_status("•", "Shutdown requested, stopping...", level="warn")
+            await _phase_initialize()
+            resolved_sources = await _phase_login()
+            await _phase_start_core(resolved_sources)
+            await _phase_run(resolved_sources)
         except (RuntimeError, ValueError) as exc:
             startup_error = str(exc)
             startup_ready = False
             _set_startup_phase("error", reason="startup_runtime_failed")
-            _log_memory_snapshot(
-                "startup_failure",
-                phase=startup_phase,
-                failure_reason=startup_error,
-                failure_stage="runtime",
-            )
+            _log_memory_snapshot("startup_failure", phase=startup_phase, failure_reason=startup_error, failure_stage="runtime")
             LOGGER.error("%s", exc)
             _print_cli_status("✗", "Startup failed", level="error")
             if _is_web_server_enabled() and _should_hold_on_startup_error():
@@ -10834,12 +10854,7 @@ async def main() -> None:
             startup_error = str(exc)
             startup_ready = False
             _set_startup_phase("error", reason="startup_runtime_unhandled_exception")
-            _log_memory_snapshot(
-                "startup_failure",
-                phase=startup_phase,
-                failure_reason=startup_error,
-                failure_stage="runtime_unhandled",
-            )
+            _log_memory_snapshot("startup_failure", phase=startup_phase, failure_reason=startup_error, failure_stage="runtime_unhandled")
             LOGGER.exception("Unhandled startup error.")
             if _is_web_server_enabled() and _should_hold_on_startup_error():
                 LOGGER.warning("Holding process alive after unhandled startup error for health visibility.")
