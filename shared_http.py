@@ -43,16 +43,19 @@ async def _get_or_create(
 
 
 async def get_codex_http_client() -> httpx.AsyncClient:
+    total_timeout = float(os.getenv("CODEX_HTTP_TIMEOUT", "90.0"))
+    connect_timeout = float(os.getenv("CODEX_HTTP_CONNECT_TIMEOUT", "20.0"))
     return await _get_or_create(
         "codex",
-        timeout=httpx.Timeout(90.0, connect=20.0),
+        timeout=httpx.Timeout(total_timeout, connect=connect_timeout),
     )
 
 
 async def get_auth_http_client() -> httpx.AsyncClient:
+    timeout = float(os.getenv("AUTH_HTTP_TIMEOUT", "30.0"))
     return await _get_or_create(
         "auth",
-        timeout=httpx.Timeout(30.0),
+        timeout=httpx.Timeout(timeout),
     )
 
 
@@ -66,9 +69,10 @@ async def get_bot_http_client(timeout: httpx.Timeout | float | int) -> httpx.Asy
 
 
 async def get_web_http_client() -> httpx.AsyncClient:
+    timeout = float(os.getenv("WEB_HTTP_TIMEOUT", "20.0"))
     return await _get_or_create(
         "web_search",
-        timeout=httpx.Timeout(20.0),
+        timeout=httpx.Timeout(timeout),
         follow_redirects=True,
     )
 
