@@ -2721,100 +2721,7 @@ async def _prime_query_bot_update_offset() -> None:
     query_bot_updates_offset = max(query_bot_updates_offset, max_seen)
 
 
-async def _resolve_query_bot_reply_target(
-    *,
-    chat_id: int,
-    sender_id: int,
-    text: str,
-    max_attempts: int = 8,
-    sleep_seconds: float = 0.45,
-) -> int | None:
-    """
-    Resolve the bot-side message_id for a user query inside the bot PM.
 
-    The outgoing MTProto message id seen by the userbot is not guaranteed to
-    match the Bot API message id visible to the bot. To thread bot replies
-    correctly, inspect recent Bot API updates and match the user's query text.
-    """
-    global query_bot_updates_offset
-
-    normalized_text = normalize_space(text)
-    if not normalized_text:
-        return None
-
-    now_ts = int(time.time())
-
-    for attempt in range(max(1, int(max_attempts))):
-        data = {
-            "timeout": "0",
-            "limit": "50",
-        }
-        if query_bot_updates_offset > 0:
-            data["offset"] = str(query_bot_updates_offset)
-
-        try:
-            updates = await _query_bot_api_request("getUpdates", data=data)
-        except Exception:
-            LOGGER.debug("Failed to resolve bot-side reply target via getUpdates.", exc_info=True)
-            return None
-
-        max_seen_offset = query_bot_updates_offset
-        matched_message_id: int | None = None
-        fallback_message_id: int | None = None
-        fallback_message_ts: int = 0
-
-        if isinstance(updates, list):
-            for update in reversed(updates):
-                if not isinstance(update, dict):
-                    continue
-                update_id = int(update.get("update_id", 0) or 0)
-                if update_id > 0:
-                    max_seen_offset = max(max_seen_offset, update_id + 1)
-
-                payload = update.get("message") or update.get("edited_message")
-                if not isinstance(payload, dict):
-                    continue
-
-                payload_chat = payload.get("chat")
-                if not isinstance(payload_chat, dict):
-                    continue
-                if int(payload_chat.get("id", 0) or 0) != int(chat_id):
-                    continue
-
-                payload_from = payload.get("from")
-                if not isinstance(payload_from, dict):
-                    continue
-                if int(payload_from.get("id", 0) or 0) != int(sender_id):
-                    continue
-
-                payload_date = int(payload.get("date", 0) or 0)
-                if payload_date > 0 and abs(now_ts - payload_date) > 180:
-                    continue
-
-                candidate = int(payload.get("message_id", 0) or 0)
-                if candidate > 0 and payload_date >= fallback_message_ts:
-                    fallback_message_id = candidate
-                    fallback_message_ts = payload_date
-
-                if candidate <= 0:
-                    continue
-
-                payload_text_raw = payload.get("text") or payload.get("caption") or ""
-                payload_text = normalize_space(str(payload_text_raw or ""))
-                if payload_text == normalized_text:
-                    matched_message_id = candidate
-                    break
-
-        query_bot_updates_offset = max(query_bot_updates_offset, max_seen_offset)
-        if matched_message_id:
-            return matched_message_id
-        if fallback_message_id:
-            return fallback_message_id
-
-        if attempt + 1 < max_attempts:
-            await asyncio.sleep(max(0.05, float(sleep_seconds)))
-
-    return None
 
 
 def _infer_chat_id_from_updates(updates: object) -> str | None:
@@ -2839,25 +2746,6 @@ def _infer_chat_id_from_updates(updates: object) -> str | None:
                 return str(chat["id"])
     return None
 
-
-def _media_type_for_bot(msg: Message) -> str:
-    if msg.photo:
-        return "photo"
-    if msg.video:
-        return "video"
-    return "document"
-
-
-def _filename_for_bot_media(msg: Message, index: int) -> str:
-    if msg.photo:
-        return f"photo_{msg.id or index}.jpg"
-    if msg.video:
-        return f"video_{msg.id or index}.mp4"
-    if msg.document and getattr(msg.document, "attributes", None):
-        for attr in msg.document.attributes:
-            if isinstance(attr, types.DocumentAttributeFilename) and attr.file_name:
-                return attr.file_name
-    return f"file_{msg.id or index}.bin"
 
 
 def _message_has_media(msg: object) -> bool:
@@ -2898,11 +2786,7 @@ def _plain_text_from_html_fragment(text: str) -> str:
     return normalize_space(strip_telegram_html(normalized))
 
 
-def _format_source_label(source_title: str) -> str:
-    safe_source = sanitize_telegram_html(source_title)
-    if _include_source_tags():
-        return f"<b>📰 {safe_source}</b>"
-    return "<b>📰 Update</b>"
+
 
 
 def _to_bot_text(text: str | None, max_len: int | None = None) -> str | None:
@@ -5085,41 +4969,7 @@ def _compact_story_bridge_text(text: str, *, max_words: int = 18) -> str:
     return clean
 
 
-def _recent_story_bridge_context(text: str, *, hours: int = 6, limit: int = 3) -> List[str]:
-    now = int(time.time())
-    since_ts = max(0, now - max(1, hours) * 3600)
-    rows = load_archive_since(since_ts, 160)
-    current_tokens = _breaking_topic_tokens(text)
-    current_norm = _breaking_topic_normalized(text)
-    if not current_tokens or not current_norm:
-        return []
 
-    ranked: list[tuple[float, int, str]] = []
-    seen_norms: set[str] = set()
-    for row in rows:
-        raw_text = str(row.get("raw_text") or "").strip()
-        if not raw_text:
-            continue
-        candidate_norm = _breaking_topic_normalized(raw_text)
-        if not candidate_norm or candidate_norm == current_norm or candidate_norm in seen_norms:
-            continue
-        candidate_tokens = _breaking_topic_tokens(raw_text)
-        overlap, ratio = _breaking_topic_similarity(current_tokens, candidate_tokens)
-        fuzzy = _breaking_topic_fuzzy_similarity(current_norm, candidate_norm)
-        if overlap < 2 and ratio < 0.34 and fuzzy < 0.55:
-            continue
-        ts = int(row.get("timestamp") or 0)
-        age = max(0, now - ts)
-        recency_bonus = max(0.0, 1.0 - min(age, hours * 3600) / float(hours * 3600 or 1)) * 0.2
-        score = overlap * 0.18 + ratio * 0.42 + fuzzy * 0.25 + recency_bonus
-        compact = _compact_story_bridge_text(raw_text)
-        if not compact:
-            continue
-        ranked.append((score, ts, f"{_format_story_bridge_age(age)}: {compact}"))
-        seen_norms.add(candidate_norm)
-
-    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [item[2] for item in ranked[: max(1, limit)]]
 
 
 def _cleanup_breaking_topic_threads_locked(now_ts: int | None = None) -> None:
@@ -5235,11 +5085,7 @@ async def _register_breaking_topic_thread(
         )
 
 
-def _prepend_breaking_continuity(payload: str) -> str:
-    prefix = sanitize_telegram_html(_breaking_topic_continuity_prefix())
-    if not prefix:
-        return payload
-    return f"<i>{prefix}</i><br><br>{payload}"
+
 
 
 async def _merge_duplicate_breaking(
@@ -5632,51 +5478,7 @@ async def _load_destination_message_ref(message_id: int) -> object | None:
     return None
 
 
-async def _process_single_message(msg: Message) -> None:
-    channel_id = str(msg.chat_id)
-    if is_seen(channel_id, msg.id):
-        return
 
-    text = (msg.message or "").strip()
-    source, link = await _source_info(msg)
-
-    if not text:
-        mark_seen(channel_id, msg.id)
-        return
-
-    summary = await summarize_or_skip(text, _require_auth_manager())
-    if summary is None:
-        mark_seen(channel_id, msg.id)
-        return
-
-    reply_to = await _resolve_source_reply_target(msg)
-    summary_headline, summary_context = extract_feed_summary_parts(summary, text)
-    resolved_context = await _resolve_dynamic_delivery_context(
-        current_text=text,
-        headline=summary_headline,
-        candidate_context=summary_context,
-        source_title=source,
-    )
-    sent_ref = await _send_text_with_ref(
-        _format_summary_text(source, summary, raw_text=text, context_override=resolved_context),
-        reply_to=reply_to,
-    )
-    _register_source_delivery_refs(
-        channel_id=channel_id,
-        source_message_ids=[msg.id],
-        sent_ref=sent_ref,
-    )
-    mark_seen(channel_id, msg.id)
-
-
-async def _process_album(messages: List[Message]) -> None:
-    if not messages:
-        return
-
-    channel_id = str(messages[0].chat_id)
-    message_ids = [m.id for m in messages]
-    mark_seen_many(channel_id, message_ids)
-    return
 
 
 async def _queue_single_message_for_digest(msg: Message) -> None:
@@ -5779,16 +5581,6 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
         pending=count_pending(),
         severity_breakdown=severity_breakdown,
     )
-
-
-async def _queue_album_for_digest(messages: List[Message]) -> None:
-    if not messages:
-        return
-
-    messages = sorted(messages, key=lambda m: m.id)
-    channel_id = str(messages[0].chat_id)
-    message_ids = [m.id for m in messages]
-    mark_seen_many(channel_id, message_ids)
 
 
 def _pipeline_worker_targets() -> Dict[str, int]:
@@ -6981,10 +6773,6 @@ async def _send_digest_message_sequence(messages: Sequence[str]) -> object | Non
     return first_ref
 
 
-def _effective_interval_seconds() -> int:
-    return _digest_interval_seconds()
-
-
 def _headline_rail_body_title(interval_minutes: int) -> str:
     minutes = max(1, int(interval_minutes))
     if minutes == 60:
@@ -7321,14 +7109,6 @@ async def _enrich_headline_rail_items(
         seen.add(key)
         resolved.append(rewritten)
     return resolved or normalized
-
-
-def _adaptive_batch_size() -> int:
-    base = _digest_max_posts()
-    health = get_quota_health()
-    scale = float(health.get("batch_scale", 1.0))
-    scaled = int(base * scale)
-    return max(8, min(base, scaled))
 
 
 async def _run_post_processors(text: str, context: Dict[str, object]) -> str:
@@ -9563,72 +9343,7 @@ def _merge_query_context(
     return ordered[: max(1, int(limit))]
 
 
-def _format_evidence_split_section(
-    telegram_rows: Sequence[Dict[str, object]],
-    web_rows: Sequence[Dict[str, object]],
-    *,
-    max_items: int = 4,
-) -> str:
-    if not telegram_rows and not web_rows:
-        return ""
 
-    limit = max(1, int(max_items))
-    lines: list[str] = ["<b>Evidence Split</b>", "<b>Telegram Providers</b>"]
-
-    telegram_seen: set[str] = set()
-    telegram_lines = 0
-    for item in telegram_rows:
-        source_raw = normalize_space(str(item.get("source") or "Telegram"))
-        source_key = source_raw.lower()
-        if source_key in telegram_seen:
-            continue
-        telegram_seen.add(source_key)
-
-        text = normalize_space(str(item.get("text") or ""))
-        if len(text) > 95:
-            text = f"{text[:92].rsplit(' ', 1)[0]}..."
-        text_safe = sanitize_telegram_html(text or "Matched update")
-        source_safe = sanitize_telegram_html(source_raw)
-        link = normalize_space(str(item.get("link") or ""))
-
-        if link.startswith("http"):
-            lines.append(f'• <i>{source_safe}</i>: <a href="{link}">{text_safe}</a>')
-        else:
-            lines.append(f"• <i>{source_safe}</i>: {text_safe}")
-        telegram_lines += 1
-        if telegram_lines >= limit:
-            break
-    if telegram_lines == 0:
-        lines.append("• <i>No recent Telegram matches.</i>")
-
-    lines.append("<b>Web Providers</b>")
-    web_seen: set[str] = set()
-    web_lines = 0
-    for item in web_rows:
-        source_raw = normalize_space(str(item.get("source") or "Web"))
-        source_key = source_raw.lower()
-        if source_key in web_seen:
-            continue
-        web_seen.add(source_key)
-
-        text = normalize_space(str(item.get("text") or ""))
-        if len(text) > 95:
-            text = f"{text[:92].rsplit(' ', 1)[0]}..."
-        text_safe = sanitize_telegram_html(text or "Matched report")
-        source_safe = sanitize_telegram_html(source_raw)
-        link = normalize_space(str(item.get("link") or ""))
-
-        if link.startswith("http"):
-            lines.append(f'• <i>{source_safe}</i>: <a href="{link}">{text_safe}</a>')
-        else:
-            lines.append(f"• <i>{source_safe}</i>: {text_safe}")
-        web_lines += 1
-        if web_lines >= limit:
-            break
-    if web_lines == 0:
-        lines.append("• <i>No recent trusted web matches in the selected time window.</i>")
-
-    return "<br>".join(lines)
 
 
 async def _safe_reply_markdown(
@@ -9773,7 +9488,7 @@ async def _safe_reply_markdown(
                 await asyncio.sleep(wait_seconds)
             except Exception:
                 LOGGER.exception("Failed to send query response message.")
-                return None
+    return None
 
 
 async def _stream_query_answer(
