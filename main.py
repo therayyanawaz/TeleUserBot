@@ -12,6 +12,7 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -283,7 +284,7 @@ def _pull_latest_repo_version_on_startup() -> bool:
     except FileNotFoundError:
         LOGGER.warning("Skipping startup git pull because git is not installed.")
         return False
-    except Exception:
+    except OSError:
         LOGGER.exception("Startup git pull failed before runtime initialization.")
         return False
 
@@ -541,6 +542,7 @@ startup_git_updated: bool = False
 pipeline_worker_tasks: List[asyncio.Task] = []
 pipeline_sentence_transformer_warm_task: asyncio.Task | None = None
 pipeline_query_web_semaphore: asyncio.Semaphore | None = None
+_shutdown_initiated: bool = False
 pipeline_stage_latency_seconds: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=200))
 pipeline_stage_runs: Dict[str, int] = defaultdict(int)
 runtime_memory_warning_logged: bool = False
@@ -615,7 +617,7 @@ def _parse_linux_process_status_memory(status_text: str) -> Dict[str, int]:
             continue
         try:
             numeric = int(parts[0])
-        except Exception:
+        except (ValueError, TypeError):
             continue
         unit = parts[1].lower() if len(parts) >= 2 else "bytes"
         size_bytes = numeric * 1024 if unit == "kb" else numeric
@@ -684,6 +686,30 @@ def _set_startup_phase(phase: str, *, reason: str = "") -> None:
         phase=startup_phase,
         phase_reason=normalize_space(reason) or startup_phase,
     )
+
+
+def _signal_handler() -> None:
+    global _shutdown_initiated
+    if _shutdown_initiated:
+        return
+    _shutdown_initiated = True
+    LOGGER.warning("Shutdown signal received. Stopping userbot...")
+    _print_cli_status("•", "Shutdown signal received, disconnecting...", level="warn")
+    asyncio.ensure_future(_shutdown_and_exit())
+
+
+async def _shutdown_and_exit() -> None:
+    tg = client
+    if tg is not None and tg.is_connected():
+        await tg.disconnect()
+
+
+def _register_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
 
 
 def _is_low_memory_runtime() -> bool:
@@ -1181,7 +1207,7 @@ def _digest_interval_seconds() -> int:
     raw = getattr(config, "DIGEST_INTERVAL_MINUTES", 30)
     try:
         minutes = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         minutes = 30
     minutes = max(1, min(minutes, 24 * 60))
     return minutes * 60
@@ -1213,7 +1239,7 @@ def _digest_daily_window_hours() -> int:
     raw = getattr(config, "DIGEST_DAILY_WINDOW_HOURS", 24)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 24
     return max(1, min(value, 168))
 
@@ -1222,7 +1248,7 @@ def _digest_daily_max_posts() -> int:
     raw = getattr(config, "DIGEST_DAILY_MAX_POSTS", 300)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 300
     return max(10, min(value, 2000))
 
@@ -1231,7 +1257,7 @@ def _digest_max_posts() -> int:
     raw = getattr(config, "DIGEST_MAX_POSTS", 80)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 80
     return max(1, min(value, 500))
 
@@ -1244,7 +1270,7 @@ def _digest_headline_context_max_items() -> int:
     raw = getattr(config, "DIGEST_HEADLINE_CONTEXT_MAX_ITEMS", 2)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 2
     return max(0, min(value, 6))
 
@@ -1253,7 +1279,7 @@ def _digest_headline_context_hours_back() -> int:
     raw = getattr(config, "DIGEST_HEADLINE_CONTEXT_HOURS_BACK", 168)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 168
     return max(1, min(value, 24 * 30))
 
@@ -1262,7 +1288,7 @@ def _digest_headline_context_telegram_max_messages() -> int:
     raw = getattr(config, "DIGEST_HEADLINE_CONTEXT_TELEGRAM_MAX_MESSAGES", 8)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 8
     return max(2, min(value, 20))
 
@@ -1271,7 +1297,7 @@ def _digest_headline_context_web_max_results() -> int:
     raw = getattr(config, "DIGEST_HEADLINE_CONTEXT_WEB_MAX_RESULTS", 6)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 6
     return max(0, min(value, 20))
 
@@ -1280,7 +1306,7 @@ def _digest_send_delay_seconds() -> float:
     raw = getattr(config, "DIGEST_SEND_DELAY_SECONDS", 0.8)
     try:
         value = float(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 0.8
     return max(0.0, min(value, 5.0))
 
@@ -1289,7 +1315,7 @@ def _digest_send_chunk_size() -> int:
     raw = getattr(config, "DIGEST_SEND_CHUNK_SIZE", 3600)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 3600
     return max(1000, min(value, 3900))
 
@@ -1298,7 +1324,7 @@ def _digest_retry_base_seconds() -> int:
     raw = getattr(config, "DIGEST_RETRY_BASE_SECONDS", 30)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 30
     return max(5, min(value, 600))
 
@@ -1307,7 +1333,7 @@ def _digest_retry_max_seconds() -> int:
     raw = getattr(config, "DIGEST_RETRY_MAX_SECONDS", 900)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 900
     return max(30, min(value, 3600))
 
@@ -1316,7 +1342,7 @@ def _digest_429_threshold_per_hour() -> int:
     raw = getattr(config, "DIGEST_429_THRESHOLD_PER_HOUR", 3)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 3
     return max(1, min(value, 50))
 
@@ -1342,7 +1368,7 @@ def _dupe_threshold() -> float:
     raw = getattr(config, "DUPE_THRESHOLD", 0.87)
     try:
         value = float(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 0.87
     return min(max(value, 0.5), 0.99)
 
@@ -1351,7 +1377,7 @@ def _dupe_cache_size() -> int:
     raw = getattr(config, "DUPE_CACHE_SIZE", 400)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 400
     return max(50, min(value, 5000))
 
@@ -1360,7 +1386,7 @@ def _dupe_history_hours() -> int:
     raw = getattr(config, "DUPE_HISTORY_HOURS", 4)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 4
     return max(1, min(value, 24))
 
@@ -1440,7 +1466,7 @@ def _query_max_messages() -> int:
     raw = getattr(config, "QUERY_MAX_MESSAGES", 50)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 50
     return max(20, min(value, 60))
 
@@ -1449,7 +1475,7 @@ def _query_default_hours_back() -> int:
     raw = getattr(config, "QUERY_DEFAULT_HOURS_BACK", 24)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 24
     return max(1, min(value, 24 * 30))
 
@@ -1462,7 +1488,7 @@ def _query_web_min_telegram_results() -> int:
     raw = getattr(config, "QUERY_WEB_MIN_TELEGRAM_RESULTS", 3)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 3
     return max(0, min(value, 20))
 
@@ -1471,7 +1497,7 @@ def _query_web_max_results() -> int:
     raw = getattr(config, "QUERY_WEB_MAX_RESULTS", 12)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 12
     return max(3, min(value, 40))
 
@@ -1495,7 +1521,7 @@ def _query_web_crosscheck_hours_back(*, requested_hours: int, explicit_time_filt
     )
     try:
         value = int(requested_hours)
-    except Exception:
+    except (ValueError, TypeError):
         value = _query_default_crosscheck_hours_back()
     return max(1, min(value, limit))
 
@@ -1508,7 +1534,7 @@ def _query_web_require_min_sources() -> int:
     raw = getattr(config, "QUERY_WEB_REQUIRE_MIN_SOURCES", 2)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 2
     return max(1, min(value, 10))
 
@@ -1566,7 +1592,7 @@ _QUERY_PROGRESS_PROVIDER_LABELS = {
 def _query_window_label(hours_back: int) -> str:
     try:
         value = max(1, int(hours_back))
-    except Exception:
+    except (ValueError, TypeError):
         value = 24
     if value % 24 == 0 and value >= 24:
         days = value // 24
@@ -1822,7 +1848,7 @@ def _query_allowed_peer_ids() -> set[int]:
     for item in raw:
         try:
             value = int(str(item).strip())
-        except Exception:
+        except (ValueError, TypeError):
             continue
         if value > 0:
             allowed.add(value)
@@ -1874,7 +1900,7 @@ def _stream_edit_interval_ms() -> int:
     raw = getattr(config, "STREAM_EDIT_INTERVAL_MS", 400)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 400
     return max(200, min(value, 2000))
 
@@ -1883,7 +1909,7 @@ def _stream_max_chars_per_edit() -> int:
     raw = getattr(config, "STREAM_MAX_CHARS_PER_EDIT", 120)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 120
     return max(60, min(value, 800))
 
@@ -1901,7 +1927,7 @@ def _web_server_port() -> int:
     raw = getattr(config, "WEB_SERVER_PORT", 8080)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 8080
     return max(1, min(value, 65535))
 
@@ -1936,7 +1962,7 @@ def _breaking_match_threshold() -> int:
     raw = getattr(config, "BREAKING_MATCH_THRESHOLD", 1)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 1
     return max(1, min(value, 10))
 
@@ -1949,7 +1975,7 @@ def _breaking_topic_window_seconds() -> int:
     raw = getattr(config, "BREAKING_TOPIC_WINDOW_MINUTES", 180)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 180
     return max(10 * 60, min(value * 60, 24 * 60 * 60))
 
@@ -1958,7 +1984,7 @@ def _breaking_topic_min_overlap() -> int:
     raw = getattr(config, "BREAKING_TOPIC_MIN_OVERLAP", 2)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 2
     return max(1, min(value, 8))
 
@@ -1967,7 +1993,7 @@ def _breaking_topic_min_ratio() -> float:
     raw = getattr(config, "BREAKING_TOPIC_MIN_RATIO", 0.55)
     try:
         value = float(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 0.55
     return min(max(value, 0.1), 1.0)
 
@@ -1976,7 +2002,7 @@ def _breaking_topic_fuzzy_ratio() -> float:
     raw = getattr(config, "BREAKING_TOPIC_FUZZY_RATIO", 0.72)
     try:
         value = float(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 0.72
     return min(max(value, 0.3), 1.0)
 
@@ -2001,7 +2027,7 @@ def _breaking_story_window_seconds() -> int:
     raw = getattr(config, "BREAKING_STORY_WINDOW_MINUTES", 180)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 180
     return max(30 * 60, min(value * 60, 24 * 60 * 60))
 
@@ -2010,7 +2036,7 @@ def _breaking_story_burst_seconds() -> int:
     raw = getattr(config, "BREAKING_STORY_BURST_SECONDS", 60)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 60
     return max(15, min(value, 15 * 60))
 
@@ -2023,7 +2049,7 @@ def _humanized_vital_opinion_probability() -> float:
     raw = getattr(config, "HUMANIZED_VITAL_OPINION_PROBABILITY", 0.35)
     try:
         value = float(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 0.35
     return min(max(value, 0.0), 1.0)
 
@@ -2455,7 +2481,7 @@ async def _bot_api_request(
         payload = {}
         try:
             payload = response.json()
-        except Exception:
+        except json.JSONDecodeError:
             payload = {}
 
         if response.status_code == 429 or (
@@ -2501,7 +2527,7 @@ async def _query_bot_api_request(
         payload = {}
         try:
             payload = response.json()
-        except Exception:
+        except json.JSONDecodeError:
             payload = {}
 
         if response.status_code == 429 or (
@@ -2567,7 +2593,7 @@ async def _ensure_query_bot_polling_mode() -> bool:
         webhook_url = normalize_space(str(info.get("url") or ""))
         try:
             pending_updates = int(info.get("pending_update_count") or 0)
-        except Exception:
+        except (ValueError, TypeError):
             pending_updates = 0
 
     if not webhook_url:
@@ -3118,7 +3144,7 @@ def _telegram_max_floodwait_seconds() -> int:
     raw = getattr(config, "TELEGRAM_MAX_FLOODWAIT_SECONDS", 90)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 90
     return max(10, min(value, 3600))
 
@@ -5283,12 +5309,12 @@ def _message_ref_id(ref: object) -> int | None:
         try:
             value = int(ref.get("message_id", 0))
             return value or None
-        except Exception:
+        except (ValueError, TypeError, AttributeError):
             return None
     try:
         value = int(getattr(ref, "id", 0) or 0)
         return value or None
-    except Exception:
+    except (ValueError, TypeError, AttributeError):
         return None
 
 
@@ -5316,7 +5342,7 @@ def _deserialize_sent_ref(value: str) -> object | None:
         return None
     try:
         payload = json.loads(raw)
-    except Exception:
+    except json.JSONDecodeError:
         payload = {}
     if not isinstance(payload, dict):
         return None
@@ -5368,11 +5394,9 @@ def _acquire_instance_lock():
 def _release_instance_lock(handle) -> None:
     if handle is None:
         return
-    try:
+    with contextlib.suppress(Exception):
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except Exception:
-        pass
     with contextlib.suppress(Exception):
         handle.close()
 
@@ -5857,7 +5881,7 @@ def _load_inbound_payload(job: Dict[str, object]) -> Dict[str, object]:
     raw = str(job.get("payload_json") or "{}")
     try:
         payload = json.loads(raw)
-    except Exception:
+    except json.JSONDecodeError:
         payload = {}
     return payload if isinstance(payload, dict) else {}
 
@@ -6376,7 +6400,7 @@ def _digest_support_line_limit() -> int:
     raw = getattr(config, "DIGEST_MAX_LINES", 12)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 12
     return max(3, min(value, 12))
 
@@ -6620,7 +6644,7 @@ def _get_last_completed_digest_window_end() -> int | None:
         return None
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         return None
     return value if value > 0 else None
 
@@ -6681,15 +6705,15 @@ def _digest_input_token_budget() -> int:
     raw_fraction = getattr(config, "DIGEST_CONTEXT_FRACTION", 0.75)
     try:
         max_tokens = int(raw_max)
-    except Exception:
+    except (ValueError, TypeError):
         max_tokens = 18000
     try:
         context_tokens = int(raw_context)
-    except Exception:
+    except (ValueError, TypeError):
         context_tokens = 200000
     try:
         fraction = float(raw_fraction)
-    except Exception:
+    except (ValueError, TypeError):
         fraction = 0.75
     fraction = min(max(fraction, 0.1), 0.9)
     hard_cap = max(4000, int(context_tokens * fraction))
@@ -6701,7 +6725,7 @@ def _digest_window_page_size() -> int:
     raw = getattr(config, "DIGEST_WINDOW_PAGE_SIZE", 200)
     try:
         value = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         value = 200
     return max(25, min(value, 1000))
 
@@ -7304,7 +7328,7 @@ async def _pin_digest_message_ref(ref: object | None, *, kind: str) -> None:
     previous_raw = get_meta(meta_key) or ""
     try:
         previous_id = int(previous_raw) if previous_raw else 0
-    except Exception:
+    except (ValueError, TypeError):
         previous_id = 0
 
     try:
@@ -8066,7 +8090,7 @@ def _maybe_decay_source_tiers(now_ts: int | None = None) -> bool:
     raw = get_meta(SOURCE_TIER_DECAY_META_KEY) or ""
     try:
         last_decay_ts = int(raw) if raw else 0
-    except Exception:
+    except (ValueError, TypeError):
         last_decay_ts = 0
     if last_decay_ts > 0 and (current_ts - last_decay_ts) < SOURCE_TIER_DECAY_INTERVAL_SECONDS:
         return False
@@ -8194,7 +8218,7 @@ async def _resolve_entity_id(chat_obj) -> int | None:
         try:
             entity = await _call_with_floodwait(tg.get_entity, username)
             return utils.get_peer_id(entity)
-        except Exception:
+        except (ValueError, TypeError):
             pass
 
     chat_id = getattr(chat_obj, "id", None)
@@ -8410,8 +8434,10 @@ async def _join_and_resolve_manual_source(source: str) -> int | None:
             check = await _call_with_floodwait(tg, CheckChatInviteRequest(hash=private_hash))
             if isinstance(check, types.ChatInviteAlready):
                 return utils.get_peer_id(check.chat)
-        except Exception:
+        except UserAlreadyParticipantError:
             pass
+        except Exception:
+            LOGGER.debug("CheckChatInviteRequest failed for source=%s", source, exc_info=True)
 
     username = _extract_public_username(source)
     if username:
@@ -10531,6 +10557,7 @@ async def main() -> None:
         startup_error = ""
         _set_startup_phase("booting", reason="startup_entered")
         _print_cli_banner()
+        _register_signal_handlers(asyncio.get_event_loop())
         _print_cli_status("•", "Pulling latest code from origin/main...", level="info")
         startup_git_updated = _pull_latest_repo_version_on_startup()
         if startup_git_updated:
