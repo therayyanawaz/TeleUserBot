@@ -312,7 +312,7 @@ def _delete_runtime_log_files(*paths: Path) -> None:
         base_path.parent.mkdir(parents=True, exist_ok=True)
         for candidate in base_path.parent.glob(f"{base_path.name}*"):
             if candidate.name == base_path.name or candidate.name.startswith(f"{base_path.name}."):
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(OSError):
                     candidate.unlink()
 
 
@@ -328,12 +328,12 @@ def _reset_runtime_logging() -> None:
             continue
         if handler in root_logger.handlers:
             root_logger.removeHandler(handler)
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             handler.close()
 
     if _console_handler is not None and _console_handler in LOGGER.handlers:
         LOGGER.removeHandler(_console_handler)
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             _console_handler.close()
 
     if _runtime_root_previous_level is not None:
@@ -584,7 +584,7 @@ def _linux_memory_budget_bytes() -> int | None:
     budget_candidates: List[int] = []
 
     meminfo_path = Path("/proc/meminfo")
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(OSError, ValueError):
         for line in meminfo_path.read_text(encoding="utf-8").splitlines():
             if not line.startswith("MemTotal:"):
                 continue
@@ -600,7 +600,7 @@ def _linux_memory_budget_bytes() -> int | None:
         path = Path(raw_path)
         if not path.exists():
             continue
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError, ValueError):
             raw_value = path.read_text(encoding="utf-8").strip().lower()
             if not raw_value or raw_value == "max":
                 continue
@@ -660,7 +660,7 @@ def _process_memory_snapshot() -> Dict[str, object]:
 
     if sys.platform.startswith("linux"):
         status_path = Path("/proc/self/status")
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             parsed = _parse_linux_process_status_memory(status_path.read_text(encoding="utf-8"))
             if parsed:
                 snapshot.update(parsed)
@@ -669,7 +669,7 @@ def _process_memory_snapshot() -> Dict[str, object]:
                 return snapshot
 
     if resource is not None:
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError, ValueError):
             usage = resource.getrusage(resource.RUSAGE_SELF)
             peak_value = int(getattr(usage, "ru_maxrss", 0) or 0)
             if peak_value > 0:
@@ -4158,7 +4158,7 @@ def _register_source_delivery_refs(
     destination_message_id = _message_ref_id(sent_ref)
     if not destination_message_id:
         return
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(sqlite3.Error):
         purge_source_delivery_refs(history_hours=_source_reply_map_history_hours())
     for source_message_id in {int(item) for item in source_message_ids if int(item or 0) > 0}:
         save_source_delivery_ref(
@@ -4400,9 +4400,9 @@ def _load_active_breaking_story_clusters_snapshot(now_ts: int | None = None) -> 
     if not _is_breaking_story_clusters_enabled():
         return []
     now = int(now_ts if now_ts is not None else time.time())
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(sqlite3.Error):
         purge_breaking_story_history(older_than_ts=_breaking_story_history_cutoff_ts(now))
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(sqlite3.Error):
         return load_active_breaking_story_clusters(
             since_ts=now - _breaking_story_window_seconds(),
             limit=250,
@@ -5260,10 +5260,10 @@ def _acquire_instance_lock():
 def _release_instance_lock(handle) -> None:
     if handle is None:
         return
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(OSError):
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(OSError):
         handle.close()
 
 
@@ -5706,7 +5706,7 @@ async def _fetch_messages_for_payload(payload: Dict[str, object]) -> List[Messag
 
     chat_ref: object = channel_id
     if channel_id.lstrip("-").isdigit():
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(ValueError):
             chat_ref = int(channel_id)
 
     tg = _require_client()
@@ -7133,7 +7133,7 @@ async def _pin_digest_message_ref(ref: object | None, *, kind: str) -> None:
 
     try:
         if previous_id > 0 and previous_id != message_id:
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(ValueError, LookupError):
                 await _unpin_digest_message_id(previous_id)
 
         if _destination_uses_bot_api():
