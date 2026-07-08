@@ -197,6 +197,9 @@ def build_digest_input_block(lines: Iterable[str]) -> str:
     return f"Raw posts:\n{joined}" if joined else "Raw posts:\n"
 
 
+QUERY_NO_MATCH_TEXT = '<i>No relevant information found in the available sources.</i>'
+
+
 AI_SEVERITY_PROMPT = """
 You are a senior newsroom classifier. Your job is to analyze a news post and return three assessments in one JSON response: severity, story signals, and moderation judgment.
 
