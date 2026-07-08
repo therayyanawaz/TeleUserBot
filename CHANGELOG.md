@@ -2,20 +2,11 @@
 
 > Auto-generated from git history. Prefer conventional commits.
 
-## v7.8 — 2026-07-08
+## 2026-07-08
 
-> **Note:** The original repository was taken down. This is a fresh reupload with the same core functionality.
+### Chores
 
-### Features
-
-- `feat` Add dynamic emoji prefixes to digest titles based on content (🚨 strikes, 🛡️ defense, 🕊️ diplomacy, etc.)
-- `feat` Enhance digest prompts with premium style examples and quality checklist
-- `feat` Add time-of-day aware quiet period messaging
-- `feat` Always initialize auth manager (fixes Groq/OpenRouter crash)
-
-### Fixes
-
-- `fix` Auth manager not initialized error when using Groq or OpenRouter LLM provider
+- `5b91730` chore: v7.8 release - digest improvements, auth fix, dynamic emoji
 
 ## 2026-07-04
 

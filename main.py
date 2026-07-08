@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "7.8"
+__version__ = "7.9"
 
 import asyncio
 import contextlib
@@ -1427,8 +1427,16 @@ def _is_severity_routing_enabled() -> bool:
 
 
 def _is_immediate_high_enabled() -> bool:
+    """Whether breaking/high-severity items should be pushed immediately.
+    
+    When digest mode is active, IMMEDIATE_HIGH defaults to False so existing
+    users don't suddenly get breaking pushes.  When digest mode is disabled
+    (old "pure push" path), IMMEDIATE_HIGH defaults to True.
+    """
     if _is_digest_mode_enabled():
-        return False
+        # Digest + push coexistence: opt-in only via .env / interactive prompt
+        return _bool_flag(getattr(config, "IMMEDIATE_HIGH", False), False)
+    # Standalone push mode (no digest): keep the historical True default
     return _bool_flag(getattr(config, "IMMEDIATE_HIGH", True), True)
 
 
@@ -2320,6 +2328,68 @@ def _prompt_llm_provider() -> None:
         # Reload config so the change takes effect immediately
         importlib.reload(config)
         # Update env vars too
+        for key, value in updates.items():
+            os.environ[key] = str(value)
+    print()
+
+
+def _prompt_delivery_mode() -> None:
+    """Interactively ask the user how they want to receive news updates.
+    
+    Mode 1: 30-minute rolling digest — all posts batched into periodic digests.
+    Mode 2: Immediate breaking push — breaking/high-severity posts delivered
+            immediately, others queued for a daily digest.
+    The LLM's AI filter (decide_filter_action) already classifies each post as
+    'skip', 'deliver' (breaking), or 'digest' (queue) — this just sets the delivery
+    behavior based on that classification.
+    """
+    if not _is_interactive_runtime():
+        return
+
+    current_digest = _is_digest_mode_enabled()
+    
+    print()
+    print("━" * 50)
+    print("  📬 Delivery Mode Selection")
+    print("━" * 50)
+    print("  How should the bot deliver news updates?")
+    print("  (The AI filter will classify each post — choose how it gets delivered)")
+    print()
+    print("  1) 30-Minute Digest  — All news batched into a rolling digest every 30 min")
+    print("                         Clean, curated briefs with grouped headlines")
+    print()
+    print("  2) Breaking Push     — Breaking news pushed instantly as it happens")
+    print("                         Non-breaking items queued for a daily summary")
+    print()
+    print(f"  3) Keep current       ({'30-Minute Digest' if current_digest else 'Breaking Push'})")
+    print()
+    
+    while True:
+        default_choice = "1" if not current_digest else "3"
+        choice = input(f"  Select mode [1-3] (default: {default_choice}): ").strip()
+        if not choice:
+            choice = default_choice
+        if choice in ("1", "2", "3"):
+            break
+        print("  Invalid choice. Enter 1, 2, or 3.")
+    
+    updates = {}
+    if choice == "1":
+        updates["DIGEST_MODE"] = "true"
+        print("  ✓ 30-minute rolling digest enabled")
+        print("  All posts will be batched into clean, curated digests every 30 minutes.")
+    elif choice == "2":
+        updates["DIGEST_MODE"] = "true"
+        updates["IMMEDIATE_HIGH"] = "true"
+        print("  ✓ Breaking push + daily digest enabled")
+        print("  Breaking/high-severity items pushed immediately.")
+        print("  Daily digest continues to capture everything else.")
+    else:
+        print(f"  ✓ Keeping current mode ({'30-Minute Digest' if current_digest else 'Breaking Push'})")
+    
+    if updates:
+        _persist_config_updates(updates)
+        importlib.reload(config)
         for key, value in updates.items():
             os.environ[key] = str(value)
     print()
@@ -10452,6 +10522,9 @@ async def _phase_initialize() -> None:
 
     # Interactive LLM provider selection (only in TTY mode)
     _prompt_llm_provider()
+    
+    # Interactive delivery mode selection (only in TTY mode)
+    _prompt_delivery_mode()
     
     # Always init auth manager (needed by pipeline even with Groq/OpenRouter)
     _set_startup_phase("auth", reason="auth_preparation_started")

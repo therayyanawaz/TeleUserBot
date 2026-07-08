@@ -50,6 +50,8 @@ Voice rules:
 - Let the facts breathe. Confidence comes from precision, not volume.
 - If a detail is genuinely striking, let it land without overhyping it.
 - Think Hemingway meets Reuters wire — clean, muscular, never boring.
+- Every line should make the reader smarter. If it doesn't, cut it.
+- Context is not padding. A headline without a country, region, or theater is incomplete.
 """.strip()
 
 
@@ -71,6 +73,9 @@ Core rules:
 7) Reject vague leads like "incident reported", "developments continue", "situation update", or "explosions shake [country]" when the source provides something more specific.
 7b) Headline reasoning rule: prefer the line with the clearest actor + action + location/result, not the first line by default.
 7c) If one line names who acted, what happened, and where or with what result, use that line over a softer framing line.
+7d) FRAGMENT REJECTION: Reject any headline that does not name a clear actor, action, and place or result. A line like '35 fighter lost, pilot ejected' is unacceptable — whose fighter? Over what theater? Who ejected? Either supply the missing context from other posts or drop the line.
+7e) THEMATIC ADJACENCY: Place related news items next to each other in the output. Do not scatter related stories across the digest. For example, all Balochistan-related items must be clustered together, not separated by unrelated items.
+7f) STORY MERGING: When multiple posts cover the same incident or closely related events, merge them into a single stronger, more specific line that captures the key facts. Do not repeat the same event in multiple weak lines.
 8) Use direct, hard-hitting, uncensored phrasing when the facts support it, but do not fabricate, exaggerate, or add commentary beyond the evidence.
 9) Preserve uncertainty explicitly when the source is hedged or disputed, but use generic wording only:
    - allowed: "initial reports indicate", "preliminary reports suggest", "early indications point to"
@@ -92,6 +97,8 @@ Style examples — study these closely:
 - Premium: <b>Iran launches salvo at Israel as air defenses light up over multiple cities</b><br>Iranian missiles streaked toward Israeli territory in a fresh barrage that triggered air-defense activations across several cities. Interceptions were reported over Tel Aviv and Haifa, with no immediate word on casualties or impact sites.<br>• Air-defense systems engaged targets over Tel Aviv and Haifa.<br>• No immediate reports of casualties.
 - Weak: <b>Gaza violence continues</b><br>There have been more strikes in Gaza today.
 - Premium: <b>Strikes pound northern Gaza as ground troops push deeper into Jabalia</b><br>Heavy bombardment concentrated on the northern Gaza Strip overnight, with ground forces advancing deeper into Jabalia for the second straight day. Medics reported casualties arriving at Indonesian Hospital, and communications were cut across large parts of the north.<br>• Ground forces advanced deeper into Jabalia for the second straight day.<br>• Communications cut across large parts of northern Gaza.
+- Weak rail: <b>Main headlines from the last 30 minutes</b><br>• 42 security officials killed in Balochistan.<br>• Pakistani soldiers killed in Lasbela attack.<br>• Drone and artillery strike on Ali Al-Taher Hill.<br>• Attack on Kalat Scouts' complex.<br>• 35 fighter lost, pilot ejected.<br>• Two arrested for spying for Russia.
+- Premium rail: <b>Balochistan & Regional Security</b><br>• At least 42 Pakistani security personnel killed in coordinated attacks across Balochistan, including a strike on the Kalat Scouts' compound and an assault in Lasbela.<br>• Dozens of fighters killed when a drone and artillery strike hit Ali Al-Taher Hill; the pilot from one downed aircraft ejected and was recovered.<br>• Two individuals arrested in a counterintelligence sweep on suspicion of passing information to Russian intelligence.
 
 Premium digest quality checklist — every digest must pass:
 ✓ The lead headline would not embarrass a wire editor. It names the actor, action, and place or result.
@@ -136,7 +143,7 @@ def build_digest_system_prompt(
             toggles.append("Never output a line that only comments on confirmation status. If a claim is unconfirmed, attach the uncertainty to the event itself.")
             toggles.append("Do not write unattributed threat or quote lines like 'X will be destroyed'; name the speaker or drop the line.")
             toggles.append("Reject continuation lines, dependent follow-ups, rhetorical questions, joke lines, history trivia, and soft feature chatter.")
-            toggles.append("headline should be a short rail label, not a narrative sentence.")
+            toggles.append("headline should be a short rail label that reflects the dominant theme of the window, like 'Balochistan & Regional Security' or 'Middle East Fallout', not a generic 'Main headlines from the last 30 minutes'.")
             toggles.append("headlines must contain only the main distinct hard-news developments as short standalone headline lines.")
             toggles.append("For each headline line, pick the strongest concrete fact, not the softest setup line.")
             toggles.append("Every kept line must stand on its own with a named actor or entity plus the action and place or result when the source provides them.")
@@ -145,6 +152,18 @@ def build_digest_system_prompt(
             toggles.append("Do not include a story paragraph in this mode.")
             toggles.append("A short source tail like 'per Die Welt' is allowed only for claims, proposals, or disputed items where attribution materially changes trust.")
             toggles.append("also_moving is optional and should contain at most a few overflow headline lines.")
+            
+            # Premium rail quality toggles
+            toggles.append("THEMATIC GROUPING: Place related news items together in the output. All Balochistan items must be clustered. Do not scatter related stories.")
+            toggles.append("STORY MERGING: When multiple posts cover the same incident or closely related events, merge them into one stronger, more specific line with full context.")
+            toggles.append("PRIORITY ORDERING: Order headlines by human impact. Death tolls and casualty events first, then military operations, then diplomatic/political, then lower-impact items.")
+            toggles.append("STORY CONTEXT: Every headline line must answer who, what, and where. A line like '35 fighter lost, pilot ejected' is unacceptable — supply the missing country/theater context or drop it.")
+            toggles.append("FRAGMENT REJECTION: Drop any line that leaves the reader confused about the basic facts. If you cannot determine whose fighter or over what territory, do not include it.")
+            toggles.append("EXAMPLES:")
+            toggles.append("  Weak: • 42 security officials killed in Balochistan. • Pakistani soldiers killed in Lasbela attack. • Attack on Kalat Scouts' complex.")
+            toggles.append("  Strong: • At least 42 Pakistani security personnel killed in coordinated Balochistan attacks, including a strike on the Kalat Scouts' compound and an assault in Lasbela.")
+            toggles.append("  Weak: • 35 fighter lost, pilot ejected.")
+            toggles.append("  Strong: • Dozens of fighters killed when a drone and artillery strike hit Ali Al-Taher Hill; the pilot ejected and was recovered.")
         else:
             toggles.append(
                 'Return ONLY one JSON object with this schema: {"quiet": boolean, "headline": string, "story": string, "highlights": [string, ...], "also_moving": [string, ...]}.'
