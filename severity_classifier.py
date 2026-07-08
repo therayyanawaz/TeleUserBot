@@ -753,12 +753,19 @@ def _register_high(source_key: str, now_ts: float) -> None:
         _HIGH_SEVERITY_HISTORY[source_key].append(now_ts)
 
 
-def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
+def classify_message_severity(
+    msg: dict,
+    ai_result: dict[str, Any] | None = None,
+) -> tuple[str, float, dict[str, Any]]:
     """
     Returns (severity, total_score, breakdown)
 
     severity: "high" | "medium" | "low"
     breakdown: full explainable dict for logging
+
+    When ai_result is provided, AI-powered severity/signals/moderation overrides
+    the deterministic system. The deterministic system still runs for the
+    breakdown dict (for logging/debugging), but the final output uses AI.
     """
 
     text = _extract_text(msg)
@@ -770,7 +777,23 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
     humanized_probability = float(msg.get("humanized_vital_probability") or 0.0)
     now_ts = float(msg.get("timestamp") or time.time())
     channel_id = str(msg.get("channel_id") or "").strip()
-    story_signals = detect_story_signals(text)
+
+    # If AI says blocked, skip deterministic system entirely
+    if ai_result and ai_result.get("moderation", {}).get("blocked", False):
+        breakdown: dict[str, Any] = {
+            "source": source_name,
+            "raw_score": 0.0,
+            "final_score": 0.0,
+            "score_band": "low",
+            "moderation": ai_result.get("moderation", {}),
+            "ai_blocked": True,
+            "ai_severity_reason": ai_result.get("severity_reason", ""),
+            "normalized_text_preview": normalized[:220],
+        }
+        return "low", 0.0, breakdown
+
+    # Run deterministic system for breakdown/logging
+    story_signals = detect_story_signals(text, ai_signals=ai_result.get("signals") if ai_result else None)
     moderation = moderation_scan_text(text)
 
     if bool(moderation.get("blocked")):
@@ -916,4 +939,18 @@ def classify_message_severity(msg: dict) -> tuple[str, float, dict[str, Any]]:
     }
     if calibration_reason:
         breakdown["calibration_reason"] = calibration_reason
+
+    # AI override: if AI result is available, use its severity and score
+    if ai_result:
+        ai_severity = ai_result.get("severity", severity)
+        if ai_severity in ("high", "medium", "low"):
+            severity = ai_severity
+        try:
+            final_score = max(0.0, min(1.0, float(ai_result.get("severity_score", final_score))))
+        except (ValueError, TypeError):
+            pass
+        breakdown["ai_override"] = True
+        breakdown["ai_severity_reason"] = ai_result.get("severity_reason", "")
+        breakdown["ai_signals"] = ai_result.get("signals", {})
+
     return severity, round(final_score, 4), breakdown

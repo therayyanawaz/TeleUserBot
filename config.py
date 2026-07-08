@@ -274,6 +274,7 @@ DUPE_USE_SENTENCE_TRANSFORMERS = _env_bool("DUPE_USE_SENTENCE_TRANSFORMERS", Fal
 # Severity router for real-time high-priority events.
 ENABLE_SEVERITY_ROUTING = _env_bool("ENABLE_SEVERITY_ROUTING", True)  # type: bool
 IMMEDIATE_HIGH = _env_bool("IMMEDIATE_HIGH", False)  # type: bool
+AI_SEVERITY_CLASSIFIER = _env_bool("AI_SEVERITY_CLASSIFIER", True)  # type: bool
 
 # Include importance indicators (★★★/★★/★) in output style.
 DIGEST_IMPORTANCE_SCORING = _env_bool("DIGEST_IMPORTANCE_SCORING", True)  # type: bool

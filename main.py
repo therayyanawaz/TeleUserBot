@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "7.9"
+__version__ = "7.10"
 
 import asyncio
 import contextlib
@@ -48,6 +48,7 @@ from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInv
 
 import config
 from ai_filter import (
+    _ai_classify_severity_and_signals,
     _call_codex_with_auth_repair,
     _clean_headline_rail_items,
     apply_cross_digest_headline_dedup,
@@ -4296,7 +4297,7 @@ def _register_source_delivery_refs(
         )
 
 
-def _classify_severity_with_breakdown(
+async def _classify_severity_with_breakdown(
     *,
     text: str,
     source: str,
@@ -4306,6 +4307,24 @@ def _classify_severity_with_breakdown(
     reply_to: int,
     album_size: int = 1,
 ) -> tuple[str, float, dict]:
+    # AI-powered severity classification — LLM overrides deterministic system
+    ai_result = None
+    try:
+        ai_raw = await _ai_classify_severity_and_signals(text, _require_auth_manager())
+        if ai_raw is not None:
+            ai_result = {
+                "severity": ai_raw.severity,
+                "severity_score": ai_raw.severity_score,
+                "severity_reason": ai_raw.severity_reason,
+                "signals": ai_raw.signals,
+                "moderation": {
+                    "blocked": ai_raw.moderation.get("blocked", False),
+                    "reason": ai_raw.moderation.get("reason", ""),
+                },
+            }
+    except Exception:
+        pass
+
     payload = {
         "text": text,
         "source": source,
@@ -4319,7 +4338,7 @@ def _classify_severity_with_breakdown(
         "humanized_vital_probability": _humanized_vital_opinion_probability(),
     }
     try:
-        severity, score, breakdown = classify_message_severity(payload)
+        severity, score, breakdown = classify_message_severity(payload, ai_result=ai_result)
     except Exception as exc:
         severity, score = "medium", 0.0
         breakdown = {
@@ -5573,7 +5592,7 @@ async def _queue_single_message_for_digest(msg: Message) -> None:
     severity_score = 0.0
     severity_breakdown: dict = {}
     if _is_severity_routing_enabled():
-        severity, severity_score, severity_breakdown = _classify_severity_with_breakdown(
+        severity, severity_score, severity_breakdown = await _classify_severity_with_breakdown(
             text=text,
             source=source,
             channel_id=channel_id,
@@ -5895,7 +5914,7 @@ async def _handle_triage_inbound_job(job: Dict[str, object]) -> None:
     severity_breakdown: dict = {}
     if combined_text:
         if _is_severity_routing_enabled():
-            severity, severity_score, severity_breakdown = _classify_severity_with_breakdown(
+            severity, severity_score, severity_breakdown = await _classify_severity_with_breakdown(
                 text=combined_text,
                 source=source,
                 channel_id=str(primary.chat_id),

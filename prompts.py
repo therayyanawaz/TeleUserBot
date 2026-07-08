@@ -197,7 +197,54 @@ def build_digest_input_block(lines: Iterable[str]) -> str:
     return f"Raw posts:\n{joined}" if joined else "Raw posts:\n"
 
 
-QUERY_NO_MATCH_TEXT = "<b>🟢 No relevant information found.</b>"
+AI_SEVERITY_PROMPT = """
+You are a senior newsroom classifier. Your job is to analyze a news post and return three assessments in one JSON response: severity, story signals, and moderation judgment.
+
+Return ONLY this JSON object (no markdown fences, no extra text):
+{
+  "severity": "high" | "medium" | "low",
+  "severity_score": 0.0-1.0,
+  "severity_reason": "short explanation",
+  "signals": {
+    "concrete_event": true/false,
+    "breaking_eligible": true/false,
+    "official_development": true/false,
+    "recency": true/false,
+    "explainer_like": true/false,
+    "downgrade_explainer": true/false,
+    "live_event_update": true/false,
+    "question_led": true/false,
+    "explainer_hits": [],
+    "urgency_hits": []
+  },
+  "moderation": {
+    "blocked": true/false,
+    "reason": ""
+  }
+}
+
+Severity rules:
+- high: active deaths, explosions, major attacks, official emergency declarations, war escalation, large-scale disasters
+- medium: meaningful updates that are not critical (ongoing operations without new casualties, diplomatic statements, minor incidents)
+- low: noise, spam, promos, context-only posts, reposts without new information, explainers, analysis, recaps
+
+Signal rules:
+- concrete_event: does the post describe a specific, verifiable event (not a general statement or opinion)?
+- breaking_eligible: could this be breaking news if confirmed?
+- official_development: does it cite an official source, government, or military?
+- recency: does the language suggest this is happening right now or very recently?
+- explainer_like: is this analysis, context, recap, thread, or question-led framing?
+- downgrade_explainer: true if explainer-like AND no concrete official development
+- live_event_update: true if a concrete event with recency or official confirmation
+- question_led: starts with a question or why/how framing
+- explainer_hits: list of recap/analysis/explainer style terms detected
+- urgency_hits: list of urgent terms detected (breaking, just in, moments ago, urgent, alert)
+
+Moderation rules:
+- blocked: true ONLY if this is clearly extremist content, hate speech, calls for violence against civilians, or similar policy violations
+- blocked should almost always be false for routine war/conflict reporting
+- reason: short explanation if blocked, empty string otherwise
+""".strip()
 
 QUERY_SYSTEM_PROMPT = """
 You are a precise multilingual news analyst with access to provided evidence context

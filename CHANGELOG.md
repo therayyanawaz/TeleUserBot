@@ -4,8 +4,17 @@
 
 ## 2026-07-08
 
+### Features
+
+- AI-powered severity classification — single LLM call per post overrides deterministic severity, signals, and moderation
+- `AI_SEVERITY_CLASSIFIER` config flag to toggle AI classification
+- `_ai_classify_severity_and_signals()` — combined severity + signals + moderation in one LLM call
+- `detect_story_signals()` accepts AI signal overrides for semantic signal detection
+
 ### Chores
 
+- `v7.10 release - AI severity classification, config flag, async pipeline wiring
+- `a60720b` chore: v7.9 release - delivery mode prompt, breaking push + daily digest coexistence
 - `5b91730` chore: v7.8 release - digest improvements, auth fix, dynamic emoji
 
 ## 2026-07-04

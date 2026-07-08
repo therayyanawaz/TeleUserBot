@@ -16,7 +16,18 @@ def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def detect_story_signals(text: str) -> Dict[str, Any]:
+def detect_story_signals(
+    text: str,
+    ai_signals: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """
+    Detect story signals from text using deterministic ontology analysis.
+
+    When ai_signals is provided, the AI's semantic understanding overrides
+    the deterministic signal detection. Fields like concrete_event,
+    breaking_eligible, explainer_like, etc. are merged on top of the
+    deterministic results so AI catches nuance the rules engine misses.
+    """
     normalized = normalize_space(text)
     lead = normalize_space(re.split(r"(?<=[.!?])\s+|\n+", normalized, maxsplit=1)[0])
     analysis = analyze_news_ontology(normalized)
@@ -48,7 +59,7 @@ def detect_story_signals(text: str) -> Dict[str, Any]:
     if concrete_event or frame.actions or frame.targets or frame.places:
         record_ontology_live_event_resolution(frame, matched=bool(match))
 
-    return {
+    result: Dict[str, Any] = {
         "normalized_text": normalized,
         "explainer_hits": explainer_hits,
         "question_led": question_led,
@@ -97,6 +108,36 @@ def detect_story_signals(text: str) -> Dict[str, Any]:
             },
         },
     }
+
+    # AI override: merge AI signals on top of deterministic results
+    if ai_signals:
+        for bool_field in (
+            "concrete_event",
+            "breaking_eligible",
+            "official_development",
+            "recency",
+            "explainer_like",
+            "downgrade_explainer",
+            "live_event_update",
+            "question_led",
+        ):
+            ai_val = ai_signals.get(bool_field)
+            if isinstance(ai_val, bool):
+                result[bool_field] = ai_val
+        # Merge explainer_hits and urgency_hits
+        ai_hits = ai_signals.get("explainer_hits", [])
+        if isinstance(ai_hits, list) and ai_hits:
+            seen = set(result["explainer_hits"])
+            for hit in ai_hits:
+                hit_str = str(hit)
+                if hit_str and hit_str not in seen:
+                    seen.add(hit_str)
+                    result["explainer_hits"].append(hit_str)
+        ai_urgency = ai_signals.get("urgency_hits", [])
+        if isinstance(ai_urgency, list) and ai_urgency:
+            result["_ai_urgency_hits"] = [str(u) for u in ai_urgency]
+
+    return result
 
 
 def looks_like_explainer_text(text: str) -> bool:

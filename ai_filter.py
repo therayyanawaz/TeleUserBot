@@ -34,6 +34,7 @@ from db import (
 from news_taxonomy import match_news_category, normalize_taxonomy_text
 from news_signals import detect_story_signals, looks_like_live_event_update, should_downgrade_explainer_urgency
 from prompts import (
+    AI_SEVERITY_PROMPT,
     HUMAN_NEWSROOM_VOICE,
     QUERY_NO_MATCH_TEXT,
     build_digest_input_block,
@@ -6361,6 +6362,115 @@ def _local_nlp_query_answer_is_confident(
     if intent == "why":
         return any(_query_has_causal_signal(sentence) for sentence in _local_nlp_query_sentences(query, context_messages, limit=3))
     return False
+
+
+@dataclass
+class AiSeverityResult:
+    """Result from AI-powered severity+signals+moderation classification."""
+    severity: str  # high/medium/low
+    severity_score: float  # 0.0-1.0
+    severity_reason: str
+    signals: Dict[str, Any]
+    moderation: Dict[str, Any]
+    ai_used: bool = True
+
+
+async def _ai_classify_severity_and_signals(
+    text: str,
+    auth_manager: AuthManager,
+) -> AiSeverityResult | None:
+    """
+    Use a single LLM call to classify severity, story signals, and moderation.
+    Returns None on failure (caller falls back to deterministic).
+    """
+    if not bool(getattr(config, "AI_SEVERITY_CLASSIFIER", True)):
+        return None
+    
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return None
+    
+    from prompts import AI_SEVERITY_PROMPT as _severity_prompt
+    instructions = _severity_prompt
+    
+    for attempt in range(2):
+        try:
+            raw = await _call_codex_with_auth_repair(
+                cleaned,
+                auth_manager,
+                instructions,
+                verbosity="low",
+            )
+            if not raw:
+                continue
+            
+            block = _extract_json_object_block(raw)
+            if not block:
+                continue
+            
+            payload = json.loads(block)
+            if not isinstance(payload, dict):
+                continue
+            
+            severity = str(payload.get("severity", "")).strip().lower()
+            if severity not in ("high", "medium", "low"):
+                continue
+            
+            try:
+                severity_score = float(payload.get("severity_score", 0.5))
+            except (ValueError, TypeError):
+                severity_score = 0.5
+            severity_score = max(0.0, min(1.0, severity_score))
+            
+            severity_reason = str(payload.get("severity_reason", "")).strip()
+            
+            raw_signals = payload.get("signals", {})
+            if not isinstance(raw_signals, dict):
+                raw_signals = {}
+            
+            raw_moderation = payload.get("moderation", {})
+            if not isinstance(raw_moderation, dict):
+                raw_moderation = {}
+            
+            signals = {
+                "concrete_event": bool(raw_signals.get("concrete_event", False)),
+                "breaking_eligible": bool(raw_signals.get("breaking_eligible", False)),
+                "official_development": bool(raw_signals.get("official_development", False)),
+                "recency": bool(raw_signals.get("recency", False)),
+                "explainer_like": bool(raw_signals.get("explainer_like", False)),
+                "downgrade_explainer": bool(raw_signals.get("downgrade_explainer", True)),
+                "live_event_update": bool(raw_signals.get("live_event_update", False)),
+                "question_led": bool(raw_signals.get("question_led", False)),
+                "explainer_hits": list(raw_signals.get("explainer_hits", [])),
+                "urgency_hits": list(raw_signals.get("urgency_hits", [])),
+            }
+            # If live_event_update is True and downgrade_explainer is True, resolve
+            if signals["live_event_update"] and signals["downgrade_explainer"]:
+                signals["live_event_update"] = False
+            
+            moderation = {
+                "blocked": bool(raw_moderation.get("blocked", False)),
+                "reason": str(raw_moderation.get("reason", "")).strip(),
+                "hard_blocked": bool(raw_moderation.get("blocked", False)),
+                "score": 1.0 if bool(raw_moderation.get("blocked", False)) else 0.0,
+            }
+            
+            return AiSeverityResult(
+                severity=severity,
+                severity_score=severity_score,
+                severity_reason=severity_reason,
+                signals=signals,
+                moderation=moderation,
+                ai_used=True,
+            )
+            
+        except Exception:
+            LOGGER.debug("AI severity classification attempt %s failed", attempt + 1, exc_info=True)
+            if attempt < 1:
+                await asyncio.sleep(0.5)
+    
+    return None
+
 
 
 async def decide_filter_action(text: str, auth_manager: AuthManager) -> FilterDecision:
