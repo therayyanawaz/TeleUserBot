@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+__version__ = "7.8"
+
 import asyncio
 import contextlib
 from difflib import SequenceMatcher
@@ -2265,6 +2267,62 @@ def _persist_config_updates(updates: Dict[str, object]) -> None:
     tmp_path = ENV_PATH.with_suffix(".tmp")
     tmp_path.write_text("\n".join(lines), encoding="utf-8")
     os.replace(tmp_path, ENV_PATH)
+
+
+def _prompt_llm_provider() -> None:
+    """Interactively ask the user which LLM provider to use at startup."""
+    if not _is_interactive_runtime():
+        return
+
+    current_provider = str(getattr(config, "LLM_PROVIDER", "auto") or "").strip().lower()
+    
+    print()
+    print("━" * 50)
+    print("  🤖 LLM Provider Selection")
+    print("━" * 50)
+    print("  Current provider:", current_provider if current_provider != "auto" else "auto-detect")
+    print()
+    print("  1) Groq  (llama-3.1-8b-instant — fast, free tier: 14,400 req/day)")
+    print("  2) OpenRouter  (nvidia/nemotron-3-ultra — free tier available)")
+    print("  3) Codex  (ChatGPT OAuth — requires ChatGPT Plus subscription)")
+    print("  4) Keep current (auto-detect based on configured API keys)")
+    print()
+    
+    while True:
+        choice = input("  Select provider [1-4] (default: " + ("1" if "groq" in current_provider else "4") + "): ").strip()
+        if not choice:
+            choice = "1" if "groq" in current_provider else "4"
+        if choice in ("1", "2", "3", "4"):
+            break
+        print("  Invalid choice. Enter 1, 2, 3, or 4.")
+    
+    updates = {}
+    if choice == "1":
+        print("  ✓ Using Groq (llama-3.1-8b-instant)")
+        print("  Note: Ensure GROQ_API_KEY is set in .env")
+        updates["LLM_PROVIDER"] = "groq"
+        updates["OPENAI_AUTH_ENV_ONLY"] = "true"
+    elif choice == "2":
+        print("  ✓ Using OpenRouter")
+        print("  Note: Ensure OPENROUTER_API_KEY is set in .env")
+        updates["LLM_PROVIDER"] = "openrouter"
+        updates["OPENAI_AUTH_ENV_ONLY"] = "true"
+    elif choice == "3":
+        print("  ✓ Using Codex (ChatGPT OAuth)")
+        print("  Note: You will need to authenticate with your ChatGPT account")
+        updates["LLM_PROVIDER"] = "codex"
+        updates["OPENAI_AUTH_ENV_ONLY"] = "false"
+    else:
+        print("  ✓ Keeping current provider setting")
+    
+    if updates:
+        _persist_config_updates(updates)
+        # Reload config so the change takes effect immediately
+        importlib.reload(config)
+        # Update env vars too
+        for key, value in updates.items():
+            os.environ[key] = str(value)
+    print()
 
 
 def _prompt_for_missing_config() -> None:
@@ -6190,6 +6248,38 @@ async def _stop_pipeline_workers() -> None:
     )
 
 
+_DIGEST_EMOJI_MAP = [
+    (r"(strike|airstrike|missile|rocket|barrage|salvo|bombing|bombard|shelling|raid|blasts?|explosion|intercept|downed|shot\s+down)", "🚨"),
+    (r"(killed|dead|deaths?|casualt|injured|wounded|fatalit|massacre)", "🕯️"),
+    (r"(air\s*defense|air\s*defence|iron\s*dome|siren|evacuat|warning|airspace)", "🛡️"),
+    (r"(ceasefire|truce|deal|agreement|negotiation|diplomacy|talks|summit)", "🕊️"),
+    (r"(sanction|embargo|restriction|ban|freeze|blockade)", "⛓️"),
+    (r"(president|prime\s*minister|minister|official|government|statement|announced|declared|ordered)", "🏛️"),
+    (r"(military|army|troops|forces|soldiers|command|general|navy|fleet)", "⚔️"),
+    (r"(drone|uav|loitering)", "🛸"),
+    (r"(ship|vessel|tanker|port|shipping|maritime|strait|hormuz)", "🚢"),
+    (r"(power|grid|outage|blackout|energy|oil|gas|electricity|fuel)", "⚡"),
+    (r"(earthquake|quake|flood|storm|hurricane|wildfire|tornado|disaster)", "🌍"),
+    (r"(cyber|hack|breach|data\s*leak|ransomware|malware|phishing)", "💻"),
+    (r"(protest|riot|unrest|demonstration|crackdown|curfew)", "✊"),
+    (r"(election|vote|ballot|campaign|candidate|parliament|cabinet|reshuffle)", "🗳️"),
+    (r"(court|trial|judge|indict|arrest|convict|sanction|probe|investigation)", "⚖️"),
+    (r"(space|satellite|launch|rocket|nasa|iss)", "🛰️"),
+    (r"(hostage|kidnap|rescue|prisoner\s*swap|release)", "🔗"),
+]
+
+
+def _pick_digest_emoji(digest_body: str) -> str:
+    """Scan digest text and return a content-matched emoji prefix."""
+    lowered = normalize_space(digest_body or "").lower()
+    if not lowered:
+        return "📰"
+    for pattern, emoji in _DIGEST_EMOJI_MAP:
+        if re.search(pattern, lowered):
+            return emoji
+    return "📰"
+
+
 def _format_digest_message(
     digest_body: str,
     total_updates: int,
@@ -6200,7 +6290,8 @@ def _format_digest_message(
 ) -> str:
     timestamp = runtime_now().strftime("%H:%M %Z").strip()
     label = sanitize_telegram_html(title.strip() or "Digest")
-    header = f"<b>📰 {label}</b>"
+    emoji = _pick_digest_emoji(digest_body)
+    header = f"<b>{emoji} {label}</b>"
     style = digest_output_style(interval_minutes or 24 * 60)
     stat_label = "headlines tracked" if style == "headline_rail" else "updates reviewed"
     metadata = sanitize_telegram_html(f"{timestamp} • {total_updates} {stat_label}")
@@ -10359,46 +10450,66 @@ async def _phase_initialize() -> None:
     _log_memory_snapshot("runtime_state_ready", phase=startup_phase)
     _print_cli_status("✓", "Database and runtime state ready", level="ok")
 
+    # Interactive LLM provider selection (only in TTY mode)
+    _prompt_llm_provider()
+    
+    # Always init auth manager (needed by pipeline even with Groq/OpenRouter)
     _set_startup_phase("auth", reason="auth_preparation_started")
-    async with spinner("Preparing AI auth context..."):
-        await _prepare_auth_runtime_for_startup()
-    _log_memory_snapshot("auth_runtime_prepared", phase=startup_phase, auth_ready=auth_ready, auth_degraded=auth_degraded, auth_mode=auth_startup_mode_effective)
-    log_structured(
-        LOGGER, "auth_startup_state",
-        mode_configured=auth_startup_mode_configured,
-        mode_effective=auth_startup_mode_effective,
-        ready=auth_ready, degraded=auth_degraded,
-        failure_reason=auth_failure_reason or None,
-        features_disabled=list(auth_features_disabled),
-        startup_repair_status=startup_auth_repair_status,
-        startup_repair_message=startup_auth_repair_message or None,
-    )
-    if auth_ready and not auth_degraded:
-        _print_cli_status("+", "OpenAI auth ready", level="ok")
+    # Skip full OpenAI OAuth if using Groq or OpenRouter (they don't need it)
+    resolved_provider = str(getattr(config, "LLM_PROVIDER", "auto")).strip().lower()
+    if resolved_provider in ("groq", "openrouter"):
+        global auth_manager
+        auth_manager = AuthManager(logger=LOGGER)
+        _set_auth_runtime_state(
+            configured_mode="degraded",
+            effective_mode="degraded",
+            ready=True,
+            degraded=False,
+            failure_reason="",
+            features_disabled=[],
+        )
+        _print_cli_status("✓", f"OpenAI auth skipped (using {resolved_provider} for LLM)", level="ok")
+        _log_memory_snapshot("auth_skipped", phase=startup_phase, provider=resolved_provider)
     else:
-        summary = _trim_runtime_reason(auth_failure_reason or "OpenAI auth unavailable.", limit=96)
-        _print_cli_status("!", f"OpenAI auth degraded; disabled: {', '.join(auth_features_disabled) or 'none'} ({summary})", level="warn")
+        _print_cli_status("•", "Preparing AI auth context...", level="info")
+        await _prepare_auth_runtime_for_startup()
+        _log_memory_snapshot("auth_runtime_prepared", phase=startup_phase, auth_ready=auth_ready, auth_degraded=auth_degraded, auth_mode=auth_startup_mode_effective)
+        log_structured(
+            LOGGER, "auth_startup_state",
+            mode_configured=auth_startup_mode_configured,
+            mode_effective=auth_startup_mode_effective,
+            ready=auth_ready, degraded=auth_degraded,
+            failure_reason=auth_failure_reason or None,
+            features_disabled=list(auth_features_disabled),
+            startup_repair_status=startup_auth_repair_status,
+            startup_repair_message=startup_auth_repair_message or None,
+        )
+        if auth_ready and not auth_degraded:
+            _print_cli_status("+", "OpenAI auth ready", level="ok")
+        else:
+            summary = _trim_runtime_reason(auth_failure_reason or "OpenAI auth unavailable.", limit=96)
+            _print_cli_status("!", f"OpenAI auth degraded; disabled: {', '.join(auth_features_disabled) or 'none'} ({summary})", level="warn")
 
 
 async def _phase_login() -> List[int]:
     global client, destination_peer, bot_destination_token, bot_destination_chat_id
 
     _set_startup_phase("telegram_login", reason="telegram_session_connect_started")
-    async with spinner("Connecting Telegram user session..."):
-        client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
-        await _ensure_user_account_session()
+    _print_cli_status("•", "Connecting Telegram user session...", level="info")
+    client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
+    await _ensure_user_account_session()
     _log_memory_snapshot("telegram_session_ready", phase=startup_phase)
     _print_cli_status("✓", "Telegram session authorized", level="ok")
 
     _set_startup_phase("destination_setup", reason="destination_validation_started")
-    async with spinner("Validating destination..."):
-        await _ensure_destination_peer()
+    _print_cli_status("•", "Validating destination...", level="info")
+    await _ensure_destination_peer()
     _log_memory_snapshot("destination_ready", phase=startup_phase)
     _print_cli_status("✓", "Destination ready", level="ok")
 
     _set_startup_phase("source_setup", reason="source_resolution_started")
-    async with spinner("Resolving source channels..."):
-        resolved_sources = await setup_sources()
+    _print_cli_status("•", "Resolving source channels...", level="info")
+    resolved_sources = await setup_sources()
     while not resolved_sources:
         if not _is_interactive_runtime():
             raise RuntimeError("No source channels resolved. Set valid FOLDER_INVITE_LINK or EXTRA_SOURCES in environment.")
@@ -10429,8 +10540,8 @@ async def _phase_start_core(resolved_sources: List[int]) -> None:
     global digest_scheduler_task, daily_digest_scheduler_task, queue_clear_scheduler_task, query_bot_poll_task
 
     _set_startup_phase("pipeline", reason="pipeline_worker_start_started")
-    async with spinner("Starting pipeline workers..."):
-        await _start_pipeline_workers()
+    _print_cli_status("•", "Starting pipeline workers...", level="info")
+    await _start_pipeline_workers()
     _print_cli_status("✓", "Inbound pipeline workers started", level="ok")
 
     _set_startup_phase("handlers", reason="handler_registration_started")

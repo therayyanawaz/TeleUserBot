@@ -7,7 +7,22 @@ from typing import Iterable
 
 def quiet_period_message(interval_minutes: int) -> str:
     _ = interval_minutes
-    return "<b>🟢 No major developments right now.</b>"
+    # Subtle time-of-day flavor so the digest never sounds like a broken record.
+    from datetime import datetime
+    hour = datetime.now().hour
+    if hour < 6:
+        vibe = "🌙"
+        note = "Quiet through the overnight hours — no major developments to report."
+    elif hour < 12:
+        vibe = "🌅"
+        note = "Morning window is calm — nothing significant crossed the wire."
+    elif hour < 18:
+        vibe = "☀️"
+        note = "Afternoon remains quiet — no major new developments in this window."
+    else:
+        vibe = "🌆"
+        note = "Evening window is still — nothing urgent broke in this period."
+    return f"<b>{vibe} {note}</b>"
 
 
 def digest_output_style(interval_minutes: int) -> str:
@@ -26,14 +41,15 @@ Never output Markdown. Never output unsupported tags. Keep tags valid and closed
 
 HUMAN_NEWSROOM_VOICE = """
 Voice rules:
-- Sound human, readable, and alive.
-- Write like a switched-on newsroom editor, not a template or bot.
-- Use natural spoken cadence while staying factual and controlled.
-- Prefer strong verbs, concrete nouns, and clean sentence rhythm.
-- Avoid repetitive sentence shapes.
-- Avoid stiff analyst jargon, robotic filler, and template phrasing.
-- Talk like a person helping a smart reader catch up fast.
+- Sound human, readable, and alive — like a switched-on editor briefing a smart reader.
+- Use natural spoken cadence with punch and pace. Vary your sentence shapes.
+- Lead with strong verbs and concrete nouns. Make every word pull weight.
+- Write like the morning brief you'd actually want to read: tight, confident, and sharp.
+- Avoid analyst mumble, robotic filler, and template phrasing at all costs.
 - Never over-dramatize, moralize, role-play, or speculate beyond the evidence.
+- Let the facts breathe. Confidence comes from precision, not volume.
+- If a detail is genuinely striking, let it land without overhyping it.
+- Think Hemingway meets Reuters wire — clean, muscular, never boring.
 """.strip()
 
 
@@ -65,13 +81,24 @@ Core rules:
 13) If no significant updates remain, output exactly:
    QUIET_PERIOD_SENTINEL
 
-Style examples:
+Style examples — study these closely:
 - Weak: <b>Situation update</b><br>Activity continues.
-- Strong: <b>Beirut braces for more strikes after Dahieh was hit again overnight</b><br>Another wave of overnight strikes and warnings kept the southern suburbs under pressure while follow-on reports pointed to more damage and fresh movement around the area.<br>• Residents reported another tense night in the southern suburbs.
+- Premium: <b>Beirut braces for more strikes after Dahieh was hit again overnight</b><br>Another wave of overnight strikes and warnings kept the southern suburbs under pressure. Follow-on reports pointed to more damage and fresh movement around the area.<br>• Residents reported another tense night in the southern suburbs.
 - Weak: <b>Officials statement</b><br>Reports say something changed.
-- Strong: <b>Tehran signals no pullback after the latest warning</b><br>Officials publicly rejected the idea of backing down, and the broader batch showed no sign that military pressure or public messaging is easing.<br>• Officials publicly rejected the idea of backing down.
+- Premium: <b>Tehran signals no pullback after the latest warning</b><br>Officials publicly rejected the idea of backing down, and there was no sign that pressure or public messaging is easing.<br>• Officials publicly rejected the idea of backing down.
 - Weak: <b>Hebrew sources report heavy blasts in Tel Aviv</b><br>Israeli media say impacts were recorded.
-- Strong: <b>Heavy blasts hit the Tel Aviv area as fresh impacts were reported</b><br>Initial reports indicate multiple strikes landed in and around the city while follow-on updates pointed to damage, interceptions, and additional alerts across the wider area.<br>• Preliminary reports point to impacts in more than one location.
+- Premium: <b>Heavy blasts hit the Tel Aviv area as fresh impacts were reported</b><br>Initial reports indicate multiple strikes landed in and around the city. Follow-on updates pointed to damage, interceptions, and additional alerts across the wider area.<br>• Preliminary reports point to impacts in more than one location.
+- Weak: <b>Iran launched missiles</b><br>Iran launched missiles at Israel and they were intercepted.
+- Premium: <b>Iran launches salvo at Israel as air defenses light up over multiple cities</b><br>Iranian missiles streaked toward Israeli territory in a fresh barrage that triggered air-defense activations across several cities. Interceptions were reported over Tel Aviv and Haifa, with no immediate word on casualties or impact sites.<br>• Air-defense systems engaged targets over Tel Aviv and Haifa.<br>• No immediate reports of casualties.
+- Weak: <b>Gaza violence continues</b><br>There have been more strikes in Gaza today.
+- Premium: <b>Strikes pound northern Gaza as ground troops push deeper into Jabalia</b><br>Heavy bombardment concentrated on the northern Gaza Strip overnight, with ground forces advancing deeper into Jabalia for the second straight day. Medics reported casualties arriving at Indonesian Hospital, and communications were cut across large parts of the north.<br>• Ground forces advanced deeper into Jabalia for the second straight day.<br>• Communications cut across large parts of northern Gaza.
+
+Premium digest quality checklist — every digest must pass:
+✓ The lead headline would not embarrass a wire editor. It names the actor, action, and place or result.
+✓ Every line adds new information. No padding, filler, or echoes.
+✓ The story paragraph (when present) reads like a cohesive brief, not unrelated sentences.
+✓ The digest leaves the reader informed, not confused. When evidence is ambiguous, say so plainly.
+✓ Each bullet pulls a concrete, specific fact — not a vague restatement of the headline.
 """.strip()
 
 
