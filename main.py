@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import errno
 import sqlite3
 import subprocess
 import sys
@@ -471,6 +472,7 @@ class RuntimeState:
     query_bot_user_id_checked: bool = False
     instance_lock_handle: object = None
     web_status_server: WebStatusServer | None = None
+    web_status_server_port: int = 8080
 
     started_as_username: str = "unknown"
     started_as_user_id: int = 0
@@ -544,6 +546,7 @@ query_allowed_bot_user_id: int | None = None
 query_bot_user_id_checked: bool = False
 instance_lock_handle = None
 web_status_server: WebStatusServer | None = None
+web_status_server_port: int = 8080
 started_as_username: str = "unknown"
 started_as_user_id: int = 0
 startup_phase: str = "booting"
@@ -1978,6 +1981,19 @@ def _is_web_server_enabled() -> bool:
 def _web_server_host() -> str:
     raw = str(getattr(config, "WEB_SERVER_HOST", "0.0.0.0") or "").strip()
     return raw or "0.0.0.0"
+
+
+def _web_server_port_fallback_enabled() -> bool:
+    return _bool_flag(getattr(config, "WEB_SERVER_PORT_FALLBACK", True), True)
+
+
+def _web_server_port_fallback_max_offset() -> int:
+    raw = getattr(config, "WEB_SERVER_PORT_FALLBACK_MAX_OFFSET", 10)
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        value = 10
+    return max(0, min(value, 1000))
 
 
 def _web_server_port() -> int:
@@ -5395,6 +5411,9 @@ def _deserialize_sent_ref(value: str) -> object | None:
 def _acquire_instance_lock():
     """
     Ensure only one process uses the Telethon session DB at a time.
+
+    If the owning PID from a previous crash is stale (no longer alive),
+    the lock file is cleaned up and a fresh lock is acquired automatically.
     """
     lock_path = ensure_runtime_dir() / "userbot.lock"
     handle = open(lock_path, "a+", encoding="utf-8")
@@ -5409,11 +5428,54 @@ def _acquire_instance_lock():
         except Exception:
             owner = ""
         handle.close()
-        owner_msg = f" (lock owner PID: {owner})" if owner else ""
-        raise RuntimeError(
-            "Another TeleUserBot instance is already running. "
-            f"Stop it before starting a new one{owner_msg}."
-        )
+
+        stale = False
+        if owner:
+            try:
+                owner_pid = int(owner)
+                os.kill(owner_pid, 0)
+            except (OSError, ValueError, ProcessLookupError):
+                stale = True
+
+        if stale:
+            LOGGER.warning(
+                "Stale instance lock from dead PID %s. Cleaning up and retrying.",
+                owner,
+            )
+            _print_cli_status(
+                "~",
+                f"Stale lock (PID {owner}) cleaned up. Retrying.",
+                level="warn",
+            )
+            lock_path.unlink(missing_ok=True)
+            handle = open(lock_path, "a+", encoding="utf-8")
+            try:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                owner2 = ""
+                try:
+                    handle.seek(0)
+                    owner2 = handle.read().strip()
+                except Exception:
+                    owner2 = ""
+                handle.close()
+                owner_msg2 = f" (lock owner PID: {owner2})" if owner2 else ""
+                kill_suggest = f" Run: kill -9 {owner2}" if owner2 else ""
+                raise RuntimeError(
+                    "Another TeleUserBot instance is already running. "
+                    f"Stop it before starting a new one{owner_msg2}.{kill_suggest}"
+                )
+            except Exception:
+                handle.close()
+                raise
+        else:
+            owner_msg = f" (lock owner PID: {owner})" if owner else ""
+            kill_hint = f" Run 'kill -9 {owner}' to stop the old instance." if owner else ""
+            raise RuntimeError(
+                "Another TeleUserBot instance is already running. "
+                f"Stop it before starting a new one{owner_msg}.{kill_hint}"
+            )
     except Exception:
         handle.close()
         raise
@@ -10514,19 +10576,62 @@ async def _phase_boot() -> bool:
         _restart_process_after_startup_update()
 
     if _is_web_server_enabled():
-        try:
-            web_status_server = WebStatusServer(
-                host=_web_server_host(),
-                port=_web_server_port(),
-                get_status=_web_status_payload,
-                get_recent_events=_recent_runtime_activity,
-                logger=LOGGER,
-            )
-            web_status_server.start()
-            _log_memory_snapshot("web_status_server_started", phase=startup_phase, web_server_host=_web_server_host(), web_server_port=_web_server_port())
-        except Exception:
-            LOGGER.exception("Failed starting web status server.")
-            web_status_server = None
+        base_port = _web_server_port()
+        max_offset = _web_server_port_fallback_max_offset() if _web_server_port_fallback_enabled() else 0
+        web_status_server = None
+
+        for offset in range(max_offset + 1):
+            candidate_port = min(base_port + offset, 65535)
+            try:
+                candidate = WebStatusServer(
+                    host=_web_server_host(),
+                    port=candidate_port,
+                    get_status=_web_status_payload,
+                    get_recent_events=_recent_runtime_activity,
+                    logger=LOGGER,
+                )
+                candidate.start()
+                web_status_server = candidate
+                web_status_server_port = candidate_port
+                _log_memory_snapshot("web_status_server_started", phase=startup_phase, web_server_host=_web_server_host(), web_server_port=candidate_port)
+                if offset > 0:
+                    LOGGER.warning(
+                        "Web status server bound to fallback port %s instead of configured port %s.",
+                        candidate_port,
+                        base_port,
+                    )
+                    _print_cli_status(
+                        "~",
+                        f"Web server on port {candidate_port} (configured {base_port} was in use)",
+                        level="warn",
+                    )
+                break
+            except OSError as exc:
+                if exc.errno == errno.EADDRINUSE:
+                    if offset < max_offset and candidate_port < 65535:
+                        continue
+                    LOGGER.error(
+                        "Web status server ports %s-%s all in use (EADDRINUSE). "
+                        "Check if another instance or service occupies these ports. "
+                        "Run: lsof -i :%s-%s",
+                        base_port,
+                        base_port + max_offset,
+                        base_port,
+                        base_port + max_offset,
+                    )
+                    _print_cli_status(
+                        "!",
+                        f"Ports {base_port}-{base_port + max_offset} all busy",
+                        level="error",
+                    )
+                else:
+                    LOGGER.exception("Failed starting web status server on port %s.", candidate_port)
+                web_status_server = None
+                break
+            except Exception:
+                LOGGER.exception("Failed starting web status server on port %s.", candidate_port)
+                web_status_server = None
+                break
 
     _set_startup_phase("config", reason="config_validation_started")
     _print_cli_status("•", "Validating configuration...", level="info")
