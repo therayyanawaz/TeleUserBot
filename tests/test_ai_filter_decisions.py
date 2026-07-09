@@ -43,7 +43,7 @@ async def test_decide_filter_action_uses_persistent_cache(isolated_db, monkeypat
             }
         )
 
-    monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex)
 
     text = (
         "Officials confirmed new power-grid restrictions across three districts, "
@@ -66,7 +66,7 @@ async def test_decide_filter_action_local_nlp_toggle_avoids_api(isolated_db, mon
         raise AssertionError("API path should not run when USE_LOCAL_NLP is enabled")
 
     monkeypatch.setattr(ai_filter.config, "USE_LOCAL_NLP", True)
-    monkeypatch.setattr(ai_filter, "_call_codex", fail_call_codex)
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fail_call_codex)
 
     text = (
         "Iranian officials announced a new airspace restriction over Tehran "
@@ -113,7 +113,7 @@ async def test_decide_filter_action_falls_back_on_invalid_json(isolated_db, monk
         calls["count"] += 1
         return "this is not valid json"
 
-    monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex)
 
     text = "Regional authorities issued a late-night statement on transport disruptions."
     decision = await ai_filter.decide_filter_action(text, _FakeAuthManager())
@@ -163,7 +163,7 @@ async def test_decide_filter_action_retries_weak_ai_copy_before_accepting(isolat
             }
         )
 
-    monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex)
 
     text = (
         "Iranian officials ordered a new airspace restriction over Tehran, "
@@ -304,7 +304,7 @@ async def test_create_digest_summary_result_falls_back_after_weak_ai_retry(monke
     async def fake_normalize_digest_output(content, *_args, **_kwargs):
         return content
 
-    monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex)
     monkeypatch.setattr(ai_filter, "_normalize_digest_output", fake_normalize_digest_output)
     monkeypatch.setattr(ai_filter.config, "DIGEST_PREFER_JSON_OUTPUT", False, raising=False)
 
@@ -1265,7 +1265,7 @@ async def test_generate_answer_from_context_result_uses_ai_after_quality_retry(m
             "• ⚠️ Authorities said it takes effect immediately after the latest warning."
         )
 
-    monkeypatch.setattr(ai_filter, "_call_codex", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex)
     monkeypatch.setattr(ai_filter, "_query_confidence_allows_answer", lambda *_args, **_kwargs: True)
 
     result = await ai_filter.generate_answer_from_context_result(

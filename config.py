@@ -410,6 +410,22 @@ STREAM_MAX_CHARS_PER_EDIT = _env_int("STREAM_MAX_CHARS_PER_EDIT", 120)  # type: 
 ENABLE_WEB_SERVER = _env_bool("ENABLE_WEB_SERVER", True)  # type: bool
 WEB_SERVER_HOST = _env_str("WEB_SERVER_HOST", "0.0.0.0")  # type: str
 WEB_SERVER_PORT = _env_int("WEB_SERVER_PORT", 8080)  # type: int
+# When the configured port is busy, automatically try the next port
+# (up to WEB_SERVER_PORT_FALLBACK_MAX_OFFSET attempts).
+WEB_SERVER_PORT_FALLBACK = _env_bool("WEB_SERVER_PORT_FALLBACK", True)  # type: bool
+WEB_SERVER_PORT_FALLBACK_MAX_OFFSET = _env_int("WEB_SERVER_PORT_FALLBACK_MAX_OFFSET", 10)  # type: int
+
+# -----------------------------------------------------------------------------
+# Telegram Connection Proxy
+# -----------------------------------------------------------------------------
+# Set TG_PROXY_ENABLED=true and configure the proxy to connect through a
+# SOCKS5 proxy when the network blocks direct MTProto connections.
+TG_PROXY_ENABLED = _env_bool("TG_PROXY_ENABLED", False)  # type: bool
+TG_PROXY_TYPE = _env_str("TG_PROXY_TYPE", "socks5").lower()  # type: str
+TG_PROXY_HOST = _env_str("TG_PROXY_HOST", "127.0.0.1")  # type: str
+TG_PROXY_PORT = _env_int("TG_PROXY_PORT", 1080)  # type: int
+TG_PROXY_USERNAME = _env_str("TG_PROXY_USERNAME", "")  # type: str
+TG_PROXY_PASSWORD = _env_str("TG_PROXY_PASSWORD", "")  # type: str
 
 # -----------------------------------------------------------------------------
 # Message Rendering

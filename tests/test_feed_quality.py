@@ -1872,10 +1872,13 @@ async def test_handle_triage_inbound_job_keyword_override_uses_high_band_floor(m
 
     monkeypatch.setattr(main, "_load_inbound_payload", lambda _job: {})
     monkeypatch.setattr(main, "_is_severity_routing_enabled", lambda: True)
+    async def _mock_classify_severity_with_breakdown(**_kwargs):
+        return ("medium", 0.12, {"raw_score": 0.12})
+
     monkeypatch.setattr(
         main,
         "_classify_severity_with_breakdown",
-        lambda **_kwargs: ("medium", 0.12, {"raw_score": 0.12}),
+        _mock_classify_severity_with_breakdown,
     )
     monkeypatch.setattr(main, "_contains_breaking_keyword", lambda _text: True)
     monkeypatch.setattr(main, "should_downgrade_explainer_urgency", lambda _text: False)

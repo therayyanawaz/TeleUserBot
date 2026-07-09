@@ -1944,7 +1944,34 @@ def _stream_max_chars_per_edit() -> int:
     return max(60, min(value, 800))
 
 
+def _build_telegram_client_proxy() -> dict | None:
+    if not _bool_flag(getattr(config, "TG_PROXY_ENABLED", False), False):
+        return None
+    proxy_type_str = normalize_space(str(getattr(config, "TG_PROXY_TYPE", "socks5") or "")).lower()
+    host = normalize_space(str(getattr(config, "TG_PROXY_HOST", "127.0.0.1") or ""))
+    try:
+        port = int(getattr(config, "TG_PROXY_PORT", 1080))
+    except (ValueError, TypeError):
+        port = 1080
+    username = str(getattr(config, "TG_PROXY_USERNAME", "") or "").strip()
+    password = str(getattr(config, "TG_PROXY_PASSWORD", "") or "").strip()
+    try:
+        import socks
+        proxy_type = socks.SOCKS5 if proxy_type_str == "socks5" else socks.SOCKS4
+    except Exception:
+        LOGGER.warning("TG_PROXY_ENABLED=True but pysocks is not installed. Try: pip install pysocks")
+        return None
+    proxy = {"proxy_type": proxy_type, "addr": host, "port": port, "rdns": True}
+    if username:
+        proxy["username"] = username
+    if password:
+        proxy["password"] = password
+    LOGGER.info("Using Telegram proxy %s:%s (%s)", host, port, proxy_type_str)
+    return proxy
+
+
 def _is_web_server_enabled() -> bool:
+
     return _bool_flag(getattr(config, "ENABLE_WEB_SERVER", True), True)
 
 
@@ -8374,7 +8401,7 @@ async def _ensure_user_account_session() -> None:
         await _call_with_floodwait(tg.log_out)
         await tg.disconnect()
 
-        client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
+        client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH, proxy=_build_telegram_client_proxy())
         await _interactive_user_login(client)
         me = await _call_with_floodwait(client.get_me)
         if getattr(me, "bot", False):
@@ -10588,7 +10615,7 @@ async def _phase_login() -> List[int]:
 
     _set_startup_phase("telegram_login", reason="telegram_session_connect_started")
     _print_cli_status("•", "Connecting Telegram user session...", level="info")
-    client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
+    client = TelegramClient("userbot", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH, proxy=_build_telegram_client_proxy())
     await _ensure_user_account_session()
     _log_memory_snapshot("telegram_session_ready", phase=startup_phase)
     _print_cli_status("✓", "Telegram session authorized", level="ok")
