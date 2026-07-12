@@ -117,7 +117,6 @@ def detect_story_signals(
             "official_development",
             "recency",
             "explainer_like",
-            "downgrade_explainer",
             "live_event_update",
             "question_led",
         ):
