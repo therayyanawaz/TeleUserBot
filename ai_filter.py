@@ -184,16 +184,36 @@ _CAPITALIZED_STOPWORDS = {
     "These",
     "Those",
     "Officials",
+    "State",
+    "Statement",
+    "Security",
     "Forces",
+    "Area",
+    "Region",
+    "City",
+    "Town",
+    "North",
+    "South",
+    "East",
+    "West",
+    "Central",
+    "Soldiers",
+    "Civilians",
+    "Rockets",
+    "Missiles",
+    "Drones",
+    "Casualties",
+    "Officers",
+    "Command",
     "Troops",
+    "Base",
+    "Headquarters",
     "Strike",
     "Strikes",
     "Attack",
     "Attacks",
     "Blast",
     "Blasts",
-    "Missile",
-    "Missiles",
     "Airstrike",
     "Airstrikes",
 }
@@ -360,6 +380,7 @@ class _LlmCircuitBreaker:
         self._failure_count = 0
         self._last_failure_time = 0.0
         self._state = "closed"
+        self._lock = asyncio.Lock()
 
     def _now(self) -> float:
         return time.monotonic()
@@ -371,39 +392,44 @@ class _LlmCircuitBreaker:
 
     @property
     def state(self) -> str:
+        if self._state == "closed":
+            return "closed"
         return self._transition()
 
-    def record_success(self) -> None:
-        self._failure_count = 0
-        self._state = "closed"
+    async def record_success(self) -> None:
+        async with self._lock:
+            self._failure_count = 0
+            self._state = "closed"
 
-    def record_failure(self) -> None:
-        self._failure_count += 1
-        self._last_failure_time = self._now()
-        if self._failure_count >= self._failure_threshold:
-            self._state = "open"
-            LOGGER.warning(
-                "LLM circuit breaker OPEN after %s consecutive failures (timeout=%ss)",
-                self._failure_count,
-                self._recovery_timeout,
-            )
+    async def record_failure(self) -> None:
+        async with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = self._now()
+            if self._failure_count >= self._failure_threshold:
+                self._state = "open"
+                LOGGER.warning(
+                    "LLM circuit breaker OPEN after %s consecutive failures (timeout=%ss)",
+                    self._failure_count,
+                    self._recovery_timeout,
+                )
 
     async def _check(self) -> None:
-        if self._transition() == "open":
-            raise _CircuitBreakerError(
-                f"LLM circuit breaker open ({self._failure_count} consecutive failures)"
-            )
+        async with self._lock:
+            if self._transition() == "open":
+                raise _CircuitBreakerError(
+                    f"LLM circuit breaker open ({self._failure_count} consecutive failures)"
+                )
 
     async def call(self, coro: Awaitable[str]) -> str:
         await self._check()
         try:
             result = await coro
-            self.record_success()
+            await self.record_success()
             return result
         except (_CodexAuthError, _CodexRateLimitError, _CircuitBreakerError):
             raise
         except Exception:
-            self.record_failure()
+            await self.record_failure()
             raise
 
 
@@ -1492,6 +1518,18 @@ def _breaking_headline_prompt() -> str:
     )
 
 
+def _vital_rational_view_fallback_prompt() -> str:
+    language = _resolve_output_language()
+    return (
+        "You are an expert news editor. Your task is to provide a single, punchy sentence explaining 'Why it matters' "
+        "for the following breaking news update. Provide context, implications, or the underlying significance.\n"
+        f"Output language MUST strictly be {language}.\n"
+        "Keep it strictly under 25 words. Start with 'Why it matters:'.\n"
+        "Write it in strong, simple, accessible English.\n"
+        "Return ONLY the sentence. No markdown. No hashtags."
+    )
+
+
 def _vital_rational_view_prompt() -> str:
     language = _resolve_output_language()
     try:
@@ -2521,9 +2559,18 @@ _ALLOWED_FILTER_FALLBACK_REASONS = {
     "empty_output",
     "quality_rejected_after_retry",
 }
-_WEAK_COPY_PATTERNS = (
+_WEAK_COPY_PATTERNS = {
     "situation update",
+    "developments continue",
+    "ongoing situation",
+    "unconfirmed reports",
+    "details are emerging",
+    "breaking news",
+    "more to follow",
+    "developing story",
+    "reports indicate",
     "incident reported",
+    "officials statement",
     "incident in",
     "latest developments",
     "major developments",
@@ -2536,7 +2583,7 @@ _WEAK_COPY_PATTERNS = (
     "heightened tension",
     "heightened tensions",
     "ongoing developments",
-)
+}
 _COPY_SPECIFICITY_STOPWORDS = {
     "about",
     "after",
@@ -6520,7 +6567,7 @@ async def decide_filter_action(text: str, auth_manager: AuthManager) -> FilterDe
 
     _FILTER_DECISION_CACHE_MISSES += 1
 
-    if _likely_noise(cleaned):
+    if _likely_noise(cleaned) or _FIRST_PERSON_OPINION_RE.search(cleaned) or _EDITORIAL_OPINION_RE.search(cleaned):
         decision = _fallback_filter_decision(cleaned)
         ai_decision_cache_set(
             normalized_hash=normalized_hash,
@@ -7357,7 +7404,17 @@ async def summarize_vital_rational_view(
 
     del recent_context
     if evidence is None:
-        return None
+        compact = cleaned if len(cleaned) <= 1800 else f"{cleaned[:1797].rsplit(' ', 1)[0]}..."
+        try:
+            raw = await _call_codex_with_auth_repair(
+                f"Current Update:\n{compact}",
+                auth_manager,
+                _vital_rational_view_fallback_prompt(),
+                verbosity="low",
+            )
+            return _cleanup_vital_view(raw) if raw else None
+        except Exception:
+            return None
 
     context_key = "||".join(
         (

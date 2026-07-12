@@ -128,6 +128,8 @@ from db import (
     prune_archive_older_than,
     purge_ai_decision_cache,
     purge_source_delivery_refs,
+    purge_recent_breaking,
+    recover_dead_inbound_jobs,
     reset_in_progress_inbound_jobs,
     retry_or_dead_letter_inbound_job,
     restore_digest_window,
@@ -141,6 +143,7 @@ from db import (
     source_tier_decay,
     count_archive_window_rows,
     purge_breaking_story_history,
+    source_tier_increment,
 )
 from news_taxonomy import (
     get_ontology_health_snapshot,
@@ -3421,7 +3424,7 @@ _EDITORIAL_PROMO_PREFIX_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _EDITORIAL_FLAG_PREFIX_RE = re.compile(r"^(?:[\U0001F1E6-\U0001F1FF]{2}\s*)+")
-_EDITORIAL_EMOJI_PREFIX_RE = re.compile(r"^(?:[\U0001F300-\U0001FAFF\u2600-\u26FF\u2700-\u27BF\uFE0F]+\s*)+")
+_EDITORIAL_EMOJI_PREFIX_RE = re.compile(r"^(?:[\U0001F300-\U0001FAFF\u2000-\u27BF\u3000-\u303F\uFE0F]+\s*)+")
 _EDITORIAL_HEADLINE_MAX_STANDARD = 160
 _EDITORIAL_HEADLINE_MAX_BREAKING = 180
 _EDITORIAL_CONTEXT_MAX_STANDARD = 200
@@ -3779,7 +3782,7 @@ def _normalize_caption_fragment(
         source_title=source_title,
         category_label=category_label,
     )
-    cleaned = cleaned.lstrip("/\\| ").strip()
+    cleaned = cleaned.lstrip("/\\| —–").strip()
     cleaned = _strip_caption_promo_noise(cleaned, source_title=source_title)
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
     cleaned = re.sub(r"[|•]+", " ", cleaned)
@@ -4338,6 +4341,8 @@ def _register_source_delivery_refs(
             source_message_id=source_message_id,
             destination_message_id=destination_message_id,
         )
+    with contextlib.suppress(Exception):
+        source_tier_increment(int(str(channel_id).strip()))
 
 
 async def _classify_severity_with_breakdown(
@@ -4593,10 +4598,15 @@ def _load_active_breaking_story_clusters_snapshot(now_ts: int | None = None) -> 
     with contextlib.suppress(sqlite3.Error):
         purge_breaking_story_history(older_than_ts=_breaking_story_history_cutoff_ts(now))
     with contextlib.suppress(sqlite3.Error):
-        return load_active_breaking_story_clusters(
+        clusters = load_active_breaking_story_clusters(
             since_ts=now - _breaking_story_window_seconds(),
             limit=250,
         )
+        max_age_seconds = 14400
+        return [
+            c for c in clusters
+            if not (int(c.get("update_count") or 0) == 0 and now - int(c.get("opened_ts") or now) > max_age_seconds)
+        ]
     return []
 
 
@@ -4663,7 +4673,7 @@ def _persist_breaking_story_cluster(
         taxonomy_key=taxonomy_key,
         root_message_id=root_message_id,
         root_sent_ref=serialized_ref,
-        current_headline=current_headline,
+        current_headline=_normalize_caption_fragment(current_headline),
         current_facts_json=(
             str(current_facts_json_override)
             if current_facts_json_override is not None
@@ -6385,6 +6395,9 @@ async def _start_pipeline_workers() -> None:
     targets = _pipeline_worker_targets()
     pipeline_query_web_semaphore = asyncio.Semaphore(max(1, int(targets.get("query_web", 1) or 1)))
     reset_in_progress_inbound_jobs(older_than_seconds=0)
+    recovered = recover_dead_inbound_jobs()
+    if recovered > 0:
+        LOGGER.warning("Recovered %s dead inbound jobs to pending.", recovered)
     purge_ai_decision_cache(
         older_than_ts=int(time.time()) - (max(1, int(getattr(config, "AI_DECISION_CACHE_HOURS", 72) or 72)) * 3600)
     )
@@ -6419,6 +6432,9 @@ async def _stop_pipeline_workers() -> None:
     pipeline_worker_tasks.clear()
     pipeline_query_web_semaphore = None
     reset_in_progress_inbound_jobs(older_than_seconds=0)
+    recovered = recover_dead_inbound_jobs()
+    if recovered > 0:
+        LOGGER.warning("Recovered %s dead inbound jobs to pending.", recovered)
     _log_memory_snapshot(
         "pipeline_workers_stopped",
         pipeline_worker_count=0,

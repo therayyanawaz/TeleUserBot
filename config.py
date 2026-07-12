@@ -163,17 +163,23 @@ def build_dynamic_source_tiers() -> dict[int, float]:
 
 
 _dynamic_digest_source_tiers: dict[int, float] | None = None
+_dynamic_digest_source_tiers_ts: float = 0.0
 
 
 def get_digest_source_tiers() -> dict[int, float]:
-    """Lazily build merged source tier dict on first call."""
+    """Lazily build merged source tier dict on first call, with 30-min TTL."""
     global _dynamic_digest_source_tiers
-    if _dynamic_digest_source_tiers is None:
+    global _dynamic_digest_source_tiers_ts
+    import time
+    
+    now = time.time()
+    if _dynamic_digest_source_tiers is None or now - _dynamic_digest_source_tiers_ts > 1800:
         try:
             dynamic = build_dynamic_source_tiers()
         except Exception:
             dynamic = {}
         _dynamic_digest_source_tiers = {**dynamic, **DIGEST_SOURCE_TIERS}
+        _dynamic_digest_source_tiers_ts = now
     return _dynamic_digest_source_tiers
 
 

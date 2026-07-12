@@ -705,6 +705,24 @@ def reset_in_progress_inbound_jobs(*, older_than_seconds: int = 0) -> int:
         return int(cur.rowcount or 0)
 
 
+def recover_dead_inbound_jobs() -> int:
+    now_ts = int(time.time())
+    with _transaction() as conn:
+        cur = conn.execute(
+            """
+            UPDATE inbound_jobs
+            SET status = 'pending',
+                retry_count = 0,
+                claimed_by = NULL,
+                claimed_at = NULL,
+                updated_at = ?
+            WHERE status = 'dead'
+            """,
+            (now_ts,),
+        )
+        return int(cur.rowcount or 0)
+
+
 def count_inbound_jobs(*, stage: str | None = None, status: str | None = None) -> int:
     clauses: List[str] = []
     params: List[object] = []

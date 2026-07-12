@@ -37,6 +37,7 @@ async def _get_or_create(
             timeout=timeout,
             follow_redirects=follow_redirects,
             limits=_default_limits(),
+            trust_env=False,
         )
         _CLIENTS[name] = created
         return created
