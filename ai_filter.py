@@ -790,14 +790,37 @@ def _is_bad_feed_headline(line: str) -> bool:
     word_count = len(re.findall(r"\b\w+\b", cleaned))
     named_entity_count = len(_extract_candidate_named_tokens(cleaned))
     has_actor_token = any(token in lowered for token in _ACTOR_TOKENS)
+    
+    ontology = signals.get("ontology", {}).get("signal_breakdown", {})
+    action_hits = ontology.get("action_hit_count", 0)
+    target_hits = ontology.get("target_hit_count", 0)
+    place_hits = ontology.get("place_hit_count", 0)
+    event_hits = ontology.get("event_hit_count", 0)
+    
+    has_substance = (
+        action_hits > 0 
+        or target_hits > 0 
+        or place_hits > 0 
+        or event_hits > 0 
+        or _DIGEST_SPECIFIC_ACTION_RE.search(cleaned) 
+        or _HEADLINE_RAIL_STANDALONE_ACTION_RE.search(cleaned)
+    )
+
+    if (
+        word_count <= 8
+        and not has_substance
+        and named_entity_count <= 1
+    ):
+        return True
+        
     if (
         word_count <= 6
         and named_entity_count == 0
-        and not _DIGEST_SPECIFIC_ACTION_RE.search(cleaned)
-        and not _HEADLINE_RAIL_STANDALONE_ACTION_RE.search(cleaned)
+        and not has_substance
         and not has_actor_token
     ):
         return True
+        
     if cleaned.count("...") or cleaned.endswith("..."):
         return True
     if _feed_segment_is_incomplete(cleaned):
