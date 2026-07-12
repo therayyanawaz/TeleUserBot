@@ -1101,12 +1101,17 @@ def _resolve_llm_provider() -> str:
         return "openrouter"
     if provider in {"groq"}:
         return "groq"
+    if provider in {"gemini"}:
+        return "gemini"
+        
     if str(getattr(config, "OPENROUTER_API_KEY", "") or "").strip():
         return "openrouter"
 
     # Auto-detect fallback
     if str(getattr(config, "GROQ_API_KEYS", "") or "").strip() or str(getattr(config, "GROQ_API_KEY", "") or "").strip():
         return "groq"
+    if str(getattr(config, "GEMINI_COOKIE_1PSID", "") or "").strip():
+        return "gemini"
     return "codex"
 
 
@@ -1116,6 +1121,10 @@ def _using_openrouter() -> bool:
 
 def _using_groq() -> bool:
     return _resolve_llm_provider() == "groq"
+
+
+def _using_gemini() -> bool:
+    return _resolve_llm_provider() == "gemini"
 
 
 def _resolve_openrouter_url() -> str:
@@ -2357,7 +2366,70 @@ async def _call_codex_non_stream(
     return _extract_response_text_from_json(data).strip()
 
 
-async def _call_codex(
+_GEMINI_OAUTH_CLIENT = None
+_GEMINI_CLIENT_LOCK = asyncio.Lock()
+
+async def _get_gemini_client():
+    global _GEMINI_OAUTH_CLIENT
+    async with _GEMINI_CLIENT_LOCK:
+        if _GEMINI_OAUTH_CLIENT is not None:
+            return _GEMINI_OAUTH_CLIENT
+            
+        cookie_1psid = str(getattr(config, "GEMINI_COOKIE_1PSID", "") or "").strip()
+        cookie_1psidts = str(getattr(config, "GEMINI_COOKIE_1PSIDTS", "") or "").strip()
+        
+        if not cookie_1psid:
+            raise RuntimeError("GEMINI_COOKIE_1PSID is not configured.")
+            
+        try:
+            from gemini_webapi import GeminiClient
+        except ImportError:
+            LOGGER.warning("gemini_webapi package not found. Run: pip install gemini-webapi")
+            raise RuntimeError("gemini_webapi is not installed.")
+            
+        client = GeminiClient(cookie_1psid, cookie_1psidts if cookie_1psidts else None)
+        await client.init(timeout=15, auto_close=False)
+        _GEMINI_OAUTH_CLIENT = client
+        return client
+
+async def _clear_gemini_client():
+    global _GEMINI_OAUTH_CLIENT
+    async with _GEMINI_CLIENT_LOCK:
+        if _GEMINI_OAUTH_CLIENT is not None:
+            try:
+                await _GEMINI_OAUTH_CLIENT.close()
+            except Exception as e:
+                LOGGER.debug("Failed to close GeminiClient cleanly: %s", e)
+            _GEMINI_OAUTH_CLIENT = None
+
+async def _call_gemini_oauth(
+    cleaned: str,
+    instructions: str,
+    *,
+    verbosity: str = "medium",
+    on_token: Callable[[str], Awaitable[None]] | None = None,
+) -> str:
+    try:
+        client = await _get_gemini_client()
+        prompt = f"{instructions}\n\n{cleaned}"
+        
+        response_text = ""
+        # We must use generate_content_stream to get an async generator
+        # and temporary=True ensures we don't spam the user's Gemini history
+        async for resp in client.generate_content_stream(prompt, temporary=True):
+            if resp.text:
+                if on_token:
+                    await on_token(resp.text)
+                response_text += resp.text
+        return response_text.strip()
+    except Exception as exc:
+        LOGGER.error("Gemini OAuth error: %s", exc)
+        # Safely clear and close the client so it re-initializes on the next request
+        await _clear_gemini_client()
+        return ""
+
+
+async def _route_llm_request(
     cleaned: str,
     auth_context: Dict[str, str],
     instructions: str,
@@ -2382,6 +2454,14 @@ async def _call_codex(
             verbosity=verbosity,
             on_token=on_token,
             image_data_urls=image_data_urls,
+        )
+
+    if _using_gemini():
+        return await _call_gemini_oauth(
+            cleaned,
+            instructions,
+            verbosity=verbosity,
+            on_token=on_token,
         )
 
     if _streaming_enabled():
@@ -2899,7 +2979,7 @@ def _decision_retry_prompt(base_prompt: str, issue: str) -> str:
     return f"{base_prompt}\n\nRevision feedback:\n- {_filter_retry_feedback(issue)}"
 
 
-async def _call_codex_with_auth_repair(
+async def call_llm_with_auth_repair(
     cleaned: str,
     auth_manager: AuthManager,
     instructions: str,
@@ -2929,7 +3009,7 @@ async def _call_codex_with_auth_repair(
     try:
         auth_context = await auth_manager.get_auth_context()
         return await _LLM_CIRCUIT_BREAKER.call(
-            _call_codex(
+            _route_llm_request(
                 cleaned,
                 auth_context,
                 instructions=instructions,
@@ -2941,7 +3021,7 @@ async def _call_codex_with_auth_repair(
         auth_context = await auth_manager.refresh_auth_context()
         try:
             return await _LLM_CIRCUIT_BREAKER.call(
-                _call_codex(
+                _route_llm_request(
                     cleaned,
                     auth_context,
                     instructions=instructions,
@@ -4748,7 +4828,7 @@ async def _normalize_digest_output(
         return cleaned
 
     try:
-        rewritten = await _call_codex_with_auth_repair(
+        rewritten = await call_llm_with_auth_repair(
             cleaned,
             auth_manager,
             _digest_english_rewrite_prompt(),
@@ -4982,7 +5062,7 @@ async def _translate_digest_posts_to_english(
         "- Keep each item as one clean English evidence line."
     )
     try:
-        raw = await _call_codex_with_auth_repair(payload, auth_manager, instructions, verbosity="low")
+        raw = await call_llm_with_auth_repair(payload, auth_manager, instructions, verbosity="low")
         parsed = _try_parse_digest_json(raw) or {}
     except Exception:
         return [dict(post) for post in posts], 0, 0
@@ -6577,7 +6657,7 @@ async def _ai_classify_severity_and_signals(
     
     for attempt in range(2):
         try:
-            raw = await _call_codex_with_auth_repair(
+            raw = await call_llm_with_auth_repair(
                 cleaned,
                 auth_manager,
                 instructions,
@@ -6709,7 +6789,7 @@ async def decide_filter_action(text: str, auth_manager: AuthManager) -> FilterDe
             else base_prompt
         )
         try:
-            raw = await _call_codex_with_auth_repair(
+            raw = await call_llm_with_auth_repair(
                 compact,
                 auth_manager,
                 instructions,
@@ -6934,7 +7014,7 @@ async def classify_severity(
     compact = cleaned if len(cleaned) <= 1800 else f"{cleaned[:1797].rsplit(' ', 1)[0]}..."
 
     try:
-        raw = await _call_codex_with_auth_repair(
+        raw = await call_llm_with_auth_repair(
             compact,
             auth_manager,
             _severity_system_prompt(),
@@ -7503,7 +7583,7 @@ async def summarize_breaking_headline(
             else base_prompt
         )
         try:
-            raw = await _call_codex_with_auth_repair(
+            raw = await call_llm_with_auth_repair(
                 compact,
                 auth_manager,
                 prompt,
@@ -7537,7 +7617,7 @@ async def summarize_vital_rational_view(
     if evidence is None:
         compact = cleaned if len(cleaned) <= 1800 else f"{cleaned[:1797].rsplit(' ', 1)[0]}..."
         try:
-            raw = await _call_codex_with_auth_repair(
+            raw = await call_llm_with_auth_repair(
                 f"Current Update:\n{compact}",
                 auth_manager,
                 _vital_rational_view_fallback_prompt(),
@@ -7567,7 +7647,7 @@ async def summarize_vital_rational_view(
     compact = _context_evidence_prompt_input(cleaned, evidence)
 
     try:
-        raw = await _call_codex_with_auth_repair(
+        raw = await call_llm_with_auth_repair(
             compact,
             auth_manager,
             _vital_rational_view_prompt(),
@@ -7863,7 +7943,7 @@ async def create_digest_summary_result(
             else base_prompt
         )
         try:
-            content = await _call_codex_with_auth_repair(
+            content = await call_llm_with_auth_repair(
                 user_payload,
                 manager,
                 prompt,
@@ -8272,7 +8352,7 @@ async def generate_answer_from_context_result(
             else base_prompt
         )
         try:
-            content = await _call_codex_with_auth_repair(
+            content = await call_llm_with_auth_repair(
                 user_payload,
                 manager,
                 prompt,

@@ -2325,10 +2325,15 @@ def _persist_config_updates(updates: Dict[str, object]) -> None:
 
 def _prompt_llm_provider() -> None:
     """Interactively ask the user which LLM provider to use at startup."""
+    import sys
     if not _is_interactive_runtime():
         return
 
     current_provider = str(getattr(config, "LLM_PROVIDER", "auto") or "").strip().lower()
+    
+    # Skip the prompt if already configured, unless --setup is passed
+    if current_provider != "auto" and "--setup" not in sys.argv:
+        return
     
     print()
     print("━" * 50)
@@ -2339,16 +2344,17 @@ def _prompt_llm_provider() -> None:
     print("  1) Groq  (llama-3.1-8b-instant — fast, free tier: 14,400 req/day)")
     print("  2) OpenRouter  (nvidia/nemotron-3-ultra — free tier available)")
     print("  3) Codex  (ChatGPT OAuth — requires ChatGPT Plus subscription)")
-    print("  4) Keep current (auto-detect based on configured API keys)")
+    print("  4) Gemini OAuth (Requires __Secure-1PSID Cookies)")
+    print("  5) Keep current (auto-detect based on configured API keys)")
     print()
     
     while True:
-        choice = input("  Select provider [1-4] (default: " + ("1" if "groq" in current_provider else "4") + "): ").strip()
+        choice = input("  Select provider [1-5] (default: " + ("1" if "groq" in current_provider else "5") + "): ").strip()
         if not choice:
-            choice = "1" if "groq" in current_provider else "4"
-        if choice in ("1", "2", "3", "4"):
+            choice = "1" if "groq" in current_provider else "5"
+        if choice in ("1", "2", "3", "4", "5"):
             break
-        print("  Invalid choice. Enter 1, 2, 3, or 4.")
+        print("  Invalid choice. Enter 1, 2, 3, 4, or 5.")
     
     updates = {}
     if choice == "1":
@@ -2376,6 +2382,22 @@ def _prompt_llm_provider() -> None:
         print("  Note: You will need to authenticate with your ChatGPT account")
         updates["LLM_PROVIDER"] = "codex"
         updates["OPENAI_AUTH_ENV_ONLY"] = "false"
+    elif choice == "4":
+        print("  ✓ Using Gemini OAuth")
+        current_1psid = str(getattr(config, "GEMINI_COOKIE_1PSID", "") or "")
+        print(f"  Current 1PSID configured: {'Yes' if current_1psid else 'None'}")
+        new_1psid = input("  Enter __Secure-1PSID (press Enter to keep current): ").strip()
+        if new_1psid:
+            updates["GEMINI_COOKIE_1PSID"] = new_1psid
+        
+        current_1psidts = str(getattr(config, "GEMINI_COOKIE_1PSIDTS", "") or "")
+        print(f"  Current 1PSIDTS configured: {'Yes' if current_1psidts else 'None'}")
+        new_1psidts = input("  Enter __Secure-1PSIDTS (press Enter to keep current): ").strip()
+        if new_1psidts:
+            updates["GEMINI_COOKIE_1PSIDTS"] = new_1psidts
+        
+        updates["LLM_PROVIDER"] = "gemini"
+        updates["OPENAI_AUTH_ENV_ONLY"] = "true"
     else:
         print("  ✓ Keeping current provider setting")
     

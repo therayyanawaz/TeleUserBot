@@ -207,6 +207,8 @@ BOT_DESTINATION_CHAT_ID = _env_str("BOT_DESTINATION_CHAT_ID", "")  # type: str
 # LLM provider settings.
 LLM_PROVIDER = _env_str("LLM_PROVIDER", "auto").lower()  # type: str
 OPENROUTER_API_KEY = _env_str("OPENROUTER_API_KEY", "")  # type: str
+GEMINI_COOKIE_1PSID = _env_str("GEMINI_COOKIE_1PSID", "")  # type: str
+GEMINI_COOKIE_1PSIDTS = _env_str("GEMINI_COOKIE_1PSIDTS", "")  # type: str
 OPENROUTER_BASE_URL = _env_str(
     "OPENROUTER_BASE_URL",
     "https://openrouter.ai/api/v1/chat/completions",
