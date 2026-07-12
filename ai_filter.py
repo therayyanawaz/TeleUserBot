@@ -243,7 +243,7 @@ _FEED_TELEGRAM_LINK_RE = re.compile(
 )
 _FEED_PROMO_TO_END_RE = re.compile(
     r"(?i)\b(?:our channel|subscribe|follow\s+us|join(?: us| our channel)?|"
-    r"watch here|watch live|livestream|live stream)\b.*$"
+    r"watch here|watch live|livestream|live stream|boost\s+the\s+channel|boost|resistancetrench)\b.*$"
 )
 _FEED_FOLLOW_PROMO_ONLY_RE = re.compile(
     r"(?i)^\s*follow(?=\s*(?:$|\||discussion\b|boost the channel\b|our channel\b|"
@@ -673,6 +673,12 @@ def _feed_segment_is_incomplete(line: str) -> bool:
     if cleaned.endswith(('...', '…')):
         return True
     if cleaned.endswith((':', '/', '-', '|', '•')):
+        return True
+    if cleaned.count('[') != cleaned.count(']'):
+        return True
+    if cleaned.count('(') != cleaned.count(')'):
+        return True
+    if re.search(r"\[(?:location|name|number|date|time|actor|country|city|target|amount)\]", cleaned, flags=re.IGNORECASE):
         return True
     if cleaned.startswith(("@", "/", "\\")):
         return True
@@ -1404,7 +1410,7 @@ def _filter_decision_system_prompt() -> str:
         "summary_html must be Telegram-safe HTML using only <b>, <i>, <u>, <s>, <tg-spoiler>, <code>, <pre>, <blockquote>, <a href>, <br>\n"
         "headline_html must be a concise one-line Telegram-safe HTML headline or empty string\n"
         "story_bridge_html must be a concise Telegram-safe HTML contextual bridge or empty string\n"
-        "Never include channel names, channel usernames, source handles, t.me links, outlet/source prefixes, or self-promo text like our channel / subscribe / follow in any field.\n"
+        "Never include channel names (e.g. ResistanceTrench), channel usernames, source handles, t.me links, outlet/source prefixes, or self-promo text like our channel / subscribe / follow / boost in any field.\n"
         "If cleanup would leave only promo, source attribution, or an incomplete fragment, output an empty string instead of that fragment.\n"
         "confidence must be a number from 0 to 1\n"
         "reason_code must be a short snake_case code\n"
@@ -1465,7 +1471,8 @@ def _breaking_headline_prompt() -> str:
             "Target 10-24 words.\n"
             "Never end with ellipsis.\n"
             "Use standard sentence capitalization. DO NOT use Title Case.\n"
-            "No prefix, no source tag, no markdown, no extra explanation, no slurs."
+            "Do NOT output placeholders (like [Location]). If a detail is missing, omit it.\n"
+            "No prefix, no source tag, no markdown, no extra explanation, no slurs, no channel names (e.g. ResistanceTrench), no promo text (e.g. boost)."
         )
     return (
         "You write sharp live-news one-liners for Telegram alerts.\n"
@@ -1480,7 +1487,8 @@ def _breaking_headline_prompt() -> str:
         "Target 12-28 words.\n"
         "Never end with ellipsis.\n"
         "Do not cut off mid-thought.\n"
-        "No prefix, no markdown, no source tag, no explanation, no hype."
+        "Do NOT output placeholders (like [Location]). If a detail is missing, omit it.\n"
+        "No prefix, no markdown, no source tag, no explanation, no hype, no channel names, no promo text."
     )
 
 
