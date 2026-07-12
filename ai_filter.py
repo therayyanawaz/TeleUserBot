@@ -18,6 +18,7 @@ import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 import httpx
+from curl_cffi import requests as curl_requests
 try:
     from langdetect import DetectorFactory as _LangDetectFactory, detect_langs as _detect_langs
 except Exception:  # pragma: no cover - optional dependency
@@ -1199,7 +1200,7 @@ def _extract_openrouter_content(payload: dict) -> str:
     return ""
 
 
-def _raise_openrouter_http_error(response: httpx.Response) -> None:
+def _raise_openrouter_http_error(response: curl_requests.Response) -> None:
     message = response.text or response.reason_phrase or "OpenRouter request failed"
     try:
         payload = response.json()
@@ -1313,7 +1314,7 @@ def _extract_groq_content(payload: dict) -> str:
     return ""
 
 
-def _raise_groq_http_error(response: httpx.Response) -> None:
+def _raise_groq_http_error(response: curl_requests.Response) -> None:
     message = response.text or response.reason_phrase or "Groq request failed"
     try:
         payload = response.json()
@@ -1729,7 +1730,7 @@ def _extract_completed_text(event: dict) -> str:
     return ""
 
 
-def _raise_codex_http_error(response: httpx.Response) -> None:
+def _raise_codex_http_error(response: curl_requests.Response) -> None:
     message = response.text or response.reason_phrase or "Request failed"
     code = ""
 
@@ -1794,7 +1795,7 @@ class _StreamingCodexResponse:
         self._image_data_urls = list(image_data_urls or [])
 
         self._stream_ctx = None
-        self._response: httpx.Response | None = None
+        self._response: curl_requests.Response | None = None
 
         self.full_text = ""
         self.metrics = CodexStreamMetrics()
@@ -1829,8 +1830,11 @@ class _StreamingCodexResponse:
         )
         self._response = await self._stream_ctx.__aenter__()
         if self._response.status_code >= 400:
-            body = await self._response.aread()
-            error_response = httpx.Response(
+            chunks = []
+            async for chunk in self._response.aiter_content():
+                chunks.append(chunk)
+            body = b"".join(chunks)
+            error_response = curl_requests.Response(
                 status_code=self._response.status_code,
                 headers=self._response.headers,
                 content=body,
@@ -1860,6 +1864,7 @@ class _StreamingCodexResponse:
         completed_text = ""
 
         async for line in self._response.aiter_lines():
+            if isinstance(line, bytes): line = line.decode('utf-8', errors='replace')
             if line == "":
                 if not data_lines:
                     continue
@@ -1937,7 +1942,7 @@ class _StreamingOpenRouterResponse:
         self._instructions = instructions
         self._image_data_urls = list(image_data_urls or [])
         self._stream_ctx = None
-        self._response: httpx.Response | None = None
+        self._response: curl_requests.Response | None = None
         self.full_text = ""
         self.metrics = CodexStreamMetrics()
         self._iterated = False
@@ -1960,8 +1965,11 @@ class _StreamingOpenRouterResponse:
         )
         self._response = await self._stream_ctx.__aenter__()
         if self._response.status_code >= 400:
-            body = await self._response.aread()
-            error_response = httpx.Response(
+            chunks = []
+            async for chunk in self._response.aiter_content():
+                chunks.append(chunk)
+            body = b"".join(chunks)
+            error_response = curl_requests.Response(
                 status_code=self._response.status_code,
                 headers=self._response.headers,
                 content=body,
@@ -1987,6 +1995,7 @@ class _StreamingOpenRouterResponse:
             return
 
         async for line in self._response.aiter_lines():
+            if isinstance(line, bytes): line = line.decode('utf-8', errors='replace')
             if not line.startswith("data:"):
                 continue
             data_str = line[5:].strip()
@@ -2022,7 +2031,7 @@ class _StreamingGroqResponse:
         self._instructions = instructions
         self._image_data_urls = list(image_data_urls or [])
         self._stream_ctx = None
-        self._response: httpx.Response | None = None
+        self._response: curl_requests.Response | None = None
         self.full_text = ""
         self.metrics = CodexStreamMetrics()
         self._iterated = False
@@ -2052,8 +2061,11 @@ class _StreamingGroqResponse:
                 continue
             break
         if self._response.status_code >= 400:
-            body = await self._response.aread()
-            error_response = httpx.Response(
+            chunks = []
+            async for chunk in self._response.aiter_content():
+                chunks.append(chunk)
+            body = b"".join(chunks)
+            error_response = curl_requests.Response(
                 status_code=self._response.status_code,
                 headers=self._response.headers,
                 content=body,
@@ -2079,6 +2091,7 @@ class _StreamingGroqResponse:
             return
 
         async for line in self._response.aiter_lines():
+            if isinstance(line, bytes): line = line.decode('utf-8', errors='replace')
             if not line.startswith("data:"):
                 continue
             data_str = line[5:].strip()
@@ -2125,7 +2138,7 @@ async def _call_openrouter_non_stream(
         stream=False,
         image_data_urls=image_data_urls,
     )
-    response: httpx.Response | None = None
+    response: curl_requests.Response | None = None
     LOGGER.debug("LLM provider=openrouter model=%s stream=false", _resolve_openrouter_model())
     for attempt in range(3):
         http = await get_codex_http_client()
@@ -2137,7 +2150,7 @@ async def _call_openrouter_non_stream(
                 timeout=45.0,
             )
             break
-        except httpx.TransportError as exc:
+        except curl_requests.errors.RequestsError as exc:
             await reset_shared_http_client("codex")
             if attempt < 2:
                 LOGGER.warning(
@@ -2229,7 +2242,7 @@ async def _call_groq_non_stream(
     max_attempts: int = 4,
 ) -> str:
     del verbosity
-    response: httpx.Response | None = None
+    response: curl_requests.Response | None = None
     LOGGER.debug("LLM provider=groq model=%s stream=false", _resolve_groq_model())
     for attempt in range(max_attempts):
         headers = _get_groq_headers()
@@ -2252,7 +2265,7 @@ async def _call_groq_non_stream(
                 _rotate_groq_key()
                 continue
             break
-        except httpx.TransportError as exc:
+        except curl_requests.errors.RequestsError as exc:
             await reset_shared_http_client("codex")
             if attempt < 2:
                 LOGGER.warning(
@@ -2337,13 +2350,13 @@ async def _call_codex_non_stream(
         stream=False,
         image_data_urls=image_data_urls,
     )
-    response: httpx.Response | None = None
+    response: curl_requests.Response | None = None
     for attempt in range(3):
         http = await get_codex_http_client()
         try:
             response = await http.post(_resolve_codex_url(), headers=headers, json=payload)
             break
-        except httpx.TransportError as exc:
+        except curl_requests.errors.RequestsError as exc:
             await reset_shared_http_client("codex")
             if attempt < 2:
                 LOGGER.warning(
@@ -2828,9 +2841,9 @@ def _fallback_reason_from_exc(exc: BaseException) -> str:
         return "auth_error"
     if isinstance(exc, _CodexRateLimitError):
         return "rate_limited"
-    if isinstance(exc, httpx.TimeoutException):
+    if isinstance(exc, curl_requests.errors.RequestsError):
         return "timeout"
-    if isinstance(exc, httpx.TransportError):
+    if isinstance(exc, curl_requests.errors.RequestsError):
         return "transport_error"
     if isinstance(exc, _CodexApiError):
         return "api_error"
@@ -7020,7 +7033,7 @@ async def classify_severity(
             _severity_system_prompt(),
             verbosity="low",
         )
-    except (_CodexRateLimitError, httpx.HTTPError, _CodexApiError, ValueError):
+    except (_CodexRateLimitError, httpx.HTTPError, curl_requests.errors.RequestsError, _CodexApiError, ValueError):
         _severity_cache_set(key, heuristic)
         return heuristic
     except Exception:
@@ -7653,7 +7666,7 @@ async def summarize_vital_rational_view(
             _vital_rational_view_prompt(),
             verbosity="low",
         )
-    except (_CodexRateLimitError, httpx.HTTPError, _CodexApiError, ValueError):
+    except (_CodexRateLimitError, httpx.HTTPError, curl_requests.errors.RequestsError, _CodexApiError, ValueError):
         _vital_view_cache_set(key, None)
         return None
     except Exception:
