@@ -9,7 +9,11 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 import json
 import logging
+import math
+import os
 import re
+import sqlite3
+import threading
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
@@ -1258,12 +1262,15 @@ def _get_groq_keys() -> list[str]:
     _GROQ_KEYS_CACHE = keys
     return keys
 
+_GROQ_ROTATION_LOCK = threading.Lock()
+
 def _rotate_groq_key() -> None:
     global _GROQ_CURRENT_KEY_IDX
-    keys = _get_groq_keys()
-    if keys and len(keys) > 1:
-        _GROQ_CURRENT_KEY_IDX = (_GROQ_CURRENT_KEY_IDX + 1) % len(keys)
-        LOGGER.warning("Groq API rate limit hit. Rotating to key index %s/%s", _GROQ_CURRENT_KEY_IDX + 1, len(keys))
+    with _GROQ_ROTATION_LOCK:
+        keys = _get_groq_keys()
+        if keys and len(keys) > 1:
+            _GROQ_CURRENT_KEY_IDX = (_GROQ_CURRENT_KEY_IDX + 1) % len(keys)
+            LOGGER.warning("Groq API rate limit hit. Rotating to key index %s/%s", _GROQ_CURRENT_KEY_IDX + 1, len(keys))
 
 def _get_groq_headers() -> dict[str, str]:
     keys = _get_groq_keys()
@@ -2207,11 +2214,12 @@ async def _call_groq_non_stream(
     *,
     verbosity: str = "medium",
     image_data_urls: Sequence[str] | None = None,
+    max_attempts: int = 4,
 ) -> str:
     del verbosity
     response: httpx.Response | None = None
     LOGGER.debug("LLM provider=groq model=%s stream=false", _resolve_groq_model())
-    for attempt in range(4):
+    for attempt in range(max_attempts):
         headers = _get_groq_headers()
         payload = _build_groq_payload(
             cleaned,
@@ -2287,6 +2295,7 @@ async def _call_groq(
         instructions,
         verbosity=verbosity,
         image_data_urls=image_data_urls,
+        max_attempts=2,
     )
 
 

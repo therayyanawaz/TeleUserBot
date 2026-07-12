@@ -2696,8 +2696,9 @@ async def _bot_api_request(
             retry_after = int(
                 (payload.get("parameters") or {}).get("retry_after", 2)  # type: ignore[union-attr]
             )
-            await asyncio.sleep(retry_after + 1)
-            continue
+            if attempt < 3:
+                await asyncio.sleep(retry_after + 1)
+                continue
 
         if response.status_code >= 400:
             raise RuntimeError(
@@ -2752,8 +2753,9 @@ async def _query_bot_api_request(
             retry_after = int(
                 (payload.get("parameters") or {}).get("retry_after", 2)  # type: ignore[union-attr]
             )
-            await asyncio.sleep(retry_after + 1)
-            continue
+            if attempt < 3:
+                await asyncio.sleep(retry_after + 1)
+                continue
 
         if response.status_code >= 400:
             raise RuntimeError(
@@ -7568,15 +7570,8 @@ async def _build_window_digest_messages(
     duplicate_collapsed_count = 0
     max_body_chars = max(1200, _digest_send_chunk_size() - 220)
 
-    for part_index, row_group in enumerate(
-        _iter_digest_row_groups(
-            row_loader,
-            token_budget=token_budget,
-            page_size=page_size,
-        ),
-        start=1,
-    ):
-        posts = await _hydrate_digest_posts(row_group)
+    async def process_part(part_idx: int, rg):
+        posts = await _hydrate_digest_posts(rg)
         result = await create_digest_summary_result(
             posts,
             _require_auth_manager(),
@@ -7588,12 +7583,26 @@ async def _build_window_digest_messages(
             {
                 **context,
                 "posts": posts,
-                "part_index": part_index,
+                "part_index": part_idx,
                 "part_count": logical_part_count,
                 "copy_origin": result.copy_origin,
                 "fallback_reason": result.fallback_reason,
             },
         )
+        return posts, result, digest_body
+
+    tasks = []
+    for part_index, row_group in enumerate(
+        _iter_digest_row_groups(
+            row_loader,
+            token_budget=token_budget,
+            page_size=page_size,
+        ),
+        start=1,
+    ):
+        tasks.append(process_part(part_index, row_group))
+        
+    for posts, result, digest_body in await asyncio.gather(*tasks):
         if headline_mode:
             ranking_posts.extend(posts)
             part_headline, _part_story, part_highlights, part_also = extract_digest_narrative_parts(
