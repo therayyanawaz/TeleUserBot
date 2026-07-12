@@ -1201,7 +1201,7 @@ def _extract_openrouter_content(payload: dict) -> str:
 
 
 def _raise_openrouter_http_error(response: curl_requests.Response) -> None:
-    message = response.text or response.reason_phrase or "OpenRouter request failed"
+    message = response.text or response.reason or "OpenRouter request failed"
     try:
         payload = response.json()
         err = payload.get("error") if isinstance(payload, dict) else None
@@ -1315,7 +1315,7 @@ def _extract_groq_content(payload: dict) -> str:
 
 
 def _raise_groq_http_error(response: curl_requests.Response) -> None:
-    message = response.text or response.reason_phrase or "Groq request failed"
+    message = response.text or response.reason or "Groq request failed"
     try:
         payload = response.json()
         err = payload.get("error") if isinstance(payload, dict) else None
@@ -1731,7 +1731,7 @@ def _extract_completed_text(event: dict) -> str:
 
 
 def _raise_codex_http_error(response: curl_requests.Response) -> None:
-    message = response.text or response.reason_phrase or "Request failed"
+    message = response.text or response.reason or "Request failed"
     code = ""
 
     try:
@@ -2842,9 +2842,7 @@ def _fallback_reason_from_exc(exc: BaseException) -> str:
     if isinstance(exc, _CodexRateLimitError):
         return "rate_limited"
     if isinstance(exc, curl_requests.errors.RequestsError):
-        return "timeout"
-    if isinstance(exc, curl_requests.errors.RequestsError):
-        return "transport_error"
+        return "network_error"
     if isinstance(exc, _CodexApiError):
         return "api_error"
     if isinstance(exc, (json.JSONDecodeError, ValueError, TypeError)):

@@ -7,10 +7,10 @@ import os
 from typing import Dict
 
 import httpx
-
+from curl_cffi import requests as curl_requests
 
 _CLIENT_LOCK = asyncio.Lock()
-_CLIENTS: Dict[str, httpx.AsyncClient] = {}
+_CLIENTS: Dict[str, httpx.AsyncClient | curl_requests.AsyncSession] = {}
 
 
 def _default_limits() -> httpx.Limits:
@@ -43,13 +43,18 @@ async def _get_or_create(
         return created
 
 
-async def get_codex_http_client() -> httpx.AsyncClient:
+async def get_codex_http_client() -> curl_requests.AsyncSession:
     total_timeout = float(os.getenv("CODEX_HTTP_TIMEOUT", "90.0"))
-    connect_timeout = float(os.getenv("CODEX_HTTP_CONNECT_TIMEOUT", "20.0"))
-    return await _get_or_create(
-        "codex",
-        timeout=httpx.Timeout(total_timeout, connect=connect_timeout),
-    )
+    async with _CLIENT_LOCK:
+        client = _CLIENTS.get("codex")
+        if client is not None:
+            return client
+        created = curl_requests.AsyncSession(
+            timeout=total_timeout,
+            impersonate="chrome",
+        )
+        _CLIENTS["codex"] = created
+        return created
 
 
 async def get_auth_http_client() -> httpx.AsyncClient:
@@ -82,7 +87,10 @@ async def reset_shared_http_client(name: str) -> None:
     async with _CLIENT_LOCK:
         client = _CLIENTS.pop(name, None)
     if client is not None:
-        await client.aclose()
+        if isinstance(client, httpx.AsyncClient):
+            await client.aclose()
+        else:
+            await client.close()
 
 
 async def close_shared_http_clients() -> None:
@@ -90,4 +98,7 @@ async def close_shared_http_clients() -> None:
         clients = list(_CLIENTS.values())
         _CLIENTS.clear()
     for client in clients:
-        await client.aclose()
+        if isinstance(client, httpx.AsyncClient):
+            await client.aclose()
+        else:
+            await client.close()
