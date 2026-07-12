@@ -220,6 +220,7 @@ LLM_MODEL = _env_str("LLM_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")  # t
 
 # Groq settings (OpenAI-compatible API)
 GROQ_API_KEY = _env_str("GROQ_API_KEY", "")  # type: str
+GROQ_API_KEYS = _env_str("GROQ_API_KEYS", "")  # type: str
 GROQ_BASE_URL = _env_str(
     "GROQ_BASE_URL",
     "https://api.groq.com/openai/v1/chat/completions",

@@ -490,6 +490,72 @@ class RuntimeActivityFormatter(logging.Formatter):
         return render_runtime_event_text(view, surface=self._surface, color=self._color, width=width)
 
 
+class RichConsoleHandler(logging.Handler):
+    """Sleek Claude Code-style console logger using rich."""
+
+    def __init__(self, *, sanitize: SanitizeFn | None = None) -> None:
+        super().__init__(level=logging.INFO)
+        self._sanitize = sanitize
+        # Lazy import to avoid circular imports if _terminal isn't loaded
+        from _terminal import _console
+        from rich.text import Text
+        from rich.table import Table
+        from rich.panel import Panel
+        from rich.console import Group
+        self._console = _console
+        self.Text = Text
+        self.Table = Table
+        self.Panel = Panel
+        self.Group = Group
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            view = build_runtime_event_view(record, sanitize=self._sanitize)
+        except Exception:
+            self._console.print(f"[bold red]Failed to format log:[/bold red] {record.msg}")
+            return
+            
+        cat_color_ansi = _CATEGORY_COLORS.get(view.category, "\033[37m").replace('\033[', '').replace('m', '')
+        color_map = {"31": "red", "32": "green", "33": "yellow", "34": "blue", "35": "magenta", "36": "cyan", "37": "white"}
+        rich_cat_color = color_map.get(cat_color_ansi, "white")
+        
+        header = self.Text()
+        header.append(f"{view.timestamp_short} ", style="dim")
+        header.append(f" {_CATEGORY_LABELS.get(view.category, view.category.upper()):<8} ", style=f"bold {rich_cat_color} reverse")
+        header.append(f" {view.title}", style="bold white")
+        
+        if view.badges:
+            header.append("  ")
+            for badge in view.badges:
+                header.append(f" {badge} ", style="dim reverse")
+                header.append(" ")
+                
+        renderables = [header]
+        
+        if view.summary:
+            renderables.append(self.Text(f"  {view.summary}", style="dim white"))
+            
+        if view.details:
+            grid = self.Table.grid(padding=(0, 2))
+            grid.add_column(style="bold dim", justify="right")
+            grid.add_column(style="none")
+            for label, value in view.details:
+                grid.add_row(f"  {label}", str(value))
+            renderables.append(grid)
+            
+        if view.traceback_text:
+            renderables.append(self.Text(view.traceback_text, style="red"))
+            
+        group = self.Group(*renderables)
+        
+        if record.levelno >= logging.ERROR or view.category == "breaking":
+            panel_style = "red" if record.levelno >= logging.ERROR else "yellow"
+            self._console.print(self.Panel(group, border_style=panel_style, padding=(0, 1)))
+        else:
+            self._console.print(group)
+            self._console.print()
+
+
 class RuntimeActivityBufferHandler(logging.Handler):
     """In-memory recent activity feed for the web surface."""
 

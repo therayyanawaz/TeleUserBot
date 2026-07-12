@@ -407,9 +407,8 @@ def _configure_runtime_logging() -> None:
     _error_handler.setLevel(logging.ERROR)
     _error_handler.setFormatter(file_formatter)
 
-    _console_handler = logging.StreamHandler()
-    _console_handler.setLevel(logging.INFO)
-    _console_handler.setFormatter(console_formatter)
+    from runtime_presenter import RichConsoleHandler
+    _console_handler = RichConsoleHandler(sanitize=_sanitize_log_text)
 
     _runtime_activity_buffer_handler = RuntimeActivityBufferHandler(
         capacity=120,
@@ -2354,12 +2353,22 @@ def _prompt_llm_provider() -> None:
     updates = {}
     if choice == "1":
         print("  ✓ Using Groq (llama-3.1-8b-instant)")
-        print("  Note: Ensure GROQ_API_KEY is set in .env")
+        current_keys = str(getattr(config, "GROQ_API_KEYS", "") or getattr(config, "GROQ_API_KEY", "") or "")
+        print(f"  Current Groq Keys configured: {'Yes' if current_keys else 'None'}")
+        new_keys = input("  Enter Groq API key(s) [comma-separated for rotation] (press Enter to keep current): ").strip()
+        if new_keys:
+            updates["GROQ_API_KEYS"] = new_keys
+            print("  ✓ Groq API keys updated")
         updates["LLM_PROVIDER"] = "groq"
         updates["OPENAI_AUTH_ENV_ONLY"] = "true"
     elif choice == "2":
         print("  ✓ Using OpenRouter")
-        print("  Note: Ensure OPENROUTER_API_KEY is set in .env")
+        current_key = str(getattr(config, "OPENROUTER_API_KEY", "") or "")
+        print(f"  Current OpenRouter Key configured: {'Yes' if current_key else 'None'}")
+        new_key = input("  Enter OpenRouter API key (press Enter to keep current): ").strip()
+        if new_key:
+            updates["OPENROUTER_API_KEY"] = new_key
+            print("  ✓ OpenRouter API key updated")
         updates["LLM_PROVIDER"] = "openrouter"
         updates["OPENAI_AUTH_ENV_ONLY"] = "true"
     elif choice == "3":
@@ -2660,6 +2669,9 @@ async def _bot_api_request(
             httpx.RemoteProtocolError,
             httpx.TransportError,
         ) as exc:
+            import shared_http
+            await shared_http.reset_shared_http_client("bot_api")
+            http = await shared_http.get_bot_http_client(_bot_api_timeout())
             if attempt >= 3:
                 raise
             wait_seconds = min(8, 2 ** attempt)
@@ -2716,8 +2728,18 @@ async def _query_bot_api_request(
 
     url = f"https://api.telegram.org/bot{token}/{method}"
     http = await get_bot_http_client(httpx.Timeout(60.0))
-    for _ in range(4):
-        response = await http.post(url, data=data)
+    for attempt in range(4):
+        try:
+            response = await http.post(url, data=data)
+        except httpx.RequestError as exc:
+            import shared_http
+            await shared_http.reset_shared_http_client("bot_api")
+            if attempt < 3:
+                await asyncio.sleep(1.0)
+                http = await shared_http.get_bot_http_client(httpx.Timeout(60.0))
+                continue
+            raise RuntimeError(f"Bot API {method} transport failed: {exc}") from exc
+
         payload = {}
         try:
             payload = response.json()

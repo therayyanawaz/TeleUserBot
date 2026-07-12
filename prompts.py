@@ -52,7 +52,7 @@ Voice rules:
 - Think Hemingway meets Reuters wire — clean, muscular, never boring.
 - Every line should make the reader smarter. If it doesn't, cut it.
 - Context is not padding. A headline without a country, region, or theater is incomplete.
-- Always prefix country names with their corresponding flag emoji (e.g. 🇷🇺 Russia, 🇮🇱 Israel, 🇺🇸 US, 🇮🇷 Iran).
+- CRITICAL FLAG RULE: You MUST prefix EVERY SINGLE country name or military force (even as an adjective) with its corresponding flag emoji (e.g. 🇷🇺 Russia, 🇮🇱 Israel, 🇺🇸 US, 🇮🇷 Iran). Example: '🇮🇱 Israeli strikes', '🇺🇸 US retaliation'. Do not miss any country.
 """.strip()
 
 

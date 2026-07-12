@@ -1099,7 +1099,9 @@ def _resolve_llm_provider() -> str:
         return "groq"
     if str(getattr(config, "OPENROUTER_API_KEY", "") or "").strip():
         return "openrouter"
-    if str(getattr(config, "GROQ_API_KEY", "") or "").strip():
+
+    # Auto-detect fallback
+    if str(getattr(config, "GROQ_API_KEYS", "") or "").strip() or str(getattr(config, "GROQ_API_KEY", "") or "").strip():
         return "groq"
     return "codex"
 
@@ -1240,10 +1242,34 @@ def _build_groq_payload(
     }
 
 
+_GROQ_KEYS_CACHE: list[str] = []
+_GROQ_CURRENT_KEY_IDX = 0
+
+def _get_groq_keys() -> list[str]:
+    global _GROQ_KEYS_CACHE
+    if _GROQ_KEYS_CACHE:
+        return _GROQ_KEYS_CACHE
+    keys = str(getattr(config, "GROQ_API_KEYS", "") or "").split(",")
+    keys = [k.strip() for k in keys if k.strip()]
+    if not keys:
+        single_key = str(getattr(config, "GROQ_API_KEY", "") or "").strip()
+        if single_key:
+            keys = [single_key]
+    _GROQ_KEYS_CACHE = keys
+    return keys
+
+def _rotate_groq_key() -> None:
+    global _GROQ_CURRENT_KEY_IDX
+    keys = _get_groq_keys()
+    if keys and len(keys) > 1:
+        _GROQ_CURRENT_KEY_IDX = (_GROQ_CURRENT_KEY_IDX + 1) % len(keys)
+        LOGGER.warning("Groq API rate limit hit. Rotating to key index %s/%s", _GROQ_CURRENT_KEY_IDX + 1, len(keys))
+
 def _get_groq_headers() -> dict[str, str]:
-    api_key = str(getattr(config, "GROQ_API_KEY", "") or "").strip()
-    if not api_key:
+    keys = _get_groq_keys()
+    if not keys:
         raise _CodexAuthError("GROQ_API_KEY is missing from configuration.")
+    api_key = keys[_GROQ_CURRENT_KEY_IDX % len(keys)]
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -1377,12 +1403,20 @@ def _breaking_headline_is_grounded(source_text: str, candidate: str) -> bool:
         unsupported_actors = {
             token for token in candidate_tokens if token in _ACTOR_TOKENS and token not in source_tokens
         }
+        allowed_actor_context = {"israel", "israeli", "iran", "iranian", "us", "usa", "ukraine", "russia", "russian", "ukrainian", "syria", "syrian", "lebanon", "lebanese"}
+        unsupported_actors = unsupported_actors - allowed_actor_context
         if unsupported_actors:
             return False
 
         unsupported_named_tokens = _extract_candidate_named_tokens(candidate_clean) - source_tokens
         if unsupported_named_tokens:
-            allowed_extras = {"tonight", "today", "tomorrow", "yesterday", "now"}
+            allowed_extras = {
+                "tonight", "today", "tomorrow", "yesterday", "now",
+                "us", "usa", "uk", "israel", "iran", "russia", "ukraine", 
+                "lebanon", "syria", "iraq", "yemen", "palestine", "gaza",
+                "china", "taiwan", "korea", "japan", "france", "germany",
+                "nato", "un", "eu", "europe"
+            }
             if not unsupported_named_tokens.issubset(allowed_extras):
                 return False
 
@@ -1508,7 +1542,7 @@ def _breaking_headline_prompt() -> str:
     from prompts import HUMAN_NEWSROOM_VOICE  # noqa: PLC0415
     language = _resolve_output_language()
     geo_rule = (
-        f"Always prefix country or force names with their flag emoji (e.g. \U0001f1f7\U0001f1fa Russia, \U0001f1ee\U0001f1f1 Israel, \U0001f1fa\U0001f1f8 US, \U0001f1ee\U0001f1f7 Iran).\n"
+        "CRITICAL FLAG RULE: You MUST prefix EVERY SINGLE country name or military force (even as an adjective) with its corresponding flag emoji (e.g. \U0001f1f7\U0001f1fa Russia, \U0001f1ee\U0001f1f1 Israel, \U0001f1fa\U0001f1f8 US, \U0001f1ee\U0001f1f7 Iran). Example: '\U0001f1ee\U0001f1f1 Israeli strikes', '\U0001f1fa\U0001f1f8 US retaliation'. Do not miss any country.\n"
         "Every headline must name the country or theater of operations. A location-free headline is incomplete.\n"
         "If the source explicitly states a casualty figure or death toll, it MUST appear in the headline. Do not abstract numbers away.\n"
         "If the source is hedged or uncertain (e.g. 'initial reports', 'reportedly'), keep that uncertainty explicit in the headline."
@@ -1975,22 +2009,29 @@ class _StreamingGroqResponse:
         self._iterated = False
 
     async def __aenter__(self) -> "_StreamingGroqResponse":
-        headers = _get_groq_headers()
-        payload = _build_groq_payload(
-            self._cleaned,
-            self._instructions,
-            stream=True,
-            image_data_urls=self._image_data_urls,
-        )
-        client = await get_codex_http_client()
-        self._stream_ctx = client.stream(
-            "POST",
-            _resolve_groq_url(),
-            headers=headers,
-            json=payload,
-            timeout=60.0,
-        )
-        self._response = await self._stream_ctx.__aenter__()
+        for attempt in range(4):
+            headers = _get_groq_headers()
+            payload = _build_groq_payload(
+                self._cleaned,
+                self._instructions,
+                stream=True,
+                image_data_urls=self._image_data_urls,
+            )
+            await _wait_for_groq_rate_limit()
+            client = await get_codex_http_client()
+            self._stream_ctx = client.stream(
+                "POST",
+                _resolve_groq_url(),
+                headers=headers,
+                json=payload,
+                timeout=60.0,
+            )
+            self._response = await self._stream_ctx.__aenter__()
+            if self._response.status_code == 429 and attempt < 3:
+                _rotate_groq_key()
+                await self._response.aclose()
+                continue
+            break
         if self._response.status_code >= 400:
             body = await self._response.aread()
             error_response = httpx.Response(
@@ -2135,6 +2176,31 @@ async def _call_openrouter(
     )
 
 
+_GROQ_TOKENS = 30.0
+_GROQ_LAST_REFILL = 0.0
+_GROQ_LOCK = asyncio.Lock()
+
+async def _wait_for_groq_rate_limit() -> None:
+    global _GROQ_TOKENS, _GROQ_LAST_REFILL
+    async with _GROQ_LOCK:
+        if _GROQ_LAST_REFILL == 0.0:
+            _GROQ_LAST_REFILL = time.monotonic()
+        while True:
+            now = time.monotonic()
+            elapsed = now - _GROQ_LAST_REFILL
+            if elapsed > 0:
+                _GROQ_TOKENS = min(30.0, _GROQ_TOKENS + (elapsed * 0.5))
+                _GROQ_LAST_REFILL = now
+
+            if _GROQ_TOKENS >= 1.0:
+                _GROQ_TOKENS -= 1.0
+                return
+
+            wait_time = (1.0 - _GROQ_TOKENS) / 0.5
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+
+
 async def _call_groq_non_stream(
     cleaned: str,
     instructions: str,
@@ -2143,16 +2209,17 @@ async def _call_groq_non_stream(
     image_data_urls: Sequence[str] | None = None,
 ) -> str:
     del verbosity
-    headers = _get_groq_headers()
-    payload = _build_groq_payload(
-        cleaned,
-        instructions,
-        stream=False,
-        image_data_urls=image_data_urls,
-    )
     response: httpx.Response | None = None
     LOGGER.debug("LLM provider=groq model=%s stream=false", _resolve_groq_model())
-    for attempt in range(3):
+    for attempt in range(4):
+        headers = _get_groq_headers()
+        payload = _build_groq_payload(
+            cleaned,
+            instructions,
+            stream=False,
+            image_data_urls=image_data_urls,
+        )
+        await _wait_for_groq_rate_limit()
         http = await get_codex_http_client()
         try:
             response = await http.post(
@@ -2161,6 +2228,9 @@ async def _call_groq_non_stream(
                 json=payload,
                 timeout=45.0,
             )
+            if response.status_code == 429 and attempt < 3:
+                _rotate_groq_key()
+                continue
             break
         except httpx.TransportError as exc:
             await reset_shared_http_client("codex")
