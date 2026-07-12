@@ -1327,7 +1327,9 @@ def _breaking_headline_is_grounded(source_text: str, candidate: str) -> bool:
 
         unsupported_named_tokens = _extract_candidate_named_tokens(candidate_clean) - source_tokens
         if unsupported_named_tokens:
-            return False
+            allowed_extras = {"tonight", "today", "tomorrow", "yesterday", "now"}
+            if not unsupported_named_tokens.issubset(allowed_extras):
+                return False
 
     unsupported_editorial = {
         token
@@ -1393,7 +1395,7 @@ def _filter_decision_system_prompt() -> str:
     language = _resolve_output_language()
     prompt = (
         "You are a strict newsroom intake classifier for Telegram news monitoring.\n"
-        f"Always write HTML fields in {language}. Translate if needed.\n"
+        f"Always write HTML fields in {language}. You MUST translate any foreign text into {language}.\n"
         f"{HUMAN_NEWSROOM_VOICE}\n"
         "Return ONLY one JSON object with these keys:\n"
         "action, severity, summary_html, headline_html, story_bridge_html, confidence, reason_code, topic_key\n"
@@ -1428,7 +1430,9 @@ def _filter_decision_system_prompt() -> str:
             "\nIf severity is high, do not invent names, numbers, locations, actors, motives, or certainty."
             "\nIf severity is high, story_bridge_html must be an empty string unless recent related updates are explicitly provided."
             "\nIf recent related updates are provided, story_bridge_html may be one or two short lines or a compact mini context block."
-            "\nIf you do provide story_bridge_html, it must start with Why it matters:, cite concrete prior-thread details, and avoid generic stakes or obvious consequences."
+            "\nIf you do provide story_bridge_html, it must start with Why it matters:, cite concrete prior-thread details, and provide deep analytical insight into its strategic significance."
+            "\nMake the Why it matters: section sound incredibly smart and important enough to read."
+            "\nWrite it in strong, simple, accessible English. Translate any foreign text to strong English."
         )
     return prompt
 
@@ -1450,7 +1454,7 @@ def _breaking_headline_prompt() -> str:
     if _breaking_style_is_unhinged():
         return (
             "You write savage one-line breaking-news alerts for Telegram.\n"
-            f"Output language must be {language}. Translate if needed.\n"
+            f"Output language MUST strictly be {language}. You MUST translate ALL foreign text into {language}.\n"
             "Return exactly one complete sentence on one line.\n"
             "Use an uncensored, hard-hitting, commentary-heavy voice.\n"
             "Profanity is allowed. Sharp editorial phrasing is allowed.\n"
@@ -1460,11 +1464,12 @@ def _breaking_headline_prompt() -> str:
             "Lead with the most important fact and make the wording hit hard.\n"
             "Target 10-24 words.\n"
             "Never end with ellipsis.\n"
+            "Use standard sentence capitalization. DO NOT use Title Case.\n"
             "No prefix, no source tag, no markdown, no extra explanation, no slurs."
         )
     return (
         "You write sharp live-news one-liners for Telegram alerts.\n"
-        f"Output language must be {language}. Translate if needed.\n"
+        f"Output language MUST strictly be {language}. You MUST translate ALL foreign text into {language}.\n"
         "Return exactly one complete sentence with facts only.\n"
         "Sound like a strong human live-news presenter: direct, concrete, active voice.\n"
         "Use natural spoken cadence without sounding casual or sloppy.\n"
@@ -1488,36 +1493,36 @@ def _vital_rational_view_prompt() -> str:
     max_words = max(10, min(max_words, 32))
     if _breaking_style_is_unhinged():
         return (
-            "You write one compact evidence-based context line for Telegram news alerts.\n"
-            f"Output language must be {language}. Translate if needed.\n"
+            "You write one highly analytical, insightful context line for Telegram news alerts.\n"
+            f"Output language MUST strictly be {language}. You MUST translate ALL foreign text into {language}.\n"
             "Start with: Why it matters:\n"
-            f"Default to one sentence. You may use two short sentences only when one sentence cannot clearly carry both the earlier anchor and the new delta. Keep the full output under {max(18, min(max_words * 2, 40))} words.\n"
+            f"Default to one sentence. Keep the full output under {max(18, min(max_words * 2, 40))} words.\n"
             "You will be given a current update, one prior anchor, an anchor detail, and one new delta.\n"
-            "Your only job is to explain the concrete change between the anchor and the current update.\n"
-            "You must mention both the earlier anchor detail and the new delta detail.\n"
-            "Do not give generic stakes, obvious consequences, empty escalation language, or vague continuity phrases.\n"
-            "Good: Why it matters: Earlier reports put the strikes around Haifa; this update places the same exchange in Acre.\n"
-            "Good: Why it matters: Earlier reports said nine were wounded in Bnei Brak; this update raises that to 12 and adds Magen David Adom confirmation.\n"
-            "Bad: Why it matters: This raises regional stability concerns.\n"
-            "Bad: Why it matters: The same story is still unfolding.\n"
+            "Explain the concrete strategic significance, macro-level impact, or crucial context of this change.\n"
+            "Make it sound incredibly smart and important enough to read, as if it's essential intelligence.\n"
+            "Write it in strong, simple, accessible English. Translate any foreign text to strong English. Avoid overly complex jargon or academic words, but maintain the deep strategic insight.\n"
+            "You must mention both the earlier anchor detail and the new delta detail, but elevate the analysis.\n"
+            "Avoid generic fluff; provide sharp, geopolitical, or high-stakes insight that a professional analyst would value.\n"
+            "Good: Why it matters: Moving the strikes from Haifa to Acre pushes the battle zone wider, showing a clear choice to strike deeper than usual.\n"
+            "Good: Why it matters: The death toll rising from 9 to 12 in Bnei Brak crosses a major line that usually forces a harsh military response.\n"
             "If the anchor detail or new delta is weak, missing, or unsupported, reply exactly: SKIP\n"
-            "Do not speculate. Do not invent causality. No hashtags. No markdown."
+            "Do not invent causality if none exists, but do highlight the strategic weight. No hashtags. No markdown."
         )
     return (
-        "You write one compact evidence-based context line for Telegram news alerts.\n"
-        f"Output language must be {language}. Translate if needed.\n"
-        f"Return exactly one sentence (max {max_words} words), neutral and precise.\n"
+        "You write one highly analytical, insightful context line for Telegram news alerts.\n"
+        f"Output language MUST strictly be {language}. You MUST translate ALL foreign text into {language}.\n"
+        f"Return exactly one sentence (max {max_words} words), precise and deeply informative.\n"
         "Start with: Why it matters:\n"
         "You will be given a current update, one prior anchor, an anchor detail, and one new delta.\n"
-        "Your only job is to explain the concrete change from the earlier anchor to the current update.\n"
-        "You must mention both the earlier anchor detail and the new delta detail.\n"
-        "Do not explain generic consequences or obvious common sense.\n"
-        "Good: Why it matters: Earlier reports centered on Bahrain; this update places the same disruption in Abu Dhabi.\n"
-        "Good: Why it matters: Earlier reports put casualties at nine in Bnei Brak; this update raises that to 12.\n"
-        "Bad: Why it matters: This raises regional stability concerns.\n"
-        "Bad: Why it matters: Civilian danger is increasing.\n"
+        "Explain the strategic significance, macro-level impact, or crucial context of this change.\n"
+        "Make it sound smart, essential to read, and analytical without being alarmist.\n"
+        "Use very simple, accessible English. Avoid overly complex jargon or academic words, but maintain the deep strategic insight.\n"
+        "You must mention both the earlier anchor detail and the new delta detail, elevating the analysis above mere repetition.\n"
+        "Avoid generic consequences or obvious common sense; focus on high-level intelligence.\n"
+        "Good: Why it matters: The shift from Bahrain to Abu Dhabi shows the disruption is spreading, putting a much larger share of regional trade at risk.\n"
+        "Good: Why it matters: The casualty jump from 9 to 12 marks a major step up in civilian harm that usually demands an immediate diplomatic reaction.\n"
         "If the anchor detail or new delta is weak, missing, or unsupported, reply exactly: SKIP\n"
-        "Do not speculate. Do not take sides. No hashtags. No markdown."
+        "Do not speculate wildly or take sides. Keep it factual but strategically profound. No hashtags. No markdown."
     )
 
 
@@ -2904,12 +2909,13 @@ def _validate_filter_decision(
             allow_fallback=False,
         )
         if _breaking_style_is_unhinged():
-            story_bridge_html = resolve_vital_rational_view_for_delivery(
-                raw_text,
-                story_bridge_html,
-                recent_context,
-                evidence=context_evidence,
-            )
+            if context_evidence:
+                story_bridge_html = resolve_vital_rational_view_for_delivery(
+                    raw_text,
+                    story_bridge_html,
+                    recent_context,
+                    evidence=context_evidence,
+                )
 
     reason_code = _sanitize_reason_code(payload.get("reason_code"))
     if bool(story_signals.get("downgrade_explainer")) and action != "deliver":

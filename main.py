@@ -2409,7 +2409,7 @@ def _prompt_delivery_mode() -> None:
     print()
     
     while True:
-        default_choice = "1" if not current_digest else "3"
+        default_choice = "2"
         choice = input(f"  Select mode [1-3] (default: {default_choice}): ").strip()
         if not choice:
             choice = default_choice

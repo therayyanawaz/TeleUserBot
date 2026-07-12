@@ -5,6 +5,11 @@ AGENT.md
 .env.*
 !.env.example
 /.github
+/data/
+.env
+.env.*
+!.env.example
+/.github
 # Local environment configuration
 *.pyc
 __pycache__/
