@@ -1505,7 +1505,14 @@ def _severity_system_prompt() -> str:
 
 
 def _breaking_headline_prompt() -> str:
+    from prompts import HUMAN_NEWSROOM_VOICE  # noqa: PLC0415
     language = _resolve_output_language()
+    geo_rule = (
+        f"Always prefix country or force names with their flag emoji (e.g. \U0001f1f7\U0001f1fa Russia, \U0001f1ee\U0001f1f1 Israel, \U0001f1fa\U0001f1f8 US, \U0001f1ee\U0001f1f7 Iran).\n"
+        "Every headline must name the country or theater of operations. A location-free headline is incomplete.\n"
+        "If the source explicitly states a casualty figure or death toll, it MUST appear in the headline. Do not abstract numbers away.\n"
+        "If the source is hedged or uncertain (e.g. 'initial reports', 'reportedly'), keep that uncertainty explicit in the headline."
+    )
     if _breaking_style_is_unhinged():
         return (
             "You write savage one-line breaking-news alerts for Telegram.\n"
@@ -1515,8 +1522,8 @@ def _breaking_headline_prompt() -> str:
             "Profanity is allowed. Sharp editorial phrasing is allowed.\n"
             "But every factual element must be directly grounded in the source text.\n"
             "Do not invent names, numbers, casualties, locations, actors, motives, or certainty.\n"
-            "If the source is hedged or uncertain, your line must keep that uncertainty explicit.\n"
             "Lead with the most important fact and make the wording hit hard.\n"
+            f"{geo_rule}\n"
             "Target 10-24 words.\n"
             "Never end with ellipsis.\n"
             "Use standard sentence capitalization. DO NOT use Title Case.\n"
@@ -1530,9 +1537,10 @@ def _breaking_headline_prompt() -> str:
         "Sound like a strong human live-news presenter: direct, concrete, active voice.\n"
         "Use natural spoken cadence without sounding casual or sloppy.\n"
         "Use the most important fact first.\n"
+        f"{geo_rule}\n"
         "Do not use generic framing like Breaking, Update, reports say, or situation update unless uncertainty is the key fact.\n"
         "Weak: Situation update after overnight military activity.\n"
-        "Strong: Air defenses lit up over Amman after overnight interceptions.\n"
+        "Strong: \U0001f1ef\U0001f1f4 Jordan air defenses lit up over Amman after overnight interceptions.\n"
         "Target 12-28 words.\n"
         "Never end with ellipsis.\n"
         "Do not cut off mid-thought.\n"
@@ -2986,14 +2994,13 @@ def _validate_filter_decision(
             headline_html,
             allow_fallback=False,
         )
-        if _breaking_style_is_unhinged():
-            if context_evidence:
-                story_bridge_html = resolve_vital_rational_view_for_delivery(
-                    raw_text,
-                    story_bridge_html,
-                    recent_context,
-                    evidence=context_evidence,
-                )
+        if context_evidence:
+            story_bridge_html = resolve_vital_rational_view_for_delivery(
+                raw_text,
+                story_bridge_html,
+                recent_context,
+                evidence=context_evidence,
+            )
 
     reason_code = _sanitize_reason_code(payload.get("reason_code"))
     if bool(story_signals.get("downgrade_explainer")) and action != "deliver":
@@ -4744,7 +4751,16 @@ def _build_digest_context(
             else "unknown-time"
         )
 
-        line = f"{idx}. ({ts_label}) {text}"
+        # Tag post with credibility tier based on pre-computed signals
+        official_dev = bool(post.get("official_development"))
+        breaking_elig = bool(post.get("breaking_eligible"))
+        if official_dev:
+            credibility_tag = "[OFFICIAL] "
+        elif breaking_elig:
+            credibility_tag = "[CONFIRMED] "
+        else:
+            credibility_tag = "[UNVERIFIED] "
+        line = f"{idx}. ({ts_label}) {credibility_tag}{text}"
 
         line_tokens = estimate_tokens_rough(line) + 8
         if lines and (used_tokens + line_tokens > token_budget):
@@ -7360,7 +7376,6 @@ def resolve_vital_rational_view_for_delivery(
     *,
     evidence: ContextEvidence | None = None,
 ) -> str:
-    del recent_context
     if evidence is None:
         return ""
     cleaned_candidate = _cleanup_vital_view(str(candidate or ""))
@@ -7372,6 +7387,8 @@ def resolve_vital_rational_view_for_delivery(
 async def summarize_breaking_headline(
     text: str,
     auth_manager: AuthManager,
+    *,
+    cluster_thread: Sequence[str] | None = None,
 ) -> Optional[str]:
     cleaned = text.strip()
     if not cleaned:
@@ -7382,7 +7399,18 @@ async def summarize_breaking_headline(
     if cached is not None or key in _HEADLINE_CACHE:
         return cached
 
-    compact = cleaned if len(cleaned) <= 1800 else f"{cleaned[:1797].rsplit(' ', 1)[0]}..."
+    # Build input with optional cluster context and timestamp
+    from datetime import datetime, timezone as _tz  # noqa: PLC0415
+    ts_label = datetime.now(_tz.utc).strftime("%H:%M UTC")
+    if cluster_thread:
+        thread_lines = "\n".join(f"- {line}" for line in cluster_thread[-3:])
+        input_text = (
+            f"Active story thread (same topic, recent):\n{thread_lines}\n"
+            f"\nCurrent post (received {ts_label}):\n{cleaned}"
+        )
+    else:
+        input_text = f"Post received: {ts_label}\n{cleaned}"
+    compact = input_text if len(input_text) <= 1800 else f"{input_text[:1797].rsplit(' ', 1)[0]}..."
     base_prompt = _breaking_headline_prompt()
     retry_issue = ""
 
@@ -7424,8 +7452,6 @@ async def summarize_vital_rational_view(
     cleaned = text.strip()
     if not cleaned:
         return None
-
-    del recent_context
     if evidence is None:
         compact = cleaned if len(cleaned) <= 1800 else f"{cleaned[:1797].rsplit(' ', 1)[0]}..."
         try:

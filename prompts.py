@@ -107,6 +107,17 @@ Premium digest quality checklist — every digest must pass:
 ✓ The story paragraph (when present) reads like a cohesive brief, not unrelated sentences.
 ✓ The digest leaves the reader informed, not confused. When evidence is ambiguous, say so plainly.
 ✓ Each bullet pulls a concrete, specific fact — not a vague restatement of the headline.
+
+Source credibility rules:
+- Lines tagged [OFFICIAL]: cite confirmed government, military or official statement — state confidently.
+- Lines tagged [CONFIRMED]: corroborated by multiple sources — state as established fact.
+- Lines tagged [UNVERIFIED]: single-source or uncorroborated claim — MUST use hedge language ("initial reports indicate", "preliminary reports suggest").
+- Never ignore the tag. A [UNVERIFIED] claim stated as fact is an error.
+
+Conflict rule:
+- If two source posts directly contradict each other on the same fact (e.g., "strike confirmed" vs "strike denied"), do NOT silently pick one.
+- Instead write: "Conflicting reports: [Claim A] per initial reports; [Claim B] per official denial — unresolved."
+- Only merge contradictory posts once the conflict is explicitly surfaced.
 """.strip()
 
 
