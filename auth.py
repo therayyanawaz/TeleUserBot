@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional, Tuple
 import httpx
 
 from shared_http import get_auth_http_client, reset_shared_http_client
+import config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -65,7 +66,7 @@ OPENAI_ISSUER = (
     .strip()
     .rstrip("/")
 )
-REDIRECT_URI = "http://localhost:1455/auth/callback"
+REDIRECT_URI = getattr(config, "OAUTH_REDIRECT_URI", "http://localhost:1455/auth/callback")
 SCOPES = "openid profile email offline_access"
 AUTH_ENDPOINT = str(
     os.getenv("OPENAI_AUTH_ENDPOINT", f"{OPENAI_ISSUER}/oauth/authorize")
@@ -919,6 +920,15 @@ class AuthManager:
             http = await get_auth_http_client()
             try:
                 response = await http.post(TOKEN_ENDPOINT, data=payload)
+                if response.status_code == 429 or response.status_code >= 500:
+                    if attempt < 2:
+                        self._logger.warning(
+                            "OpenAI OAuth HTTP %s on attempt %s/3",
+                            response.status_code,
+                            attempt + 1,
+                        )
+                        await asyncio.sleep(0.35 * (attempt + 1))
+                        continue
                 break
             except httpx.TransportError as exc:
                 await reset_shared_http_client("auth")

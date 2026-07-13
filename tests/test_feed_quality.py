@@ -2438,7 +2438,7 @@ async def test_generate_answer_from_context_uses_deterministic_strategy_for_stra
     async def fail_call_codex(*_args, **_kwargs):
         raise AssertionError("strategic query should not call ai path")
 
-    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fail_call_codex)
+    monkeypatch.setattr(ai_filter, "_call_codex_non_stream", fail_call_codex)
 
     result = await ai_filter.generate_answer_from_context_result(
         (

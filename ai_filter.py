@@ -2150,6 +2150,11 @@ async def _call_openrouter_non_stream(
                 json=payload,
                 timeout=45.0,
             )
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < 2:
+                    LOGGER.warning("OpenRouter HTTP %s on attempt %s/3", response.status_code, attempt + 1)
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
             break
         except curl_requests.errors.RequestsError as exc:
             await reset_shared_http_client("codex")
@@ -2262,9 +2267,13 @@ async def _call_groq_non_stream(
                 json=payload,
                 timeout=45.0,
             )
-            if response.status_code == 429 and attempt < 3:
-                _rotate_groq_key()
-                continue
+            if response.status_code == 429 or response.status_code >= 500:
+                if response.status_code == 429:
+                    _rotate_groq_key()
+                if attempt < max_attempts - 1:
+                    LOGGER.warning("Groq HTTP %s on attempt %s/%s", response.status_code, attempt + 1, max_attempts)
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
             break
         except curl_requests.errors.RequestsError as exc:
             await reset_shared_http_client("codex")
@@ -2356,6 +2365,11 @@ async def _call_codex_non_stream(
         http = await get_codex_http_client()
         try:
             response = await http.post(_resolve_codex_url(), headers=headers, json=payload)
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < 2:
+                    LOGGER.warning("Codex HTTP %s on attempt %s/3", response.status_code, attempt + 1)
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
             break
         except curl_requests.errors.RequestsError as exc:
             await reset_shared_http_client("codex")
@@ -2430,12 +2444,20 @@ async def _call_gemini_oauth(
         response_text = ""
         # We must use generate_content_stream to get an async generator
         # and temporary=True ensures we don't spam the user's Gemini history
-        async for resp in client.generate_content_stream(prompt, temporary=True):
-            if resp.text:
-                if on_token:
-                    await on_token(resp.text)
-                response_text += resp.text
+        async def _consume_stream():
+            nonlocal response_text
+            async for resp in client.generate_content_stream(prompt, temporary=True):
+                if resp.text:
+                    if on_token:
+                        await on_token(resp.text)
+                    response_text += resp.text
+                    
+        await asyncio.wait_for(_consume_stream(), timeout=90.0)
         return response_text.strip()
+    except TimeoutError as exc:
+        LOGGER.error("Gemini OAuth stream timed out.")
+        await _clear_gemini_client()
+        raise _CodexApiError("Gemini stream timeout.") from exc
     except Exception as exc:
         LOGGER.error("Gemini OAuth error: %s", exc)
         # Safely clear and close the client so it re-initializes on the next request
@@ -2703,8 +2725,8 @@ def _extract_json_object_block(text: str) -> str:
     if not cleaned:
         return ""
 
-    # JSON fenced code block
-    m = re.search(r"```json\s*(\{.*?\})\s*```", cleaned, re.DOTALL | re.IGNORECASE)
+    # JSON fenced code block or generic code block
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL | re.IGNORECASE)
     if m:
         return m.group(1).strip()
 
@@ -7961,6 +7983,8 @@ async def create_digest_summary_result(
                 prompt,
                 on_token=on_token,
             )
+        except (_CodexRateLimitError, _CodexAuthError):
+            raise
         except Exception as exc:
             fallback_html = local_fallback_digest(prepared_posts, interval_minutes=interval_minutes)
             major_block_count, timeline_item_count = _digest_render_counts(

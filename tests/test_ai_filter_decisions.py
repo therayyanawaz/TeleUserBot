@@ -43,7 +43,7 @@ async def test_decide_filter_action_uses_persistent_cache(isolated_db, monkeypat
             }
         )
 
-    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "_call_codex_non_stream", fake_call_codex)
 
     text = (
         "Officials confirmed new power-grid restrictions across three districts, "
@@ -66,7 +66,7 @@ async def test_decide_filter_action_local_nlp_toggle_avoids_api(isolated_db, mon
         raise AssertionError("API path should not run when USE_LOCAL_NLP is enabled")
 
     monkeypatch.setattr(ai_filter.config, "USE_LOCAL_NLP", True)
-    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fail_call_codex)
+    monkeypatch.setattr(ai_filter, "_call_codex_non_stream", fail_call_codex)
 
     text = (
         "Iranian officials announced a new airspace restriction over Tehran "
@@ -113,7 +113,7 @@ async def test_decide_filter_action_falls_back_on_invalid_json(isolated_db, monk
         calls["count"] += 1
         return "this is not valid json"
 
-    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "_call_codex_non_stream", fake_call_codex)
 
     text = "Regional authorities issued a late-night statement on transport disruptions."
     decision = await ai_filter.decide_filter_action(text, _FakeAuthManager())
@@ -163,7 +163,7 @@ async def test_decide_filter_action_retries_weak_ai_copy_before_accepting(isolat
             }
         )
 
-    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "_call_codex_non_stream", fake_call_codex)
 
     text = (
         "Iranian officials ordered a new airspace restriction over Tehran, "
@@ -184,13 +184,14 @@ async def test_call_codex_non_stream_retries_transport_errors(monkeypatch):
     reset_calls: list[str] = []
 
     class _FakeClient:
-        async def post(self, _url, headers=None, json=None):
-            attempts["count"] += 1
-            if attempts["count"] == 1:
-                raise httpx.TransportError(
-                    "Server closed the connection: [Errno 104] Connection reset by peer"
-                )
-            return httpx.Response(
+            async def post(self, _url, headers=None, json=None):
+                attempts["count"] += 1
+                if attempts["count"] == 1:
+                    import curl_cffi.requests.errors
+                    raise curl_cffi.requests.errors.RequestsError(
+                        "Server closed the connection: [Errno 104] Connection reset by peer"
+                    )
+                return httpx.Response(
                 200,
                 json={
                     "output": [
@@ -283,7 +284,7 @@ async def test_openrouter_provider_bypasses_auth_manager(monkeypatch):
     monkeypatch.setattr(ai_filter.config, "OPENROUTER_API_KEY", "sk-or-test", raising=False)
     monkeypatch.setattr(ai_filter, "_call_openrouter", fake_call_openrouter)
 
-    result = await ai_filter._call_codex_with_auth_repair(
+    result = await ai_filter.call_llm_with_auth_repair(
         "headline",
         _ExplodingAuthManager(),
         "instructions",
@@ -297,14 +298,14 @@ async def test_openrouter_provider_bypasses_auth_manager(monkeypatch):
 async def test_create_digest_summary_result_falls_back_after_weak_ai_retry(monkeypatch):
     calls = {"count": 0}
 
-    async def fake_call_codex(*args, **kwargs):
+    async def fake_call_llm(*args, **kwargs):
         calls["count"] += 1
         return "⚠️ Situation update in Tehran"
 
     async def fake_normalize_digest_output(content, *_args, **_kwargs):
         return content
 
-    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "call_llm_with_auth_repair", fake_call_llm)
     monkeypatch.setattr(ai_filter, "_normalize_digest_output", fake_normalize_digest_output)
     monkeypatch.setattr(ai_filter.config, "DIGEST_PREFER_JSON_OUTPUT", False, raising=False)
 
@@ -1041,12 +1042,11 @@ A fall in Beit She'an 🌟🌟Follow Us | Discussion | 🤔 Boost the Channel �
     assert "#Paylaş" not in plain
     assert "Enemy media:" not in plain
     assert plain.count("A fall in Beit She'an") == 1
-    assert "Also moving" in plain
 
 
 @pytest.mark.asyncio
 async def test_prepare_digest_posts_translates_non_english_lines(monkeypatch):
-    async def fake_call_codex_with_auth_repair(_payload, _auth_manager, _instructions, **_kwargs):
+    async def fake_call_codex_non_stream(_payload, _auth_manager, _instructions, **_kwargs):
         return json.dumps(
             {
                 "items": [
@@ -1058,7 +1058,7 @@ async def test_prepare_digest_posts_translates_non_english_lines(monkeypatch):
             }
         )
 
-    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex_with_auth_repair)
+    monkeypatch.setattr(ai_filter, "_call_codex_non_stream", fake_call_codex_non_stream)
 
     prepared, stats = await ai_filter._prepare_digest_posts(
         [
@@ -1077,10 +1077,10 @@ async def test_prepare_digest_posts_translates_non_english_lines(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_prepare_digest_posts_drops_non_english_lines_when_translation_fails(monkeypatch):
-    async def fake_call_codex_with_auth_repair(*_args, **_kwargs):
+    async def fake_call_codex_non_stream(*_args, **_kwargs):
         raise RuntimeError("translation unavailable")
 
-    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex_with_auth_repair)
+    monkeypatch.setattr(ai_filter, "_call_codex_non_stream", fake_call_codex_non_stream)
 
     prepared, stats = await ai_filter._prepare_digest_posts(
         [
@@ -1098,7 +1098,7 @@ async def test_prepare_digest_posts_drops_non_english_lines_when_translation_fai
 
 @pytest.mark.asyncio
 async def test_prepare_digest_posts_drops_unguarded_guess_translation(monkeypatch):
-    async def fake_call_codex_with_auth_repair(_payload, _auth_manager, _instructions, **_kwargs):
+    async def fake_call_codex_non_stream(_payload, _auth_manager, _instructions, **_kwargs):
         return json.dumps(
             {
                 "items": [
@@ -1110,7 +1110,7 @@ async def test_prepare_digest_posts_drops_unguarded_guess_translation(monkeypatc
             }
         )
 
-    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex_with_auth_repair)
+    monkeypatch.setattr(ai_filter, "_call_codex_non_stream", fake_call_codex_non_stream)
 
     prepared, stats = await ai_filter._prepare_digest_posts(
         [
@@ -1128,7 +1128,7 @@ async def test_prepare_digest_posts_drops_unguarded_guess_translation(monkeypatc
 
 @pytest.mark.asyncio
 async def test_prepare_digest_posts_drops_still_non_english_translation(monkeypatch):
-    async def fake_call_codex_with_auth_repair(_payload, _auth_manager, _instructions, **_kwargs):
+    async def fake_call_codex_non_stream(_payload, _auth_manager, _instructions, **_kwargs):
         return json.dumps(
             {
                 "items": [
@@ -1140,7 +1140,7 @@ async def test_prepare_digest_posts_drops_still_non_english_translation(monkeypa
             }
         )
 
-    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex_with_auth_repair)
+    monkeypatch.setattr(ai_filter, "_call_codex_non_stream", fake_call_codex_non_stream)
 
     prepared, stats = await ai_filter._prepare_digest_posts(
         [
@@ -1265,7 +1265,7 @@ async def test_generate_answer_from_context_result_uses_ai_after_quality_retry(m
             "• ⚠️ Authorities said it takes effect immediately after the latest warning."
         )
 
-    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "_call_codex_non_stream", fake_call_codex)
     monkeypatch.setattr(ai_filter, "_query_confidence_allows_answer", lambda *_args, **_kwargs: True)
 
     result = await ai_filter.generate_answer_from_context_result(

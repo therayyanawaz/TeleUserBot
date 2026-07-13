@@ -11,7 +11,9 @@ import db
 def isolated_db(tmp_path, monkeypatch):
     db_path = tmp_path / "teleuserbot-test.db"
     monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("LLM_PROVIDER", "codex")
     monkeypatch.setattr(auth, "DB_PATH", str(db_path))
+    monkeypatch.setattr(config, "LLM_PROVIDER", "codex", raising=False)
     monkeypatch.setattr(db, "DB_PATH", str(db_path))
     config._dynamic_digest_source_tiers = None
     db.init_db()

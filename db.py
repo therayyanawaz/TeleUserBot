@@ -405,8 +405,8 @@ def init_db() -> None:
             "ON source_delivery_refs(timestamp)"
         )
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_inbound_jobs_stage_status "
-            "ON inbound_jobs(stage, status, run_after_ts, priority, id)"
+            "CREATE INDEX IF NOT EXISTS idx_inbound_jobs_stage_status_optimal "
+            "ON inbound_jobs(stage, status, priority DESC, run_after_ts ASC, id ASC)"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_inbound_jobs_channel_message "

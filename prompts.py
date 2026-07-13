@@ -119,6 +119,7 @@ Conflict rule:
 - If two source posts directly contradict each other on the same fact (e.g., "strike confirmed" vs "strike denied"), do NOT silently pick one.
 - Instead write: "Conflicting reports: [Claim A] per initial reports; [Claim B] per official denial — unresolved."
 - Only merge contradictory posts once the conflict is explicitly surfaced.
+- EXCEPTION: Chronological updates are NOT conflicts. If a newer post explicitly updates, corrects, or overrides an older post (e.g., a rising casualty count or corrected location), adopt the newer facts and do not present it as a conflicting report.
 """.strip()
 
 
@@ -132,12 +133,13 @@ def build_digest_system_prompt(
     include_source_tags: bool,
 ) -> str:
     style = digest_output_style(interval_minutes)
-    prompt = DIGEST_PROMPT_CORE.replace(
-        "QUIET_PERIOD_SENTINEL",
-        quiet_period_message(interval_minutes),
-    )
+    if json_mode:
+        quiet_text = '13) If no significant updates remain, set the `"quiet"` boolean to `true` in your JSON output.'
+    else:
+        quiet_text = quiet_period_message(interval_minutes)
+    prompt = DIGEST_PROMPT_CORE.replace("QUIET_PERIOD_SENTINEL", quiet_text)
     toggles = [
-        f"Output language must be {output_language}.",
+        f"Output language must be {output_language}. Do not translate proper nouns, organization names, or localized entities.",
         f"Include source tags: {'yes' if include_source_tags else 'no'} (if no, omit source brackets).",
         f"Include links when reliable and available: {'yes' if include_links else 'no'}.",
         f"Importance scoring hint enabled: {'yes' if importance_scoring else 'no'}.",

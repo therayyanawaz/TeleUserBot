@@ -156,7 +156,7 @@ async def test_summarize_breaking_headline_uses_style_specific_cache(monkeypatch
             return "Two rockets landed near Haifa overnight."
         return "Officials say two rockets landed near Haifa overnight."
 
-    monkeypatch.setattr(ai_filter, "_call_codex_with_auth_repair", fake_call_codex)
+    monkeypatch.setattr(ai_filter, "_call_codex_non_stream", fake_call_codex)
 
     text = "Officials say two rockets landed near Haifa overnight."
     classic = await ai_filter.summarize_breaking_headline(text, _FakeAuthManager())

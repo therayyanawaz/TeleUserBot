@@ -2445,22 +2445,48 @@ async def _prompt_llm_provider() -> None:
                                             lock_win = profile_dir / "lockfile"
                                             if lock_linux.exists() or lock_linux.is_symlink() or lock_win.exists():
                                                 print(f"  ! System {channel} profile is locked (browser is currently open).")
-                                                print(f"  ! Hint: If you want to use your logged-in {channel} session, close ALL {channel} windows first.")
-                                                print(f"  ! Falling back to an isolated profile...")
-                                                continue
+                                                print(f"  ! Attempting to clone your session so you don't have to log in again...")
+                                                import shutil
+                                                if isolated_profile.exists():
+                                                    shutil.rmtree(isolated_profile, ignore_errors=True)
+                                                os.makedirs(isolated_profile / "Default", exist_ok=True)
+                                                try:
+                                                    shutil.copy2(profile_dir / "Local State", isolated_profile / "Local State")
+                                                    shutil.copy2(profile_dir / "Default" / "Cookies", isolated_profile / "Default" / "Cookies")
+                                                except Exception:
+                                                    pass
+                                                profile_dir = isolated_profile
                                         except Exception:
                                             pass
                                             
                                     kwargs = {
                                         "user_data_dir": profile_dir,
-                                        "headless": False,
-                                        "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+                                        "headless": True if use_system_profile else False,
+                                        "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+                                        "ignore_default_args": ["--use-mock-keychain", "--password-store=basic"]
                                     }
                                     if channel:
                                         kwargs["channel"] = channel
                                         
                                     context = await p.chromium.launch_persistent_context(**kwargs)
-                                    print(f"  ✓ Launched {'system ' + channel if channel else 'downloaded Chromium'} browser (Profile: {'system' if use_system_profile else 'isolated'}).")
+                                    
+                                    if use_system_profile:
+                                        c_1psid = ""
+                                        c_1psidts = ""
+                                        for c in await context.cookies():
+                                            if c["name"] == "__Secure-1PSID":
+                                                c_1psid = c["value"]
+                                            elif c["name"] == "__Secure-1PSIDTS":
+                                                c_1psidts = c["value"]
+                                                
+                                        if c_1psid:
+                                            print("  ✓ Found Google session in your background profile!")
+                                            return c_1psid, c_1psidts
+                                        else:
+                                            await context.close()
+                                            continue
+                                            
+                                    print(f"  ✓ Launched {'system ' + channel if channel else 'downloaded Chromium'} browser (Profile: isolated).")
                                     break
                                 except Exception as e:
                                     if "in use by another instance" in str(e):
@@ -2495,18 +2521,14 @@ async def _prompt_llm_provider() -> None:
                                     has_1psid = False
                                     for c in cookies:
                                         if c["name"] == "__Secure-1PSID":
+                                            c_1psid = c["value"]
                                             has_1psid = True
-                                            break
+                                        elif c["name"] == "__Secure-1PSIDTS":
+                                            c_1psidts = c["value"]
                                             
                                     if has_1psid and "gemini.google.com/app" in current_url:
                                         await asyncio.sleep(2)
-                                        cookies = await context.cookies()
-                                        for c in cookies:
-                                            if c["name"] == "__Secure-1PSID":
-                                                c_1psid = c["value"]
-                                            elif c["name"] == "__Secure-1PSIDTS":
-                                                c_1psidts = c["value"]
-                                        break
+                                        return c_1psid, c_1psidts
                                         
                                     await asyncio.sleep(1)
                             finally:
@@ -2560,10 +2582,14 @@ async def _prompt_llm_provider() -> None:
                     client = GeminiClient(test_1psid, test_1psidts if test_1psidts else None)
                     try:
                         await client.init(timeout=10)
-                        if "UNAUTHENTICATED" in repr(getattr(client, "account_status", "")):
-                            print("  ✗ Cookie validation failed: Account is UNAUTHENTICATED (cookies expired or invalid)")
-                            return False
-                        return True
+                        try:
+                            await client.generate_content("hello")
+                            return True
+                        except Exception as e:
+                            if "UNAUTHENTICATED" in str(e) or "401" in str(e) or "403" in str(e):
+                                print(f"  ✗ Cookie validation failed: API rejected the cookie.")
+                                return False
+                            return True
                     except Exception as e:
                         print(f"  ✗ Cookie validation failed: {e}")
                         return False
@@ -3106,7 +3132,11 @@ def _infer_chat_id_from_updates(updates: object) -> str | None:
 
 
 def _message_has_media(msg: object) -> bool:
-    return bool(getattr(msg, "media", None))
+    has_media = bool(getattr(msg, "media", None))
+    text_val = getattr(msg, "text", getattr(msg, "message", ""))
+    has_text = bool(str(text_val or "").strip())
+    has_grouped_id = bool(getattr(msg, "grouped_id", None))
+    return has_media and not has_text and not has_grouped_id
 
 
 def _format_summary_text_legacy(source_title: str, summary: str) -> str:
@@ -3468,6 +3498,7 @@ def _telegram_max_floodwait_seconds() -> int:
 
 async def _call_with_floodwait(func, *args, **kwargs):
     network_attempt = 0
+    flood_wait_retries = 0
     while True:
         try:
             return await func(*args, **kwargs)
@@ -3475,13 +3506,14 @@ async def _call_with_floodwait(func, *args, **kwargs):
             wait_seconds = int(exc.seconds) + 1
             operation = getattr(func, "__name__", repr(func))
             max_wait = _telegram_max_floodwait_seconds()
-            if wait_seconds > max_wait:
+            if wait_seconds > max_wait or flood_wait_retries >= 3:
                 LOGGER.error(
-                    "FloodWaitError too long for %s: %s second(s). Aborting call.",
+                    "FloodWaitError too long/frequent for %s: %s second(s). Aborting call.",
                     operation,
                     wait_seconds,
                 )
                 raise LongFloodWaitError(wait_seconds, operation) from exc
+            flood_wait_retries += 1
             LOGGER.error("FloodWaitError: sleeping %s second(s).", wait_seconds)
             await asyncio.sleep(wait_seconds)
         except Exception as exc:
@@ -4914,8 +4946,13 @@ def _persist_breaking_story_cluster(
     if root_ref is not None and cluster_id:
         breaking_story_ref_cache[cluster_id] = _compact_sent_ref(root_ref)
 
+breaking_story_policy_lock = asyncio.Lock()
 
-async def _apply_breaking_story_cluster_policy(
+async def _apply_breaking_story_cluster_policy(*args, **kwargs) -> Dict[str, object]:
+    async with breaking_story_policy_lock:
+        return await _apply_breaking_story_cluster_policy_inner(*args, **kwargs)
+
+async def _apply_breaking_story_cluster_policy_inner(
     *,
     messages: Sequence[Message],
     source: str,
@@ -4937,11 +4974,11 @@ async def _apply_breaking_story_cluster_policy(
     )
 
     resolution = resolve_breaking_story_cluster(
-        candidate,
-        _load_active_breaking_story_clusters_snapshot(now),
-        now_ts=now,
-        burst_seconds=_breaking_story_burst_seconds(),
-    ) if _is_breaking_story_clusters_enabled() else None
+            candidate,
+            _load_active_breaking_story_clusters_snapshot(now),
+            now_ts=now,
+            burst_seconds=_breaking_story_burst_seconds(),
+        ) if _is_breaking_story_clusters_enabled() else None
 
     if resolution is not None and resolution.mismatch_reason:
         log_structured(
@@ -7226,9 +7263,15 @@ async def _send_digest_message_sequence(messages: Sequence[str]) -> object | Non
     first_ref = None
     delay = _digest_send_delay_seconds()
     for idx, message in enumerate(messages):
-        ref = await _send_digest_message(message)
-        if first_ref is None:
-            first_ref = ref
+        try:
+            ref = await _send_digest_message(message)
+            if first_ref is None:
+                first_ref = ref
+        except Exception as exc:
+            if idx > 0:
+                LOGGER.warning("Failed to send chunk %s of digest sequence; dropping remaining chunks to prevent duplicate spam. Error: %s", idx + 1, exc)
+                break
+            raise
         if idx < len(messages) - 1 and delay > 0:
             await asyncio.sleep(delay)
     return first_ref

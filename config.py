@@ -164,6 +164,7 @@ def build_dynamic_source_tiers() -> dict[int, float]:
 
 _dynamic_digest_source_tiers: dict[int, float] | None = None
 _dynamic_digest_source_tiers_ts: float = 0.0
+DIGEST_SOURCE_TIERS_TTL_SEC = _env_int("DIGEST_SOURCE_TIERS_TTL_SEC", 1800)
 
 
 def get_digest_source_tiers() -> dict[int, float]:
@@ -173,7 +174,7 @@ def get_digest_source_tiers() -> dict[int, float]:
     import time
     
     now = time.time()
-    if _dynamic_digest_source_tiers is None or now - _dynamic_digest_source_tiers_ts > 1800:
+    if _dynamic_digest_source_tiers is None or now - _dynamic_digest_source_tiers_ts > DIGEST_SOURCE_TIERS_TTL_SEC:
         try:
             dynamic = build_dynamic_source_tiers()
         except Exception:
@@ -207,6 +208,9 @@ BOT_DESTINATION_CHAT_ID = _env_str("BOT_DESTINATION_CHAT_ID", "")  # type: str
 # LLM provider settings.
 LLM_PROVIDER = _env_str("LLM_PROVIDER", "auto").lower()  # type: str
 OPENROUTER_API_KEY = _env_str("OPENROUTER_API_KEY", "")  # type: str
+OPENAI_CLIENT_ID = _env_str("OPENAI_CLIENT_ID", "")  # type: str
+OPENAI_CLIENT_SECRET = _env_str("OPENAI_CLIENT_SECRET", "")  # type: str
+OAUTH_REDIRECT_URI = _env_str("OAUTH_REDIRECT_URI", "http://localhost:1455/auth/callback")  # type: str
 GEMINI_COOKIE_1PSID = _env_str("GEMINI_COOKIE_1PSID", "")  # type: str
 GEMINI_COOKIE_1PSIDTS = _env_str("GEMINI_COOKIE_1PSIDTS", "")  # type: str
 OPENROUTER_BASE_URL = _env_str(
@@ -241,9 +245,9 @@ OPENAI_AUTH_STARTUP_MODE = _env_str("OPENAI_AUTH_STARTUP_MODE", "auto").lower() 
 # Digest Mode Core
 # -----------------------------------------------------------------------------
 DIGEST_MODE = _env_bool("DIGEST_MODE", True)  # type: bool
-DIGEST_INTERVAL_MINUTES = _env_int("DIGEST_INTERVAL_MINUTES", 30)  # type: int
+DIGEST_INTERVAL_MINUTES = max(1, _env_int("DIGEST_INTERVAL_MINUTES", 30))  # type: int
 DIGEST_DAILY_TIMES = _env_list("DIGEST_DAILY_TIMES", ["00:00"])  # type: list[str]
-CROSS_DIGEST_DEDUP_SEC = _env_int("CROSS_DIGEST_DEDUP_SEC", 3600)  # type: int
+CROSS_DIGEST_DEDUP_SEC = max(1, _env_int("CROSS_DIGEST_DEDUP_SEC", 3600))  # type: int
 ALSO_MOVING_MAX = _env_int("ALSO_MOVING_MAX", 4)  # type: int
 # Digest queue clearing is intentionally disabled at runtime to preserve full intake flow.
 # Daily digest window in hours (midnight digest summarizes this trailing window).
@@ -348,8 +352,8 @@ PIPELINE_TRIAGE_WORKERS = _env_int("PIPELINE_TRIAGE_WORKERS", 4)  # type: int
 PIPELINE_AI_WORKERS = _env_int("PIPELINE_AI_WORKERS", 2)  # type: int
 PIPELINE_DELIVERY_WORKERS = _env_int("PIPELINE_DELIVERY_WORKERS", 2)  # type: int
 PIPELINE_QUERY_WEB_WORKERS = _env_int("PIPELINE_QUERY_WEB_WORKERS", 1)  # type: int
-PIPELINE_JOB_MAX_RETRIES = _env_int("PIPELINE_JOB_MAX_RETRIES", 4)  # type: int
-PIPELINE_RETRY_BASE_SECONDS = _env_int("PIPELINE_RETRY_BASE_SECONDS", 2)  # type: int
+PIPELINE_JOB_MAX_RETRIES = max(1, _env_int("PIPELINE_JOB_MAX_RETRIES", 4))  # type: int
+PIPELINE_RETRY_BASE_SECONDS = max(1, _env_int("PIPELINE_RETRY_BASE_SECONDS", 2))  # type: int
 AI_DECISION_CACHE_HOURS = _env_int("AI_DECISION_CACHE_HOURS", 72)  # type: int
 
 # -----------------------------------------------------------------------------
