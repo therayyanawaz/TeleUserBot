@@ -10786,9 +10786,8 @@ async def _phase_initialize() -> None:
     
     # Always init auth manager (needed by pipeline even with Groq/OpenRouter)
     _set_startup_phase("auth", reason="auth_preparation_started")
-    # Skip full OpenAI OAuth if using Groq or OpenRouter (they don't need it)
     resolved_provider = str(getattr(config, "LLM_PROVIDER", "auto")).strip().lower()
-    if resolved_provider in ("groq", "openrouter"):
+    if resolved_provider in ("groq", "openrouter", "gemini"):
         global auth_manager
         auth_manager = AuthManager(logger=LOGGER)
         _set_auth_runtime_state(
