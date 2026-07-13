@@ -2404,15 +2404,27 @@ async def _prompt_llm_provider() -> None:
                         profile_dir = Path(".gemini_playwright_profile").absolute()
                         
                         async with async_playwright() as p:
-                            try:
-                                context = await p.chromium.launch_persistent_context(
-                                    user_data_dir=profile_dir,
-                                    headless=False,
-                                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-                                )
-                            except Exception as e:
-                                print(f"  ✗ Failed to launch Chromium: {e}")
-                                return "", ""
+                            context = None
+                            for channel in ["chrome", "msedge", None]:
+                                try:
+                                    kwargs = {
+                                        "user_data_dir": profile_dir,
+                                        "headless": False,
+                                        "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+                                    }
+                                    if channel:
+                                        kwargs["channel"] = channel
+                                        
+                                    context = await p.chromium.launch_persistent_context(**kwargs)
+                                    print(f"  ✓ Launched {'system ' + channel if channel else 'downloaded Chromium'} browser.")
+                                    break
+                                except Exception as e:
+                                    if channel is None:
+                                        print(f"  ✗ Failed to launch browser: {e}")
+                                        if "Executable doesn't exist" in str(e):
+                                            print("  ! Hint: Run '.venv/bin/playwright install chromium' to download the fallback browser.")
+                                        return "", ""
+                                    continue
                                 
                             try:
                                 page = context.pages[0] if context.pages else await context.new_page()
