@@ -2401,12 +2401,45 @@ async def _prompt_llm_provider() -> None:
                     
                     async def _extract_cookies():
                         from pathlib import Path
-                        profile_dir = Path(".gemini_playwright_profile").absolute()
+                        import platform
+                        import os
+                        
+                        system = platform.system()
+                        system_profiles = []
+                        if system == "Linux":
+                            system_profiles.append(Path("~/.config/google-chrome").expanduser())
+                            system_profiles.append(Path("~/.config/microsoft-edge").expanduser())
+                        elif system == "Windows":
+                            system_profiles.append(Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data")
+                            system_profiles.append(Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "User Data")
+                        elif system == "Darwin":
+                            system_profiles.append(Path("~/Library/Application Support/Google/Chrome").expanduser())
+                            system_profiles.append(Path("~/Library/Application Support/Microsoft Edge").expanduser())
+                            
+                        isolated_profile = Path(".gemini_playwright_profile").absolute()
                         
                         async with async_playwright() as p:
                             context = None
-                            for channel in ["chrome", "msedge", None]:
+                            
+                            channels_to_try = [
+                                ("chrome", True),
+                                ("chrome", False),
+                                ("msedge", True),
+                                ("msedge", False),
+                                (None, False)
+                            ]
+                            
+                            for channel, use_system_profile in channels_to_try:
                                 try:
+                                    profile_dir = isolated_profile
+                                    if use_system_profile:
+                                        if channel == "chrome" and system_profiles and system_profiles[0].exists():
+                                            profile_dir = system_profiles[0]
+                                        elif channel == "msedge" and len(system_profiles) > 1 and system_profiles[1].exists():
+                                            profile_dir = system_profiles[1]
+                                        else:
+                                            continue
+                                            
                                     kwargs = {
                                         "user_data_dir": profile_dir,
                                         "headless": False,
@@ -2416,10 +2449,12 @@ async def _prompt_llm_provider() -> None:
                                         kwargs["channel"] = channel
                                         
                                     context = await p.chromium.launch_persistent_context(**kwargs)
-                                    print(f"  ✓ Launched {'system ' + channel if channel else 'downloaded Chromium'} browser.")
+                                    print(f"  ✓ Launched {'system ' + channel if channel else 'downloaded Chromium'} browser (Profile: {'system' if use_system_profile else 'isolated'}).")
                                     break
                                 except Exception as e:
-                                    if channel is None:
+                                    if "in use by another instance" in str(e):
+                                        print(f"  ! System {channel} profile is locked (browser is open). Falling back...")
+                                    elif channel is None:
                                         print(f"  ✗ Failed to launch browser: {e}")
                                         if "Executable doesn't exist" in str(e):
                                             print("  ! Hint: Run '.venv/bin/playwright install chromium' to download the fallback browser.")
