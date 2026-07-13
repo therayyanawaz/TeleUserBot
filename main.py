@@ -2412,6 +2412,9 @@ async def _prompt_llm_provider() -> None:
                     client = GeminiClient(test_1psid, test_1psidts if test_1psidts else None)
                     try:
                         await client.init(timeout=10)
+                        if "UNAUTHENTICATED" in repr(getattr(client, "account_status", "")):
+                            print("  ✗ Cookie validation failed: Account is UNAUTHENTICATED (cookies expired or invalid)")
+                            return False
                         return True
                     except Exception as e:
                         print(f"  ✗ Cookie validation failed: {e}")

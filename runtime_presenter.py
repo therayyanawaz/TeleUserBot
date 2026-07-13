@@ -359,7 +359,7 @@ def build_runtime_event_view(
     else:
         title = message.splitlines()[0].strip() if message.strip() else "Runtime activity"
         if len(message.splitlines()) > 1:
-            details = tuple(("Context", " ".join(line.strip() for line in message.splitlines()[1:] if line.strip())),)
+            details = (("Context", " ".join(line.strip() for line in message.splitlines()[1:] if line.strip())),)
         elif record.name != "tg_news_userbot":
             summary = record.name
 
