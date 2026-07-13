@@ -2440,6 +2440,17 @@ async def _prompt_llm_provider() -> None:
                                         else:
                                             continue
                                             
+                                        try:
+                                            lock_linux = profile_dir / "SingletonLock"
+                                            lock_win = profile_dir / "lockfile"
+                                            if lock_linux.exists() or lock_linux.is_symlink() or lock_win.exists():
+                                                print(f"  ! System {channel} profile is locked (browser is currently open).")
+                                                print(f"  ! Hint: If you want to use your logged-in {channel} session, close ALL {channel} windows first.")
+                                                print(f"  ! Falling back to an isolated profile...")
+                                                continue
+                                        except Exception:
+                                            pass
+                                            
                                     kwargs = {
                                         "user_data_dir": profile_dir,
                                         "headless": False,
