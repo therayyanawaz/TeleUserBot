@@ -2329,7 +2329,7 @@ def _persist_config_updates(updates: Dict[str, object]) -> None:
     os.replace(tmp_path, ENV_PATH)
 
 
-def _prompt_llm_provider() -> None:
+async def _prompt_llm_provider() -> None:
     """Interactively ask the user which LLM provider to use at startup."""
     import sys
     if not _is_interactive_runtime():
@@ -2422,7 +2422,7 @@ def _prompt_llm_provider() -> None:
                         except Exception:
                             pass
                             
-                if asyncio.run(_check_gemini()):
+                if await _check_gemini():
                     print("  ✓ Gemini cookies validated successfully!")
                     if new_1psid:
                         updates["GEMINI_COOKIE_1PSID"] = new_1psid
@@ -10776,7 +10776,7 @@ async def _phase_initialize() -> None:
     _print_cli_status("✓", "Database and runtime state ready", level="ok")
 
     # Interactive LLM provider selection (only in TTY mode)
-    _prompt_llm_provider()
+    await _prompt_llm_provider()
     
     # Interactive delivery mode selection (only in TTY mode)
     _prompt_delivery_mode()
