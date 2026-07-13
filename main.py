@@ -2400,29 +2400,63 @@ async def _prompt_llm_provider() -> None:
                     from playwright.async_api import async_playwright
                     
                     async def _extract_cookies():
+                        from pathlib import Path
+                        profile_dir = Path(".gemini_playwright_profile").absolute()
+                        
                         async with async_playwright() as p:
-                            browser = await p.chromium.launch(headless=False)
-                            context = await browser.new_context()
-                            page = await context.new_page()
-                            await page.goto("https://gemini.google.com/")
-                            print("  ! Browser opened. Please log in to Google.")
-                            print("  ! The browser will automatically close once cookies are detected.")
-                            
-                            c_1psid = ""
-                            c_1psidts = ""
-                            for _ in range(300):  # 5 minutes max
-                                cookies = await context.cookies()
-                                for c in cookies:
-                                    if c["name"] == "__Secure-1PSID":
-                                        c_1psid = c["value"]
-                                    elif c["name"] == "__Secure-1PSIDTS":
-                                        c_1psidts = c["value"]
-                                        
-                                if c_1psid and c_1psidts:
-                                    break
-                                await asyncio.sleep(1)
+                            try:
+                                context = await p.chromium.launch_persistent_context(
+                                    user_data_dir=profile_dir,
+                                    headless=False,
+                                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+                                )
+                            except Exception as e:
+                                print(f"  ✗ Failed to launch Chromium: {e}")
+                                return "", ""
                                 
-                            await browser.close()
+                            try:
+                                page = context.pages[0] if context.pages else await context.new_page()
+                                await page.goto("https://gemini.google.com/app")
+                                print("  ! Browser opened. Please log in to Google (or solve the CAPTCHA).")
+                                print("  ! Keep this window open. The bot is actively waiting for you to reach the Gemini dashboard...")
+                                
+                                c_1psid = ""
+                                c_1psidts = ""
+                                
+                                for _ in range(600):  # 10 minutes max
+                                    if context.is_closed():
+                                        print("  ! Browser was closed prematurely.")
+                                        break
+                                        
+                                    try:
+                                        cookies = await context.cookies()
+                                        current_url = page.url
+                                    except Exception:
+                                        break
+                                        
+                                    has_1psid = False
+                                    for c in cookies:
+                                        if c["name"] == "__Secure-1PSID":
+                                            has_1psid = True
+                                            break
+                                            
+                                    if has_1psid and "gemini.google.com/app" in current_url:
+                                        await asyncio.sleep(2)
+                                        cookies = await context.cookies()
+                                        for c in cookies:
+                                            if c["name"] == "__Secure-1PSID":
+                                                c_1psid = c["value"]
+                                            elif c["name"] == "__Secure-1PSIDTS":
+                                                c_1psidts = c["value"]
+                                        break
+                                        
+                                    await asyncio.sleep(1)
+                            finally:
+                                try:
+                                    await context.close()
+                                except Exception:
+                                    pass
+                                    
                             return c_1psid, c_1psidts
                     
                     extracted_1psid, extracted_1psidts = await _extract_cookies()
@@ -2434,7 +2468,15 @@ async def _prompt_llm_provider() -> None:
                         print("  ✗ Failed to extract cookies (timed out).")
                         continue
                 except ImportError:
-                    print("  ✗ Playwright not installed. Run: pip install playwright && playwright install chromium")
+                    print("  ! Playwright is not installed. Installing automatically... (this may take a minute)")
+                    import subprocess
+                    import sys
+                    try:
+                        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
+                        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+                        print("  ✓ Playwright installed! Please type 'auto' again to launch the browser.")
+                    except subprocess.CalledProcessError as e:
+                        print(f"  ✗ Failed to auto-install Playwright: {e}")
                     continue
                 except Exception as e:
                     print(f"  ✗ Browser error: {e}")
