@@ -19,6 +19,7 @@ import errno
 import sqlite3
 import subprocess
 import sys
+import math
 import time
 from types import SimpleNamespace
 import urllib.parse
@@ -728,7 +729,12 @@ def _signal_handler() -> None:
 async def _shutdown_and_exit() -> None:
     tg = client
     if tg is not None and tg.is_connected():
-        await tg.disconnect()
+        try:
+            await asyncio.wait_for(tg.disconnect(), timeout=2.0)
+        except Exception:
+            pass
+    import os
+    os._exit(0)
 
 
 def _register_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
@@ -5644,19 +5650,6 @@ async def _edit_sent_text(ref: object, text: str) -> object:
             )
             data["text"] = _to_plain_text(fallback_text) or ""
             result = await _bot_api_request("editMessageText", data=data)
-            if isinstance(result, dict):
-                return result
-            return ref
-        except Exception:
-            data.pop("parse_mode", None)
-            fallback_text = (
-                strip_telegram_html(payload_text) if _is_html_formatting_enabled() else payload_text
-            )
-            if is_media_ref:
-                data["caption"] = _to_plain_text(fallback_text) or ""
-            else:
-                data["text"] = _to_plain_text(fallback_text) or ""
-            result = await _bot_api_request(method, data=data)
             if isinstance(result, dict):
                 return result
             return ref
