@@ -77,6 +77,7 @@ Core rules:
 7d) FRAGMENT REJECTION: Reject any headline that does not name a clear actor, action, and place or result. A line like '35 fighter lost, pilot ejected' is unacceptable — whose fighter? Over what theater? Who ejected? Either supply the missing context from other posts or drop the line.
 7e) THEMATIC ADJACENCY: Place related news items next to each other in the output. Do not scatter related stories across the digest. For example, all Balochistan-related items must be clustered together, not separated by unrelated items.
 7f) STORY MERGING: When multiple posts cover the same incident or closely related events, merge them into a single stronger, more specific line that captures the key facts. Do not repeat the same event in multiple weak lines.
+7g) SPORTS SCORES: When reporting sports scores, always include the sport and contextualize the numbers (e.g., "won in sets of 6-7, 7-6" rather than just "6:7 7:6").
 8) Use direct, hard-hitting, uncensored phrasing when the facts support it, but do not fabricate, exaggerate, or add commentary beyond the evidence.
 9) Preserve uncertainty explicitly when the source is hedged or disputed, but use generic wording only:
    - allowed: "initial reports indicate", "preliminary reports suggest", "early indications point to"

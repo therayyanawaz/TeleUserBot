@@ -960,7 +960,7 @@ def extract_feed_summary_parts(summary_html: str, raw_text: str) -> tuple[str, s
     headline = lines[0] if lines else normalize_space(strip_telegram_html(summary_html or ""))
     if not headline:
         headline = _fallback_headline(raw_text) or normalize_space(raw_text)
-    context = " ".join(lines[1:]).strip()
+    context = "\n".join(lines[1:]).strip()
     return headline, context
 
 
@@ -1526,6 +1526,7 @@ def _filter_decision_system_prompt() -> str:
         "Reject vague leads like situation update, incident reported, developments continue, explosions shake [country], or tensions rise unless the source itself is equally vague.\n"
         "Use skip for reports of 'attacks' or 'strikes' that fail to mention any specific target, location, or victim.\n"
         "Use skip for casualty reports (e.g., 'soldiers killed') that fail to specify whose soldiers or which faction they belong to.\n"
+        "Use skip for purely informational, geographical, or background sentences (e.g. 'City X is home to Base Y') that do not contain a concrete new event or development.\n"
         "Do not let line 2 merely restate line 1 in different words.\n"
         "The first line must lead with the actual development, not the source framing.\n"
         "Omit the second line if it would be fluff, generic stakes, or obvious common sense.\n"
@@ -7699,7 +7700,7 @@ def _make_generated_text_result(
     narrative_also_moving: Sequence[str] = (),
 ) -> GeneratedTextResult:
     resolved_headline = normalize_space(narrative_headline)
-    resolved_story = normalize_space(narrative_story)
+    resolved_story = str(narrative_story or "").strip()
     resolved_highlights = [
         normalize_space(str(item)) for item in narrative_highlights if normalize_space(str(item))
     ]
