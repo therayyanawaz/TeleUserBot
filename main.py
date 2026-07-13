@@ -50,7 +50,7 @@ from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInv
 import config
 from ai_filter import (
     _ai_classify_severity_and_signals,
-    _call_codex_with_auth_repair,
+    call_llm_with_auth_repair,
     _clean_headline_rail_items,
     apply_cross_digest_headline_dedup,
     rank_headline_rail_items,
@@ -7264,7 +7264,7 @@ async def _headline_context_ai_rewrite(
         ]
     )
     try:
-        rewritten = await _call_codex_with_auth_repair(
+        rewritten = await call_llm_with_auth_repair(
             payload,
             _require_auth_manager(),
             prompt,
