@@ -2331,10 +2331,7 @@ def _prompt_llm_provider() -> None:
 
     current_provider = str(getattr(config, "LLM_PROVIDER", "auto") or "").strip().lower()
     
-    # Skip the prompt if already configured, unless --setup is passed
-    if current_provider != "auto" and "--setup" not in sys.argv:
-        return
-    
+    # The user requested the LLM menu to ask on every restart.
     print()
     print("━" * 50)
     print("  🤖 LLM Provider Selection")
