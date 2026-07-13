@@ -2390,11 +2390,59 @@ async def _prompt_llm_provider() -> None:
         while True:
             current_1psid = str(getattr(config, "GEMINI_COOKIE_1PSID", "") or "")
             print(f"  Current 1PSID configured: {'Yes' if current_1psid else 'None'}")
-            new_1psid = input("  Enter __Secure-1PSID (press Enter to keep current): ").strip()
+            new_1psid = input("  Enter __Secure-1PSID (press Enter to keep current, type 'auto' to launch browser): ").strip()
+            new_1psidts = ""
             
-            current_1psidts = str(getattr(config, "GEMINI_COOKIE_1PSIDTS", "") or "")
-            print(f"  Current 1PSIDTS configured: {'Yes' if current_1psidts else 'None'}")
-            new_1psidts = input("  Enter __Secure-1PSIDTS (press Enter to keep current): ").strip()
+            if new_1psid.lower() == "auto":
+                print("  ! Launching web browser for automatic extraction...")
+                try:
+                    import asyncio
+                    from playwright.async_api import async_playwright
+                    
+                    async def _extract_cookies():
+                        async with async_playwright() as p:
+                            browser = await p.chromium.launch(headless=False)
+                            context = await browser.new_context()
+                            page = await context.new_page()
+                            await page.goto("https://gemini.google.com/")
+                            print("  ! Browser opened. Please log in to Google.")
+                            print("  ! The browser will automatically close once cookies are detected.")
+                            
+                            c_1psid = ""
+                            c_1psidts = ""
+                            for _ in range(300):  # 5 minutes max
+                                cookies = await context.cookies()
+                                for c in cookies:
+                                    if c["name"] == "__Secure-1PSID":
+                                        c_1psid = c["value"]
+                                    elif c["name"] == "__Secure-1PSIDTS":
+                                        c_1psidts = c["value"]
+                                        
+                                if c_1psid and c_1psidts:
+                                    break
+                                await asyncio.sleep(1)
+                                
+                            await browser.close()
+                            return c_1psid, c_1psidts
+                    
+                    extracted_1psid, extracted_1psidts = await _extract_cookies()
+                    if extracted_1psid:
+                        new_1psid = extracted_1psid
+                        new_1psidts = extracted_1psidts
+                        print("  ✓ Successfully extracted cookies from browser!")
+                    else:
+                        print("  ✗ Failed to extract cookies (timed out).")
+                        continue
+                except ImportError:
+                    print("  ✗ Playwright not installed. Run: pip install playwright && playwright install chromium")
+                    continue
+                except Exception as e:
+                    print(f"  ✗ Browser error: {e}")
+                    continue
+            else:
+                current_1psidts = str(getattr(config, "GEMINI_COOKIE_1PSIDTS", "") or "")
+                print(f"  Current 1PSIDTS configured: {'Yes' if current_1psidts else 'None'}")
+                new_1psidts = input("  Enter __Secure-1PSIDTS (press Enter to keep current): ").strip()
             
             test_1psid = new_1psid if new_1psid else current_1psid
             test_1psidts = new_1psidts if new_1psidts else current_1psidts
