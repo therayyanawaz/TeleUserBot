@@ -2387,18 +2387,57 @@ def _prompt_llm_provider() -> None:
         updates["OPENAI_AUTH_ENV_ONLY"] = "false"
     elif choice == "4":
         print("  ✓ Using Gemini OAuth")
-        current_1psid = str(getattr(config, "GEMINI_COOKIE_1PSID", "") or "")
-        print(f"  Current 1PSID configured: {'Yes' if current_1psid else 'None'}")
-        new_1psid = input("  Enter __Secure-1PSID (press Enter to keep current): ").strip()
-        if new_1psid:
-            updates["GEMINI_COOKIE_1PSID"] = new_1psid
-        
-        current_1psidts = str(getattr(config, "GEMINI_COOKIE_1PSIDTS", "") or "")
-        print(f"  Current 1PSIDTS configured: {'Yes' if current_1psidts else 'None'}")
-        new_1psidts = input("  Enter __Secure-1PSIDTS (press Enter to keep current): ").strip()
-        if new_1psidts:
-            updates["GEMINI_COOKIE_1PSIDTS"] = new_1psidts
-        
+        while True:
+            current_1psid = str(getattr(config, "GEMINI_COOKIE_1PSID", "") or "")
+            print(f"  Current 1PSID configured: {'Yes' if current_1psid else 'None'}")
+            new_1psid = input("  Enter __Secure-1PSID (press Enter to keep current): ").strip()
+            
+            current_1psidts = str(getattr(config, "GEMINI_COOKIE_1PSIDTS", "") or "")
+            print(f"  Current 1PSIDTS configured: {'Yes' if current_1psidts else 'None'}")
+            new_1psidts = input("  Enter __Secure-1PSIDTS (press Enter to keep current): ").strip()
+            
+            test_1psid = new_1psid if new_1psid else current_1psid
+            test_1psidts = new_1psidts if new_1psidts else current_1psidts
+            
+            if not test_1psid:
+                print("  ! Error: __Secure-1PSID is required for Gemini.")
+                continue
+                
+            print("  ⏳ Validating Gemini cookies... please wait.")
+            
+            try:
+                import asyncio
+                from gemini_webapi import GeminiClient
+                async def _check_gemini():
+                    client = GeminiClient(test_1psid, test_1psidts if test_1psidts else None)
+                    try:
+                        await client.init(timeout=10)
+                        return True
+                    except Exception as e:
+                        print(f"  ✗ Cookie validation failed: {e}")
+                        return False
+                    finally:
+                        try:
+                            await client.close()
+                        except Exception:
+                            pass
+                            
+                if asyncio.run(_check_gemini()):
+                    print("  ✓ Gemini cookies validated successfully!")
+                    if new_1psid:
+                        updates["GEMINI_COOKIE_1PSID"] = new_1psid
+                    if new_1psidts:
+                        updates["GEMINI_COOKIE_1PSIDTS"] = new_1psidts
+                    break
+                else:
+                    print("  ! Please double check your cookies in the browser and try again.")
+            except ImportError:
+                print("  ! gemini_webapi not installed. Run: pip install gemini-webapi")
+                break
+            except Exception as e:
+                print(f"  ✗ Validation error: {e}")
+                break
+                
         updates["LLM_PROVIDER"] = "gemini"
         updates["OPENAI_AUTH_ENV_ONLY"] = "true"
     else:
