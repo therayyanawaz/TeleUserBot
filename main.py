@@ -3474,10 +3474,10 @@ _EDITORIAL_PROMO_PREFIX_RE = re.compile(
 )
 _EDITORIAL_FLAG_PREFIX_RE = re.compile(r"^(?:[\U0001F1E6-\U0001F1FF]{2}\s*)+")
 _EDITORIAL_EMOJI_PREFIX_RE = re.compile(r"^(?:[\U0001F300-\U0001FAFF\u2000-\u27BF\u3000-\u303F\uFE0F]+\s*)+")
-_EDITORIAL_HEADLINE_MAX_STANDARD = 160
-_EDITORIAL_HEADLINE_MAX_BREAKING = 180
-_EDITORIAL_CONTEXT_MAX_STANDARD = 200
-_EDITORIAL_CONTEXT_MAX_BREAKING = 220
+_EDITORIAL_HEADLINE_MAX_STANDARD = 220
+_EDITORIAL_HEADLINE_MAX_BREAKING = 280
+_EDITORIAL_CONTEXT_MAX_STANDARD = 300
+_EDITORIAL_CONTEXT_MAX_BREAKING = 350
 _CAPTION_HANDLE_RE = re.compile(r"(?<!\w)@[A-Za-z0-9_]{2,}\b")
 _CAPTION_TELEGRAM_LINK_RE = re.compile(
     r"(?i)\b(?:https?://)?(?:t\.me|telegram\.me)/[A-Za-z0-9_+./-]+"
@@ -3520,25 +3520,12 @@ _CAPTION_INCOMPLETE_TAIL_WORDS = {
     "with",
 }
 _CAPTION_DANGLING_TAIL_WORDS = {
-    "he",
-    "her",
-    "his",
-    "it",
-    "its",
-    "my",
-    "our",
-    "she",
-    "that",
-    "their",
-    "theirs",
-    "them",
-    "they",
-    "this",
-    "those",
-    "these",
-    "whose",
-    "your",
-    "yours",
+    "he", "her", "his", "it", "its", "my", "our", "she", "that", "their", "theirs", "them", "they", "this", "those", "these", "whose", "your", "yours",
+    "which", "who", "whom", "where", "when", "what",
+    "is", "are", "was", "were", "am", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did",
+    "can", "could", "shall", "should", "will", "would", "may", "might", "must",
+    "about", "above", "after", "against", "along", "among", "around", "before", "behind", "below", "beneath", "beside", "between", "beyond", "down", "during", "except", "inside", "near", "off", "onto", "out", "outside", "over", "past", "through", "toward", "under", "underneath", "until", "up", "upon", "within", "without"
 }
 _CAPTION_GEO_PREFIX_ALLOWLIST = {
     "beirut",
