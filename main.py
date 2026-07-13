@@ -5529,12 +5529,31 @@ def _acquire_instance_lock():
                 handle.close()
                 raise
         else:
-            owner_msg = f" (lock owner PID: {owner})" if owner else ""
-            kill_hint = f" Run 'kill -9 {owner}' to stop the old instance." if owner else ""
-            raise RuntimeError(
-                "Another TeleUserBot instance is already running. "
-                f"Stop it before starting a new one{owner_msg}.{kill_hint}"
-            )
+            LOGGER.warning("Another instance is running (PID %s). Auto-killing it.", owner)
+            _print_cli_status("~", f"Auto-killing old instance (PID {owner})...", level="warn")
+            handle.close()
+            try:
+                import signal
+                owner_pid = int(owner)
+                os.kill(owner_pid, signal.SIGTERM)
+                time.sleep(1.0)
+                try:
+                    os.kill(owner_pid, 0)
+                    os.kill(owner_pid, signal.SIGKILL)
+                    time.sleep(0.5)
+                except OSError:
+                    pass
+            except Exception as exc:
+                raise RuntimeError(f"Could not kill old instance {owner}. Run 'kill -9 {owner}' manually.") from exc
+            
+            lock_path.unlink(missing_ok=True)
+            handle = open(lock_path, "a+", encoding="utf-8")
+            try:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                handle.close()
+                raise RuntimeError("Failed to acquire lock even after killing old instance.")
     except Exception:
         handle.close()
         raise
