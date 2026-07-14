@@ -1579,6 +1579,14 @@ def _breaking_headline_prompt() -> str:
         "If the source explicitly states a casualty figure or death toll, it MUST appear in the headline. Do not abstract numbers away.\n"
         "If the source is hedged or uncertain (e.g. 'initial reports', 'reportedly'), keep that uncertainty explicit in the headline."
     )
+    third_party_rule = (
+        "OBJECTIVE THIRD-PARTY PERSPECTIVE RULE: You are a headline generator operating strictly as a third-party observer.\n"
+        "You must NEVER use first-person (I, we, my, our, us) or second-person (you, your) pronouns in any headline.\n"
+        "All headlines must be written from an external, objective perspective, as if reported by a neutral newsroom entity.\n"
+        "If the source text quotes someone speaking in first-person (e.g. 'I will say this to the leaders of Iran: Do not assume there will be peace if you attack us'), you MUST reframe and attribute the quote to the speaker in third person (e.g. '\U0001f1fa\U0001f1f8 US officials warn \U0001f1ee\U0001f1f7 Iran against attacks').\n"
+        "The headline must never sound like it is speaking as the bot or directly to the reader.\n"
+        "If you include emotion or opinion, it must be attributed to a third party (e.g., 'Critics say...' or 'Officials warn...')."
+    )
     if _breaking_style_is_unhinged():
         return (
             "You write savage one-line breaking-news alerts for Telegram.\n"
@@ -1589,6 +1597,7 @@ def _breaking_headline_prompt() -> str:
             "But every factual element must be directly grounded in the source text.\n"
             "Do not invent names, numbers, casualties, locations, actors, motives, or certainty.\n"
             "Lead with the most important fact and make the wording hit hard.\n"
+            f"{third_party_rule}\n"
             f"{geo_rule}\n"
             "Target 10-24 words.\n"
             "Never end with ellipsis.\n"
@@ -1603,6 +1612,7 @@ def _breaking_headline_prompt() -> str:
         "Sound like a strong human live-news presenter: direct, concrete, active voice.\n"
         "Use natural spoken cadence without sounding casual or sloppy.\n"
         "Use the most important fact first.\n"
+        f"{third_party_rule}\n"
         f"{geo_rule}\n"
         "Do not use generic framing like Breaking, Update, reports say, or situation update unless uncertainty is the key fact.\n"
         "Weak: Situation update after overnight military activity.\n"
@@ -2978,6 +2988,14 @@ def _translated_digest_line_is_usable(source_text: str, candidate: str) -> bool:
     return True
 
 
+def _copy_has_first_or_second_person_pronoun(text: str) -> bool:
+    if re.search(r"\b(we|our|us|you|your|my)\b", text, re.IGNORECASE):
+        return True
+    if re.search(r"(?:^|[\s:\"'\(\[-])I\s+(?:will|am|have|do|can|must|say|warn|told|think|believe|warned|said|reiterate|caution|would|should|shall)\b", text):
+        return True
+    return False
+
+
 def _news_copy_quality_issue(candidate: str, source_text: str, *, allow_short: bool = False) -> str:
     cleaned = normalize_space(strip_telegram_html(candidate))
     lowered = cleaned.lower()
@@ -2985,6 +3003,8 @@ def _news_copy_quality_issue(candidate: str, source_text: str, *, allow_short: b
         return "empty_output"
     if _feed_segment_is_incomplete(cleaned):
         return "incomplete_copy"
+    if _copy_has_first_or_second_person_pronoun(cleaned):
+        return "pronoun_leak"
     if any(pattern in lowered for pattern in _WEAK_COPY_PATTERNS):
         return "vague_copy"
     words = re.findall(r"[A-Za-z0-9][A-Za-z0-9.'/-]*", cleaned)
@@ -2999,6 +3019,11 @@ def _news_copy_quality_issue(candidate: str, source_text: str, *, allow_short: b
 
 def _filter_retry_feedback(issue: str) -> str:
     issue = normalize_space(issue).lower()
+    if issue == "pronoun_leak":
+        return (
+            "Your last answer used first-person (I, we, our, us) or second-person (you, your) pronouns. "
+            "You must operate strictly as a third-party observer. Rewrite from an external, objective perspective without any first or second person pronouns or self-referential quotes."
+        )
     if issue in {"invalid_payload", "empty_output"}:
         return (
             "Your last answer was unusable. Return exactly one valid JSON object with every required key, "
