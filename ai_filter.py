@@ -2428,6 +2428,22 @@ async def _get_gemini_client():
             
         client = GeminiClient(cookie_1psid, cookie_1psidts if cookie_1psidts else None)
         await client.init(timeout=_DEFAULT_API_TIMEOUT, auto_close=False)
+        status = getattr(client, "account_status", None)
+        if status is not None:
+            status_val = getattr(status, "value", status)
+            status_name = getattr(status, "name", str(status))
+            if status_val == 1016 or "UNAUTHENTICATED" in str(status_name).upper():
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+                raise RuntimeError("Gemini cookies expired or invalid (UNAUTHENTICATED). Please re-copy __Secure-1PSID.")
+            elif status_val != 1000:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+                raise RuntimeError(f"Gemini account status is {status_name} ({status_val}). Cannot initialize.")
         _GEMINI_OAUTH_CLIENT = client
         return client
 
