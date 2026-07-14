@@ -724,13 +724,19 @@ def _feed_segment_is_incomplete(line: str) -> bool:
         return True
     if cleaned.startswith(("@", "/", "\\")):
         return True
+    if re.match(r"^[a-z]", cleaned):
+        return True
+    if any(entity in cleaned for entity in ("&amp;", "&lt;", "&gt;", "&quot;")):
+        return True
+    if re.search(r"(?i)\b(?:buyhatke|easy returns|buy now|discount|coupon|promo code|👉|✅|subscribe|t\.me/|bit\.ly)\b", cleaned):
+        return True
     words = re.findall(r"[A-Za-z0-9][A-Za-z0-9.'/-]*", cleaned)
     if not words:
         return True
     tail_word = words[-1].strip(".,;:!?").lower()
-    if tail_word in _FEED_INCOMPLETE_TAIL_WORDS:
+    if tail_word in _FEED_INCOMPLETE_TAIL_WORDS or tail_word in _FEED_DANGLING_TAIL_WORDS:
         return True
-    if tail_word in {"its", "their", "his", "her", "our", "your", "my", "whose"}:
+    if tail_word in {"its", "their", "his", "her", "our", "your", "my", "whose", "own", "also", "israeli", "russian", "iranian", "american", "zionist", "ukrainian"}:
         return True
     match = re.match(
         r"^(?P<prefix>[A-Za-z][A-Za-z0-9&'._ -]{1,40})\s*:\s*(?P<rest>.+)$",
@@ -3509,6 +3515,8 @@ def _digest_is_low_value_quote_or_rant(text: str) -> bool:
         return False
     if _DIGEST_SIGNATURE_LINE_RE.fullmatch(lowered):
         return True
+    if re.search(r"(?i)^(?:all of this is|this is|they ask if|in the name of allah|glory to the martyrs|citing [“\"']?anonymous sources[”\"']?|public relations department|according to [“\"']?anonymous sources[”\"']?)\b", cleaned):
+        return True
     if len(cleaned.split()) < 4 and not _DIGEST_SPECIFIC_ACTION_RE.search(cleaned):
         return True
     if _DIGEST_RANT_FRAGMENT_RE.search(cleaned):
@@ -3520,6 +3528,8 @@ def _digest_is_low_value_quote_or_rant(text: str) -> bool:
     ):
         return True
     if _DIGEST_QUOTE_FRAGMENT_RE.search(cleaned) and _feed_segment_is_incomplete(cleaned):
+        return True
+    if cleaned.endswith(("\".", "'.", "\"", "'", "!”", "?”")) and not _DIGEST_SPECIFIC_ACTION_RE.search(cleaned):
         return True
     named = _extract_candidate_named_tokens(cleaned)
     if len(named) >= 2 and _OFFICIAL_VERB_RE.search(cleaned):
@@ -4103,7 +4113,7 @@ def _digest_clean_line(text: str, *, max_chars: int, allow_short: bool = False) 
         return ""
     if _digest_has_citation_language(cleaned):
         return ""
-    if not allow_short and not _digest_needs_english_rewrite(cleaned, "English") and _feed_segment_is_incomplete(cleaned):
+    if not _digest_needs_english_rewrite(cleaned, "English") and _feed_segment_is_incomplete(cleaned):
         return ""
     return _truncate_digest_fact(cleaned, max_chars=max_chars)
 
