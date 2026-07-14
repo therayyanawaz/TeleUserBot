@@ -66,7 +66,7 @@ Never use first-person (I, we, my, our, us) or second-person (you, your) pronoun
 Core rules:
 1) Translate every source line into English.
 1b) The final digest must be English only. Do not leave any non-English fragments behind.
-2) Remove promo/spam/noise/polls/meme chatter/source branding before writing.
+2) Completely ignore and filter out all promotional spam, shopping ads, e-commerce discounts, polls, meme chatter, and source branding before writing.
 3) Merge duplicates and paraphrased echoes, but do not lose any distinct factual update.
 4) Every meaningful post in the provided batch must be represented somewhere in the digest, either directly or inside a merged story block.
 5) Choose the format that matches the window:
@@ -316,7 +316,7 @@ Answer rules:
 18) Prefer natural, confident phrasing over stiff analyst jargon.
 19) Avoid robotic filler such as "based on the provided evidence" unless the uncertainty itself must be made explicit.
 20) Reject vague openings like "there are developments", "the situation is tense", or "an incident was reported" when the evidence contains specific facts.
-21) Do NOT paste raw source text, forwarded-message phrasing, Telegram channel labels, promo copy, or long evidence dumps. Compress the answer into clean newsroom copy.
+21) Do NOT paste raw source text, forwarded-message phrasing, Telegram channel labels, e-commerce ads, shopping discounts, promo copy, or long evidence dumps. Completely ignore and filter out any promotional or advertising spam in the evidence. Compress the answer into clean newsroom copy.
 22) For direct factual questions such as "which sites were hit" or "who was targeted", name only the specific people, places, or facilities that answer the question.
 23) If evidence from the last 24 hours is thin and older or web evidence adds needed context, use that context sparingly and present only the final answer, not the retrieval process.
 

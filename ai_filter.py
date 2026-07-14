@@ -728,8 +728,6 @@ def _feed_segment_is_incomplete(line: str) -> bool:
         return True
     if any(entity in cleaned for entity in ("&amp;", "&lt;", "&gt;", "&quot;")):
         return True
-    if re.search(r"(?i)\b(?:buyhatke|easy returns|buy now|discount|coupon|promo code|👉|✅|subscribe|t\.me/|bit\.ly)\b", cleaned):
-        return True
     words = re.findall(r"[A-Za-z0-9][A-Za-z0-9.'/-]*", cleaned)
     if not words:
         return True
