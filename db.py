@@ -25,27 +25,60 @@ ROLLING_DIGEST_ACTIVE_BATCH_KEY = "rolling_digest_active_batch_id"
 ROLLING_DIGEST_ACTIVE_WINDOW_END_KEY = "rolling_digest_active_window_end_ts"
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+import random
+import threading
+
+_DB_WAL_INITIALIZED = False
+_DB_WAL_LOCK = threading.Lock()
+
+
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
+    global _DB_WAL_INITIALIZED
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            if not _DB_WAL_INITIALIZED:
+                with _DB_WAL_LOCK:
+                    if not _DB_WAL_INITIALIZED:
+                        conn.execute("PRAGMA journal_mode=WAL")
+                        _DB_WAL_INITIALIZED = True
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=30000")
+            try:
+                yield conn
+                return
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() and attempt < max_retries - 1:
+                time.sleep(0.05 * (2 ** attempt) + random.uniform(0.01, 0.05))
+                continue
+            raise
 
 
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
-    conn = _connect()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            with _connect() as conn:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    yield conn
+                    conn.commit()
+                    return
+                except Exception:
+                    conn.rollback()
+                    raise
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() and attempt < max_retries - 1:
+                time.sleep(0.05 * (2 ** attempt) + random.uniform(0.01, 0.05))
+                continue
+            raise
 
 
 def _to_rows_dict(rows: Iterable[sqlite3.Row]) -> List[Dict[str, object]]:
@@ -367,6 +400,16 @@ def init_db() -> None:
         )
         _ensure_source_corroboration_hits_table(conn)
         _ensure_headlined_stories_table(conn)
+        
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS source_alias_cache (
+                username TEXT PRIMARY KEY,
+                peer_id INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_digest_queue_pending "
@@ -1116,6 +1159,7 @@ def claim_digest_window(
               AND timestamp > ?
               AND timestamp <= ?
             ORDER BY timestamp ASC, id ASC
+            LIMIT 500
             """,
             (lower_bound_ts, cutoff_ts),
         ).fetchall()
@@ -2201,3 +2245,74 @@ def purge_breaking_story_history(*, older_than_ts: int) -> Tuple[int, int]:
             (cutoff,),
         )
     return int(deleted_clusters.rowcount or 0), int(deleted_events.rowcount or 0)
+
+
+def get_cached_source_id(username: str) -> int | None:
+    normalized = username.strip().lower()
+    if not normalized:
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT peer_id FROM source_alias_cache WHERE username = ?",
+            (normalized,)
+        ).fetchone()
+        if row:
+            return int(row[0])
+    return None
+
+def set_cached_source_id(username: str, peer_id: int) -> None:
+    normalized = username.strip().lower()
+    if not normalized:
+        return
+    with _transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO source_alias_cache (username, peer_id, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(username) DO UPDATE SET
+                peer_id = excluded.peer_id,
+                updated_at = excluded.updated_at
+            """,
+            (normalized, int(peer_id), int(time.time()))
+        )
+
+def load_sampled_archive_window(since_ts: int, until_ts: int, limit: int) -> List[Dict[str, object]]:
+    resolved_limit = max(1, int(limit))
+    lower = int(max(0, since_ts))
+    upper = int(max(lower, until_ts))
+    with _connect() as conn:
+        total_rows = conn.execute(
+            "SELECT COUNT(*) FROM digest_archive WHERE timestamp >= ? AND timestamp < ?",
+            (lower, upper)
+        ).fetchone()[0]
+        
+        if total_rows <= resolved_limit:
+            rows = conn.execute(
+                """
+                SELECT id, channel_id, message_id, source_name, raw_text, message_link, timestamp
+                FROM digest_archive
+                WHERE timestamp >= ? AND timestamp < ?
+                ORDER BY timestamp ASC, id ASC
+                """,
+                (lower, upper)
+            ).fetchall()
+            return _to_archive_rows_dict(rows)
+            
+        step = max(1, total_rows // resolved_limit)
+        rows = conn.execute(
+            f"""
+            WITH numbered AS (
+                SELECT id, channel_id, message_id, source_name, raw_text, message_link, timestamp,
+                       row_number() OVER (ORDER BY timestamp ASC, id ASC) as rn
+                FROM digest_archive
+                WHERE timestamp >= ? AND timestamp < ?
+            )
+            SELECT id, channel_id, message_id, source_name, raw_text, message_link, timestamp
+            FROM numbered
+            WHERE rn % {step} = 0 OR rn = 1
+            LIMIT ?
+            """,
+            (lower, upper, resolved_limit)
+        ).fetchall()
+        
+    return _to_archive_rows_dict(rows)

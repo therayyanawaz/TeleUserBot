@@ -13,14 +13,32 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_ROOT / ".env"
 
 
+import threading
+
+_CONFIG_LOCK = threading.RLock()
+
+
+def _safe_ast_eval(text: str) -> object:
+    """Safely evaluate AST literals while preventing recursion crashes or memory exhaustion."""
+    if len(text) > 100_000:
+        raise ValueError("Input text exceeds safe length limit for AST evaluation.")
+    try:
+        return ast.literal_eval(text)
+    except (ValueError, SyntaxError, RecursionError, MemoryError, AttributeError):
+        raise ValueError("Invalid or unsafe AST representation.")
+
+
 def _load_dotenv(path: Path) -> None:
     """Minimal .env loader without third-party dependencies."""
     if not path.exists():
         return
 
     try:
+        # Prevent loading massive files that could exhaust RAM if misconfigured.
+        if path.stat().st_size > 1_000_000:
+            return
         lines = path.read_text(encoding="utf-8").splitlines()
-    except Exception:
+    except (OSError, UnicodeDecodeError):
         return
 
     for raw in lines:
@@ -36,9 +54,9 @@ def _load_dotenv(path: Path) -> None:
 
         if value and value[0] == value[-1] and value[0] in {'"', "'"}:
             try:
-                parsed = ast.literal_eval(value)
+                parsed = _safe_ast_eval(value)
                 value = str(parsed)
-            except (ValueError, SyntaxError):
+            except ValueError:
                 value = value[1:-1]
 
         # Environment variables provided by shell/process take precedence.
@@ -109,10 +127,10 @@ def _env_list(key: str, default: list[str] | None = None) -> list[str]:
 
     # Accept Python list representation.
     try:
-        parsed_py = ast.literal_eval(text)
+        parsed_py = _safe_ast_eval(text)
         if isinstance(parsed_py, list):
             return _normalize_list(parsed_py)
-    except (ValueError, SyntaxError):
+    except ValueError:
         pass
 
     # Fallback: comma-separated values.
@@ -136,10 +154,10 @@ def _env_dict(key: str, default: dict[str, object] | None = None) -> dict[str, o
         pass
 
     try:
-        parsed_py = ast.literal_eval(text)
+        parsed_py = _safe_ast_eval(text)
         if isinstance(parsed_py, dict):
             return dict(parsed_py)
-    except (ValueError, SyntaxError):
+    except ValueError:
         pass
 
     return dict(default or {})
@@ -168,20 +186,24 @@ DIGEST_SOURCE_TIERS_TTL_SEC = _env_int("DIGEST_SOURCE_TIERS_TTL_SEC", 1800)
 
 
 def get_digest_source_tiers() -> dict[int, float]:
-    """Lazily build merged source tier dict on first call, with 30-min TTL."""
+    """Lazily build merged source tier dict on first call, with 30-min TTL and thread synchronization."""
     global _dynamic_digest_source_tiers
     global _dynamic_digest_source_tiers_ts
     import time
-    
+
     now = time.time()
-    if _dynamic_digest_source_tiers is None or now - _dynamic_digest_source_tiers_ts > DIGEST_SOURCE_TIERS_TTL_SEC:
-        try:
-            dynamic = build_dynamic_source_tiers()
-        except Exception:
-            dynamic = {}
-        _dynamic_digest_source_tiers = {**dynamic, **DIGEST_SOURCE_TIERS}
-        _dynamic_digest_source_tiers_ts = now
-    return _dynamic_digest_source_tiers
+    with _CONFIG_LOCK:
+        if _dynamic_digest_source_tiers is None or now - _dynamic_digest_source_tiers_ts > DIGEST_SOURCE_TIERS_TTL_SEC:
+            try:
+                dynamic = build_dynamic_source_tiers()
+            except Exception:
+                # If DB query fails, retain existing cache if available rather than wiping it
+                if _dynamic_digest_source_tiers is not None:
+                    return _dynamic_digest_source_tiers
+                dynamic = {}
+            _dynamic_digest_source_tiers = {**dynamic, **DIGEST_SOURCE_TIERS}
+            _dynamic_digest_source_tiers_ts = now
+        return _dynamic_digest_source_tiers
 
 
 # Telegram API credentials from https://my.telegram.org

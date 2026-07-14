@@ -49,7 +49,8 @@ def _load_dotenv_defaults(path: Path) -> None:
             continue
         if value and value[0] == value[-1] and value[0] in {'"', "'"}:
             try:
-                value = str(ast.literal_eval(value))
+                if len(value) <= 100_000:
+                    value = str(ast.literal_eval(value))
             except Exception:
                 value = value[1:-1]
         os.environ.setdefault(key, value)
@@ -201,10 +202,13 @@ def _build_callback_handler(expected_path: str):
         def do_GET(self) -> None:  # noqa: N802
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path != expected_path:
-                self.send_response(404)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(b"Not found.")
+                try:
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(b"Not found.")
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
                 return
 
             query = urllib.parse.parse_qs(parsed.query)
@@ -215,13 +219,16 @@ def _build_callback_handler(expected_path: str):
                 error_description=query.get("error_description", [None])[0],
             )
 
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(
-                b"<html><body><h3>OpenAI authentication complete.</h3>"
-                b"<p>Return to terminal.</p></body></html>"
-            )
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(
+                    b"<html><body><h3>OpenAI authentication complete.</h3>"
+                    b"<p>Return to terminal.</p></body></html>"
+                )
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
 
     return CallbackHandler
 
@@ -233,7 +240,16 @@ def _wait_for_callback(timeout_seconds: int) -> _CallbackResult:
     path = parsed.path or "/"
 
     handler_cls = _build_callback_handler(path)
-    server = _CallbackServer((host, port), handler_cls)
+    server = None
+    for offset in range(10):
+        try:
+            server = _CallbackServer((host, port + offset), handler_cls)
+            break
+        except OSError:
+            if offset == 9:
+                raise
+    if server is None:
+        raise OAuthError("Failed to bind OAuth callback server on any port.")
     server.timeout = 1
     deadline = time.time() + timeout_seconds
     try:
@@ -304,11 +320,11 @@ def write_auth_payload_to_env_file(payload: Dict[str, str], env_path: Path) -> P
     if not env_path.exists():
         example_path = env_path.parent / ".env.example"
         if example_path.exists():
-            env_path.write_text(example_path.read_text(encoding="utf-8"), encoding="utf-8")
+            original_text = example_path.read_text(encoding="utf-8")
         else:
-            env_path.write_text("", encoding="utf-8")
-
-    original_text = env_path.read_text(encoding="utf-8")
+            original_text = ""
+    else:
+        original_text = env_path.read_text(encoding="utf-8")
     original_lines = original_text.splitlines()
     has_trailing_newline = original_text.endswith("\n")
 
@@ -336,7 +352,20 @@ def write_auth_payload_to_env_file(payload: Dict[str, str], env_path: Path) -> P
     out_text = "\n".join(updated_lines)
     if has_trailing_newline or out_text:
         out_text += "\n"
-    env_path.write_text(out_text, encoding="utf-8")
+    tmp_path = env_path.with_name(f".{env_path.name}.tmp.{os.getpid()}")
+    try:
+        tmp_path.write_text(out_text, encoding="utf-8")
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        tmp_path.replace(env_path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
     return env_path
 
 
@@ -406,12 +435,21 @@ def _load_token_data_from_file(path: Path = TOKEN_PATH) -> Optional[Dict[str, An
 def _write_token_data_to_file(token_data: Dict[str, Any], path: Path = TOKEN_PATH) -> Path:
     token_path = path.expanduser().resolve()
     token_path.parent.mkdir(parents=True, exist_ok=True)
-    serialized = json.dumps(token_data, indent=2, ensure_ascii=False)
-    token_path.write_text(serialized + "\n", encoding="utf-8")
+    serialized = json.dumps(token_data, indent=2, ensure_ascii=False) + "\n"
+    tmp_path = token_path.with_name(f".{token_path.name}.tmp.{os.getpid()}")
     try:
-        os.chmod(token_path, 0o600)
-    except OSError:
-        pass
+        tmp_path.write_text(serialized, encoding="utf-8")
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        tmp_path.replace(token_path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
     return token_path
 
 
@@ -419,8 +457,11 @@ def _delete_token_file(path: Path = TOKEN_PATH) -> bool:
     token_path = path.expanduser().resolve()
     if not token_path.exists():
         return False
-    token_path.unlink()
-    return True
+    try:
+        token_path.unlink()
+        return True
+    except OSError:
+        return False
 
 
 def _token_recency_score(token_data: Optional[Dict[str, Any]]) -> int:

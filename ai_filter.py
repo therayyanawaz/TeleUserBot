@@ -74,6 +74,7 @@ DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_DIGEST_MAX_POSTS = 80
 DEFAULT_DIGEST_MAX_TOKENS = 18000
+_DEFAULT_API_TIMEOUT = float(getattr(config, "LLM_API_TIMEOUT", 60.0))
 FILTER_DECISION_PROMPT_VERSION = "v6"
 VITAL_VIEW_PROMPT_VERSION = "v3"
 USE_LOCAL_NLP = bool(getattr(config, "USE_LOCAL_NLP", False))
@@ -354,6 +355,7 @@ _SUMMARY_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
 _SEVERITY_CACHE: "OrderedDict[str, str]" = OrderedDict()
 _HEADLINE_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
 _VITAL_VIEW_CACHE: "OrderedDict[str, Optional[str]]" = OrderedDict()
+_AI_CACHE_LOCK = threading.Lock()
 _QUOTA_WARNING_LOGGED = False
 _FILTER_DECISION_CACHE_HITS = 0
 _FILTER_DECISION_CACHE_MISSES = 0
@@ -385,7 +387,7 @@ class _LlmCircuitBreaker:
         self._failure_count = 0
         self._last_failure_time = 0.0
         self._state = "closed"
-        self._lock = asyncio.Lock()
+        self._lock = threading.Lock()
 
     def _now(self) -> float:
         return time.monotonic()
@@ -397,17 +399,18 @@ class _LlmCircuitBreaker:
 
     @property
     def state(self) -> str:
-        if self._state == "closed":
-            return "closed"
-        return self._transition()
+        with self._lock:
+            if self._state == "closed":
+                return "closed"
+            return self._transition()
 
     async def record_success(self) -> None:
-        async with self._lock:
+        with self._lock:
             self._failure_count = 0
             self._state = "closed"
 
     async def record_failure(self) -> None:
-        async with self._lock:
+        with self._lock:
             self._failure_count += 1
             self._last_failure_time = self._now()
             if self._failure_count >= self._failure_threshold:
@@ -419,7 +422,7 @@ class _LlmCircuitBreaker:
                 )
 
     async def _check(self) -> None:
-        async with self._lock:
+        with self._lock:
             if self._transition() == "open":
                 raise _CircuitBreakerError(
                     f"LLM circuit breaker open ({self._failure_count} consecutive failures)"
@@ -532,17 +535,19 @@ def get_filter_decision_cache_stats() -> Dict[str, float]:
 
 
 def _cache_get(key: str) -> Optional[Optional[str]]:
-    if key not in _SUMMARY_CACHE:
-        return None
-    _SUMMARY_CACHE.move_to_end(key)
-    return _SUMMARY_CACHE[key]
+    with _AI_CACHE_LOCK:
+        if key not in _SUMMARY_CACHE:
+            return None
+        _SUMMARY_CACHE.move_to_end(key)
+        return _SUMMARY_CACHE[key]
 
 
 def _cache_set(key: str, value: Optional[str]) -> None:
-    _SUMMARY_CACHE[key] = value
-    _SUMMARY_CACHE.move_to_end(key)
-    while len(_SUMMARY_CACHE) > CACHE_MAX_ITEMS:
-        _SUMMARY_CACHE.popitem(last=False)
+    with _AI_CACHE_LOCK:
+        _SUMMARY_CACHE[key] = value
+        _SUMMARY_CACHE.move_to_end(key)
+        while len(_SUMMARY_CACHE) > CACHE_MAX_ITEMS:
+            _SUMMARY_CACHE.popitem(last=False)
 
 
 def _cache_key(text: str) -> str:
@@ -550,45 +555,51 @@ def _cache_key(text: str) -> str:
 
 
 def _severity_cache_get(key: str) -> Optional[str]:
-    if key not in _SEVERITY_CACHE:
-        return None
-    _SEVERITY_CACHE.move_to_end(key)
-    return _SEVERITY_CACHE[key]
+    with _AI_CACHE_LOCK:
+        if key not in _SEVERITY_CACHE:
+            return None
+        _SEVERITY_CACHE.move_to_end(key)
+        return _SEVERITY_CACHE[key]
 
 
 def _severity_cache_set(key: str, value: str) -> None:
-    _SEVERITY_CACHE[key] = value
-    _SEVERITY_CACHE.move_to_end(key)
-    while len(_SEVERITY_CACHE) > CACHE_MAX_ITEMS:
-        _SEVERITY_CACHE.popitem(last=False)
+    with _AI_CACHE_LOCK:
+        _SEVERITY_CACHE[key] = value
+        _SEVERITY_CACHE.move_to_end(key)
+        while len(_SEVERITY_CACHE) > CACHE_MAX_ITEMS:
+            _SEVERITY_CACHE.popitem(last=False)
 
 
 def _headline_cache_get(key: str) -> Optional[Optional[str]]:
-    if key not in _HEADLINE_CACHE:
-        return None
-    _HEADLINE_CACHE.move_to_end(key)
-    return _HEADLINE_CACHE[key]
+    with _AI_CACHE_LOCK:
+        if key not in _HEADLINE_CACHE:
+            return None
+        _HEADLINE_CACHE.move_to_end(key)
+        return _HEADLINE_CACHE[key]
 
 
 def _headline_cache_set(key: str, value: Optional[str]) -> None:
-    _HEADLINE_CACHE[key] = value
-    _HEADLINE_CACHE.move_to_end(key)
-    while len(_HEADLINE_CACHE) > CACHE_MAX_ITEMS:
-        _HEADLINE_CACHE.popitem(last=False)
+    with _AI_CACHE_LOCK:
+        _HEADLINE_CACHE[key] = value
+        _HEADLINE_CACHE.move_to_end(key)
+        while len(_HEADLINE_CACHE) > CACHE_MAX_ITEMS:
+            _HEADLINE_CACHE.popitem(last=False)
 
 
 def _vital_view_cache_get(key: str) -> Optional[Optional[str]]:
-    if key not in _VITAL_VIEW_CACHE:
-        return None
-    _VITAL_VIEW_CACHE.move_to_end(key)
-    return _VITAL_VIEW_CACHE[key]
+    with _AI_CACHE_LOCK:
+        if key not in _VITAL_VIEW_CACHE:
+            return None
+        _VITAL_VIEW_CACHE.move_to_end(key)
+        return _VITAL_VIEW_CACHE[key]
 
 
 def _vital_view_cache_set(key: str, value: Optional[str]) -> None:
-    _VITAL_VIEW_CACHE[key] = value
-    _VITAL_VIEW_CACHE.move_to_end(key)
-    while len(_VITAL_VIEW_CACHE) > CACHE_MAX_ITEMS:
-        _VITAL_VIEW_CACHE.popitem(last=False)
+    with _AI_CACHE_LOCK:
+        _VITAL_VIEW_CACHE[key] = value
+        _VITAL_VIEW_CACHE.move_to_end(key)
+        while len(_VITAL_VIEW_CACHE) > CACHE_MAX_ITEMS:
+            _VITAL_VIEW_CACHE.popitem(last=False)
 
 
 def _likely_noise(text: str) -> bool:
@@ -1962,7 +1973,7 @@ class _StreamingOpenRouterResponse:
             _resolve_openrouter_url(),
             headers=headers,
             json=payload,
-            timeout=60.0,
+            timeout=_DEFAULT_API_TIMEOUT,
         )
         self._response = await self._stream_ctx.__aenter__()
         if self._response.status_code >= 400:
@@ -2053,7 +2064,7 @@ class _StreamingGroqResponse:
                 _resolve_groq_url(),
                 headers=headers,
                 json=payload,
-                timeout=60.0,
+                timeout=_DEFAULT_API_TIMEOUT,
             )
             self._response = await self._stream_ctx.__aenter__()
             if self._response.status_code == 429 and attempt < 3:
@@ -2148,7 +2159,7 @@ async def _call_openrouter_non_stream(
                 _resolve_openrouter_url(),
                 headers=headers,
                 json=payload,
-                timeout=45.0,
+                timeout=_DEFAULT_API_TIMEOUT,
             )
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt < 2:
@@ -2265,7 +2276,7 @@ async def _call_groq_non_stream(
                 _resolve_groq_url(),
                 headers=headers,
                 json=payload,
-                timeout=45.0,
+                timeout=_DEFAULT_API_TIMEOUT,
             )
             if response.status_code == 429 or response.status_code >= 500:
                 if response.status_code == 429:
@@ -2416,7 +2427,7 @@ async def _get_gemini_client():
             raise RuntimeError("gemini_webapi is not installed.")
             
         client = GeminiClient(cookie_1psid, cookie_1psidts if cookie_1psidts else None)
-        await client.init(timeout=15, auto_close=False)
+        await client.init(timeout=_DEFAULT_API_TIMEOUT, auto_close=False)
         _GEMINI_OAUTH_CLIENT = client
         return client
 
@@ -2452,7 +2463,7 @@ async def _call_gemini_oauth(
                         await on_token(resp.text)
                     response_text += resp.text
                     
-        await asyncio.wait_for(_consume_stream(), timeout=90.0)
+        await asyncio.wait_for(_consume_stream(), timeout=_DEFAULT_API_TIMEOUT)
         return response_text.strip()
     except TimeoutError as exc:
         LOGGER.error("Gemini OAuth stream timed out.")
@@ -2730,10 +2741,22 @@ def _extract_json_object_block(text: str) -> str:
     if m:
         return m.group(1).strip()
 
-    # first object-like block
     start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start >= 0 and end > start:
+    if start < 0:
+        return ""
+    
+    depth = 0
+    end = -1
+    for i in range(start, len(cleaned)):
+        if cleaned[i] == "{":
+            depth += 1
+        elif cleaned[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    
+    if end > start:
         return cleaned[start : end + 1].strip()
     return ""
 
@@ -6268,6 +6291,7 @@ def _build_query_context_lines(
     used = 0
     seen = set()
     ranked_messages = _rank_query_context(query, context_messages, limit=24)
+    ranked_messages.sort(key=lambda item: int(item.get("timestamp", 0) or 0))
 
     for idx, item in enumerate(ranked_messages, start=1):
         text = normalize_space(str(item.get("text") or ""))
@@ -6987,7 +7011,9 @@ async def summarize_or_skip(text: str, auth_manager: AuthManager) -> Optional[st
 
     key = _cache_key(cleaned)
     cached = _cache_get(key)
-    if cached is not None or key in _SUMMARY_CACHE:
+    with _AI_CACHE_LOCK:
+        has_key = key in _SUMMARY_CACHE
+    if cached is not None or has_key:
         return cached
 
     if _likely_noise(cleaned):
@@ -7983,8 +8009,6 @@ async def create_digest_summary_result(
                 prompt,
                 on_token=on_token,
             )
-        except (_CodexRateLimitError, _CodexAuthError):
-            raise
         except Exception as exc:
             fallback_html = local_fallback_digest(prepared_posts, interval_minutes=interval_minutes)
             major_block_count, timeline_item_count = _digest_render_counts(

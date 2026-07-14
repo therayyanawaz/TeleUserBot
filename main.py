@@ -145,6 +145,9 @@ from db import (
     count_archive_window_rows,
     purge_breaking_story_history,
     source_tier_increment,
+    get_cached_source_id,
+    set_cached_source_id,
+    load_sampled_archive_window,
 )
 from news_taxonomy import (
     get_ontology_health_snapshot,
@@ -438,7 +441,7 @@ class RuntimeState:
     bot_destination_chat_id: str | None = None
     premium_emoji_map: Dict[str, str] = field(default_factory=dict)
 
-    album_buffers: Dict[Tuple[str, int], List[Message]] = field(default_factory=lambda: defaultdict(list))
+    album_buffers: Dict[Tuple[str, int], List[int]] = field(default_factory=lambda: defaultdict(list))
     album_tasks: Dict[Tuple[str, int], asyncio.Task] = field(default_factory=dict)
     digest_scheduler_task: asyncio.Task | None = None
     daily_digest_scheduler_task: asyncio.Task | None = None
@@ -466,7 +469,7 @@ class RuntimeState:
     query_bot_poll_started_at: int = 0
 
     breaking_delivery_refs: Dict[str, Dict[str, object]] = field(default_factory=dict)
-    breaking_story_ref_cache: Dict[str, object] = field(default_factory=dict)
+    breaking_story_ref_cache: Dict[str, Tuple[int, object]] = field(default_factory=dict)
     breaking_topic_threads: List[Dict[str, object]] = field(default_factory=list)
     breaking_topic_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -510,7 +513,7 @@ bot_destination_chat_id: str | None = None
 premium_emoji_map: Dict[str, str] = {}
 
 # (channel_id, grouped_id) -> [messages]
-album_buffers: Dict[Tuple[str, int], List[Message]] = defaultdict(list)
+album_buffers: Dict[Tuple[str, int], List[int]] = defaultdict(list)
 album_tasks: Dict[Tuple[str, int], asyncio.Task] = {}
 digest_scheduler_task: asyncio.Task | None = None
 daily_digest_scheduler_task: asyncio.Task | None = None
@@ -541,9 +544,10 @@ query_conversation_history: Dict[int, Deque[Dict[str, str]]] = defaultdict(
 query_bot_updates_offset: int = 0
 query_bot_poll_started_at: int = 0
 breaking_delivery_refs: Dict[str, Dict[str, object]] = {}
-breaking_story_ref_cache: Dict[str, object] = {}
+breaking_story_ref_cache: Dict[str, Tuple[int, object]] = {}
 breaking_topic_threads: List[Dict[str, object]] = []
 breaking_topic_lock = asyncio.Lock()
+breaking_delivery_refs_lock = asyncio.Lock()
 delivery_context_stats: Dict[str, int] = defaultdict(int)
 query_allowed_bot_user_id: int | None = None
 query_bot_user_id_checked: bool = False
@@ -727,12 +731,10 @@ def _signal_handler() -> None:
 
 
 async def _shutdown_and_exit() -> None:
-    tg = client
-    if tg is not None and tg.is_connected():
-        try:
-            await asyncio.wait_for(tg.disconnect(), timeout=2.0)
-        except Exception:
-            pass
+    try:
+        await asyncio.wait_for(_shutdown_client(), timeout=5.0)
+    except Exception:
+        pass
     import os
     os._exit(0)
 
@@ -2454,11 +2456,10 @@ async def _prompt_llm_provider() -> None:
                                                     shutil.copy2(profile_dir / "Local State", isolated_profile / "Local State")
                                                     shutil.copy2(profile_dir / "Default" / "Cookies", isolated_profile / "Default" / "Cookies")
                                                 except Exception:
-                                                    pass
+                                                    LOGGER.warning("Failed to copy Chrome profile cookies/state", exc_info=True)
                                                 profile_dir = isolated_profile
                                         except Exception:
-                                            pass
-                                            
+                                            LOGGER.warning("Failed isolated profile creation", exc_info=True)
                                     kwargs = {
                                         "user_data_dir": profile_dir,
                                         "headless": True if use_system_profile else False,
@@ -4629,7 +4630,7 @@ async def _classify_severity_with_breakdown(
                 },
             }
     except Exception:
-        pass
+        LOGGER.warning("Failed to extract AI severity signals", exc_info=True)
 
     payload = {
         "text": text,
@@ -4875,13 +4876,14 @@ async def _resolve_breaking_story_root_ref(cluster: Dict[str, object]) -> object
         return None
 
     cached = breaking_story_ref_cache.get(cluster_id)
-    if _message_ref_id(cached) == root_message_id:
-        return cached
+    if cached and _message_ref_id(cached[1]) == root_message_id:
+        breaking_story_ref_cache[cluster_id] = (int(time.time()), cached[1])
+        return cached[1]
 
     stored_ref = _deserialize_sent_ref(str(cluster.get("root_sent_ref") or ""))
     ref = await _load_destination_message_ref(root_message_id)
     if ref is not None:
-        breaking_story_ref_cache[cluster_id] = _compact_sent_ref(ref)
+        breaking_story_ref_cache[cluster_id] = (int(time.time()), _compact_sent_ref(ref))
     return ref
 
 
@@ -4944,7 +4946,7 @@ def _persist_breaking_story_cluster(
         status="active",
     )
     if root_ref is not None and cluster_id:
-        breaking_story_ref_cache[cluster_id] = _compact_sent_ref(root_ref)
+        breaking_story_ref_cache[cluster_id] = (int(time.time()), _compact_sent_ref(root_ref))
 
 breaking_story_policy_lock = asyncio.Lock()
 
@@ -5505,49 +5507,50 @@ async def _merge_duplicate_breaking(
         return False
 
     now = int(time.time())
-    _cleanup_breaking_refs(now)
-    entry = breaking_delivery_refs.get(result.matched_hash)
-    if not entry:
-        return False
+    async with breaking_delivery_refs_lock:
+        _cleanup_breaking_refs(now)
+        entry = breaking_delivery_refs.get(result.matched_hash)
+        if not entry:
+            return False
 
-    base_text = str(entry.get("base_text") or "").strip()
-    if not base_text:
-        return False
+        base_text = str(entry.get("base_text") or "").strip()
+        if not base_text:
+            return False
 
-    sources = entry.get("sources")
-    if not isinstance(sources, set):
-        sources = {str(entry.get("primary_source") or "").strip()}
-    clean_source = source_name.strip()
-    if not clean_source:
-        clean_source = "another channel"
-    if clean_source in sources:
-        return True
-    sources.add(clean_source)
+        sources = entry.get("sources")
+        if not isinstance(sources, set):
+            sources = {str(entry.get("primary_source") or "").strip()}
+        clean_source = source_name.strip()
+        if not clean_source:
+            clean_source = "another channel"
+        if clean_source in sources:
+            return True
+        sources.add(clean_source)
 
-    primary_source = str(entry.get("primary_source") or "").strip()
-    extra_sources = [src for src in sorted(sources) if src and src != primary_source]
-    if not extra_sources:
+        primary_source = str(entry.get("primary_source") or "").strip()
+        extra_sources = [src for src in sorted(sources) if src and src != primary_source]
+        if not extra_sources:
+            entry["sources"] = sources
+            entry["ts"] = now
+            return True
+
+        suffix = ", ".join(extra_sources[:6])
+        merged_text = f"{base_text}<br><br><i>(also reported by {sanitize_telegram_html(suffix)})</i>"
+        if len(merged_text) > 3900:
+            merged_text = merged_text[:3897].rstrip() + "..."
+
+        try:
+            updated_ref = await _edit_sent_text(entry.get("ref"), merged_text)
+        except Exception:
+            LOGGER.debug("Failed to merge duplicate breaking edit.", exc_info=True)
+            return False
+
+        entry["ref"] = updated_ref
         entry["sources"] = sources
         entry["ts"] = now
+        entry["ref"] = _compact_sent_ref(updated_ref)
+        breaking_delivery_refs[result.matched_hash] = entry
         return True
-
-    suffix = ", ".join(extra_sources[:6])
-    merged_text = f"{base_text}<br><br><i>(also reported by {sanitize_telegram_html(suffix)})</i>"
-    if len(merged_text) > 3900:
-        merged_text = merged_text[:3897].rstrip() + "..."
-
-    try:
-        updated_ref = await _edit_sent_text(entry.get("ref"), merged_text)
-    except Exception:
-        LOGGER.debug("Failed to merge duplicate breaking edit.", exc_info=True)
-        return False
-
-    entry["ref"] = updated_ref
-    entry["sources"] = sources
-    entry["ts"] = now
-    entry["ref"] = _compact_sent_ref(updated_ref)
-    breaking_delivery_refs[result.matched_hash] = entry
-    return True
 
 
 async def _init_dupe_detector() -> None:
@@ -5569,7 +5572,7 @@ async def _init_dupe_detector() -> None:
         await asyncio.to_thread(
             detector.warm_start_from_db,
             warm_hours=min(2, _dupe_history_hours()),
-            ensure_backends=not _dupe_use_sentence_transformers(),
+            ensure_backends=False,
         )
         await asyncio.to_thread(detector.purge_old_records)
 
@@ -5681,7 +5684,7 @@ def _deserialize_sent_ref(value: str) -> object | None:
     return {"message_id": message_id}
 
 
-def _acquire_instance_lock():
+async def _acquire_instance_lock():
     """
     Ensure only one process uses the Telethon session DB at a time.
 
@@ -5750,11 +5753,11 @@ def _acquire_instance_lock():
                 import signal
                 owner_pid = int(owner)
                 os.kill(owner_pid, signal.SIGTERM)
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 try:
                     os.kill(owner_pid, 0)
                     os.kill(owner_pid, signal.SIGKILL)
-                    time.sleep(0.5)
+                    await asyncio.sleep(0.5)
                 except OSError:
                     pass
             except Exception as exc:
@@ -6177,7 +6180,8 @@ async def _enqueue_inbound_messages(
         return False
     payload = _build_inbound_payload(messages, kind=kind, grouped_id=grouped_id)
     message_ids = _pipeline_job_message_ids(payload)
-    inserted = enqueue_inbound_job(
+    inserted = await asyncio.to_thread(
+        enqueue_inbound_job,
         job_key=_pipeline_job_key(
             channel_id=str(payload.get("channel_id") or ""),
             message_ids=message_ids,
@@ -6629,31 +6633,38 @@ async def _handle_inbound_job(stage: str, job: Dict[str, object]) -> None:
 async def _run_inbound_stage_worker(stage: str, worker_index: int) -> None:
     worker_id = f"{stage}-{worker_index}-{uuid.uuid4().hex[:8]}"
     while True:
-        jobs = claim_inbound_jobs(stage, 1, worker_id=worker_id)
-        if not jobs:
-            await asyncio.sleep(0.25)
-            continue
-
-        job = jobs[0]
-        started = time.perf_counter()
         try:
-            await _handle_inbound_job(stage, job)
+            jobs = await asyncio.to_thread(claim_inbound_jobs, stage, 1, worker_id=worker_id)
+            if not jobs:
+                await asyncio.sleep(0.25)
+                continue
+
+            job = jobs[0]
+            started = time.perf_counter()
+            try:
+                await _handle_inbound_job(stage, job)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOGGER.exception(
+                    "Inbound pipeline stage failed stage=%s job_id=%s job_key=%s",
+                    stage,
+                    job.get("id"),
+                    job.get("job_key"),
+                )
+                await asyncio.to_thread(
+                    retry_or_dead_letter_inbound_job,
+                    int(job["id"]),
+                    error_text=str(exc)[:1000],
+                    retry_delay_seconds=_pipeline_retry_delay_seconds(int(job.get("retry_count") or 0)),
+                )
+            finally:
+                _record_pipeline_stage_latency(stage, time.perf_counter() - started)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            LOGGER.exception(
-                "Inbound pipeline stage failed stage=%s job_id=%s job_key=%s",
-                stage,
-                job.get("id"),
-                job.get("job_key"),
-            )
-            retry_or_dead_letter_inbound_job(
-                int(job["id"]),
-                error_text=str(exc)[:1000],
-                retry_delay_seconds=_pipeline_retry_delay_seconds(int(job.get("retry_count") or 0)),
-            )
-        finally:
-            _record_pipeline_stage_latency(stage, time.perf_counter() - started)
+        except Exception:
+            LOGGER.exception("Inbound pipeline worker encountered an error. Retrying.")
+            await asyncio.sleep(5)
 
 
 async def _start_pipeline_workers() -> None:
@@ -6678,12 +6689,12 @@ async def _start_pipeline_workers() -> None:
         INBOUND_STAGE_ARCHIVE,
     ):
         for index in range(max(1, int(targets.get(stage, 1) or 1))):
-                pipeline_worker_tasks.append(
-                    asyncio.create_task(
-                        _run_inbound_stage_worker(stage, index + 1),
-                        name=f"inbound-{stage}-{index + 1}",
-                    )
+                task = asyncio.create_task(
+                    _run_inbound_stage_worker(stage, index + 1),
+                    name=f"inbound-{stage}-{index + 1}",
                 )
+                task.add_done_callback(_task_supervisor_callback)
+                pipeline_worker_tasks.append(task)
     _log_memory_snapshot(
         "pipeline_workers_started",
         pipeline_worker_count=len(pipeline_worker_tasks),
@@ -7853,7 +7864,12 @@ async def _build_window_digest_messages(
     ):
         tasks.append(process_part(part_index, row_group))
         
-    for posts, result, digest_body in await asyncio.gather(*tasks):
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for res in results:
+        if isinstance(res, Exception):
+            LOGGER.error(f"Digest part processing failed: {res}")
+            continue
+        posts, result, digest_body = res
         if headline_mode:
             ranking_posts.extend(posts)
             part_headline, _part_story, part_highlights, part_also = extract_digest_narrative_parts(
@@ -8168,21 +8184,21 @@ async def _flush_digest_queue_once() -> bool:
     async with digest_loop_lock:
         interval_seconds = max(60, _digest_interval_seconds())
         interval_minutes = max(1, interval_seconds // 60)
-        active_batch_id, active_window_end_ts, active_rows = load_active_digest_window_claim()
+        active_batch_id, active_window_end_ts, active_rows = await asyncio.to_thread(load_active_digest_window_claim)
         batch_id = active_batch_id
         window_end_ts = int(active_window_end_ts or 0)
         claimed_rows = int(active_rows or 0)
         recovery_mode = False
 
         if batch_id and window_end_ts <= 0:
-            restore_digest_window(batch_id)
+            await asyncio.to_thread(restore_digest_window, batch_id)
             batch_id = ""
             claimed_rows = 0
 
         if batch_id:
-            batch_min_ts, _batch_max_ts, batch_row_count = load_batch_row_timestamp_bounds(batch_id)
+            batch_min_ts, _batch_max_ts, batch_row_count = await asyncio.to_thread(load_batch_row_timestamp_bounds, batch_id)
             if batch_row_count <= 0:
-                restore_digest_window(batch_id)
+                await asyncio.to_thread(restore_digest_window, batch_id)
                 batch_id = ""
                 claimed_rows = 0
             else:
@@ -8385,12 +8401,11 @@ async def _send_daily_archive_digest_once() -> None:
         )
 
         try:
-            row_loader = lambda *, after_id=0, limit=200: load_archive_window_page(
-                since_ts,
-                now_ts,
-                after_id=after_id,
-                limit=limit,
-            )
+            max_posts = _digest_daily_max_posts()
+            sampled_rows = load_sampled_archive_window(since_ts, now_ts, max_posts)
+            
+            def row_loader(*, after_id=0, limit=200):
+                return sampled_rows if after_id == 0 else []
             messages, stats = await _build_window_digest_messages(
                 row_loader,
                 total_updates=total_rows,
@@ -8480,8 +8495,8 @@ async def run_digest_scheduler() -> None:
         quota_health=get_quota_health(),
     )
 
-    try:
-        while True:
+    while True:
+        try:
             _maybe_decay_source_tiers()
             delay = _compute_next_scheduler_delay_seconds()
             digest_next_run_ts = time.time() + delay
@@ -8490,10 +8505,13 @@ async def run_digest_scheduler() -> None:
             processed = await _flush_digest_queue_once()
             if delay <= 0 and not processed:
                 await asyncio.sleep(1)
-    except asyncio.CancelledError:
-        LOGGER.info("Digest scheduler stopped.")
-        digest_next_run_ts = None
-        return
+        except asyncio.CancelledError:
+            LOGGER.info("Digest scheduler stopped.")
+            digest_next_run_ts = None
+            return
+        except Exception:
+            LOGGER.exception("Digest scheduler encountered an error. Retrying in 60s.")
+            await asyncio.sleep(60)
 
 
 async def run_daily_digest_scheduler() -> None:
@@ -8507,14 +8525,40 @@ async def run_daily_digest_scheduler() -> None:
         daily_times=[f"{h:02d}:{m:02d}" for h, m in daily_times],
         window_hours=_digest_daily_window_hours(),
     )
-    try:
-        while True:
+    while True:
+        try:
             delay = seconds_until_next_daily_time(daily_times)
             await asyncio.sleep(delay)
             await _send_daily_archive_digest_once()
-    except asyncio.CancelledError:
-        LOGGER.info("Daily digest scheduler stopped.")
-        return
+        except asyncio.CancelledError:
+            LOGGER.info("Daily digest scheduler stopped.")
+            return
+        except Exception:
+            LOGGER.exception("Daily digest scheduler encountered an error. Retrying in 60s.")
+            await asyncio.sleep(60)
+
+
+def _prune_memory_caches() -> None:
+    now = int(time.time())
+    cutoff = now - 86400
+    
+    stale_story = [k for k, v in breaking_story_ref_cache.items() if v[0] < cutoff]
+    for k in stale_story:
+        breaking_story_ref_cache.pop(k, None)
+        
+    stale_users = []
+    for uid, history in list(query_conversation_history.items()):
+        if not history:
+            stale_users.append(uid)
+            continue
+        try:
+            ts = int(history[-1].get("timestamp", 0) or 0)
+            if ts < cutoff:
+                stale_users.append(uid)
+        except Exception:
+            pass
+    for uid in stale_users:
+        query_conversation_history.pop(uid, None)
 
 
 async def run_digest_queue_clear_scheduler() -> None:
@@ -8535,47 +8579,56 @@ async def run_digest_queue_clear_scheduler() -> None:
         interval_seconds=interval,
         scope=scope,
     )
-    try:
-        while True:
+    while True:
+        try:
             await asyncio.sleep(interval)
             async with digest_loop_lock:
-                deleted = clear_digest_queue_scoped(scope)
-                headlined_story_prune(older_than_seconds=7200)
+                deleted = await asyncio.to_thread(clear_digest_queue_scoped, scope)
+                await asyncio.to_thread(headlined_story_prune, 7200)
+            
+            _prune_memory_caches()
+            
             log_structured(
                 LOGGER,
                 "digest_queue_cleared",
                 deleted=deleted,
                 scope=scope,
-                pending_after=count_pending(),
-                inflight_after=count_inflight(),
+                pending_after=await asyncio.to_thread(count_pending),
+                inflight_after=await asyncio.to_thread(count_inflight),
             )
-    except asyncio.CancelledError:
-        LOGGER.info("Digest queue clear scheduler stopped.")
-        return
+        except asyncio.CancelledError:
+            LOGGER.info("Digest queue clear scheduler stopped.")
+            return
+        except Exception:
+            LOGGER.exception("Digest queue clear scheduler encountered an error. Retrying.")
+            await asyncio.sleep(10)
 
 
 async def _flush_album_after_wait(key: Tuple[str, int]) -> None:
     try:
         await asyncio.sleep(ALBUM_WAIT_SECONDS)
+    except asyncio.CancelledError:
+        pass
+    finally:
         items = album_buffers.pop(key, [])
         album_tasks.pop(key, None)
         if items:
-            items = await _refresh_album_messages(items)
-            inserted = await _enqueue_inbound_messages(
-                items,
-                kind="album",
-                grouped_id=int(key[1] or 0),
-            )
-            if not inserted:
-                LOGGER.debug(
-                    "Skipped duplicate inbound album enqueue channel_id=%s grouped_id=%s",
-                    key[0],
-                    key[1],
-                )
-    except asyncio.CancelledError:
-        return
-    except Exception:
-        LOGGER.exception("Album processing failed for key=%s", key)
+            try:
+                refreshed_items = await _refresh_album_messages(key[0], items)
+                if refreshed_items:
+                    inserted = await _enqueue_inbound_messages(
+                        refreshed_items,
+                        kind="album",
+                        grouped_id=int(key[1] or 0),
+                    )
+                    if not inserted:
+                        LOGGER.debug(
+                            "Skipped duplicate inbound album enqueue channel_id=%s grouped_id=%s",
+                            key[0],
+                            key[1],
+                        )
+            except Exception:
+                LOGGER.exception("Album processing failed for key=%s", key)
 
 
 async def _resolve_entity_id(chat_obj) -> int | None:
@@ -8608,7 +8661,7 @@ async def _resolve_entity_id(chat_obj) -> int | None:
         return None
 
 
-async def _refresh_album_messages(messages: List[Message]) -> List[Message]:
+async def _refresh_album_messages(chat_ref: str, ids: List[int]) -> List[Message]:
     """
     Rehydrate buffered album fragments from Telegram before processing.
 
@@ -8616,21 +8669,15 @@ async def _refresh_album_messages(messages: List[Message]) -> List[Message]:
     Refetching by IDs gives the authoritative server copy and prevents silent
     caption loss on grouped media.
     """
-    if not messages:
-        return messages
-
-    ordered = sorted(messages, key=lambda m: int(m.id or 0))
-    chat_ref = ordered[0].chat_id
-    ids = [int(m.id or 0) for m in ordered if int(m.id or 0) > 0]
     if not ids:
-        return ordered
+        return []
 
     tg = _require_client()
     try:
         refreshed = await _call_with_floodwait(tg.get_messages, chat_ref, ids=ids)
     except Exception:
-        LOGGER.debug("Failed to refresh album messages; using buffered fragments.", exc_info=True)
-        return ordered
+        LOGGER.debug("Failed to refresh album messages", exc_info=True)
+        return []
 
     refreshed_list: List[Message]
     if isinstance(refreshed, Message):
@@ -8640,14 +8687,7 @@ async def _refresh_album_messages(messages: List[Message]) -> List[Message]:
     else:
         refreshed_list = []
 
-    if not refreshed_list:
-        return ordered
-
-    refreshed_by_id = {int(item.id or 0): item for item in refreshed_list if int(item.id or 0) > 0}
-    resolved: List[Message] = []
-    for original in ordered:
-        resolved.append(refreshed_by_id.get(int(original.id or 0), original))
-    return sorted(resolved, key=lambda m: int(m.id or 0))
+    return [item for item in refreshed_list if item is not None]
 
 
 async def _connect_client_with_lock_guard(
@@ -8808,6 +8848,10 @@ async def _join_and_resolve_manual_source(source: str) -> int | None:
 
     username = _extract_public_username(source)
     if username:
+        cached_id = get_cached_source_id(username)
+        if cached_id is not None:
+            return cached_id
+
         try:
             await _call_with_floodwait(tg, JoinChannelRequest(username))
         except UserAlreadyParticipantError:
@@ -8817,7 +8861,10 @@ async def _join_and_resolve_manual_source(source: str) -> int | None:
 
         try:
             entity = await _call_with_floodwait(tg.get_entity, username)
-            return utils.get_peer_id(entity)
+            peer_id = utils.get_peer_id(entity)
+            if peer_id is not None:
+                set_cached_source_id(username, peer_id)
+            return peer_id
         except Exception:
             LOGGER.debug("Failed resolving entity for source=%s", source, exc_info=True)
             return None
@@ -10010,6 +10057,8 @@ async def _safe_reply_markdown(
                 await asyncio.sleep(wait_seconds)
             except Exception:
                 LOGGER.exception("Failed to send query response message.")
+                await asyncio.sleep(0.5)
+                break
     return None
 
 
@@ -10680,7 +10729,7 @@ async def _on_new_message(event: events.NewMessage.Event) -> None:
 
         if msg.grouped_id:
             key = (channel_id, int(msg.grouped_id))
-            album_buffers[key].append(msg)
+            album_buffers[key].append(int(msg.id))
             task = album_tasks.get(key)
             if task and not task.done():
                 task.cancel()
@@ -10961,8 +11010,10 @@ async def _phase_initialize() -> None:
     _set_startup_phase("initializing", reason="runtime_initialization_started")
     _load_premium_emoji_map()
     _log_memory_snapshot("premium_emoji_map_loaded", phase=startup_phase, premium_emoji_count=len(premium_emoji_map))
+    _print_cli_status("•", "Initializing database...", level="info")
     init_db()
     _log_memory_snapshot("database_initialized", phase=startup_phase)
+    _print_cli_status("•", "Initializing duplicate detector...", level="info")
     await _init_dupe_detector()
     _log_memory_snapshot("dupe_detector_initialized", phase=startup_phase)
     _startup_health_check()
@@ -11081,14 +11132,18 @@ async def _phase_start_core(resolved_sources: List[int]) -> None:
 
     if _is_query_mode_enabled() and _looks_like_bot_token(_bot_destination_token_from_config()):
         query_bot_poll_task = asyncio.create_task(run_query_bot_poll_loop(), name="query-bot-poll")
+        query_bot_poll_task.add_done_callback(_task_supervisor_callback)
     if _is_missing_folder_invite_link():
         LOGGER.info("Listening to %s manually configured channels.", len(resolved_sources))
     if _is_digest_mode_enabled():
         digest_scheduler_task = asyncio.create_task(run_digest_scheduler(), name="digest-scheduler")
+        digest_scheduler_task.add_done_callback(_task_supervisor_callback)
         if _digest_daily_times():
             daily_digest_scheduler_task = asyncio.create_task(run_daily_digest_scheduler(), name="daily-digest-scheduler")
+            daily_digest_scheduler_task.add_done_callback(_task_supervisor_callback)
         if _digest_queue_clear_interval_seconds() > 0:
             queue_clear_scheduler_task = asyncio.create_task(run_digest_queue_clear_scheduler(), name="digest-queue-clear-scheduler")
+            queue_clear_scheduler_task.add_done_callback(_task_supervisor_callback)
             _print_cli_status("✓", "Schedulers started (30m rolling + daily + queue clear)", level="ok")
         else:
             queue_clear_scheduler_task = None
@@ -11110,6 +11165,19 @@ async def _phase_run(resolved_sources: List[int]) -> None:
         _print_cli_status("•", "Shutdown requested, stopping...", level="warn")
 
 
+def _task_supervisor_callback(task: asyncio.Task) -> None:
+    try:
+        exc = task.exception()
+        if exc:
+            LOGGER.critical("Background task %s died with exception: %s", task.get_name(), exc, exc_info=exc)
+        else:
+            LOGGER.critical("Background task %s unexpectedly finished cleanly.", task.get_name())
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        LOGGER.critical("Failed to inspect supervised task: %s", e, exc_info=True)
+
+
 async def main() -> None:
     global instance_lock_handle, startup_phase, startup_ready, startup_error, startup_git_updated
 
@@ -11121,7 +11189,7 @@ async def main() -> None:
         _set_startup_phase("lock", reason="instance_lock_started")
         _print_cli_status("•", "Checking single-instance lock...", level="info")
         try:
-            instance_lock_handle = _acquire_instance_lock()
+            instance_lock_handle = await _acquire_instance_lock()
             _log_memory_snapshot("instance_lock_acquired", phase=startup_phase)
             _print_cli_status("✓", "Instance lock acquired", level="ok")
         except RuntimeError as exc:

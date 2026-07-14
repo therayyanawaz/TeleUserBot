@@ -42,14 +42,17 @@ class WebStatusServer:
                 return
 
             def _send_html(self, status_code: int, payload: str) -> None:
-                raw = str(payload or "").encode("utf-8")
-                self.send_response(status_code)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
+                try:
+                    raw = str(payload or "").encode("utf-8")
+                    self.send_response(status_code)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
 
             def do_GET(self) -> None:  # noqa: N802
                 path = self.path.split("?", 1)[0]
@@ -110,7 +113,26 @@ class WebStatusServer:
                     ),
                 )
 
-        self._server = ThreadingHTTPServer((self._host, self._port), Handler)
+        try:
+            from config import WEB_SERVER_PORT_FALLBACK, WEB_SERVER_PORT_FALLBACK_MAX_OFFSET
+            max_attempts = max(1, int(WEB_SERVER_PORT_FALLBACK_MAX_OFFSET)) if WEB_SERVER_PORT_FALLBACK else 1
+        except Exception:
+            max_attempts = 10
+
+        bound = False
+        for offset in range(max_attempts):
+            target_port = self._port + offset
+            try:
+                self._server = ThreadingHTTPServer((self._host, target_port), Handler)
+                bound = True
+                break
+            except OSError:
+                if offset == max_attempts - 1:
+                    raise
+
+        if not bound or self._server is None:
+            return
+
         setattr(self._server, "_logger", self._logger)
         self._thread = threading.Thread(
             target=self._server.serve_forever,

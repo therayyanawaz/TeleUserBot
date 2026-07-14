@@ -497,6 +497,7 @@ class OntologyAnalysis:
 
 
 _TAXONOMY_CACHE: NewsTaxonomy | None = None
+_TAXONOMY_LOCK = threading.Lock()
 _HEALTH_LOCK = threading.Lock()
 _LABEL_RESOLUTION_WINDOW: deque[tuple[float, bool]] = deque(maxlen=4096)
 _LIVE_EVENT_RESOLUTION_WINDOW: deque[tuple[float, bool, tuple[str, ...]]] = deque(maxlen=4096)
@@ -847,48 +848,52 @@ def load_news_taxonomy(
     taxonomy_path = taxonomy_path.resolve()
     if not force_reload and _TAXONOMY_CACHE is not None and _TAXONOMY_CACHE.path == taxonomy_path:
         return _TAXONOMY_CACHE
-    if not taxonomy_path.exists():
-        raise NewsTaxonomyError(f"News taxonomy file not found: {taxonomy_path}")
 
-    try:
-        payload = json.loads(taxonomy_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise NewsTaxonomyError(f"Invalid JSON in news taxonomy: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise NewsTaxonomyError("News taxonomy root must be a JSON object.")
+    with _TAXONOMY_LOCK:
+        if not force_reload and _TAXONOMY_CACHE is not None and _TAXONOMY_CACHE.path == taxonomy_path:
+            return _TAXONOMY_CACHE
+        if not taxonomy_path.exists():
+            raise NewsTaxonomyError(f"News taxonomy file not found: {taxonomy_path}")
 
-    version = payload.get("version")
-    if not isinstance(version, int) or version < 1:
-        raise NewsTaxonomyError("News taxonomy must define an integer version >= 1.")
+        try:
+            payload = json.loads(taxonomy_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise NewsTaxonomyError(f"Invalid JSON in news taxonomy: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise NewsTaxonomyError("News taxonomy root must be a JSON object.")
 
-    compiler = _load_compiler_config(payload.get("compiler"))
-    raw_categories = payload.get("categories")
-    if not isinstance(raw_categories, list) or not raw_categories:
-        raise NewsTaxonomyError("News taxonomy must define a non-empty 'categories' list.")
+        version = payload.get("version")
+        if not isinstance(version, int) or version < 1:
+            raise NewsTaxonomyError("News taxonomy must define an integer version >= 1.")
 
-    categories: list[NewsCategory] = []
-    seen_keys: set[str] = set()
-    for raw_category in raw_categories:
-        category = _build_category(raw_category, compiler=compiler)
-        if category.key in seen_keys:
-            raise NewsTaxonomyError(f"Duplicate taxonomy category key '{category.key}'.")
-        seen_keys.add(category.key)
-        categories.append(category)
+        compiler = _load_compiler_config(payload.get("compiler"))
+        raw_categories = payload.get("categories")
+        if not isinstance(raw_categories, list) or not raw_categories:
+            raise NewsTaxonomyError("News taxonomy must define a non-empty 'categories' list.")
 
-    moderation = payload.get("moderation")
-    if not isinstance(moderation, dict):
-        moderation = {}
+        categories: list[NewsCategory] = []
+        seen_keys: set[str] = set()
+        for raw_category in raw_categories:
+            category = _build_category(raw_category, compiler=compiler)
+            if category.key in seen_keys:
+                raise NewsTaxonomyError(f"Duplicate taxonomy category key '{category.key}'.")
+            seen_keys.add(category.key)
+            categories.append(category)
 
-    taxonomy = NewsTaxonomy(
-        version=version,
-        path=taxonomy_path,
-        categories=tuple(categories),
-        compiler=compiler,
-        moderation=moderation,
-    )
-    if path is None:
-        _TAXONOMY_CACHE = taxonomy
-    return taxonomy
+        moderation = payload.get("moderation")
+        if not isinstance(moderation, dict):
+            moderation = {}
+
+        taxonomy = NewsTaxonomy(
+            version=version,
+            path=taxonomy_path,
+            categories=tuple(categories),
+            compiler=compiler,
+            moderation=moderation,
+        )
+        if path is None:
+            _TAXONOMY_CACHE = taxonomy
+        return taxonomy
 
 
 def get_news_taxonomy() -> NewsTaxonomy:

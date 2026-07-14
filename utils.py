@@ -1138,8 +1138,6 @@ def load_custom_emoji_map(
     """
     p = Path(path).expanduser()
     if not p.exists():
-        if logger:
-            logger.warning("Premium emoji map not found: %s", p)
         return {}
 
     try:
@@ -2091,6 +2089,15 @@ async def search_recent_news_web(
             return []
 
         try:
+            if len(response.text) > 1_000_000:
+                if logger:
+                    logger.debug(
+                        "Web cross-check RSS payload too large (%s bytes) provider=%s variant=%s",
+                        len(response.text),
+                        provider_name,
+                        variant,
+                    )
+                return []
             root = ET.fromstring(response.text)
         except Exception:
             if logger:
@@ -2865,49 +2872,52 @@ class HybridDuplicateEngine:
     def _ensure_backends(self) -> None:
         if self._backend_name != "uninitialized":
             return
+        with self._lock:
+            if self._backend_name != "uninitialized":
+                return
 
-        semantic_loaded = False
-        if self.use_sentence_transformers:
+            semantic_loaded = False
+            if self.use_sentence_transformers:
+                try:
+                    from sentence_transformers import SentenceTransformer  # type: ignore
+
+                    model = None
+                    for candidate in ("all-MiniLM-L6-v2", "paraphrase-MiniLM-L6-v2"):
+                        try:
+                            model = SentenceTransformer(candidate)
+                            break
+                        except Exception:
+                            continue
+                    if model is not None:
+                        self._st_model = model
+                        semantic_loaded = True
+                except Exception as exc:
+                    semantic_loaded = False
+                    if self.logger:
+                        self.logger.warning(
+                            "sentence-transformers unavailable; using no-HF semantic proxy for dedupe (%s)",
+                            exc,
+                        )
+
             try:
-                from sentence_transformers import SentenceTransformer  # type: ignore
+                from rapidfuzz import fuzz  # type: ignore
 
-                model = None
-                for candidate in ("all-MiniLM-L6-v2", "paraphrase-MiniLM-L6-v2"):
-                    try:
-                        model = SentenceTransformer(candidate)
-                        break
-                    except Exception:
-                        continue
-                if model is not None:
-                    self._st_model = model
-                    semantic_loaded = True
-            except Exception as exc:
-                semantic_loaded = False
+                self._fuzz = fuzz
+            except Exception:
+                self._fuzz = None
+
+            if semantic_loaded:
+                self._backend_name = "hybrid_semantic_tfidf_fuzzy"
                 if self.logger:
-                    self.logger.warning(
-                        "sentence-transformers unavailable; using no-HF semantic proxy for dedupe (%s)",
-                        exc,
+                    self.logger.info(
+                        "Hybrid duplicate backend: sentence-transformers + TF-IDF + rapidfuzz"
                     )
-
-        try:
-            from rapidfuzz import fuzz  # type: ignore
-
-            self._fuzz = fuzz
-        except Exception:
-            self._fuzz = None
-
-        if semantic_loaded:
-            self._backend_name = "hybrid_semantic_tfidf_fuzzy"
-            if self.logger:
-                self.logger.info(
-                    "Hybrid duplicate backend: sentence-transformers + TF-IDF + rapidfuzz"
-                )
-        else:
-            self._backend_name = "hybrid_nohf_semproxy_tfidf_fuzzy"
-            if self.logger:
-                self.logger.info(
-                    "Hybrid duplicate backend: no-HF semantic proxy + TF-IDF + rapidfuzz"
-                )
+            else:
+                self._backend_name = "hybrid_nohf_semproxy_tfidf_fuzzy"
+                if self.logger:
+                    self.logger.info(
+                        "Hybrid duplicate backend: no-HF semantic proxy + TF-IDF + rapidfuzz"
+                    )
 
     def _serialize_embedding(self, embedding: tuple[float, ...] | None) -> bytes | None:
         if not embedding:
@@ -2976,7 +2986,7 @@ class HybridDuplicateEngine:
 
         rows = load_recent_breaking(
             since_ts=now_ts - (self.history_hours * 3600),
-            limit=self.max_items,
+            limit=min(self.max_items, 1000),
         )
         rows = list(reversed(rows))
         rebuilt: deque[_HybridRecord] = deque()
@@ -3068,7 +3078,7 @@ class HybridDuplicateEngine:
         hours = max(1, min(int(warm_hours), self.history_hours))
         rows = load_recent_breaking(
             since_ts=now_ts - (hours * 3600),
-            limit=self.max_items,
+            limit=min(self.max_items, 300),
         )
         rows = list(reversed(rows))
 
