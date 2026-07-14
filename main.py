@@ -1778,10 +1778,10 @@ class _QueryProgressTracker:
         variant = normalize_space(str(payload.get("variant") or ""))
         force = False
         if scope == "telegram":
-            if phase == "fallback":
-                self._remember(self._telegram_terms, "recent history scan", max_items=3)
+            if phase == "fallback" or (phase == "variant" and (not variant or variant == "None")):
+                self._remember(self._telegram_terms, "recent timeline scan", max_items=3)
                 force = True
-            elif variant:
+            elif variant and variant != "None":
                 self._remember(self._telegram_terms, variant, max_items=3)
                 force = len(self._telegram_terms) <= 1
         elif scope == "web":

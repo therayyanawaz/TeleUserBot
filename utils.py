@@ -482,6 +482,8 @@ _QUERY_GENERIC_TERMS = {
     "status",
     "subject",
     "summary",
+    "summarize",
+    "overview",
     "than",
     "that",
     "the",
@@ -489,6 +491,7 @@ _QUERY_GENERIC_TERMS = {
     "there",
     "this",
     "today",
+    "top",
     "up",
     "update",
     "updates",
@@ -496,6 +499,9 @@ _QUERY_GENERIC_TERMS = {
     "was",
     "were",
     "what",
+    "whats",
+    "what's",
+    "whatis",
     "which",
     "when",
     "where",
@@ -503,6 +509,28 @@ _QUERY_GENERIC_TERMS = {
     "would",
     "with",
     "why",
+    "world",
+    "global",
+    "general",
+    "going",
+    "major",
+    "big",
+    "notable",
+    "happen",
+    "new",
+    "everything",
+    "anything",
+    "channel",
+    "channels",
+    "feed",
+    "feeds",
+    "wire",
+    "wires",
+    "currently",
+    "overall",
+    "see",
+    "stand",
+    "stands",
     "you",
     "yesterday",
 }
@@ -715,9 +743,12 @@ def build_query_search_variants(query: str, *, broad_query: bool = False) -> lis
     """
     normalized = normalize_space(query)
     base_keywords = extract_query_keywords(query)
+    numbers = extract_query_numbers(query)
+    if broad_query and not base_keywords and not numbers:
+        return [None]
+
     focus_phrases = extract_query_focus_phrases(query)
     expanded_terms = expand_query_terms(query)
-    numbers = extract_query_numbers(query)
 
     variants: list[str | None] = []
     seen: set[str] = set()
@@ -778,10 +809,10 @@ def build_query_search_variants(query: str, *, broad_query: bool = False) -> lis
             _push(" ".join([*numbers[:2], *base_keywords[:2]]))
             _push(" ".join([*base_keywords[:2], *numbers[:2]]))
 
-    if broad_query and not base_keywords and not focus_phrases and not numbers:
-        _push(None)
+    if not variants:
+        variants.append(None)
 
-    return variants or [None]
+    return variants
 
 
 def extract_query_numbers(query: str) -> list[str]:
