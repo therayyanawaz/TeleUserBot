@@ -308,19 +308,21 @@ python auth.py logout --env-file .env
 
 ## 🧠 LLM Provider Selection
 
-TeleUserBot supports three LLM backends. The active provider is determined by `LLM_PROVIDER` (or auto-detected from available API keys).
+TeleUserBot supports four LLM backends. The active provider is determined by `LLM_PROVIDER` (or selected via the interactive startup menu).
 
 | Provider | Config Key | Model Env Var | Notes |
 |----------|------------|---------------|-------|
 | **Codex** (default) | `LLM_PROVIDER=codex` | `CODEX_MODEL` | ChatGPT-account OAuth (PKCE). No API key needed. Uses `gpt-5.4-mini` by default. |
 | **OpenRouter** | `LLM_PROVIDER=openrouter` | `LLM_MODEL` | API key required. Free tier available. Default: `nvidia/nemotron-3-ultra-550b-a55b:free` (1M context). |
 | **Groq** | `LLM_PROVIDER=groq` | `GROQ_MODEL` | API key required. Ultra-fast LPU inference. Free tier: 14,400 req/day. Default: `llama-3.3-70b-versatile` (131K context). |
+| **Gemini OAuth** | `LLM_PROVIDER=gemini` | N/A (Web interface) | Uses `gemini.google.com` browser cookies (`__Secure-1PSID`). Free and unlimited web session via `gemini-webapi`. |
 
 ### Auto-detection order
-1. Explicit `LLM_PROVIDER=codex|openrouter|groq`
-2. `OPENROUTER_API_KEY` set → OpenRouter
-3. `GROQ_API_KEY` set → Groq
-4. Default → Codex (ChatGPT OAuth)
+1. Explicit `LLM_PROVIDER=codex|openrouter|groq|gemini`
+2. `GEMINI_COOKIE_1PSID` set → Gemini OAuth
+3. `OPENROUTER_API_KEY` set → OpenRouter
+4. `GROQ_API_KEY` set → Groq
+5. Default → Codex (ChatGPT OAuth)
 
 ### OpenRouter (free tier)
 ```env
@@ -337,6 +339,19 @@ GROQ_API_KEY=gsk_...
 GROQ_MODEL=llama-3.3-70b-versatile
 ```
 Free tier models: `llama-3.3-70b-versatile`, `llama-3.1-8b-instant`, `qwen3-32b`, `gemma2-9b-it`, `mixtral-8x7b-32768`. Get key at <https://console.groq.com>.
+
+### Gemini OAuth (Web Session)
+Requires `gemini-webapi` (`pip install gemini-webapi`).
+```env
+LLM_PROVIDER=gemini
+GEMINI_COOKIE_1PSID="g.a000xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+# Optional (recommended for long-term stability):
+GEMINI_COOKIE_1PSIDTS="sidts-CjEBxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+```
+To get your cookies:
+1. Open [gemini.google.com](https://gemini.google.com) and sign in.
+2. Open DevTools (`F12`) → **Application** → **Cookies** → `https://gemini.google.com`.
+3. Copy the value of `__Secure-1PSID` (and optionally `__Secure-1PSIDTS`).
 
 ### Codex (ChatGPT OAuth)
 ```env
@@ -440,6 +455,15 @@ Duplicate defense runs in layers.
 ### Story continuity
 
 When follow-up posts arrive as replies in the source channel, the bot can preserve that relationship in the destination feed.
+
+### Configuration & Performance Options
+```env
+DUPE_HISTORY_HOURS=4                # How many hours of recent breaking history to check against (default: 4, max: 24)
+DUPE_MERGE_INSTEAD_OF_SKIP=true     # Merge near-duplicates into evolving breaking alerts instead of dropping them
+DUPE_USE_SENTENCE_TRANSFORMERS=false # Enable heavy ML semantic embeddings (default: false for instant non-blocking startup)
+```
+
+**Performance Guarantee:** TeleUserBot uses non-blocking lazy loading for semantic engines during startup, capping DB warm-start queries so duplicate detector initialization completes in **under 10 milliseconds** regardless of SQLite database size.
 
 ## 🚨 Severity Routing
 
