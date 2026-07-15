@@ -1,10 +1,4 @@
-
 AGENT.md
-/data/
-.env
-.env.*
-!.env.example
-/.github
 /data/
 .env
 .env.*
@@ -20,3 +14,11 @@ __pycache__/
 userbot.session
 userbot.session-journal
 .venv/
+
+# Runtime artifacts — testing profiles, databases, logs
+.gemini_playwright_profile/
+.gemini_test_profile/
+db.sqlite
+codex_log.txt
+digest.txt
+temp.txt
